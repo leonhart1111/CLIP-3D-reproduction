@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "name": "constrained_5p0_multianchor_paper_strict",
+  "technology_nm": 45,
+  "mcpat": {
+    "temperature_k": 320,
+    "device_type": 0,
+    "longer_channel_device": 1,
+    "interconnect_projection_type": 1,
+    "opt_for_clk": 0,
+    "power_calibration": {
+      "dynamic_scale": 1.0468541644733147,
+      "leakage_scale": 1.0342212887903453,
+      "provenance": {
+        "kind": "Table III multi-anchor least-squares fallback",
+        "report": "results/calibration/table3_crosscheck_20260729/granular_multianchor_report.json"
+      },
+      "by_workload": {
+        "fft": {
+          "dynamic_scale": 0.9884165907283013,
+          "leakage_scale": 1.0450962029376138,
+          "provenance": {
+            "kind": "two FFT Table III anchors",
+            "report": "results/calibration/table3_crosscheck_20260729/granular_multianchor_report.json"
+          }
+        },
+        "matmul": {
+          "dynamic_scale": 1.1999768243888054,
+          "leakage_scale": 1.0156524358094388,
+          "provenance": {
+            "kind": "one MATMUL Table III anchor; local and not transferable",
+            "report": "results/calibration/table3_crosscheck_20260729/granular_multianchor_report.json"
+          }
+        }
+      }
+    }
+  },
+  "cacti": {
+    "use_paper_table_ii": true
+  },
+  "frequency": {
+    "f0_ghz": 2.0,
+    "fmin_ghz": 0.4,
+    "tsafe_c": 95.0,
+    "ambient_c": 25.0
+  },
+  "physical": {
+    "tiers": 2,
+    "grid_size": 32,
+    "utilization": 0.70,
+    "area_reference_mm2": 150.0,
+    "area_reference_raw_mm2": 57.713078,
+    "area_reference_basis": "McPAT non-cache area plus Table II cache area for the 4-core 32kB/512kB reference",
+    "thermal_stack": {
+      "silicon_resistivity_mk_per_w": 0.01,
+      "tim_resistivity_mk_per_w": 0.25,
+      "interposer_thickness_m": 0.0001,
+      "active_silicon_thickness_m": 0.00005,
+      "tim_thickness_m": 0.00002,
+      "local_resistance_scale": 6.176913662316973,
+      "silicon_resistance_scale": 1.0,
+      "tim_resistance_scale": 1.0,
+      "calibration": {
+        "kind": "best common Table III local-rise least-squares approximation",
+        "report": "results/calibration/table3_crosscheck_20260729/granular_multianchor_report.json",
+        "exact_fit_rejected": true
+      }
+    },
+    "r_convec_k_per_w": 5.0
+  },
+  "layout_optimizer": {
+    "r_convec_k_per_w": 5.0,
+    "alpha": 0.3,
+    "beta": 0.0,
+    "cross_tier_weight": 0.965,
+    "lambda_wire": 0.0009623320634835142,
+    "allowed_l2_tiers": [1],
+    "validation_policy": "paper-single",
+    "baseline_guard_bips_tolerance": 1e-9,
+    "require_scipy": true,
+    "parameter_status": {
+      "alpha_beta": "rejected by held-out spatial validation; beta tier effect is unidentifiable in legal P1 samples",
+      "cross_tier_weight": "provisional only; 16x16 fit does not preserve the formal 32x32 position ordering",
+      "lambda_wire": "one FFT matched R2 finite difference; multi-level and cross-workload validation pending"
+    },
+    "parameter_acceptance": {
+      "table3_power_and_stack": false,
+      "thermal_proxy_direction": false,
+      "lambda_wire_transfer": false,
+      "formal_claim_allowed": false,
+      "reports": [
+        "results/calibration/table3_crosscheck_20260729/final_anchor_audit.json",
+        "results/calibration/granular_proxy_20260729/calibration_report.json",
+        "results/calibration/thermal_proxy_5p0_3x3_20260728/lambda_wire_report.json"
+      ]
+    }
+  },
+  "comparison_layouts": {
+    "candidate_grid": 11,
+    "top_k_hotspot": 3,
+    "sa_iterations": 600,
+    "sa_seed": 20260725,
+    "sa_selection_lambda": 0.5
+  },
+  "delay": {
+    "tsv_hops": 1,
+    "cycles_per_tsv": 2,
+    "l1_pipeline_cycles": 1,
+    "wire_rounding": "nearest",
+    "wire_aggregation": "mean"
+  },
+  "provenance": {
+    "paper": [
+      "45 nm, four cores, 2 GHz",
+      "32x32 per active tier, 70% utilization, 150 mm^2 reference",
+      "T_safe=95 C, experimental T_amb=25 C, f_min=0.4 GHz",
+      "P1 cores bottom and L2 top; L-BFGS-B with BL/center/TR starts",
+      "one final optimized-layout HotSpot; mean wire delay in equation (15)"
+    ],
+    "local_reproduction": [
+      "Detailed McPAT functional blocks are preserved instead of one uniform core_logic rectangle.",
+      "Power and stack parameters use Table III observables only, never target layout improvement.",
+      "The common stack fit is not exact; residuals and rejected alternatives are in the calibration report.",
+      "The methodology prose mentions 45 C, but equation (13) and Table III f_sus numerically require the experimental 25 C ambient.",
+      "This config is the most defensible current approximation, not a claim that unpublished paper parameters were recovered."
+    ]
+  }
+}

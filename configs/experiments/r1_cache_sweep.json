@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "name": "clip3d_r1_cache_sweep",
+  "workloads": [
+    "fft",
+    "cholesky",
+    "stream",
+    "matmul",
+    "stencil"
+  ],
+  "l1d_sizes": [
+    "16kB",
+    "32kB",
+    "64kB",
+    "128kB"
+  ],
+  "l2_sizes": [
+    "128kB",
+    "256kB",
+    "512kB",
+    "1024kB",
+    "2048kB"
+  ],
+  "fixed_architecture": {
+    "cores": 4,
+    "cpu": "X86O3CPU",
+    "clock": "2GHz",
+    "issue_width": 4,
+    "rob_entries": 192,
+    "l1i_size": "32kB",
+    "l1_associativity": 2,
+    "l2_associativity": 8,
+    "cache_line_bytes": 64
+  },
+  "profiles": {
+    "paper": {
+      "warmup_insts": 100000000,
+      "measure_insts": 500000000,
+      "instruction_window_scope": "cpu0",
+      "workload_options": {}
+    },
+    "paper_all_cores": {
+      "warmup_insts": 100000000,
+      "measure_insts": 500000000,
+      "instruction_window_scope": "all-cores",
+      "workload_options": {}
+    },
+    "smoke": {
+      "warmup_insts": 2000000,
+      "measure_insts": 300000,
+      "instruction_window_scope": "cpu0",
+      "workload_options": {
+        "matmul": "-n 128 -r 20 -t 4",
+        "stencil": "-n 256 -i 100 -t 4"
+      }
+    }
+  }
+}

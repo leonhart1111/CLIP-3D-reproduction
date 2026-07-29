@@ -1,0 +1,459 @@
+from __future__ import annotations
+
+import math
+import tempfile
+import unittest
+from pathlib import Path
+
+from workflow.cacti.characterize_cache import PAPER_TABLE_II, parse_cacti_output
+from workflow.analysis.summarize_sweep import summarize
+from workflow.common import write_json
+from workflow.floorplan.comparison_layouts import generate as generate_comparison_layouts
+from workflow.floorplan.build_module_model import apply_physical_areas
+from workflow.floorplan.generate_hotspot_inputs import baseline_layout, grid_power, materialize
+from workflow.floorplan.layout_metrics import derive_layout_delays
+from workflow.floorplan.optimize_layout import optimize, proxy_temperature
+from workflow.mcpat.parse_mcpat import (
+    apply_power_calibration,
+    parse_mcpat_text,
+    resolve_power_calibration,
+)
+from workflow.r2.calibrate_lambda_wire import (
+    calibrate as calibrate_lambda_wire,
+    calibrate_series as calibrate_lambda_wire_series,
+)
+from workflow.run_lifting_pipeline import (
+    evaluate_comparison_candidates, select_clip3d_candidate, validate_config,
+)
+from workflow.run_lifting_sweep import completed as lifting_completed
+from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT, run_hotspot
+from workflow.thermal.calibrate_proxy import (
+    candidate_layouts, parse_external_case, sample_split,
+)
+from workflow.thermal.sustainable_frequency import closed_form_frequency
+from workflow.thermal.validate_frequency import validate_case
+
+
+def metric_lines(area, dynamic, sub, gate, indent="  "):
+    return (f"{indent}Area = {area} mm^2\n{indent}Runtime Dynamic = {dynamic} W\n"
+            f"{indent}Subthreshold Leakage = {sub} W\n{indent}Gate Leakage = {gate} W\n")
+
+
+class FrequencyTests(unittest.TestCase):
+    def test_paper_anchor(self):
+        frequency, state, raw = closed_form_frequency(100.0, 0.446)
+        self.assertEqual(state, "thermally_limited")
+        self.assertAlmostEqual(frequency, 1.759326, places=5)
+        self.assertAlmostEqual(raw, frequency)
+
+    def test_headroom(self):
+        self.assertEqual(closed_form_frequency(90.0, 0.5)[0], 2.0)
+
+    def test_lambda_wire_matched_pair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "base_result.json", {"ipc2": 3.0})
+            write_json(root / "candidate_result.json", {"ipc2": 3.1})
+            write_json(root / "base_latency.json", {
+                "layout_delays": {"wire_cycles": 2}
+            })
+            write_json(root / "candidate_latency.json", {
+                "layout_delays": {"wire_cycles": 1}
+            })
+            result = calibrate_lambda_wire(
+                root / "base_result.json", root / "candidate_result.json",
+                root / "base_latency.json", root / "candidate_latency.json",
+                ipc1=4.0, frequency_ghz=2.0,
+            )
+            self.assertAlmostEqual(result["lambda_wire"], 0.05)
+
+    def test_lambda_wire_multilevel_regression(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            samples = []
+            for cycles, ipc2 in ((0, 3.2), (1, 3.1), (2, 3.0), (3, 2.9)):
+                result = root / f"result_{cycles}.json"
+                latency = root / f"latency_{cycles}.json"
+                write_json(result, {"ipc2": ipc2})
+                write_json(latency, {
+                    # The geometry field may intentionally differ during a
+                    # synthetic latency sweep; calibration must use the value
+                    # actually injected into gem5.
+                    "layout_delays": {"wire_cycles": 9},
+                    "components_cycles": {"layout_wire": cycles},
+                    "gem5_overrides": {"xbar_forward_latency": 5 + cycles},
+                })
+                samples.append((str(cycles), result, latency))
+            report = calibrate_lambda_wire_series(
+                samples, ipc1=4.0, frequency_ghz=2.0,
+            )
+            self.assertAlmostEqual(report["lambda_wire"], 0.05)
+            self.assertAlmostEqual(report["fit"]["r_squared"], 1.0)
+            self.assertTrue(report["recommendation"]["accepted_for_this_workload"])
+
+
+class ParserTests(unittest.TestCase):
+    def test_workload_power_calibration_is_explicitly_resolved(self):
+        config = {"power_calibration": {
+            "dynamic_scale": 1.1,
+            "leakage_scale": 1.2,
+            "by_workload": {
+                "fft": {"dynamic_scale": 0.9, "leakage_scale": 1.05}
+            },
+        }}
+        fft = resolve_power_calibration(config, "fft")
+        matmul = resolve_power_calibration(config, "matmul")
+        self.assertEqual(fft["dynamic_scale"], 0.9)
+        self.assertTrue(fft["selection"]["used_workload_override"])
+        self.assertEqual(matmul["dynamic_scale"], 1.1)
+        self.assertFalse(matmul["selection"]["used_workload_override"])
+
+    def test_cacti_parser(self):
+        text = """Access time (ns): 1.5
+Cycle time (ns): 2.0
+Total dynamic read energy per access (nJ): 0.1
+Total dynamic write energy per access (nJ): 0.2
+Total leakage power of a bank (mW): 3.0
+Cache height x width (mm): 2 x 4
+"""
+        result = parse_cacti_output(text)
+        self.assertEqual(result["area_mm2"], 8.0)
+
+    def test_mcpat_parser_and_cache_subtraction(self):
+        sep = "*" * 40
+        processor = metric_lines(12, 6, 1, 1)
+        core = (metric_lines(8, 4, 0.8, 0.2) + "Instruction Cache:\n" +
+                metric_lines(1, 0.5, 0.1, 0.1, "    ") + "Data Cache:\n" +
+                metric_lines(2, 1, 0.2, 0.1, "    "))
+        l2 = metric_lines(3, 1, 0.3, 0.2)
+        text = ("Technology 45 nm\nCore clock Rate(MHz) 2000\nProcessor:\n" + processor +
+                f"\n{sep}\nCore:\n" + core + f"\n{sep}\nL2\n" + l2)
+        result = parse_mcpat_text(text)
+        logic = result["modules"][0]
+        self.assertAlmostEqual(logic["area_mm2"], 5.0)
+        self.assertAlmostEqual(logic["dynamic_power_w"], 2.5)
+
+        apply_power_calibration(result, dynamic_scale=2.0, leakage_scale=3.0,
+                                provenance={"kind": "unit test"})
+        self.assertAlmostEqual(result["modules"][0]["dynamic_power_w"], 5.0)
+        self.assertAlmostEqual(result["modules"][0]["leakage_power_w"], 1.5)
+        self.assertAlmostEqual(result["modules"][0]["raw_power"]["total_power_w"], 3.0)
+
+    def test_detailed_mcpat_preserves_functional_core_blocks(self):
+        sep = "*" * 40
+        processor = metric_lines(20, 10, 2, 1)
+        core = (
+            metric_lines(10, 5, 1, 0.5)
+            + "Instruction Fetch Unit:\n" + metric_lines(2, 1, 0.2, 0.1, "    ")
+            + "Instruction Cache:\n" + metric_lines(1, 0.2, 0.1, 0.05, "      ")
+            + "Renaming Unit:\n" + metric_lines(1, 0.5, 0.1, 0.05, "    ")
+            + "Load Store Unit:\n" + metric_lines(3, 1.5, 0.3, 0.15, "    ")
+            + "Data Cache:\n" + metric_lines(2, 0.4, 0.2, 0.1, "      ")
+            + "Memory Management Unit:\n" + metric_lines(1, 0.5, 0.1, 0.05, "    ")
+            + "Execution Unit:\n" + metric_lines(2, 1.0, 0.2, 0.1, "    ")
+        )
+        l2 = metric_lines(3, 1, 0.3, 0.2)
+        text = (
+            "Technology 45 nm\nCore clock Rate(MHz) 2000\nProcessor:\n" + processor
+            + f"\n{sep}\nCore:\n" + core + f"\n{sep}\nL2\n" + l2
+        )
+        result = parse_mcpat_text(text)
+        kinds = {module["kind"] for module in result["modules"]}
+        self.assertIn("core_exec", kinds)
+        self.assertIn("core_ifu", kinds)
+        self.assertEqual(
+            result["checks"]["core_logic_granularity"],
+            "McPAT top-level functional blocks",
+        )
+
+    def test_paper_table_ii_anchor(self):
+        self.assertEqual(PAPER_TABLE_II[("l1d", 64 * 1024)]["area_mm2"], 1.16)
+        self.assertEqual(PAPER_TABLE_II[("l2", 1024 * 1024)]["access_time_ns"], 1.984)
+
+    def test_module_model_consumes_cacti_cache_geometry(self):
+        modules = [
+            {"name": "core0_logic", "kind": "core_logic", "area_mm2": 10.0,
+             "dynamic_power_w": 1.0, "leakage_power_w": 0.1, "total_power_w": 1.1},
+            {"name": "core0_l1i", "kind": "l1i", "area_mm2": 20.0,
+             "dynamic_power_w": 0.1, "leakage_power_w": 0.1, "total_power_w": 0.2},
+            {"name": "core0_l1d", "kind": "l1d", "area_mm2": 30.0,
+             "dynamic_power_w": 0.1, "leakage_power_w": 0.1, "total_power_w": 0.2},
+            {"name": "shared_l2", "kind": "l2", "area_mm2": 40.0,
+             "dynamic_power_w": 0.1, "leakage_power_w": 0.1, "total_power_w": 0.2},
+        ]
+        metadata = {"l1i_size": "32kB", "l1d_size": "64kB", "l2_size": "512kB"}
+        cacti = {"records": [
+            {"level": "l1d", "size": "32kB", "size_bytes": 32 * 1024,
+             "area_mm2": 0.74, "width_mm": 1.0, "height_mm": 0.74,
+             "value_source": "paper Table II"},
+            {"level": "l1d", "size": "64kB", "size_bytes": 64 * 1024,
+             "area_mm2": 1.16, "width_mm": 1.45, "height_mm": 0.8,
+             "value_source": "paper Table II"},
+            {"level": "l2", "size": "512kB", "size_bytes": 512 * 1024,
+             "area_mm2": 10.01, "width_mm": 5.0, "height_mm": 2.002,
+             "value_source": "paper Table II"},
+        ]}
+        physical = apply_physical_areas(modules, metadata, cacti, 2.0)
+        by_kind = {module["kind"]: module for module in physical}
+        self.assertAlmostEqual(by_kind["core_logic"]["area_mm2"], 20.0)
+        self.assertEqual(by_kind["core_logic"]["area_source"], "McPAT")
+        self.assertAlmostEqual(by_kind["l1d"]["area_mm2"], 2.32)
+        self.assertAlmostEqual(by_kind["l1d"]["raw_area_mm2"], 30.0)
+        self.assertEqual(by_kind["l1d"]["area_source"], "paper Table II")
+        self.assertAlmostEqual(by_kind["l2"]["preferred_width_mm"], 5.0 * math.sqrt(2.0))
+
+
+class GridTests(unittest.TestCase):
+    def model(self):
+        modules = []
+        for core in range(4):
+            modules.append({"name": f"core{core}_logic", "kind": "core_logic", "core": core,
+                            "area_mm2": 1.0, "dynamic_power_w": 0.8,
+                            "leakage_power_w": 0.2, "total_power_w": 1.0})
+        modules.extend((
+            {"name": "shared_l2", "kind": "l2", "area_mm2": 1.0,
+             "dynamic_power_w": 0.4, "leakage_power_w": 0.1, "total_power_w": 0.5},
+            {"name": "noc", "kind": "interconnect", "area_mm2": 0.1,
+             "dynamic_power_w": 0.1, "leakage_power_w": 0.01, "total_power_w": 0.11},
+        ))
+        return {"schema_version": 1, "ipc1": 4.0, "gamma": 0.21,
+                "modules": modules, "totals": {"total_power_w": 4.61,
+                "dynamic_power_w": 3.7, "leakage_power_w": 0.91}}
+
+    def test_exact_power_conservation(self):
+        gridded = grid_power(baseline_layout(self.model()), 8)
+        for tier in gridded["power_conservation"]:
+            for field in ("dynamic_power_w", "leakage_power_w", "total_power_w"):
+                self.assertLess(abs(tier[field]["residual"]), 1e-10)
+
+    def test_fixed_bin_l2_is_lower_left(self):
+        layout = baseline_layout(self.model())
+        l2 = next(module for module in layout["modules"] if module["kind"] == "l2")
+        self.assertEqual(l2["tier"], 1)
+        self.assertAlmostEqual(l2["x_mm"], 0.0)
+        self.assertAlmostEqual(l2["y_mm"], 0.0)
+
+    def test_fixed_bin_preserves_l2_preferred_aspect_ratio(self):
+        model = self.model()
+        l2 = next(module for module in model["modules"] if module["kind"] == "l2")
+        l2["preferred_width_mm"] = 1.5
+        l2["preferred_height_mm"] = 2.0 / 3.0
+        placed = next(
+            module for module in baseline_layout(model)["modules"]
+            if module["kind"] == "l2"
+        )
+        self.assertAlmostEqual(placed["width_mm"], 1.5)
+        self.assertAlmostEqual(placed["height_mm"], 2.0 / 3.0)
+
+    def test_proxy_calibration_candidates_are_legal_and_split_is_stable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "modules.json"
+            write_json(path, self.model())
+            candidates = candidate_layouts(path, grid_points=3, utilization=0.70)
+            self.assertGreater(len(candidates), 0)
+            for candidate in candidates:
+                layout = candidate["layout"]
+                self.assertEqual(len(layout["modules"]), len(self.model()["modules"]))
+            self.assertEqual(sample_split(0, 0, 0, 0, 3), "validation")
+            self.assertEqual(sample_split(0, 1, 1, 0, 3), "validation")
+            self.assertEqual(sample_split(0, 0, 1, 0, 3), "train")
+
+    def test_external_proxy_cases_preserve_spatial_group(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = Path(temporary)
+            for name in ("layout.json", "thermal_result.json", "hotspot_manifest.json"):
+                write_json(case / name, {})
+            group, label, parsed = parse_external_case(f"fft:center={case}")
+            self.assertEqual(group, "fft")
+            self.assertEqual(label, "center")
+            self.assertEqual(parsed, case.resolve())
+
+    def test_layout_delays_come_from_final_tiers_and_coordinates(self):
+        layout = baseline_layout(self.model())
+        delays = derive_layout_delays(layout)
+        self.assertEqual(delays["tsv_hops"], 1)
+        self.assertGreaterEqual(delays["wire_cycles_unrounded"], 0.0)
+        self.assertGreaterEqual(
+            delays["maximum_wire_cycles_unrounded"], delays["wire_cycles_unrounded"]
+        )
+        same_tier = {**layout, "modules": [dict(module) for module in layout["modules"]]}
+        next(module for module in same_tier["modules"] if module["kind"] == "l2")["tier"] = 0
+        self.assertEqual(derive_layout_delays(same_tier)["tsv_hops"], 0)
+
+    def test_area_quadrature_proxy_is_finite_and_geometry_sensitive(self):
+        layout = baseline_layout(self.model())
+        center = proxy_temperature(
+            layout["modules"], layout["die_width_mm"], 25.0, 5.0,
+            0.3, 0.0, 0.9, "center",
+        )
+        area = proxy_temperature(
+            layout["modules"], layout["die_width_mm"], 25.0, 5.0,
+            0.3, 0.0, 0.9, "area-quadrature", 2,
+        )
+        self.assertTrue(math.isfinite(area))
+        self.assertNotAlmostEqual(center, area, places=9)
+
+    def test_optimizer_reports_physical_observability(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            write_json(root / "modules.json", model)
+            report = optimize(
+                root / "modules.json", root / "layout.json", root / "report.json",
+                allowed_l2_tiers=[1], require_scipy=False,
+            )
+            diagnostics = report["observability_diagnostics"]
+            self.assertAlmostEqual(
+                diagnostics["movable_l2_power_fraction"],
+                0.5 / model["totals"]["total_power_w"],
+            )
+            self.assertIn("layout_delays", report["baseline"])
+            self.assertIn("mean_wire_cycles_rounded", report["predicted_deltas"])
+            self.assertIn("paper_mean_r2_cycle_changed", diagnostics)
+
+    def test_comparison_layouts_emit_three_recorded_candidates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+            report = generate_comparison_layouts(
+                root / "modules.json", root / "search", "sa-lambda",
+                candidate_grid=5, top_k=3, sa_iterations=20, sa_seed=7,
+            )
+            self.assertEqual(report["hotspot_candidate_count"], 3)
+            self.assertEqual(len(report["search"]), 11)
+
+    @unittest.skipUnless(DEFAULT_HOTSPOT.is_file(), "HotSpot executable unavailable")
+    def test_comparison_candidates_run_three_hotspot_solves(self):
+        config = {
+            "frequency": {"ambient_c": 25.0, "f0_ghz": 2.0,
+                          "fmin_ghz": 0.4, "tsafe_c": 95.0},
+            "physical": {"grid_size": 4, "utilization": 0.70,
+                         "r_convec_k_per_w": 5.0},
+            "layout_optimizer": {"alpha": 0.3, "beta": 0.1,
+                                 "cross_tier_weight": 0.65},
+            "comparison_layouts": {"candidate_grid": 5, "top_k_hotspot": 3,
+                                   "sa_iterations": 20, "sa_seed": 7,
+                                   "sa_selection_lambda": 0.5},
+            "delay": {"wire_rounding": "nearest"},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+            layout, thermal, selection = evaluate_comparison_candidates(
+                root / "modules.json", root / "output", config, "sa-lambda"
+            )
+            self.assertTrue(layout.is_file())
+            self.assertGreater(thermal["tmax_c"], 25.0)
+            self.assertEqual(selection["hotspot_solves"], 3)
+
+    @unittest.skipUnless(DEFAULT_HOTSPOT.is_file(), "HotSpot executable unavailable")
+    def test_small_real_hotspot_case(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+            materialize(root / "modules.json", root / "case", grid_size=4)
+            result = run_hotspot(root / "case")
+            self.assertGreater(result["tmax_c"], 25.0)
+            self.assertTrue(math.isfinite(result["tmax_c"]))
+
+            validation = validate_case(
+                root / "case", root / "modules.json", root / "validation.json",
+                [0.5, 1.0, 2.0], validate_solution=False,
+            )
+            self.assertLess(validation["max_abs_linear_error_c"], 0.05)
+
+
+class FormalGuardTests(unittest.TestCase):
+    def test_clip3d_real_hotspot_guard_rejects_lower_thermal_bips(self):
+        fixed = {"policy": "fixed-bin", "bips1_thermal": 3.45,
+                 "wire_cycles": 1, "tmax_c": 124.39}
+        proposed = {"policy": "optimized", "bips1_thermal": 3.43,
+                    "wire_cycles": 1, "tmax_c": 124.54}
+        selected, reason = select_clip3d_candidate([fixed, proposed])
+        self.assertEqual(selected["policy"], "fixed-bin")
+        self.assertIn("baseline guard", reason)
+
+    def test_clip3d_real_hotspot_guard_uses_discrete_wire_tie_break(self):
+        fixed = {"policy": "fixed-bin", "bips1_thermal": 3.45,
+                 "wire_cycles": 2, "tmax_c": 120.0}
+        proposed = {"policy": "optimized", "bips1_thermal": 3.45,
+                    "wire_cycles": 1, "tmax_c": 121.0}
+        selected, reason = select_clip3d_candidate([proposed, fixed])
+        self.assertEqual(selected["policy"], "optimized")
+        self.assertIn("wire latency", reason)
+
+    def test_lifting_resume_rejects_stale_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "pipeline_summary.json", {
+                "layout_method": "fixed-bin", "cooling": {"r_convec_k_per_w": 5.0},
+                "ipc2": 1.0, "bips2": 1.0,
+            })
+            old = {"physical": {"r_convec_k_per_w": 5.0}, "mcpat": {"temperature_k": 370}}
+            new = {"physical": {"r_convec_k_per_w": 5.0}, "mcpat": {"temperature_k": 320}}
+            write_json(root / "run_config.json", {"config": old})
+            self.assertFalse(lifting_completed(root, new, "fixed-bin", True))
+            self.assertTrue(lifting_completed(root, old, "fixed-bin", True))
+
+    def test_mismatched_optimizer_and_hotspot_cooling_is_rejected(self):
+        config = {
+            "schema_version": 1,
+            "physical": {"r_convec_k_per_w": 3.5},
+            "layout_optimizer": {"r_convec_k_per_w": 5.0},
+        }
+        with self.assertRaises(ValueError):
+            validate_config(config, "clip3d")
+        validate_config(config, "fixed-bin")
+
+    def test_negative_clip3d_guard_tolerance_is_rejected(self):
+        config = {
+            "schema_version": 1,
+            "physical": {"r_convec_k_per_w": 5.0},
+            "layout_optimizer": {"r_convec_k_per_w": 5.0,
+                                 "baseline_guard_bips_tolerance": -1.0},
+        }
+        with self.assertRaises(ValueError):
+            validate_config(config, "clip3d")
+
+    def test_invalid_paper_mode_controls_are_rejected(self):
+        config = {
+            "schema_version": 1,
+            "physical": {"r_convec_k_per_w": 5.0},
+            "layout_optimizer": {
+                "r_convec_k_per_w": 5.0,
+                "validation_policy": "not-a-policy",
+            },
+        }
+        with self.assertRaises(ValueError):
+            validate_config(config, "clip3d")
+        config["layout_optimizer"]["validation_policy"] = "paper-single"
+        config["layout_optimizer"]["allowed_l2_tiers"] = [2]
+        with self.assertRaises(ValueError):
+            validate_config(config, "clip3d")
+        config["layout_optimizer"]["allowed_l2_tiers"] = [1]
+        config["layout_optimizer"]["wire_objective"] = "invented"
+        with self.assertRaises(ValueError):
+            validate_config(config, "clip3d")
+
+    def test_formal_summary_requires_real_r2(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            point = {
+                "workload": "matmul", "l1d_size": "32kB", "l2_size": "512kB",
+                "layout_method": "fixed-bin", "cooling": {"r_convec_k_per_w": 3.5},
+                "ipc1": 2.0, "tmax_c": 80.0, "sustainable_frequency_ghz": 2.0,
+                "bips1_thermal": 4.0, "ipc2": None, "bips2": None,
+                "r2_critical_path_cycles": 10, "total_pipeline_seconds": 1.0,
+            }
+            write_json(root / "point/pipeline_summary.json", point)
+            with self.assertRaises(ValueError):
+                summarize(root, root / "strict.csv", root / "strict.json")
+            result = summarize(
+                root, root / "proxy.csv", root / "proxy.json",
+                allow_proxy=True, expected_points=1,
+            )
+            self.assertFalse(result["r2_complete"])
+
+
+if __name__ == "__main__":
+    unittest.main()

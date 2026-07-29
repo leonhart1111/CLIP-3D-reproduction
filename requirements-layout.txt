@@ -1,0 +1,4 @@
+# Project-local layout optimizer environment.
+# Installed with: .venv/bin/python -m pip install -r requirements-layout.txt
+numpy==2.4.6
+scipy==1.15.3

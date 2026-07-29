@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Downloaded / built tools
+tools/src/
+tools/build/
+tools/install/
+
+# gem5 / experiment outputs
+m5out/
+runs/
+results/
+
+# Benchmark downloads / binaries
+benchmarks/bin/
+benchmarks/inputs/
+benchmarks/src/splash2/
+benchmarks/src/stream/
+
+# Build products and logs
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+*.log
+
+# Local/editor files
+.DS_Store
+.vscode/
+.idea/

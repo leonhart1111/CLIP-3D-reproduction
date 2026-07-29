@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "frequencies_ghz": [0.5, 1.0, 2.0],
+  "validate_solution": true,
+  "cases": [
+    {
+      "label": "baseline_stream_256k_32k",
+      "case_dir": "runs/architecture_sweep/lifting_baseline_3p5/stream/l1d_32kB/l2_256kB/hotspot"
+    },
+    {
+      "label": "baseline_matmul_boundary",
+      "case_dir": "runs/architecture_sweep/lifting_baseline_3p5/matmul/l1d_128kB/l2_2048kB/hotspot"
+    },
+    {
+      "label": "baseline_fft_256k_32k",
+      "case_dir": "runs/architecture_sweep/lifting_baseline_3p5/fft/l1d_32kB/l2_256kB/hotspot"
+    },
+    {
+      "label": "baseline_fft_1m_64k",
+      "case_dir": "runs/architecture_sweep/lifting_baseline_3p5/fft/l1d_64kB/l2_1024kB/hotspot"
+    },
+    {
+      "label": "constrained_stream_256k_32k",
+      "case_dir": "runs/architecture_sweep/lifting_constrained_5p0/stream/l1d_32kB/l2_256kB/hotspot"
+    },
+    {
+      "label": "constrained_matmul_2m_128k",
+      "case_dir": "runs/architecture_sweep/lifting_constrained_5p0/matmul/l1d_128kB/l2_2048kB/hotspot"
+    },
+    {
+      "label": "constrained_fft_1m_64k",
+      "case_dir": "runs/architecture_sweep/lifting_constrained_5p0/fft/l1d_64kB/l2_1024kB/hotspot"
+    }
+  ]
+}
