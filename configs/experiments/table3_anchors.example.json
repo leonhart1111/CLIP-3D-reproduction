@@ -2,6 +2,12 @@
   "schema_version": 1,
   "frequencies_ghz": [0.5, 1.0, 2.0],
   "validate_solution": true,
+  "frequency_settings": {
+    "f0_ghz": 2.0,
+    "fmin_ghz": 0.4,
+    "tsafe_c": 95.0,
+    "scaling_mode": "separated-dynamic-leakage"
+  },
   "cases": [
     {
       "label": "baseline_stream_256k_32k",

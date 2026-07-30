@@ -35,7 +35,12 @@ from workflow.thermal.calibrate_proxy import (
     sample_split,
 )
 from workflow.thermal.sustainable_frequency import closed_form_frequency
-from workflow.thermal.validate_frequency import validate_case
+from workflow.thermal.run_anchor_validation import run_manifest
+from workflow.thermal.validate_frequency import (
+    compose_separated_ptrace,
+    read_ptrace,
+    validate_case,
+)
 
 
 def metric_lines(area, dynamic, sub, gate, indent="  "):
@@ -44,6 +49,102 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
 
 
 class FrequencyTests(unittest.TestCase):
+    def test_separated_frequency_trace_scales_only_dynamic_power(self):
+        """Changing frequency must not scale per-cell leakage power."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "dynamic.ptrace").write_text("a b\n8 4\n", encoding="utf-8")
+            (root / "leakage.ptrace").write_text("a b\n2 6\n", encoding="utf-8")
+
+            result = compose_separated_ptrace(
+                root / "dynamic.ptrace", root / "leakage.ptrace", root / "one.ptrace",
+                frequency_ghz=1.0, f0_ghz=2.0,
+            )
+
+            self.assertEqual(read_ptrace(root / "one.ptrace")[1], [6.0, 8.0])
+            self.assertEqual(result["dynamic_scale"], 0.5)
+
+    def test_separated_frequency_trace_rejects_misaligned_power_traces(self):
+        """A reordered HotSpot power trace must not silently misplace power."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "dynamic.ptrace").write_text("a b\n8 4\n", encoding="utf-8")
+            (root / "leakage.ptrace").write_text("b a\n2 6\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "headers"):
+                compose_separated_ptrace(
+                    root / "dynamic.ptrace", root / "leakage.ptrace", root / "one.ptrace",
+                    frequency_ghz=1.0, f0_ghz=2.0,
+                )
+
+    def test_frequency_validation_defaults_to_separated_hotspot_trace(self):
+        """Formal frequency validation writes and reports the per-cell raw-power trace."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = root / "case"
+            case.mkdir()
+            write_json(root / "modules.json", {"gamma": 0.2})
+            write_json(case / "hotspot_manifest.json", {
+                "ambient_c": 25.0, "r_convec_k_per_w": 5.0,
+            })
+            write_json(case / "thermal_result.json", {"tmax_c": 100.0})
+            (case / "power_dynamic.ptrace").write_text("a b\n8 4\n", encoding="utf-8")
+            (case / "power_leakage.ptrace").write_text("a b\n2 6\n", encoding="utf-8")
+            (case / "power.ptrace").write_text("a b\n10 10\n", encoding="utf-8")
+
+            with patch("workflow.thermal.validate_frequency.run_hotspot",
+                       return_value={"tmax_c": 80.0}):
+                result = validate_case(
+                    case, root / "modules.json", root / "validation.json", [1.0],
+                    validate_solution=False,
+                )
+
+            run = result["frequencies"][0]
+            self.assertEqual(result["scaling_mode"], "separated-dynamic-leakage")
+            self.assertEqual(run["hotspot_tmax_c"], 80.0)
+            self.assertEqual(read_ptrace(Path(run["power_trace"]))[1], [6.0, 8.0])
+            self.assertEqual(run["trace_sums_w"]["dynamic"], 12.0)
+            self.assertEqual(run["trace_sums_w"]["leakage"], 8.0)
+            self.assertEqual(run["trace_sums_w"]["composed"], 14.0)
+            self.assertEqual(run["trace_sums_w"]["total_at_f0"], 20.0)
+            self.assertEqual(
+                run["uniform_gamma_comparison"]["scaling_mode"], "paper-uniform-gamma"
+            )
+            self.assertFalse(result["recommendation"]["accepted"])
+
+    def test_anchor_manifest_forwards_frequency_settings(self):
+        """Manifest f0 must control the dynamic scale used in every anchor case."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = root / "case"
+            case.mkdir()
+            write_json(root / "modules.json", {"gamma": 0.2})
+            write_json(case / "hotspot_manifest.json", {
+                "ambient_c": 25.0, "r_convec_k_per_w": 5.0,
+            })
+            write_json(case / "thermal_result.json", {"tmax_c": 80.0})
+            (case / "power_dynamic.ptrace").write_text("a\n8\n", encoding="utf-8")
+            (case / "power_leakage.ptrace").write_text("a\n2\n", encoding="utf-8")
+            (case / "power.ptrace").write_text("a\n10\n", encoding="utf-8")
+            manifest = {
+                "frequency_settings": {
+                    "f0_ghz": 1.0, "fmin_ghz": 0.4, "tsafe_c": 95.0,
+                    "scaling_mode": "separated-dynamic-leakage",
+                },
+                "frequencies_ghz": [0.5], "validate_solution": False,
+                "cases": [{"label": "one", "case_dir": str(case),
+                           "modules": str(root / "modules.json")}],
+            }
+            write_json(root / "anchors.json", manifest)
+
+            with patch("workflow.thermal.validate_frequency.run_hotspot",
+                       return_value={"tmax_c": 60.0}):
+                result = run_manifest(root / "anchors.json", root / "summary.json")
+
+            run = result["cases"][0]["result"]["frequencies"][0]
+            self.assertEqual(run["dynamic_scale"], 0.5)
+            self.assertEqual(read_ptrace(Path(run["power_trace"]))[1], [6.0])
+
     def test_paper_anchor(self):
         frequency, state, raw = closed_form_frequency(100.0, 0.446)
         self.assertEqual(state, "thermally_limited")
@@ -541,8 +642,14 @@ class GridTests(unittest.TestCase):
             validation = validate_case(
                 root / "case", root / "modules.json", root / "validation.json",
                 [0.5, 1.0, 2.0], validate_solution=False,
+                scaling_mode="separated-dynamic-leakage",
             )
-            self.assertLess(validation["max_abs_linear_error_c"], 0.05)
+            self.assertEqual(validation["scaling_mode"], "separated-dynamic-leakage")
+            self.assertTrue(math.isfinite(validation["max_abs_linear_error_c"]))
+            self.assertLess(
+                validation["frequencies"][0]["trace_sums_w"]["composed"],
+                validation["frequencies"][0]["trace_sums_w"]["total_at_f0"],
+            )
 
 
 class FormalGuardTests(unittest.TestCase):

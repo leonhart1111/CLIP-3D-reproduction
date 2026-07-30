@@ -21,6 +21,7 @@ def run_manifest(manifest_path: Path, output: Path) -> dict:
             case_dir, modules, case_output,
             [float(value) for value in manifest.get("frequencies_ghz", [0.5, 1.0, 2.0])],
             bool(manifest.get("validate_solution", True)),
+            manifest.get("frequency_settings"),
         )
         results.append({"label": case["label"], "result": result})
     summary = {
