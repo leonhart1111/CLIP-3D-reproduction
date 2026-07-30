@@ -4,6 +4,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from workflow.cacti.characterize_cache import PAPER_TABLE_II, parse_cacti_output
 from workflow.analysis.summarize_sweep import summarize
@@ -30,7 +31,8 @@ from workflow.run_lifting_pipeline import (
 from workflow.run_lifting_sweep import completed as lifting_completed
 from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT, run_hotspot
 from workflow.thermal.calibrate_proxy import (
-    candidate_layouts, parse_external_case, proxy_acceptance_checks, sample_split,
+    calibrate, candidate_layouts, parse_external_case, proxy_acceptance_checks,
+    sample_split,
 )
 from workflow.thermal.sustainable_frequency import closed_form_frequency
 from workflow.thermal.validate_frequency import validate_case
@@ -280,6 +282,163 @@ class GridTests(unittest.TestCase):
         )
         self.assertTrue(checks["beta_policy_valid"])
         self.assertNotIn("beta_tier_effect_identifiable", checks)
+
+    def test_strict_p1_rejects_non_three_point_grid_before_creating_cases(self):
+        """A strict-P1 run must not begin HotSpot work with a non-3x3 grid."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            model["power_provenance"] = {
+                "dynamic": "McPAT Runtime Dynamic",
+                "leakage": "McPAT Subthreshold Leakage + Gate Leakage",
+                "postprocessing": "none",
+            }
+            model_path = root / "modules.json"
+            config_path = root / "strict.json"
+            output_dir = root / "calibration"
+            write_json(model_path, model)
+            write_json(config_path, {
+                "frequency": {"ambient_c": 25.0},
+                "physical": {"grid_size": 4, "utilization": 0.70,
+                             "r_convec_k_per_w": 5.0},
+                "layout_optimizer": {"alpha": 0.3, "beta": 0.0,
+                                     "cross_tier_weight": 0.65},
+                "formal_validation": {"strict_p1": True},
+            })
+            with patch("workflow.thermal.calibrate_proxy.run_one",
+                       side_effect=AssertionError("HotSpot work must not start")):
+                with self.assertRaisesRegex(
+                        ValueError, "strict P1 calibration requires grid_points == 3"):
+                    calibrate(
+                        [("fft", model_path)], config_path, output_dir,
+                        grid_points=4, workers=1, allowed_l2_tiers=(1,),
+                        fixed_beta=0.0, target_grid_size=32,
+                    )
+            self.assertFalse((output_dir / "cases").exists())
+
+    def test_strict_p1_rejects_non_target_hotspot_grid_before_creating_cases(self):
+        """A strict-P1 run must use the fixed 32-cell target validation grid."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            model["power_provenance"] = {
+                "dynamic": "McPAT Runtime Dynamic",
+                "leakage": "McPAT Subthreshold Leakage + Gate Leakage",
+                "postprocessing": "none",
+            }
+            model_path = root / "modules.json"
+            config_path = root / "strict.json"
+            output_dir = root / "calibration"
+            write_json(model_path, model)
+            write_json(config_path, {
+                "frequency": {"ambient_c": 25.0},
+                "physical": {"grid_size": 4, "utilization": 0.70,
+                             "r_convec_k_per_w": 5.0},
+                "layout_optimizer": {"alpha": 0.3, "beta": 0.0,
+                                     "cross_tier_weight": 0.65},
+                "formal_validation": {"strict_p1": True},
+            })
+            with patch("workflow.thermal.calibrate_proxy.run_one",
+                       side_effect=AssertionError("HotSpot work must not start")):
+                with self.assertRaisesRegex(
+                        ValueError, "strict P1 calibration requires target_grid_size == 32"):
+                    calibrate(
+                        [("fft", model_path)], config_path, output_dir,
+                        grid_points=3, workers=1, allowed_l2_tiers=(1,),
+                        fixed_beta=0.0, target_grid_size=16,
+                    )
+            self.assertFalse((output_dir / "cases").exists())
+
+    def test_strict_p1_report_promotes_the_held_out_cross_tier_weight(self):
+        """The report's promotable fit must retain its selected held-out weight."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            model["power_provenance"] = {
+                "dynamic": "McPAT Runtime Dynamic",
+                "leakage": "McPAT Subthreshold Leakage + Gate Leakage",
+                "postprocessing": "none",
+            }
+            model_path = root / "modules.json"
+            config_path = root / "strict.json"
+            output_dir = root / "calibration"
+            write_json(model_path, model)
+            write_json(config_path, {
+                "frequency": {"ambient_c": 25.0},
+                "physical": {"grid_size": 4, "utilization": 0.70,
+                             "r_convec_k_per_w": 5.0},
+                "layout_optimizer": {"alpha": 0.3, "beta": 0.0,
+                                     "cross_tier_weight": 0.65},
+                "formal_validation": {"strict_p1": True},
+            })
+
+            def completed_sample(sample, config, hotspot, force):
+                case_dir = Path(sample["case_dir"])
+                case_dir.mkdir(parents=True)
+                write_json(case_dir / "layout.json", sample["layout"])
+                return {
+                    key: value for key, value in sample.items() if key != "layout"
+                } | {"tmax_c": 60.0, "peak_unit": "core0_logic", "reused": False}
+
+            def synthetic_fit(samples, config, starts=None, spatial_weight=0.0,
+                              fixed_beta=None, fixed_cross_tier_weight=None):
+                cross_weight = (0.91 if fixed_cross_tier_weight is None
+                                else fixed_cross_tier_weight)
+                return {
+                    "parameters": {"alpha": 1.25, "beta": 0.0,
+                                   "cross_tier_weight": cross_weight},
+                    "rank": 2 if fixed_cross_tier_weight is None else 1,
+                    "active_parameters": (
+                        ["alpha", "cross_tier_weight"]
+                        if fixed_cross_tier_weight is None else ["alpha"]
+                    ),
+                    "beta_status": "fixed_unidentifiable_under_p1",
+                    "fixed_cross_tier_weight": fixed_cross_tier_weight,
+                }
+
+            def synthetic_cross_validation(*args, **kwargs):
+                return {
+                    "selected": {
+                        "cross_tier_weight": 0.25,
+                        "training_fit": synthetic_fit(
+                            *args[:2], fixed_beta=kwargs["fixed_beta"],
+                            fixed_cross_tier_weight=0.25,
+                        ),
+                    },
+                    "candidates": [],
+                }
+
+            def synthetic_metrics(samples, parameters, config):
+                selected = parameters[2] == 0.25
+                return {
+                    "rmse_c": 0.4 if selected else 0.5,
+                    "spatial_centered_rmse_c": 0.1 if selected else 0.2,
+                    "spatial_spearman": 0.9,
+                }
+
+            with patch("workflow.thermal.calibrate_proxy.run_one", completed_sample), \
+                 patch("workflow.thermal.calibrate_proxy.fit", synthetic_fit), \
+                 patch("workflow.thermal.calibrate_proxy.cross_validate_weight",
+                       synthetic_cross_validation), \
+                 patch("workflow.thermal.calibrate_proxy.metrics", synthetic_metrics), \
+                 patch("workflow.thermal.calibrate_proxy.write_samples_csv"):
+                report = calibrate(
+                    [("fft", model_path)], config_path, output_dir,
+                    grid_points=3, workers=1, allowed_l2_tiers=(1,),
+                    fixed_beta=0.0, target_grid_size=32,
+                )
+
+            self.assertEqual(read_json(output_dir / "calibration_report.json"), report)
+            self.assertEqual(
+                report["fit"]["parameters"]["cross_tier_weight"],
+                report["cross_validation"]["selected"]["cross_tier_weight"],
+            )
+            self.assertEqual(report["fit"]["parameters"]["alpha"], 1.25)
+            self.assertEqual(report["fit"]["parameters"]["beta"], 0.0)
+            self.assertTrue(
+                report["recommendation"]["checks"]
+                ["active_parameter_jacobian_full_rank"]
+            )
 
     def test_external_proxy_cases_preserve_spatial_group(self):
         with tempfile.TemporaryDirectory() as temporary:

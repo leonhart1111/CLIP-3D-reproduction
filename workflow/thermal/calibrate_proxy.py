@@ -511,6 +511,8 @@ def calibrate(models: list[tuple[str, Path]], config_path: Path, output_dir: Pat
     strict_p1 = config_strict_p1 or allowed_l2_tiers == (1,)
     if strict_p1 and allowed_l2_tiers != (1,):
         raise ValueError("strict P1 calibration requires allowed_l2_tiers == (1,)")
+    if strict_p1 and grid_points != 3:
+        raise ValueError("strict P1 calibration requires grid_points == 3")
     if strict_p1 and fixed_beta != 0.0:
         raise ValueError("strict P1 calibration requires fixed_beta == 0.0")
     if strict_p1 and target_grid_size != 32:
@@ -572,12 +574,12 @@ def calibrate(models: list[tuple[str, Path]], config_path: Path, output_dir: Pat
     )
     selected_training_fit = cross_validation["selected"]["training_fit"]
     selected_weight = float(cross_validation["selected"]["cross_tier_weight"])
-    # Refit both identifiable parameters on every position after the held-out
-    # search evaluates the non-smooth cross-tier response.  With strict P1,
-    # beta stays fixed and the active Jacobian is [alpha, cross_tier_weight].
+    # Refit alpha on every position after the held-out search selects the
+    # non-smooth cross-tier response.  Keeping that selected weight fixed
+    # makes this report's promotable parameter map match the held-out choice.
     fitted = fit(
         completed, config, spatial_weight=spatial_weight,
-        fixed_beta=fixed_beta,
+        fixed_beta=fixed_beta, fixed_cross_tier_weight=selected_weight,
     )
     parameter_dict = fitted["parameters"]
     parameters = [
@@ -762,7 +764,7 @@ def calibrate(models: list[tuple[str, Path]], config_path: Path, output_dir: Pat
     baseline_validation = evaluations["defaults"]["validation"]
     calibrated_validation = evaluations["cross_validated_training_fit"]["validation"]
     acceptance_checks = proxy_acceptance_checks(
-        calibrated_validation, baseline_validation, fitted["rank"], selected_weight,
+        calibrated_validation, baseline_validation, direct_joint_fit["rank"], selected_weight,
         fitted["beta_status"],
     )
     if strict_p1:
