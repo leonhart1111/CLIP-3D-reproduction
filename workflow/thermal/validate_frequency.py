@@ -148,7 +148,8 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
     leakage_trace = case_dir / "power_leakage.ptrace"
     total_trace = case_dir / "power.ptrace"
 
-    def run_frequency(frequency: float, result_suffix: str = "") -> dict:
+    def run_frequency(frequency: float, result_suffix: str = "",
+                      record_hotspot_failure: bool = False) -> dict:
         stem = safe_stem(frequency)
         uniform_gamma_scale = gamma + (1.0 - gamma) * frequency / f0
         if selected_scaling_mode == "separated-dynamic-leakage":
@@ -179,13 +180,22 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
                 "total_trace_sum_w": total_trace_sum_w,
                 "power_trace": str(trace.resolve()),
             }
-        thermal = run_hotspot(
-            case_dir, ptrace_name=trace.name,
-            result_name=(
-                f"thermal_{selected_scaling_mode.replace('-', '_')}_"
-                f"{stem}GHz{result_suffix}.json"
-            ),
-        )
+        try:
+            thermal = run_hotspot(
+                case_dir, ptrace_name=trace.name,
+                result_name=(
+                    f"thermal_{selected_scaling_mode.replace('-', '_')}_"
+                    f"{stem}GHz{result_suffix}.json"
+                ),
+            )
+        except Exception as error:
+            if not record_hotspot_failure:
+                raise
+            return {
+                "frequency_ghz": frequency,
+                "power_trace": trace_info["power_trace"],
+                "hotspot_error": f"{type(error).__name__}: {error}",
+            }
         uniform_gamma_tmax = ambient + uniform_gamma_scale * (
             float(base_thermal["tmax_c"]) - ambient
         )
@@ -216,16 +226,29 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
     )
     solution_validation = None
     if validate_solution and fsus < f0:
-        solution_run = run_frequency(fsus, "_fsus")
-        hotspot_tmax = float(solution_run["hotspot_tmax_c"])
-        safe_error = abs(hotspot_tmax - tsafe) if math.isfinite(hotspot_tmax) else math.inf
-        solution_validation = {
-            "frequency_ghz": fsus, "hotspot_tmax_c": hotspot_tmax,
-            "safe_temperature_c": tsafe,
-            "safe_error_c": safe_error,
-            "accepted": math.isfinite(hotspot_tmax) and safe_error <= 1.0,
-            "power_trace": solution_run["power_trace"],
-        }
+        solution_run = run_frequency(fsus, "_fsus", record_hotspot_failure=True)
+        if "hotspot_error" in solution_run:
+            solution_validation = {
+                "frequency_ghz": fsus,
+                "hotspot_tmax_c": None,
+                "safe_temperature_c": tsafe,
+                "safe_error_c": None,
+                "accepted": False,
+                "power_trace": solution_run["power_trace"],
+                "error": solution_run["hotspot_error"],
+            }
+        else:
+            hotspot_tmax = float(solution_run["hotspot_tmax_c"])
+            safe_error = (
+                abs(hotspot_tmax - tsafe) if math.isfinite(hotspot_tmax) else math.inf
+            )
+            solution_validation = {
+                "frequency_ghz": fsus, "hotspot_tmax_c": hotspot_tmax,
+                "safe_temperature_c": tsafe,
+                "safe_error_c": safe_error,
+                "accepted": math.isfinite(hotspot_tmax) and safe_error <= 1.0,
+                "power_trace": solution_run["power_trace"],
+            }
 
     accepted = (
         fsus >= f0 or
@@ -235,6 +258,11 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
         recommendation_basis = "f_sus is at f0; no below-f0 HotSpot safety solve is required"
     elif solution_validation is None:
         recommendation_basis = "below-f0 HotSpot safety solve was skipped"
+    elif solution_validation.get("error"):
+        recommendation_basis = (
+            "below-f0 HotSpot safety solve failed: "
+            f"{solution_validation['error']}"
+        )
     else:
         recommendation_basis = "below-f0 HotSpot safety error is finite and no greater than 1.0 C"
 
@@ -244,7 +272,7 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
         "r_convec_k_per_w": manifest["r_convec_k_per_w"],
         "ambient_c": ambient, "gamma": gamma, "f0_ghz": f0,
         "base_tmax_c": base_thermal["tmax_c"], "frequencies": runs,
-        "max_abs_linear_error_c": max(
+        "max_abs_uniform_gamma_comparison_error_c": max(
             abs(run["uniform_gamma_comparison"]["error_vs_hotspot_c"])
             for run in runs
         ),
@@ -273,7 +301,10 @@ def main() -> None:
         args.case_dir, args.modules, args.output, args.frequencies_ghz,
         not args.no_solution_validation,
     )
-    print(f"max linear error={result['max_abs_linear_error_c']:.6f} C")
+    print(
+        "max uniform-gamma comparison error="
+        f"{result['max_abs_uniform_gamma_comparison_error_c']:.6f} C"
+    )
 
 
 if __name__ == "__main__":

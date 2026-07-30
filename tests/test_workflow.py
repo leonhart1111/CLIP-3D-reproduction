@@ -106,11 +106,86 @@ class FrequencyTests(unittest.TestCase):
             self.assertEqual(run["trace_sums_w"]["dynamic"], 12.0)
             self.assertEqual(run["trace_sums_w"]["leakage"], 8.0)
             self.assertEqual(run["trace_sums_w"]["composed"], 14.0)
+            self.assertIn("max_abs_uniform_gamma_comparison_error_c", result)
+            self.assertNotIn("max_abs_linear_error_c", result)
             self.assertEqual(run["trace_sums_w"]["total_at_f0"], 20.0)
             self.assertEqual(
                 run["uniform_gamma_comparison"]["scaling_mode"], "paper-uniform-gamma"
             )
             self.assertFalse(result["recommendation"]["accepted"])
+
+    def test_below_f0_hotspot_failure_writes_a_rejected_validation_result(self):
+        """A failed mandatory safety solve must leave an auditable rejection on disk."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = root / "case"
+            case.mkdir()
+            output = root / "validation.json"
+            write_json(root / "modules.json", {"gamma": 0.2})
+            write_json(case / "hotspot_manifest.json", {
+                "ambient_c": 25.0, "r_convec_k_per_w": 5.0,
+            })
+            write_json(case / "thermal_result.json", {"tmax_c": 100.0})
+            (case / "power_dynamic.ptrace").write_text("a\n8\n", encoding="utf-8")
+            (case / "power_leakage.ptrace").write_text("a\n2\n", encoding="utf-8")
+            (case / "power.ptrace").write_text("a\n10\n", encoding="utf-8")
+
+            def fail_only_for_fsus(_case_dir, ptrace_name, result_name):
+                if "_fsus" in ptrace_name:
+                    raise RuntimeError("injected f_sus HotSpot failure")
+                return {"tmax_c": 80.0}
+
+            with patch("workflow.thermal.validate_frequency.run_hotspot",
+                       side_effect=fail_only_for_fsus):
+                result = validate_case(
+                    case, root / "modules.json", output, [1.0],
+                    validate_solution=True,
+                )
+
+            recorded = read_json(output)
+            self.assertEqual(recorded, result)
+            self.assertFalse(result["recommendation"]["accepted"])
+            self.assertFalse(result["solution_validation"]["accepted"])
+            self.assertIn("injected f_sus HotSpot failure",
+                          result["solution_validation"]["error"])
+
+    def test_anchor_summary_reports_actual_hotspot_run_counts_and_acceptance(self):
+        """Anchor summaries must distinguish requested runs from mandatory safety solves."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = {
+                "frequencies_ghz": [0.5, 1.0],
+                "cases": [
+                    {"label": "first", "case_dir": str(root / "first")},
+                    {"label": "second", "case_dir": str(root / "second")},
+                ],
+            }
+            write_json(root / "anchors.json", manifest)
+            results = [
+                {
+                    "frequencies": [{}, {}],
+                    "max_abs_uniform_gamma_comparison_error_c": 0.25,
+                    "solution_validation": {"accepted": True, "safe_error_c": 0.5},
+                    "recommendation": {"accepted": True},
+                },
+                {
+                    "frequencies": [{}],
+                    "max_abs_uniform_gamma_comparison_error_c": 0.75,
+                    "solution_validation": None,
+                    "recommendation": {"accepted": False},
+                },
+            ]
+
+            with patch("workflow.thermal.run_anchor_validation.validate_case",
+                       side_effect=results):
+                summary = run_manifest(root / "anchors.json", root / "summary.json")
+
+            self.assertEqual(read_json(root / "summary.json"), summary)
+            self.assertEqual(summary["requested_frequency_hotspot_run_count"], 3)
+            self.assertEqual(summary["fsus_safety_solve_count"], 1)
+            self.assertEqual(summary["hotspot_run_count"], 4)
+            self.assertEqual(summary["max_abs_uniform_gamma_comparison_error_c"], 0.75)
+            self.assertFalse(summary["recommendation"]["accepted"])
 
     def test_anchor_manifest_forwards_frequency_settings(self):
         """Manifest f0 must control the dynamic scale used in every anchor case."""
@@ -645,7 +720,9 @@ class GridTests(unittest.TestCase):
                 scaling_mode="separated-dynamic-leakage",
             )
             self.assertEqual(validation["scaling_mode"], "separated-dynamic-leakage")
-            self.assertTrue(math.isfinite(validation["max_abs_linear_error_c"]))
+            self.assertTrue(math.isfinite(
+                validation["max_abs_uniform_gamma_comparison_error_c"]
+            ))
             self.assertLess(
                 validation["frequencies"][0]["trace_sums_w"]["composed"],
                 validation["frequencies"][0]["trace_sums_w"]["total_at_f0"],

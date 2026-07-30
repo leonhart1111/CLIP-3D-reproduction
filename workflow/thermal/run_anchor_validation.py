@@ -24,17 +24,34 @@ def run_manifest(manifest_path: Path, output: Path) -> dict:
             manifest.get("frequency_settings"),
         )
         results.append({"label": case["label"], "result": result})
+    requested_frequency_hotspot_run_count = sum(
+        len(item["result"]["frequencies"]) for item in results
+    )
+    fsus_safety_solve_count = sum(
+        item["result"]["solution_validation"] is not None for item in results
+    )
+    safe_errors = [
+        item["result"]["solution_validation"]["safe_error_c"]
+        for item in results
+        if item["result"]["solution_validation"] is not None
+        and item["result"]["solution_validation"]["safe_error_c"] is not None
+    ]
     summary = {
         "schema_version": 1, "manifest": str(manifest_path.resolve()),
         "case_count": len(results),
-        "frequency_run_count": sum(len(item["result"]["frequencies"]) for item in results),
-        "max_abs_linear_error_c": max(
-            item["result"]["max_abs_linear_error_c"] for item in results
+        "requested_frequency_hotspot_run_count": requested_frequency_hotspot_run_count,
+        "fsus_safety_solve_count": fsus_safety_solve_count,
+        "hotspot_run_count": (
+            requested_frequency_hotspot_run_count + fsus_safety_solve_count
         ),
-        "max_safe_error_c": max(
-            (item["result"]["solution_validation"] or {"safe_error_c": 0.0})["safe_error_c"]
-            for item in results
+        "max_abs_uniform_gamma_comparison_error_c": max(
+            item["result"]["max_abs_uniform_gamma_comparison_error_c"] for item in results
         ),
+        "max_safe_error_c": max(safe_errors, default=0.0),
+        "recommendation": {
+            "accepted": all(item["result"]["recommendation"]["accepted"]
+                            for item in results),
+        },
         "cases": results,
     }
     write_json(output, summary)
@@ -47,7 +64,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     result = run_manifest(args.manifest.resolve(), args.output.resolve())
-    print(f"validated {result['case_count']} anchors / {result['frequency_run_count']} frequency runs")
+    print(
+        f"validated {result['case_count']} anchors / "
+        f"{result['requested_frequency_hotspot_run_count']} requested frequency runs / "
+        f"{result['hotspot_run_count']} total HotSpot runs"
+    )
 
 
 if __name__ == "__main__":
