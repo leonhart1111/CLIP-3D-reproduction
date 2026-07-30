@@ -95,6 +95,13 @@ def validate_config(config: dict, layout_method: str) -> None:
     allowed_tiers = config.get("layout_optimizer", {}).get("allowed_l2_tiers", [0, 1])
     if not allowed_tiers or any(int(tier) not in (0, 1) for tier in allowed_tiers):
         raise ValueError("layout_optimizer.allowed_l2_tiers must contain tier 0 and/or tier 1")
+    if config.get("formal_validation", {}).get("strict_p1") is True:
+        if list(allowed_tiers) != [1]:
+            raise ValueError("strict P1 requires layout_optimizer.allowed_l2_tiers == [1]")
+        if validation_policy != "paper-single":
+            raise ValueError("strict P1 requires layout_optimizer.validation_policy == paper-single")
+        if float(config.get("layout_optimizer", {}).get("beta", 0.0)) != 0.0:
+            raise ValueError("strict P1 requires layout_optimizer.beta == 0.0")
     proxy_model = config.get("layout_optimizer", {}).get(
         "proxy_spatial_model", "center"
     )

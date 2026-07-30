@@ -7,7 +7,9 @@ from pathlib import Path
 
 from workflow.cacti.characterize_cache import PAPER_TABLE_II, parse_cacti_output
 from workflow.analysis.summarize_sweep import summarize
-from workflow.common import write_json
+from workflow.analysis.prepare_raw_power_validation import prepare
+from workflow.analysis.promote_validated_config import promote
+from workflow.common import read_json, write_json
 from workflow.floorplan.comparison_layouts import generate as generate_comparison_layouts
 from workflow.floorplan.build_module_model import apply_physical_areas
 from workflow.floorplan.generate_hotspot_inputs import baseline_layout, grid_power, materialize
@@ -364,6 +366,35 @@ class GridTests(unittest.TestCase):
 
 
 class FormalGuardTests(unittest.TestCase):
+    def test_raw_power_p1_candidate_has_only_top_tier_l2(self):
+        config = read_json(Path(
+            "configs/experiments/clip3d_constrained_5p0_raw_power_p1_candidate.json"
+        ))
+        self.assertEqual(config["layout_optimizer"]["allowed_l2_tiers"], [1])
+        self.assertEqual(config["layout_optimizer"]["validation_policy"], "paper-single")
+        self.assertEqual(config["layout_optimizer"]["beta"], 0.0)
+        self.assertFalse(config["formal_validation"]["accepted"])
+        validate_config(config, "clip3d")
+
+    def test_promotion_rejects_failed_proxy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "proxy.json", {"recommendation": {"accepted": False}})
+            write_json(root / "wire.json", {"recommendation": {"accepted": True}})
+            write_json(root / "frequency.json", {"recommendation": {"accepted": True}})
+            with self.assertRaisesRegex(ValueError, "proxy"):
+                promote(
+                    root / "proxy.json", root / "wire.json", root / "frequency.json",
+                    Path("configs/experiments/clip3d_constrained_5p0_raw_power_p1_candidate.json"),
+                    root / "formal.json",
+                )
+
+    def test_prepare_validation_manifest_requires_the_four_named_r1_points(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(FileNotFoundError, "fft"):
+                prepare(root, root / "input_manifest.json")
+
     def test_clip3d_real_hotspot_guard_rejects_lower_thermal_bips(self):
         fixed = {"policy": "fixed-bin", "bips1_thermal": 3.45,
                  "wire_cycles": 1, "tmax_c": 124.39}
