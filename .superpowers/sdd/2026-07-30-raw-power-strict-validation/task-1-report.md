@@ -71,3 +71,40 @@ Output: exit 0; `Ran 35 tests in 1.417s`; `OK`. This included all three new `For
 - Manifest construction validates all four input points before calling the atomic writer, so a failure does not create a partial output manifest.
 - Only Task 1 hunks were staged from the already-dirty shared files; unrelated raw-power-calibration-removal changes remain unstaged.
 - Positive promotion and complete-manifest paths were not run against real reports/R1 outputs because Task 1 must not launch gem5/HotSpot experiments; later tasks produce the required accepted artifacts.
+
+## Fix Round 1: Reviewer Findings
+
+### Root Cause
+
+`validate_config` previously constrained only strict-P1 tier/policy/beta values.  It did not inspect an accepted configuration's promotion artifacts or tie optimizer numbers back to the accepted proxy/wire reports.  `prepare` also used caller-provided cache-size strings to construct input paths and allowed a missing or blank instruction-window scope into a manifest.
+
+### TDD Evidence
+
+Added four behavior tests before production changes: a forged accepted formal config is rejected; promotion emits report-derived, hash-recorded provenance that validates; noncanonical cache sizes are rejected before point discovery; and an empty instruction-window scope fails without a manifest.
+
+RED command (exit 1):
+
+```bash
+python -m unittest tests.test_workflow.FormalGuardTests.test_accepted_formal_config_rejects_manual_parameters_without_artifact_provenance tests.test_workflow.FormalGuardTests.test_promotion_emits_report_derived_formal_config_that_validates tests.test_workflow.FormalGuardTests.test_prepare_rejects_noncanonical_cache_sizes_before_point_discovery tests.test_workflow.FormalGuardTests.test_prepare_rejects_missing_instruction_window_scope_without_manifest -v
+```
+
+The pre-fix run had three assertion failures (manual accepted values, prose-only promotion provenance, and blank scope) and one point-discovery `FileNotFoundError` instead of the requested cache-size rejection.
+
+GREEN command (exit 0): the same four tests; `Ran 4 tests in 0.004s; OK`.
+
+### Fix Details
+
+- Accepted strict-P1 configs now require accepted proxy/wire/frequency artifacts with absolute paths, lowercase 64-character SHA-256 values, matching on-disk hashes, and accepted report contents.  The validator verifies the proxy beta status and exact numeric alpha/cross-tier/lambda derivation through structured parameter-provenance entries; beta remains a fixed zero provenance record.
+- Promotion now writes that structured provenance before its final validation.
+- Preparation now accepts only the four canonical 32kB/512kB points and requires each metadata scope to be a nonblank string before it writes the manifest.
+
+### Verification
+
+```bash
+python -m unittest tests.test_workflow.FormalGuardTests -v
+# Ran 14 tests in 0.006s; OK
+python -m unittest discover -s tests -v
+# Ran 39 tests in 1.425s; OK
+```
+
+No R1/gem5/HotSpot execution was performed.

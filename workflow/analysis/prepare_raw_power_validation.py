@@ -26,6 +26,10 @@ def sha256(path: Path) -> str:
 def prepare(r1_root: Path, output: Path, l1d_size: str = "32kB",
             l2_size: str = "512kB") -> dict:
     """Validate all four fixed R1 points before atomically writing a manifest."""
+    if l1d_size != "32kB" or l2_size != "512kB":
+        raise ValueError(
+            "strict R1 validation requires exactly l1d_size=32kB and l2_size=512kB"
+        )
     r1_root = r1_root.resolve()
     records = []
     for workload in WORKLOADS:
@@ -45,6 +49,9 @@ def prepare(r1_root: Path, output: Path, l1d_size: str = "32kB",
             raise ValueError(
                 f"{workload} R1 metadata does not match requested point: {', '.join(mismatched)}"
             )
+        instruction_window_scope = metadata.get("instruction_window_scope")
+        if not isinstance(instruction_window_scope, str) or not instruction_window_scope.strip():
+            raise ValueError(f"{workload} R1 metadata has no instruction_window_scope")
         files = {
             name: {"path": str((point / name).resolve()), "sha256": sha256(point / name)}
             for name in REQUIRED_FILES
@@ -54,7 +61,7 @@ def prepare(r1_root: Path, output: Path, l1d_size: str = "32kB",
             "l1d_size": l1d_size,
             "l2_size": l2_size,
             "directory": str(point.resolve()),
-            "instruction_window_scope": metadata.get("instruction_window_scope"),
+            "instruction_window_scope": instruction_window_scope,
             "files": files,
         })
     manifest = {

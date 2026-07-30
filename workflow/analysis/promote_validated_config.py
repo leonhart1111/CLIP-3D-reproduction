@@ -75,10 +75,22 @@ def promote(proxy_report: Path, wire_summary: Path, frequency_report: Path,
     config["name"] = "constrained_5p0_raw_power_p1_formal"
     provenance = optimizer.setdefault("parameter_provenance", {})
     provenance.update({
-        "alpha": "accepted strict-P1 proxy report",
-        "beta": "fixed_unidentifiable_under_p1",
-        "cross_tier_weight": "accepted strict-P1 proxy report",
-        "lambda_wire": "accepted cross-workload R2 wire report",
+        "alpha": {
+            "artifact": "proxy_report",
+            "field": "fit.parameters.alpha",
+            "value": optimizer["alpha"],
+        },
+        "beta": {"source": "fixed_unidentifiable_under_p1", "value": 0.0},
+        "cross_tier_weight": {
+            "artifact": "proxy_report",
+            "field": "fit.parameters.cross_tier_weight",
+            "value": optimizer["cross_tier_weight"],
+        },
+        "lambda_wire": {
+            "artifact": "wire_summary",
+            "field": "selected_lambda_wire",
+            "value": optimizer["lambda_wire"],
+        },
     })
     validate_config(config, "clip3d")
     write_json(output_config, config)

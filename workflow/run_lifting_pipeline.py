@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import shutil
 import subprocess
@@ -60,6 +61,97 @@ def validate_r1(r1_dir: Path) -> None:
         raise ValueError(f"R1 status is not success: {status}")
 
 
+def sha256(path: Path) -> str:
+    """Return the SHA-256 digest of one formal-validation artifact."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def finite_number(value: object, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a finite number")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} must be a finite number") from error
+    if not math.isfinite(result):
+        raise ValueError(f"{label} must be a finite number")
+    return result
+
+
+def validate_accepted_strict_p1(config: dict) -> None:
+    """Verify that an accepted strict-P1 config still derives from its reports."""
+    formal = config.get("formal_validation", {})
+    if formal.get("promotion") != "workflow.analysis.promote_validated_config only":
+        raise ValueError("accepted strict-P1 config has invalid promotion provenance")
+    artifacts = formal.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ValueError("accepted strict-P1 config requires formal_validation.artifacts")
+
+    reports = {}
+    for name in ("proxy_report", "wire_summary", "frequency_report"):
+        artifact = artifacts.get(name)
+        if not isinstance(artifact, dict):
+            raise ValueError(f"accepted strict-P1 config requires {name} artifact")
+        path_text = artifact.get("path")
+        digest = artifact.get("sha256")
+        if not isinstance(path_text, str) or not Path(path_text).is_absolute():
+            raise ValueError(f"accepted strict-P1 {name} artifact path must be absolute")
+        if not isinstance(digest, str) or len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest):
+            raise ValueError(f"accepted strict-P1 {name} artifact sha256 must be 64 lowercase hex characters")
+        path = Path(path_text)
+        if not path.is_file():
+            raise ValueError(f"accepted strict-P1 {name} artifact is missing: {path}")
+        if sha256(path) != digest:
+            raise ValueError(f"accepted strict-P1 {name} artifact sha256 does not match")
+        report = read_json(path)
+        if not isinstance(report, dict) or report.get("recommendation", {}).get("accepted") is not True:
+            raise ValueError(f"accepted strict-P1 {name} report is not accepted")
+        reports[name] = report
+
+    proxy = reports["proxy_report"]
+    if proxy.get("strict_p1", {}).get("beta_status") != "fixed_unidentifiable_under_p1":
+        raise ValueError("accepted strict-P1 proxy beta status is invalid")
+    optimizer = config["layout_optimizer"]
+    proxy_parameters = proxy.get("fit", {}).get("parameters", {})
+    expected = {
+        "alpha": {
+            "artifact": "proxy_report",
+            "field": "fit.parameters.alpha",
+            "value": finite_number(proxy_parameters.get("alpha"), "proxy alpha"),
+        },
+        "cross_tier_weight": {
+            "artifact": "proxy_report",
+            "field": "fit.parameters.cross_tier_weight",
+            "value": finite_number(
+                proxy_parameters.get("cross_tier_weight"), "proxy cross_tier_weight"
+            ),
+        },
+        "lambda_wire": {
+            "artifact": "wire_summary",
+            "field": "selected_lambda_wire",
+            "value": finite_number(
+                reports["wire_summary"].get("selected_lambda_wire"), "wire selected_lambda_wire"
+            ),
+        },
+        "beta": {"source": "fixed_unidentifiable_under_p1", "value": 0.0},
+    }
+    provenance = optimizer.get("parameter_provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("accepted strict-P1 config requires parameter_provenance")
+    for parameter, record in expected.items():
+        if provenance.get(parameter) != record:
+            raise ValueError(
+                f"accepted strict-P1 {parameter} parameter_provenance does not match reports"
+            )
+        if finite_number(optimizer.get(parameter), parameter) != record["value"]:
+            raise ValueError(f"accepted strict-P1 {parameter} does not match report provenance")
+
+
 def validate_config(config: dict, layout_method: str) -> None:
     if config.get("schema_version") != 1:
         raise ValueError("unsupported CLIP-3D pipeline config schema")
@@ -102,6 +194,8 @@ def validate_config(config: dict, layout_method: str) -> None:
             raise ValueError("strict P1 requires layout_optimizer.validation_policy == paper-single")
         if float(config.get("layout_optimizer", {}).get("beta", 0.0)) != 0.0:
             raise ValueError("strict P1 requires layout_optimizer.beta == 0.0")
+        if config.get("formal_validation", {}).get("accepted") is True:
+            validate_accepted_strict_p1(config)
     proxy_model = config.get("layout_optimizer", {}).get(
         "proxy_spatial_model", "center"
     )

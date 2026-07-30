@@ -366,6 +366,20 @@ class GridTests(unittest.TestCase):
 
 
 class FormalGuardTests(unittest.TestCase):
+    @staticmethod
+    def write_complete_r1_tree(root: Path, instruction_window_scope: str = "roi") -> None:
+        for workload in ("fft", "matmul", "stencil", "stream"):
+            point = root / workload / "l1d_32kB" / "l2_512kB"
+            point.mkdir(parents=True)
+            write_json(point / "r1_metadata.json", {
+                "workload": workload,
+                "l1d_size": "32kB",
+                "l2_size": "512kB",
+                "instruction_window_scope": instruction_window_scope,
+            })
+            (point / "stats.txt").write_text("sim_ticks 100\n", encoding="utf-8")
+            write_json(point / "status.json", {"state": "success"})
+
     def test_raw_power_p1_candidate_has_only_top_tier_l2(self):
         config = read_json(Path(
             "configs/experiments/clip3d_constrained_5p0_raw_power_p1_candidate.json"
@@ -394,6 +408,98 @@ class FormalGuardTests(unittest.TestCase):
             root = Path(temporary)
             with self.assertRaisesRegex(FileNotFoundError, "fft"):
                 prepare(root, root / "input_manifest.json")
+
+    def test_accepted_formal_config_rejects_manual_parameters_without_artifact_provenance(self):
+        config = read_json(Path(
+            "configs/experiments/clip3d_constrained_5p0_raw_power_p1_candidate.json"
+        ))
+        config["layout_optimizer"].update({
+            "alpha": 0.31,
+            "cross_tier_weight": 0.94,
+            "lambda_wire": 0.125,
+            "parameter_provenance": {
+                "alpha": "manually chosen",
+                "beta": "fixed_unidentifiable_under_p1",
+                "cross_tier_weight": "manually chosen",
+                "lambda_wire": "manually chosen",
+            },
+        })
+        config["formal_validation"]["accepted"] = True
+        with self.assertRaisesRegex(ValueError, "accepted strict-P1.*artifacts"):
+            validate_config(config, "clip3d")
+
+    def test_promotion_emits_report_derived_formal_config_that_validates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proxy = {
+                "recommendation": {"accepted": True},
+                "strict_p1": {"beta_status": "fixed_unidentifiable_under_p1"},
+                "fit": {"parameters": {"alpha": 0.31, "cross_tier_weight": 0.94}},
+            }
+            wire = {
+                "recommendation": {"accepted": True},
+                "selected_lambda_wire": 0.125,
+            }
+            frequency = {
+                "recommendation": {"accepted": True},
+                "selected_frequency_ghz": 2.5,
+            }
+            write_json(root / "proxy.json", proxy)
+            write_json(root / "wire.json", wire)
+            write_json(root / "frequency.json", frequency)
+            output = root / "formal.json"
+            formal = promote(
+                root / "proxy.json", root / "wire.json", root / "frequency.json",
+                Path("configs/experiments/clip3d_constrained_5p0_raw_power_p1_candidate.json"),
+                output,
+            )
+
+            optimizer = formal["layout_optimizer"]
+            self.assertEqual(optimizer["alpha"], 0.31)
+            self.assertEqual(optimizer["cross_tier_weight"], 0.94)
+            self.assertEqual(optimizer["lambda_wire"], 0.125)
+            self.assertEqual(optimizer["beta"], 0.0)
+            self.assertEqual(optimizer["parameter_provenance"]["alpha"], {
+                "artifact": "proxy_report",
+                "field": "fit.parameters.alpha",
+                "value": 0.31,
+            })
+            self.assertEqual(optimizer["parameter_provenance"]["cross_tier_weight"], {
+                "artifact": "proxy_report",
+                "field": "fit.parameters.cross_tier_weight",
+                "value": 0.94,
+            })
+            self.assertEqual(optimizer["parameter_provenance"]["lambda_wire"], {
+                "artifact": "wire_summary",
+                "field": "selected_lambda_wire",
+                "value": 0.125,
+            })
+            self.assertEqual(optimizer["parameter_provenance"]["beta"], {
+                "source": "fixed_unidentifiable_under_p1",
+                "value": 0.0,
+            })
+            for artifact in formal["formal_validation"]["artifacts"].values():
+                self.assertTrue(Path(artifact["path"]).is_absolute())
+                self.assertRegex(artifact["sha256"], r"^[0-9a-f]{64}$")
+            validate_config(read_json(output), "clip3d")
+
+    def test_prepare_rejects_noncanonical_cache_sizes_before_point_discovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "input_manifest.json"
+            self.write_complete_r1_tree(root)
+            with self.assertRaisesRegex(ValueError, "l1d_size=32kB and l2_size=512kB"):
+                prepare(root, output, l1d_size="64kB")
+            self.assertFalse(output.exists())
+
+    def test_prepare_rejects_missing_instruction_window_scope_without_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "input_manifest.json"
+            self.write_complete_r1_tree(root, instruction_window_scope=" ")
+            with self.assertRaisesRegex(ValueError, "instruction_window_scope"):
+                prepare(root, output)
+            self.assertFalse(output.exists())
 
     def test_clip3d_real_hotspot_guard_rejects_lower_thermal_bips(self):
         fixed = {"policy": "fixed-bin", "bips1_thermal": 3.45,
