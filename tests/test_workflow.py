@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +25,11 @@ from workflow.mcpat.parse_mcpat import (
 from workflow.r2.calibrate_lambda_wire import (
     calibrate as calibrate_lambda_wire,
     calibrate_series as calibrate_lambda_wire_series,
+    main as calibrate_lambda_wire_main,
+)
+from workflow.r2.run_wire_sensitivity import (
+    build_sensitivity_vectors,
+    summarize_workloads,
 )
 from workflow.run_lifting_pipeline import (
     evaluate_comparison_candidates, select_clip3d_candidate, validate_config,
@@ -270,6 +276,98 @@ class FrequencyTests(unittest.TestCase):
             self.assertAlmostEqual(report["lambda_wire"], 0.05)
             self.assertAlmostEqual(report["fit"]["r_squared"], 1.0)
             self.assertTrue(report["recommendation"]["accepted_for_this_workload"])
+
+    def test_wire_sensitivity_vectors_change_only_injected_wire(self):
+        """A matched series must not alter any non-wire R2 input."""
+        base = {
+            "schema_version": 1,
+            "components_cycles": {
+                "l1i_cacti": 2, "l1d_cacti": 3, "l2_cacti": 4,
+                "l2_arbitration": 3, "tsv": 2, "l1_pipeline": 1,
+                "layout_wire": 9,
+            },
+            "critical_l1d_to_l2_cycles": 22,
+            "gem5_overrides": {
+                "l1d_tag_latency": 3, "l1d_data_latency": 3,
+                "xbar_forward_latency": 14, "xbar_response_latency": 1,
+            },
+            "gem5_args": ["--l1d-tag-latency", "3"],
+            "layout": "/fixture/layout.json",
+        }
+
+        vectors = build_sensitivity_vectors(base, [0, 1, 2])
+        self.assertEqual(base["components_cycles"]["layout_wire"], 9)
+        for cycle, vector in vectors.items():
+            normalized_base = deepcopy(base)
+            normalized_vector = deepcopy(vector)
+            for candidate in (normalized_base, normalized_vector):
+                del candidate["components_cycles"]["layout_wire"]
+                del candidate["critical_l1d_to_l2_cycles"]
+                del candidate["gem5_overrides"]["xbar_forward_latency"]
+                del candidate["gem5_args"]
+            self.assertEqual(normalized_vector, normalized_base)
+            self.assertEqual(vector["components_cycles"]["layout_wire"], cycle)
+            self.assertEqual(vector["critical_l1d_to_l2_cycles"], 13 + cycle)
+            self.assertEqual(vector["gem5_overrides"]["xbar_forward_latency"], 5 + cycle)
+            self.assertEqual(
+                vector["gem5_args"],
+                ["--l1d-tag-latency", "3", "--l1d-data-latency", "3",
+                 "--xbar-forward-latency", str(5 + cycle),
+                 "--xbar-response-latency", "1"],
+            )
+
+    def test_wire_sensitivity_global_acceptance_rule(self):
+        """A formal lambda exists only for four accepted, mutually-close workloads."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def report(workload, value):
+                path = root / f"{workload.lower()}.json"
+                write_json(path, {
+                    "workload": workload,
+                    "calibration": {
+                        "lambda_wire": value,
+                        "recommendation": {"accepted_for_this_workload": True},
+                    },
+                })
+                return path
+
+            paths = [
+                report("FFT", 0.010), report("MATMUL", 0.011),
+                report("STENCIL", 0.009), report("STREAM", 0.010),
+            ]
+            summary = summarize_workloads(paths)
+            self.assertTrue(summary["recommendation"]["accepted"])
+            self.assertEqual(summary["selected_lambda_wire"], 0.01)
+
+            paths[-1] = report("STREAM", 0.040)
+            rejected = summarize_workloads(paths)
+            self.assertFalse(rejected["recommendation"]["accepted"])
+            self.assertIsNone(rejected["selected_lambda_wire"])
+
+    def test_local_wire_calibration_cannot_write_a_formal_config(self):
+        """A local workload fit must not become a formal lambda configuration."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            samples = []
+            for cycle, ipc2 in ((0, 3.2), (1, 3.1), (2, 3.0)):
+                result = root / f"result_{cycle}.json"
+                latency = root / f"latency_{cycle}.json"
+                write_json(result, {"ipc2": ipc2})
+                write_json(latency, {"components_cycles": {"layout_wire": cycle}})
+                samples.append(f"{cycle}={result},{latency}")
+            config = root / "candidate.json"
+            output = root / "report.json"
+            forbidden = root / "formal.json"
+            write_json(config, {"layout_optimizer": {"lambda_wire": 0.0}})
+            argv = [
+                "calibrate_lambda_wire", "--ipc1", "4", "--frequency-ghz", "2",
+                "--output", str(output), "--input-config", str(config),
+                "--output-config", str(forbidden),
+            ] + [argument for sample in samples for argument in ("--sample", sample)]
+            with patch("sys.argv", argv), self.assertRaises(SystemExit):
+                calibrate_lambda_wire_main()
+            self.assertFalse(forbidden.exists())
 
 
 class ParserTests(unittest.TestCase):

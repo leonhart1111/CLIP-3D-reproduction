@@ -11,9 +11,88 @@ promoted to a universal parameter.
 from __future__ import annotations
 
 import argparse
+import math
+import statistics
 from pathlib import Path
 
 from workflow.common import read_json, write_json
+
+
+REQUIRED_WORKLOADS = ("FFT", "MATMUL", "STENCIL", "STREAM")
+
+
+def summarize_workloads(series_reports: list[Path]) -> dict:
+    """Select a shared lambda only from four accepted, agreeing local series."""
+    records = {}
+    rejection_reasons = []
+    for path in series_reports:
+        source = Path(path).resolve()
+        report = read_json(source)
+        workload = str(report.get("workload", "")).upper()
+        calibration = report.get("calibration", report)
+        if workload in records:
+            rejection_reasons.append(f"duplicate workload report: {workload}")
+            continue
+        accepted = bool(
+            calibration.get("recommendation", {}).get("accepted_for_this_workload")
+        )
+        value = calibration.get("lambda_wire")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and not math.isfinite(value):
+            value = None
+        records[workload] = {
+            "lambda_wire": value, "accepted_for_this_workload": accepted,
+            "report": str(source),
+        }
+
+    observed = set(records)
+    required = set(REQUIRED_WORKLOADS)
+    missing = sorted(required - observed)
+    unexpected = sorted(observed - required)
+    if missing:
+        rejection_reasons.append("missing required workloads: " + ", ".join(missing))
+    if unexpected:
+        rejection_reasons.append("unexpected workloads: " + ", ".join(unexpected))
+    for workload in REQUIRED_WORKLOADS:
+        record = records.get(workload)
+        if record is None:
+            continue
+        if not record["accepted_for_this_workload"]:
+            rejection_reasons.append(f"local series not accepted: {workload}")
+        if record["lambda_wire"] is None or record["lambda_wire"] <= 0:
+            rejection_reasons.append(f"invalid local lambda_wire: {workload}")
+
+    values = [records[workload]["lambda_wire"] for workload in REQUIRED_WORKLOADS
+              if workload in records and records[workload]["lambda_wire"] is not None]
+    median = statistics.median(values) if len(values) == len(REQUIRED_WORKLOADS) else None
+    if median is not None:
+        low, high = 0.75 * median, 1.25 * median
+        outside = [workload for workload in REQUIRED_WORKLOADS
+                   if not low <= records[workload]["lambda_wire"] <= high]
+        if outside:
+            rejection_reasons.append(
+                "lambda_wire outside ±25% median: " + ", ".join(outside)
+            )
+    accepted = not rejection_reasons
+    return {
+        "schema_version": 1,
+        "required_workloads": list(REQUIRED_WORKLOADS),
+        "workloads": records,
+        "median_lambda_wire": median,
+        "selected_lambda_wire": median if accepted else None,
+        "recommendation": {
+            "accepted": accepted,
+            "acceptance": (
+                "exactly FFT, MATMUL, STENCIL, and STREAM; each local OLS is accepted; "
+                "every lambda_wire is within ±25% of the median"
+            ),
+            "rejection_reasons": rejection_reasons,
+            "local_values_are_not_formal_parameters": True,
+        },
+    }
 
 
 def injected_wire_cycles(latency: dict) -> int:
@@ -203,6 +282,11 @@ def main() -> None:
     args = parser.parse_args()
     if bool(args.input_config) != bool(args.output_config):
         parser.error("--input-config and --output-config must be supplied together")
+    if args.input_config:
+        parser.error(
+            "a local workload lambda cannot write a formal config; "
+            "use workflow.r2.run_wire_sensitivity --summary after all four workloads"
+        )
     legacy = (args.baseline_result, args.candidate_result,
               args.baseline_latency, args.candidate_latency)
     if args.sample and any(legacy):
@@ -220,23 +304,6 @@ def main() -> None:
             "provide at least three --sample entries or all four legacy pair paths"
         )
     write_json(args.output, report)
-    if args.input_config:
-        config = read_json(args.input_config)
-        config["name"] = f"{config.get('name', args.input_config.stem)}_wire_fitted"
-        config["layout_optimizer"]["lambda_wire"] = report["lambda_wire"]
-        config["layout_optimizer"]["lambda_wire_calibration"] = {
-            "report": str(args.output.resolve()),
-            "method": report["method"],
-            "reference_sustainable_frequency_ghz": args.frequency_ghz,
-            "status": "local pilot estimate; cross-workload R2 validation pending",
-        }
-        config.setdefault("provenance", {}).setdefault(
-            "reproduction_assumptions", []
-        ).append(
-            "lambda_wire was estimated from a matched local gem5 R2 latency pair; "
-            "it is not a paper-disclosed constant."
-        )
-        write_json(args.output_config, config)
     ipc_loss = (
         report.get("ipc_loss_per_added_cycle")
         if "ipc_loss_per_added_cycle" in report
