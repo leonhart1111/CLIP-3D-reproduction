@@ -19,15 +19,23 @@ def _gem5_args(overrides: dict) -> list[str]:
             for item in ("--" + key.replace("_", "-"), str(value))]
 
 
-def build_sensitivity_vectors(base_vector: dict, cycles: list[int]) -> dict[int, dict]:
-    """Return independent vectors that change only the injected wire latency."""
+def _validated_cycles(cycles: list[int]) -> list[int]:
+    """Validate the distinct wire levels required for an R2 calibration."""
     if not cycles:
-        raise ValueError("wire sensitivity requires at least one cycle")
+        raise ValueError("wire sensitivity requires at least three distinct cycle levels")
     requested = [int(cycle) for cycle in cycles]
     if any(cycle < 0 for cycle in requested):
         raise ValueError("wire sensitivity cycles must be non-negative")
     if len(set(requested)) != len(requested):
         raise ValueError("wire sensitivity cycles must be distinct")
+    if len(requested) < 3:
+        raise ValueError("wire sensitivity requires at least three distinct cycle levels")
+    return requested
+
+
+def build_sensitivity_vectors(base_vector: dict, cycles: list[int]) -> dict[int, dict]:
+    """Return independent vectors that change only the injected wire latency."""
+    requested = _validated_cycles(cycles)
 
     components = base_vector.get("components_cycles", {})
     required = ("l1d_cacti", "l1_pipeline", "l2_cacti", "l2_arbitration", "tsv")
@@ -178,13 +186,14 @@ def _resume_result(cycle_dir: Path, hashes: dict[str, str]) -> dict | None:
 def run_series(r1_dir: Path, point_dir: Path, output_dir: Path, cycles: list[int],
                config_path: Path, execute: bool = True) -> dict:
     """Prepare or execute one exact-R1, exact-lifting-point sensitivity series."""
+    requested = _validated_cycles(cycles)
     r1_dir = Path(r1_dir).resolve()
     point_dir = Path(point_dir).resolve()
     output_dir = Path(output_dir).resolve()
     config_path = Path(config_path).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     base, _ = _base_vector(r1_dir, point_dir, output_dir, config_path)
-    vectors = build_sensitivity_vectors(base, cycles)
+    vectors = build_sensitivity_vectors(base, requested)
     _assert_matched_vectors(vectors)
     metadata = read_json(r1_dir / "r1_metadata.json")
     samples = []

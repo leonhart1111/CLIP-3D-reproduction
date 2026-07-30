@@ -29,6 +29,7 @@ from workflow.r2.calibrate_lambda_wire import (
 )
 from workflow.r2.run_wire_sensitivity import (
     build_sensitivity_vectors,
+    run_series,
     summarize_workloads,
 )
 from workflow.run_lifting_pipeline import (
@@ -295,7 +296,7 @@ class FrequencyTests(unittest.TestCase):
             "layout": "/fixture/layout.json",
         }
 
-        vectors = build_sensitivity_vectors(base, [0, 1, 2])
+        vectors = build_sensitivity_vectors(base, [0, 1, 2, 3])
         self.assertEqual(base["components_cycles"]["layout_wire"], 9)
         for cycle, vector in vectors.items():
             normalized_base = deepcopy(base)
@@ -315,6 +316,28 @@ class FrequencyTests(unittest.TestCase):
                  "--xbar-forward-latency", str(5 + cycle),
                  "--xbar-response-latency", "1"],
             )
+
+    def test_wire_sensitivity_rejects_fewer_than_three_distinct_cycles(self):
+        """R2 calibration requires three distinct injected wire levels."""
+        for cycles in ([0], [0, 1]):
+            with self.subTest(cycles=cycles), self.assertRaisesRegex(
+                ValueError, "at least three distinct"
+            ):
+                build_sensitivity_vectors({}, cycles)
+
+    def test_wire_sensitivity_series_rejects_short_cycles_before_preparation(self):
+        """Invalid cycle input must not build a vector or invoke an R2 run."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch(
+                "workflow.r2.run_wire_sensitivity._base_vector",
+                side_effect=AssertionError("base vector must not be prepared"),
+            ):
+                with self.assertRaisesRegex(ValueError, "at least three distinct"):
+                    run_series(
+                        root / "r1", root / "point", root / "output", [0, 1],
+                        root / "candidate.json", execute=False,
+                    )
 
     def test_wire_sensitivity_global_acceptance_rule(self):
         """A formal lambda exists only for four accepted, mutually-close workloads."""
