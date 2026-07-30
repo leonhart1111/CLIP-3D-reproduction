@@ -30,7 +30,7 @@ from workflow.run_lifting_pipeline import (
 from workflow.run_lifting_sweep import completed as lifting_completed
 from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT, run_hotspot
 from workflow.thermal.calibrate_proxy import (
-    candidate_layouts, parse_external_case, sample_split,
+    candidate_layouts, parse_external_case, proxy_acceptance_checks, sample_split,
 )
 from workflow.thermal.sustainable_frequency import closed_form_frequency
 from workflow.thermal.validate_frequency import validate_case
@@ -259,6 +259,27 @@ class GridTests(unittest.TestCase):
             self.assertEqual(sample_split(0, 0, 0, 0, 3), "validation")
             self.assertEqual(sample_split(0, 1, 1, 0, 3), "validation")
             self.assertEqual(sample_split(0, 0, 1, 0, 3), "train")
+
+    def test_proxy_calibration_can_restrict_samples_to_p1_top_tier(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "modules.json"
+            write_json(path, self.model())
+            candidates = candidate_layouts(
+                path, grid_points=3, utilization=0.70, allowed_l2_tiers=(1,)
+            )
+            self.assertTrue(candidates)
+            self.assertEqual({item["tier"] for item in candidates}, {1})
+
+    def test_strict_p1_acceptance_allows_fixed_unidentifiable_beta(self):
+        checks = proxy_acceptance_checks(
+            validation={"rmse_c": 0.4, "spatial_centered_rmse_c": 0.1,
+                        "spatial_spearman": 0.9},
+            baseline={"rmse_c": 0.5, "spatial_centered_rmse_c": 0.2},
+            fitted_rank=2, selected_weight=0.7,
+            beta_status="fixed_unidentifiable_under_p1",
+        )
+        self.assertTrue(checks["beta_policy_valid"])
+        self.assertNotIn("beta_tier_effect_identifiable", checks)
 
     def test_external_proxy_cases_preserve_spatial_group(self):
         with tempfile.TemporaryDirectory() as temporary:

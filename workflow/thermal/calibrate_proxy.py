@@ -4,7 +4,7 @@
 This is a reproduction calibration utility, not an implementation detail
 published by the CLIP-3D authors.  It moves the shared L2 over a deterministic
 normalized grid, runs the same HotSpot stack used by the lifting pipeline, and
-fits alpha, beta, and the cross-tier coupling weight with a held-out split.
+fits only the identifiable proxy parameters with a held-out split.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import hashlib
 import math
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -64,8 +65,27 @@ def parse_external_case(text: str) -> tuple[str, str, Path]:
     return group, sample_label, path
 
 
-def candidate_layouts(model_path: Path, grid_points: int,
-                      utilization: float) -> list[dict]:
+def parse_l2_tiers(text: str) -> tuple[int, ...]:
+    try:
+        tiers = tuple(int(value) for value in text.split(",") if value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("tiers must be comma-separated integers") from error
+    if not tiers or any(tier not in (0, 1) for tier in tiers) or len(set(tiers)) != len(tiers):
+        raise argparse.ArgumentTypeError("tiers must be a non-empty subset of 0,1")
+    return tiers
+
+
+def candidate_layouts(model_path: Path, grid_points: int, utilization: float,
+                      allowed_l2_tiers: tuple[int, ...] = (0, 1)) -> list[dict]:
+    """Return legal L2 placements restricted to the requested physical tiers."""
+    if grid_points < 2:
+        raise ValueError("grid_points must be at least 2")
+    if not allowed_l2_tiers:
+        raise ValueError("allowed_l2_tiers must not be empty")
+    if any(type(tier) is not int or tier not in (0, 1) for tier in allowed_l2_tiers):
+        raise ValueError("allowed_l2_tiers must contain only 0 and/or 1")
+    if len(set(allowed_l2_tiers)) != len(allowed_l2_tiers):
+        raise ValueError("allowed_l2_tiers must not contain duplicates")
     model = read_json(model_path)
     base = baseline_layout(model, utilization)
     original = next(module for module in base["modules"] if module["kind"] == "l2")
@@ -77,7 +97,7 @@ def candidate_layouts(model_path: Path, grid_points: int,
         raise ValueError(f"L2 does not fit in die for {model_path}")
 
     layouts = []
-    for tier in (0, 1):
+    for tier in allowed_l2_tiers:
         for row in range(grid_points):
             fy = row / (grid_points - 1)
             for column in range(grid_points):
@@ -101,6 +121,47 @@ def candidate_layouts(model_path: Path, grid_points: int,
     if not layouts:
         raise RuntimeError(f"no legal calibration layouts for {model_path}")
     return layouts
+
+
+def proxy_acceptance_checks(validation: dict, baseline: dict, fitted_rank: int,
+                            selected_weight: float, beta_status: str) -> dict:
+    """Return the strict-P1 checks without concealing a failed condition."""
+    return {
+        "lower_validation_rmse": validation["rmse_c"] < baseline["rmse_c"],
+        "lower_validation_spatial_rmse": (
+            validation["spatial_centered_rmse_c"]
+            < baseline["spatial_centered_rmse_c"]
+        ),
+        "validation_spatial_rank_at_least_0p8": (
+            validation["spatial_spearman"] is not None
+            and validation["spatial_spearman"] >= 0.8
+        ),
+        "cross_weight_not_on_bound": 0.0 < selected_weight < 1.0,
+        "active_parameter_jacobian_full_rank": fitted_rank == 2,
+        "beta_policy_valid": beta_status == "fixed_unidentifiable_under_p1",
+    }
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def require_raw_power_provenance(model_path: Path) -> None:
+    provenance = read_json(model_path).get("power_provenance")
+    required = {
+        "dynamic": "McPAT Runtime Dynamic",
+        "leakage": "McPAT Subthreshold Leakage + Gate Leakage",
+        "postprocessing": "none",
+    }
+    if not isinstance(provenance, dict) or any(
+            provenance.get(key) != value for key, value in required.items()):
+        raise ValueError(
+            f"model must use raw direct-McPAT power with no postprocessing: {model_path}"
+        )
 
 
 def sample_split(model_index: int, row: int, column: int, tier: int,
@@ -233,6 +294,7 @@ def metrics(samples: list[dict], parameters: list[float], config: dict) -> dict:
 
 def fit(samples: list[dict], config: dict, starts: list[list[float]] | None = None,
         spatial_weight: float = 0.0,
+        fixed_beta: float | None = None,
         fixed_cross_tier_weight: float | None = None) -> dict:
     import numpy as np
     from scipy.optimize import least_squares
@@ -242,19 +304,30 @@ def fit(samples: list[dict], config: dict, starts: list[list[float]] | None = No
     default = config["layout_optimizer"]
     if fixed_cross_tier_weight is not None and not 0 <= fixed_cross_tier_weight <= 1:
         raise ValueError("fixed_cross_tier_weight must be in [0, 1]")
+    if fixed_beta is not None and not 0 <= fixed_beta <= 20:
+        raise ValueError("fixed_beta must be in [0, 20]")
+    active_parameters = ["alpha"]
+    if fixed_beta is None:
+        active_parameters.append("beta")
+    if fixed_cross_tier_weight is None:
+        active_parameters.append("cross_tier_weight")
     if starts is None:
-        if fixed_cross_tier_weight is None:
-            starts = [
-                [float(default["alpha"]), float(default["beta"]),
-                 float(default["cross_tier_weight"])],
-                [0.1, 0.1, 0.0], [0.5, 0.5, 0.25], [1.0, 0.1, 0.5],
-                [1.0, 1.0, 0.75], [2.0, 0.5, 1.0],
-            ]
-        else:
-            starts = [
-                [float(default["alpha"]), float(default["beta"])],
-                [0.1, 0.1], [0.5, 0.5], [1.0, 0.0], [1.0, 1.0], [2.0, 0.5],
-            ]
+        initial = {
+            "alpha": float(default["alpha"]),
+            "beta": float(default["beta"]),
+            "cross_tier_weight": float(default["cross_tier_weight"]),
+        }
+        trial_values = {
+            "alpha": (0.1, 0.5, 1.0, 2.0),
+            "beta": (0.0, 0.1, 0.5, 1.0),
+            "cross_tier_weight": (0.0, 0.25, 0.5, 0.75, 1.0),
+        }
+        starts = [[initial[name] for name in active_parameters]]
+        for index in range(max(len(values) for values in trial_values.values())):
+            starts.append([
+                trial_values[name][index % len(trial_values[name])]
+                for name in active_parameters
+            ])
 
     if spatial_weight < 0:
         raise ValueError("spatial_weight must be non-negative")
@@ -263,9 +336,15 @@ def fit(samples: list[dict], config: dict, starts: list[list[float]] | None = No
         groups.setdefault(sample["model_label"], []).append(index)
 
     def expanded(parameters):
-        if fixed_cross_tier_weight is None:
-            return parameters
-        return [parameters[0], parameters[1], fixed_cross_tier_weight]
+        values = dict(zip(active_parameters, parameters))
+        return [
+            float(values["alpha"]),
+            float(fixed_beta if fixed_beta is not None else values["beta"]),
+            float(
+                fixed_cross_tier_weight if fixed_cross_tier_weight is not None
+                else values["cross_tier_weight"]
+            ),
+        ]
 
     def residuals(parameters):
         proxy_parameters = expanded(parameters)
@@ -282,9 +361,12 @@ def fit(samples: list[dict], config: dict, starts: list[list[float]] | None = No
         return np.concatenate((absolute, spatial_weight * centered))
 
     solutions = []
-    lower = [0.0, 0.0] if fixed_cross_tier_weight is not None else [0.0, 0.0, 0.0]
-    upper = [20.0, 20.0] if fixed_cross_tier_weight is not None else [20.0, 20.0, 1.0]
+    lower = [0.0 for _ in active_parameters]
+    upper = [1.0 if name == "cross_tier_weight" else 20.0
+             for name in active_parameters]
     for start in starts:
+        if len(start) != len(active_parameters):
+            raise ValueError("each fit start must contain one value per active parameter")
         result = least_squares(
             residuals, start, bounds=(lower, upper),
             xtol=1e-12, ftol=1e-12, gtol=1e-12, max_nfev=4000,
@@ -305,13 +387,13 @@ def fit(samples: list[dict], config: dict, starts: list[list[float]] | None = No
     )
     standard_errors = np.sqrt(np.maximum(np.diag(covariance), 0.0))
     proxy_parameters = expanded(result.x)
-    standard_error_values = {
-        "alpha": float(standard_errors[0]),
-        "beta": float(standard_errors[1]),
-        "cross_tier_weight": (
-            float(standard_errors[2]) if fixed_cross_tier_weight is None else None
-        ),
-    }
+    standard_error_values = {"alpha": None, "beta": None, "cross_tier_weight": None}
+    for index, name in enumerate(active_parameters):
+        standard_error_values[name] = float(standard_errors[index])
+    beta_status = (
+        "fixed_unidentifiable_under_p1" if fixed_beta == 0.0
+        else "fixed" if fixed_beta is not None else "fitted"
+    )
     return {
         "parameters": {
             "alpha": float(proxy_parameters[0]),
@@ -322,18 +404,22 @@ def fit(samples: list[dict], config: dict, starts: list[list[float]] | None = No
         "jacobian_singular_values": [float(value) for value in singular_values],
         "jacobian_condition_number": condition,
         "rank": int(np.linalg.matrix_rank(result.jac)),
+        "active_parameters": active_parameters,
         "cost_sum_squared_error": float(np.sum(result.fun ** 2)),
         "success": bool(result.success),
         "message": result.message,
         "function_evaluations": int(result.nfev),
         "spatial_residual_weight": spatial_weight,
+        "fixed_beta": fixed_beta,
+        "beta_status": beta_status,
         "fixed_cross_tier_weight": fixed_cross_tier_weight,
     }
 
 
 def cross_validate_weight(training: list[dict], validation: list[dict],
                           config: dict, spatial_weight: float,
-                          step: float = 0.005) -> dict:
+                          step: float = 0.005,
+                          fixed_beta: float | None = None) -> dict:
     if not 0 < step <= 1:
         raise ValueError("cross_weight_step must be in (0, 1]")
     count = int(math.floor(1.0 / step + 1e-12))
@@ -344,6 +430,7 @@ def cross_validate_weight(training: list[dict], validation: list[dict],
     for weight in weights:
         fitted = fit(
             training, config, spatial_weight=spatial_weight,
+            fixed_beta=fixed_beta,
             fixed_cross_tier_weight=weight,
         )
         vector = list(fitted["parameters"].values())
@@ -408,12 +495,28 @@ def calibrate(models: list[tuple[str, Path]], config_path: Path, output_dir: Pat
               hotspot_grid_size: int | None = None,
               spatial_weight: float = 10.0,
               cross_weight_step: float = 0.005,
-              external_cases: list[tuple[str, str, Path]] | None = None) -> dict:
+              external_cases: list[tuple[str, str, Path]] | None = None,
+              allowed_l2_tiers: tuple[int, ...] = (0, 1),
+              fixed_beta: float | None = None,
+              target_grid_size: int = 32) -> dict:
     if grid_points < 2:
         raise ValueError("grid_points must be at least 2")
     if workers < 1:
         raise ValueError("workers must be positive")
+    if target_grid_size < 2:
+        raise ValueError("target_grid_size must be at least 2")
+    allowed_l2_tiers = tuple(allowed_l2_tiers)
     target_config = read_json(config_path)
+    config_strict_p1 = target_config.get("formal_validation", {}).get("strict_p1") is True
+    strict_p1 = config_strict_p1 or allowed_l2_tiers == (1,)
+    if strict_p1 and allowed_l2_tiers != (1,):
+        raise ValueError("strict P1 calibration requires allowed_l2_tiers == (1,)")
+    if strict_p1 and fixed_beta != 0.0:
+        raise ValueError("strict P1 calibration requires fixed_beta == 0.0")
+    if strict_p1 and target_grid_size != 32:
+        raise ValueError("strict P1 calibration requires target_grid_size == 32")
+    for _, model_path in models:
+        require_raw_power_provenance(model_path)
     config = copy.deepcopy(target_config)
     if hotspot_grid_size is not None:
         if hotspot_grid_size < 2:
@@ -424,7 +527,8 @@ def calibrate(models: list[tuple[str, Path]], config_path: Path, output_dir: Pat
     samples = []
     for model_index, (label, model_path) in enumerate(models):
         candidates = candidate_layouts(
-            model_path, grid_points, float(config["physical"]["utilization"])
+            model_path, grid_points, float(config["physical"]["utilization"]),
+            allowed_l2_tiers,
         )
         for candidate in candidates:
             identifier = (
@@ -458,18 +562,22 @@ def calibrate(models: list[tuple[str, Path]], config_path: Path, output_dir: Pat
     ))
     training = [sample for sample in completed if sample["split"] == "train"]
     validation = [sample for sample in completed if sample["split"] == "validation"]
-    absolute_fit = fit(training, config)
-    direct_joint_fit = fit(training, config, spatial_weight=spatial_weight)
+    absolute_fit = fit(training, config, fixed_beta=fixed_beta)
+    direct_joint_fit = fit(
+        training, config, spatial_weight=spatial_weight, fixed_beta=fixed_beta,
+    )
     cross_validation = cross_validate_weight(
-        training, validation, config, spatial_weight, cross_weight_step
+        training, validation, config, spatial_weight, fixed_beta=fixed_beta,
+        step=cross_weight_step,
     )
     selected_training_fit = cross_validation["selected"]["training_fit"]
     selected_weight = float(cross_validation["selected"]["cross_tier_weight"])
-    # After the held-out set chooses the non-smooth cross-tier hyperparameter,
-    # use all spatial samples to obtain the final alpha and beta estimates.
+    # Refit both identifiable parameters on every position after the held-out
+    # search evaluates the non-smooth cross-tier response.  With strict P1,
+    # beta stays fixed and the active Jacobian is [alpha, cross_tier_weight].
     fitted = fit(
         completed, config, spatial_weight=spatial_weight,
-        fixed_cross_tier_weight=selected_weight,
+        fixed_beta=fixed_beta,
     )
     parameter_dict = fitted["parameters"]
     parameters = [
@@ -519,6 +627,10 @@ def calibrate(models: list[tuple[str, Path]], config_path: Path, output_dir: Pat
     for group, label, case_dir in external_cases or []:
         thermal = read_json(case_dir / "thermal_result.json")
         manifest = read_json(case_dir / "hotspot_manifest.json")
+        if int(manifest.get("grid_size", -1)) != target_grid_size:
+            raise ValueError(
+                f"external case must use target grid {target_grid_size}: {case_dir}"
+            )
         if not math.isclose(
             float(manifest["r_convec_k_per_w"]),
             float(target_config["physical"]["r_convec_k_per_w"]),
@@ -550,6 +662,7 @@ def calibrate(models: list[tuple[str, Path]], config_path: Path, output_dir: Pat
             continue
         loo_fit = fit(
             loo_train, config, spatial_weight=spatial_weight,
+            fixed_beta=fixed_beta,
             fixed_cross_tier_weight=selected_weight,
         )
         values = loo_fit["parameters"]
@@ -559,17 +672,41 @@ def calibrate(models: list[tuple[str, Path]], config_path: Path, output_dir: Pat
             "held_out_metrics": metrics(loo_test, vector, config),
         }
 
+    input_hashes = {
+        "configuration": {
+            "path": str(config_path.resolve()), "sha256": sha256(config_path),
+        },
+        "models": [
+            {"label": label, "path": str(path.resolve()), "sha256": sha256(path)}
+            for label, path in models
+        ],
+        "external_cases": [
+            {
+                "group": group,
+                "label": label,
+                "files": {
+                    name: {
+                        "path": str((case_dir / name).resolve()),
+                        "sha256": sha256(case_dir / name),
+                    }
+                    for name in ("layout.json", "thermal_result.json", "hotspot_manifest.json")
+                },
+            }
+            for group, label, case_dir in external_cases or []
+        ],
+    }
     report = {
         "schema_version": 1,
         "method": "equation-(14) constrained nonlinear least squares against HotSpot",
         "config": str(config_path.resolve()),
         "models": [{"label": label, "path": str(path)} for label, path in models],
+        "input_hashes": input_hashes,
         "sample_count": len(completed),
         "training_count": len(training),
         "validation_count": len(validation),
         "grid_points_per_axis": grid_points,
         "calibration_hotspot_grid_size": int(config["physical"]["grid_size"]),
-        "target_hotspot_grid_size": int(target_config["physical"]["grid_size"]),
+        "target_hotspot_grid_size": target_grid_size,
         "hotspot_workers": workers,
         "spatial_residual_weight": spatial_weight,
         "cross_weight_step": cross_weight_step,
@@ -581,7 +718,7 @@ def calibrate(models: list[tuple[str, Path]], config_path: Path, output_dir: Pat
         "leave_one_model_out": leave_one_model_out,
         "external_target_grid_validation": external_evaluations,
         "interpretation": {
-            "fit_scope": "alpha, beta, cross_tier_weight only; R_conv and Lc remain fixed",
+            "fit_scope": "active thermal-proxy parameters only; R_conv and Lc remain fixed",
             "fit_objective": (
                 "absolute temperature residuals plus spatial_weight times within-model "
                 "centered residuals; weight 10 makes 0.1 C spatial error comparable to 1 C absolute error"
@@ -624,22 +761,36 @@ def calibrate(models: list[tuple[str, Path]], config_path: Path, output_dir: Pat
     }
     baseline_validation = evaluations["defaults"]["validation"]
     calibrated_validation = evaluations["cross_validated_training_fit"]["validation"]
-    acceptance_checks = {
-        "lower_validation_rmse": (
-            calibrated_validation["rmse_c"] < baseline_validation["rmse_c"]
-        ),
-        "lower_validation_spatial_rmse": (
-            calibrated_validation["spatial_centered_rmse_c"]
-            < baseline_validation["spatial_centered_rmse_c"]
-        ),
-        "validation_spatial_rank_at_least_0p8": (
-            calibrated_validation["spatial_spearman"] is not None
-            and calibrated_validation["spatial_spearman"] >= 0.8
-        ),
-        "cross_weight_not_on_bound": 0.0 < selected_weight < 1.0,
-        "final_alpha_beta_jacobian_full_rank": fitted["rank"] == 2,
-        "beta_tier_effect_identifiable": beta_identifiable,
-    }
+    acceptance_checks = proxy_acceptance_checks(
+        calibrated_validation, baseline_validation, fitted["rank"], selected_weight,
+        fitted["beta_status"],
+    )
+    if strict_p1:
+        report["strict_p1"] = {
+            "enabled": True,
+            "allowed_l2_tiers": [1],
+            "beta": 0.0,
+            "beta_status": "fixed_unidentifiable_under_p1",
+            "candidate_layout_policy": "top-tier L2 positions only",
+        }
+        expected_fitting_workloads = {"fft", "matmul", "stencil"}
+        fitting_workloads = {label.casefold() for label, _ in models}
+        target_groups = {group.casefold() for group, _, _ in external_cases or []}
+        acceptance_checks.update({
+            "fitting_workloads_are_fft_matmul_stencil": (
+                fitting_workloads == expected_fitting_workloads
+            ),
+            "target_validation_is_separate_stream_group": target_groups == {"stream"},
+            "target_grid_validation_supplied": external_evaluations is not None,
+            "leave_one_workload_out_spatial_ranks_at_least_0p8": (
+                len(leave_one_model_out) == len(models)
+                and all(
+                    values["held_out_metrics"]["spatial_spearman"] is not None
+                    and values["held_out_metrics"]["spatial_spearman"] >= 0.8
+                    for values in leave_one_model_out.values()
+                )
+            ),
+        })
     if external_evaluations is not None:
         external_default = external_evaluations["defaults"]
         external_fitted = external_evaluations["fitted"]
@@ -656,37 +807,22 @@ def calibrate(models: list[tuple[str, Path]], config_path: Path, output_dir: Pat
                 and external_fitted["spatial_spearman"] >= 0.8
             ),
         })
+    elif strict_p1:
+        acceptance_checks.update({
+            "lower_external_target_grid_rmse": False,
+            "lower_external_target_grid_spatial_rmse": False,
+            "external_target_grid_spatial_rank_at_least_0p8": False,
+        })
     accepted = all(acceptance_checks.values())
     report["recommendation"] = {
         "accepted": accepted,
         "checks": acceptance_checks,
-        "action": (
-            "use suggested_config.json for a post-calibration layout rerun"
-            if accepted else
-            "do not replace formal config; improve the thermal proxy or collect more diverse data"
-        ),
+        "action": "do not modify a configuration; promote only through formal validation",
     }
     write_json(output_dir / "calibration_report.json", report)
     write_samples_csv(
         output_dir / "samples.csv", completed, default_parameters, parameters, config
     )
-    suggested = target_config
-    suggested["name"] = f"{suggested.get('name', config_path.stem)}_thermal_proxy_fitted"
-    if accepted:
-        suggested["layout_optimizer"].update(parameter_dict)
-    suggested.setdefault("provenance", {}).setdefault("reproduction_assumptions", []).append(
-        "Equation-(14) alpha/beta/cross-tier values were fitted against local detailed-3D HotSpot; see calibration_report.json before treating them as transferable."
-    )
-    suggested["layout_optimizer"]["thermal_proxy_calibration"] = {
-        "report": str((output_dir / "calibration_report.json").resolve()),
-        "accepted": accepted,
-        "candidate_parameters": parameter_dict,
-        "sample_count": len(completed),
-        "validation_rmse_c": calibrated_validation["rmse_c"],
-        "validation_spatial_rmse_c": calibrated_validation["spatial_centered_rmse_c"],
-        "spatial_spearman": calibrated_validation["spatial_spearman"],
-    }
-    write_json(output_dir / "suggested_config.json", suggested)
     return report
 
 
@@ -700,7 +836,7 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument(
         "--hotspot-grid-size", type=int,
-        help="training-grid override; keep target config unchanged in suggested_config.json",
+        help="training-grid override; never changes the selected configuration",
     )
     parser.add_argument(
         "--spatial-weight", type=float, default=10.0,
@@ -715,6 +851,18 @@ def main() -> None:
         help=("repeatable GROUP:SAMPLE=CASE_DIR target-grid case; cases sharing "
               "GROUP are used to validate spatial ordering"),
     )
+    parser.add_argument(
+        "--allowed-l2-tiers", type=parse_l2_tiers, default=(0, 1),
+        help="comma-separated candidate L2 tiers; strict P1 uses 1",
+    )
+    parser.add_argument(
+        "--fixed-beta", type=float,
+        help="fix beta rather than fitting it; strict P1 requires 0.0",
+    )
+    parser.add_argument(
+        "--target-grid-size", type=int, default=32,
+        help="required HotSpot grid size for every external target-validation case",
+    )
     parser.add_argument("--hotspot", type=Path, default=DEFAULT_HOTSPOT)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -722,7 +870,7 @@ def main() -> None:
         args.model, args.config.resolve(), args.output_dir, args.grid_points,
         args.workers, args.hotspot.resolve(), args.force, args.hotspot_grid_size,
         args.spatial_weight, args.cross_weight_step,
-        args.external_case,
+        args.external_case, args.allowed_l2_tiers, args.fixed_beta, args.target_grid_size,
     )
     values = report["fit"]["parameters"]
     validation = report["evaluations"]["cross_validated_training_fit"]["validation"]
