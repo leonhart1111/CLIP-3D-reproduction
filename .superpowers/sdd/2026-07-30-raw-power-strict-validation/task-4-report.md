@@ -161,3 +161,40 @@ OK
 ```
 
 No gem5 or HotSpot executable was run for this fix.
+
+## Strict validation boundary regression fix — round 3
+
+Review found that the side-effect boundary regression covered only the
+two-cycle input `[0, 1]`. The test now parameterizes the same observable
+boundary contract for both `[0]` and `[0, 1]`, always with `execute=True`:
+`run_series()` raises before creating the output path, building the base
+vector, or invoking `run_r2`.
+
+Mutation evidence: temporarily moving `_validated_cycles()` after
+`output_dir.mkdir()` made both subcases fail on the intended filesystem
+boundary:
+
+```text
+$ python -m unittest tests.test_workflow.FrequencyTests.test_wire_sensitivity_series_rejects_short_cycles_before_output_or_execution -v
+FAIL (cycles=[0]): AssertionError: True is not false
+FAIL (cycles=[0, 1]): AssertionError: True is not false
+Ran 1 test in 0.003s
+FAILED (failures=2)
+```
+
+After restoring the validation-first implementation, the focused validation
+tests passed:
+
+```text
+$ python -m unittest tests.test_workflow.FrequencyTests.test_wire_sensitivity_rejects_fewer_than_three_distinct_cycles tests.test_workflow.FrequencyTests.test_wire_sensitivity_series_rejects_short_cycles_before_preparation tests.test_workflow.FrequencyTests.test_wire_sensitivity_series_rejects_short_cycles_before_output_or_execution -v
+Ran 3 tests in 0.002s
+OK
+```
+
+Fresh full-suite verification, without gem5 or HotSpot execution:
+
+```text
+$ python -m unittest discover -s tests -v
+Ran 56 tests in 2.838s
+OK
+```

@@ -340,25 +340,27 @@ class FrequencyTests(unittest.TestCase):
                     )
 
     def test_wire_sensitivity_series_rejects_short_cycles_before_output_or_execution(self):
-        """An invalid series must leave no output directory or R2 execution behind."""
+        """One or two levels must fail before any sensitivity-series side effect."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            output = root / "not-created"
-            with patch(
-                "workflow.r2.run_wire_sensitivity._base_vector",
-                side_effect=AssertionError("base vector must not be prepared"),
-            ) as base_vector, patch(
-                "workflow.r2.run_wire_sensitivity.run_r2",
-                side_effect=AssertionError("R2 must not run"),
-            ) as r2_run:
-                with self.assertRaisesRegex(ValueError, "at least three distinct"):
-                    run_series(
-                        root / "r1", root / "point", output, [0, 1],
-                        root / "candidate.json", execute=True,
-                    )
-            self.assertFalse(output.exists())
-            base_vector.assert_not_called()
-            r2_run.assert_not_called()
+            for cycles in ([0], [0, 1]):
+                with self.subTest(cycles=cycles):
+                    output = root / f"not-created-{'-'.join(map(str, cycles))}"
+                    with patch(
+                        "workflow.r2.run_wire_sensitivity._base_vector",
+                        side_effect=AssertionError("base vector must not be prepared"),
+                    ) as base_vector, patch(
+                        "workflow.r2.run_wire_sensitivity.run_r2",
+                        side_effect=AssertionError("R2 must not run"),
+                    ) as r2_run:
+                        with self.assertRaisesRegex(ValueError, "at least three distinct"):
+                            run_series(
+                                root / "r1", root / "point", output, cycles,
+                                root / "candidate.json", execute=True,
+                            )
+                    self.assertFalse(output.exists())
+                    base_vector.assert_not_called()
+                    r2_run.assert_not_called()
 
     def test_wire_sensitivity_global_acceptance_rule(self):
         """A formal lambda exists only for four accepted, mutually-close workloads."""
