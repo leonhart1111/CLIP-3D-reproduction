@@ -12,6 +12,13 @@ from workflow.common import read_json, write_json
 
 
 ACTION = "operational use permitted; non-formal and not promotable"
+APPROVED_PARAMETERS = {
+    "alpha": 1.5643788695171585,
+    "beta": 0.0,
+    "cross_tier_weight": 0.995,
+}
+APPROVED_MINIMUM_RANK = 0.5
+APPROVED_LOO_POLICY = "diagnostic_only"
 
 
 def sha256(path: Path) -> str:
@@ -38,6 +45,9 @@ def evaluate(proxy_report: Path, config: Path, output: Path) -> dict:
     """Write an operational decision without changing its config or evidence."""
     proxy_report = proxy_report.resolve()
     config = config.resolve()
+    output = output.resolve()
+    if output == proxy_report or output == config:
+        raise ValueError("output must not alias an input")
     report = read_json(proxy_report)
     configured = read_json(config)
     policy = configured.get("operational_validation", {})
@@ -71,6 +81,10 @@ def evaluate(proxy_report: Path, config: Path, output: Path) -> dict:
     for name, value in report_parameters.items():
         if abs(configured_parameters[name] - value) > 1e-12:
             raise ValueError(f"config {name} does not match report {name}")
+        if abs(value - APPROVED_PARAMETERS[name]) > 1e-12:
+            raise ValueError(f"report {name} does not match approved operational {name}")
+        if abs(configured_parameters[name] - APPROVED_PARAMETERS[name]) > 1e-12:
+            raise ValueError(f"config {name} does not match approved operational {name}")
 
     minimum_validation_rank = finite_value(
         policy.get("minimum_validation_spatial_spearman"),
@@ -80,6 +94,20 @@ def evaluate(proxy_report: Path, config: Path, output: Path) -> dict:
         policy.get("minimum_external_target_spatial_spearman"),
         "minimum_external_target_spatial_spearman",
     )
+    if abs(minimum_validation_rank - APPROVED_MINIMUM_RANK) > 1e-12:
+        raise ValueError(
+            "operational_validation.minimum_validation_spatial_spearman "
+            "must equal the approved value"
+        )
+    if abs(minimum_target_rank - APPROVED_MINIMUM_RANK) > 1e-12:
+        raise ValueError(
+            "operational_validation.minimum_external_target_spatial_spearman "
+            "must equal the approved value"
+        )
+    if policy.get("leave_one_workload_out") != APPROVED_LOO_POLICY:
+        raise ValueError(
+            "operational_validation.leave_one_workload_out must equal the approved value"
+        )
     fitted_validation_rmse = finite_value(validation.get("rmse_c"), "validation rmse_c")
     default_validation_rmse = finite_value(baseline.get("rmse_c"), "baseline rmse_c")
     fitted_validation_centered_rmse = finite_value(
@@ -110,13 +138,13 @@ def evaluate(proxy_report: Path, config: Path, output: Path) -> dict:
             fitted_validation_centered_rmse < default_validation_centered_rmse
         ),
         "validation_spatial_rank_at_least_0p5": (
-            fitted_validation_rank >= minimum_validation_rank
+            fitted_validation_rank >= APPROVED_MINIMUM_RANK
         ),
         "lower_target_rmse": fitted_target_rmse < default_target_rmse,
         "lower_target_centered_rmse": (
             fitted_target_centered_rmse < default_target_centered_rmse
         ),
-        "target_spatial_rank_at_least_0p5": fitted_target_rank >= minimum_target_rank,
+        "target_spatial_rank_at_least_0p5": fitted_target_rank >= APPROVED_MINIMUM_RANK,
         "cross_tier_weight_is_interior": 0.0 < cross_tier_weight < 1.0,
         "beta_is_fixed_unidentifiable_under_p1": (
             report.get("strict_p1", {}).get("beta_status")

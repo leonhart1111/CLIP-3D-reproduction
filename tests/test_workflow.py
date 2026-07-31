@@ -1011,6 +1011,58 @@ class OperationalProfileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "alpha.*does not match"):
                 evaluate_operational_proxy(report_path, mismatch_config, output_path)
 
+    def test_operational_evaluator_rejects_output_aliases_without_modifying_inputs(self):
+        """The separate decision artifact cannot overwrite either immutable input."""
+        for alias in ("proxy", "config"):
+            with self.subTest(output=alias):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    report_path = root / "proxy.json"
+                    config_path = root / "operational.json"
+                    write_json(report_path, self.measured_report())
+                    write_json(config_path, read_json(self.operational_config()))
+                    output_path = report_path if alias == "proxy" else config_path
+                    original = output_path.read_bytes()
+                    with self.assertRaisesRegex(ValueError, "output.*input"):
+                        evaluate_operational_proxy(report_path, config_path, output_path)
+                    self.assertEqual(output_path.read_bytes(), original)
+
+    def test_operational_evaluator_rejects_self_consistent_noncanonical_parameters(self):
+        """Matching changed values cannot redefine the approved operational profile."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = self.measured_report()
+            report["fit"]["parameters"]["alpha"] = 1.0
+            config = read_json(self.operational_config())
+            config["layout_optimizer"]["alpha"] = 1.0
+            report_path = root / "proxy.json"
+            config_path = root / "operational.json"
+            write_json(report_path, report)
+            write_json(config_path, config)
+
+            with self.assertRaisesRegex(ValueError, "alpha.*approved"):
+                evaluate_operational_proxy(report_path, config_path, root / "result.json")
+
+    def test_operational_evaluator_rejects_mutated_operational_policy(self):
+        """The approved rank floors and diagnostic-only LOO status are immutable."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "proxy.json"
+            write_json(report_path, self.measured_report())
+            for field, value in (
+                    ("minimum_validation_spatial_spearman", 0.6),
+                    ("minimum_external_target_spatial_spearman", 0.6),
+                    ("leave_one_workload_out", "release_gate")):
+                with self.subTest(field=field):
+                    config = read_json(self.operational_config())
+                    config["operational_validation"][field] = value
+                    config_path = root / f"{field}.json"
+                    write_json(config_path, config)
+                    with self.assertRaisesRegex(ValueError, "operational_validation.*approved"):
+                        evaluate_operational_proxy(
+                            report_path, config_path, root / f"{field}-result.json"
+                        )
+
     def test_operational_config_cannot_be_formally_promoted(self):
         """Accepted-looking synthetic reports cannot turn an operational config formal."""
         with tempfile.TemporaryDirectory() as temporary:
