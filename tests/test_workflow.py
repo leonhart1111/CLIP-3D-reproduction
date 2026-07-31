@@ -1084,6 +1084,34 @@ class OperationalProfileTests(unittest.TestCase):
                     self.operational_config(), root / "formal.json",
                 )
 
+    def test_operational_launcher_separates_pilot_from_full_r1_requirements(self):
+        """The launcher may lift R2, but never starts R1 or formal promotion."""
+        script = Path("scripts/run_operational_raw_power_p1.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('case "$MODE" in', script)
+        self.assertIn("--run-r2", script)
+        self.assertIn("all 100 R1 status files must be success", script)
+        self.assertNotIn("run_r1_sweep.py", script)
+        self.assertNotIn("promote_validated_config", script)
+
+    def test_operational_launcher_uses_nonexistent_roots_and_named_lock(self):
+        """New output roots and distinct operational tmux/flock sessions are required."""
+        script = Path("scripts/run_operational_raw_power_p1.sh").read_text(
+            encoding="utf-8"
+        )
+        documentation = Path("docs/formal_reproduction_zh.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('test ! -e "$ROOT"', script)
+        self.assertIn('runs/operational_raw_power_p1/$MODE', script)
+        self.assertIn('"$ROOT/fixed-bin"', script)
+        self.assertIn('"$ROOT/clip3d"', script)
+        self.assertIn("clip_operational_pilot", documentation)
+        self.assertIn("/tmp/clip-operational-pilot.lock", documentation)
+        self.assertIn("clip_operational_full", documentation)
+        self.assertIn("/tmp/clip-operational-full.lock", documentation)
+
 
 class FormalGuardTests(unittest.TestCase):
     @staticmethod

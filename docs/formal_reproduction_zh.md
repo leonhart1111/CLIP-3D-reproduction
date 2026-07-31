@@ -172,3 +172,23 @@ python -m workflow.analysis.evaluate_operational_proxy \
 该配置固定使用报告中的 `alpha=1.5643788695171585`、`beta=0.0` 和 `cross_tier_weight=0.995`。接受条件是内部验证及独立 STREAM 目标验证的 RMSE 和中心化 RMSE 都优于默认值，两个空间 Spearman 均不低于 `0.5`，交层权重严格位于 `(0, 1)`，并且 beta 状态为 `fixed_unidentifiable_under_p1`；配置参数必须与源报告在 `1e-12` 内一致。全部 leave-one-workload-out 排名仅作为诊断，最低值 `0.28571428571428575` 不参与该运行许可门槛。
 
 输出会明确标记 `mode=operational` 和 `non_formal=true`，且动作文本为 `operational use permitted; non-formal and not promotable`。`formal_validation.promotion` 明确禁止提升该配置，`promote_validated_config` 也会在读取任何报告前拒绝 `strict_p1` 不为 true 的候选。`lambda_wire=0.0` 仍是待匹配 R2 延迟研究校准前的非正式零值，不能作为已校准线延迟参数引用。
+
+### 6.1 受保护的 operational pilot 和完整运行
+
+只能使用 `scripts/run_operational_raw_power_p1.sh` 启动此非正式配置。启动器先运行独立评估器并要求其建议被接受，再记录配置和不可修改源报告的 SHA-256；它不启动 R1，也不执行任何正式提升。`pilot` 只使用 MATMUL 的 `l1d_32kB/l2_512kB` R1 点，顺序运行一次 fixed-bin 和一次 clip3d，并且两次都运行 R2：
+
+```bash
+tmux new-session -d -s clip_operational_pilot "cd /home/zyjiang/Agenticflow/CLIP && flock -n /tmp/clip-operational-pilot.lock bash scripts/run_operational_raw_power_p1.sh pilot"
+tmux attach -t clip_operational_pilot
+```
+
+默认输出根目录是新的 `runs/operational_raw_power_p1/pilot`；若该目录已经存在，启动器会拒绝执行，避免混合或覆盖结果。可将第二个参数替换为一个不存在的自定义输出根目录。
+
+完整运行在启动两个 100 点 lifting sweep 之前，必须确认 R1 根目录恰有 100 个 `status.json`，并且每一个的状态都是 `success`。因此在 100 个 R1 点仍有未完成、失败或缺失时，它会拒绝运行：
+
+```bash
+tmux new-session -d -s clip_operational_full "cd /home/zyjiang/Agenticflow/CLIP && flock -n /tmp/clip-operational-full.lock bash scripts/run_operational_raw_power_p1.sh full"
+tmux attach -t clip_operational_full
+```
+
+完整模式默认写入新的 `runs/operational_raw_power_p1/full/{fixed-bin,clip3d}`，两个 sweep 都固定使用 `--jobs 1 --run-r2`。所有这些输出都必须保持 operational/non-formal 标签；尤其 `lambda_wire=0.0` 仍是等待匹配 R2 证据的未校准值。
