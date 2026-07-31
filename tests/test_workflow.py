@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import subprocess
 import tempfile
 import unittest
 from copy import deepcopy
@@ -86,20 +87,12 @@ class WorkflowTests(unittest.TestCase):
             _, leakage_values = read_ptrace(leakage_path)
             validate_total_trace(names, dynamic_values, leakage_values, total_path)
 
-    def test_local_hotspot_sources_use_high_precision_steady_formats(self):
-        """Steady temperature writers must not quantize calculated values to 0.01 K."""
-        root = Path(__file__).resolve().parents[1]
-        expected_formats = {
-            "tools/src/hotspot/hotspot.c": ('"%.17g\\t"', '"%.17g\\n"'),
-            "tools/src/hotspot/temperature_block.c": ('"%s\\t%.17g\\n"',),
-            "tools/src/hotspot/temperature_grid.c": (
-                '"%d\\t%.17g\\n"', '"%s%s\\t%.17g\\n"', '"%s\\t%.17g\\n"',
-            ),
-        }
-        for relative_path, formats in expected_formats.items():
-            source = (root / relative_path).read_text(encoding="utf-8")
-            for output_format in formats:
-                self.assertIn(output_format, source, msg=relative_path)
+    def test_hotspot_sources_are_not_tracked_by_this_repository(self):
+        completed = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "tools/src/hotspot/hotspot.c"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
 
 class FrequencyTests(unittest.TestCase):
     def test_separated_frequency_trace_scales_only_dynamic_power(self):
