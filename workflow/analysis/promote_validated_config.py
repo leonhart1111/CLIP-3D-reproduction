@@ -44,6 +44,9 @@ def promote(proxy_report: Path, wire_summary: Path, frequency_report: Path,
     wire_summary = wire_summary.resolve()
     frequency_report = frequency_report.resolve()
     candidate_config = candidate_config.resolve()
+    config = copy.deepcopy(read_json(candidate_config))
+    if config.get("formal_validation", {}).get("strict_p1") is not True:
+        raise ValueError("candidate formal_validation.strict_p1 must be exactly true")
     proxy = read_json(proxy_report)
     wire = read_json(wire_summary)
     frequency = read_json(frequency_report)
@@ -53,7 +56,6 @@ def promote(proxy_report: Path, wire_summary: Path, frequency_report: Path,
     if proxy.get("strict_p1", {}).get("beta_status") != "fixed_unidentifiable_under_p1":
         raise ValueError("proxy strict-P1 beta status is not fixed_unidentifiable_under_p1")
 
-    config = copy.deepcopy(read_json(candidate_config))
     validate_config(config, "clip3d")
     optimizer = config["layout_optimizer"]
     parameters = proxy.get("fit", {}).get("parameters", {})

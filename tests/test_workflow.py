@@ -11,6 +11,7 @@ from unittest.mock import patch
 from workflow.cacti.characterize_cache import PAPER_TABLE_II, parse_cacti_output
 from workflow.analysis.summarize_sweep import summarize
 from workflow.analysis.prepare_raw_power_validation import prepare
+from workflow.analysis.evaluate_operational_proxy import evaluate as evaluate_operational_proxy
 from workflow.analysis.promote_validated_config import promote
 from workflow.common import read_json, write_json
 from workflow.floorplan.comparison_layouts import generate as generate_comparison_layouts
@@ -910,6 +911,126 @@ class GridTests(unittest.TestCase):
                 validation["frequencies"][0]["trace_sums_w"]["composed"],
                 validation["frequencies"][0]["trace_sums_w"]["total_at_f0"],
             )
+
+
+class OperationalProfileTests(unittest.TestCase):
+    @staticmethod
+    def measured_report(target_rank: float = 0.5) -> dict:
+        return {
+            "fit": {"parameters": {
+                "alpha": 1.5643788695171585,
+                "beta": 0.0,
+                "cross_tier_weight": 0.995,
+            }},
+            "evaluations": {
+                "cross_validated_training_fit": {"validation": {
+                    "rmse_c": 0.8048080400435677,
+                    "spatial_centered_rmse_c": 0.12900228266536495,
+                    "spatial_spearman": 0.6571428571428573,
+                }},
+                "defaults": {"validation": {
+                    "rmse_c": 13.455896637598286,
+                    "spatial_centered_rmse_c": 0.38150141151565364,
+                    "spatial_spearman": 0.8857142857142858,
+                }},
+            },
+            "external_target_grid_validation": {
+                "fitted": {
+                    "rmse_c": 3.047894945341817,
+                    "spatial_centered_rmse_c": 0.3118797983194971,
+                    "spatial_spearman": target_rank,
+                },
+                "defaults": {
+                    "rmse_c": 12.748167980320552,
+                    "spatial_centered_rmse_c": 0.39245312881639577,
+                    "spatial_spearman": 0.5,
+                },
+            },
+            "strict_p1": {"beta_status": "fixed_unidentifiable_under_p1"},
+            "leave_one_model_out": {
+                "fft": {"held_out_metrics": {"spatial_spearman": 0.6428571428571429}},
+                "matmul": {"held_out_metrics": {"spatial_spearman": 0.5}},
+                "stencil": {"held_out_metrics": {"spatial_spearman": 0.28571428571428575}},
+            },
+        }
+
+    @staticmethod
+    def operational_config() -> Path:
+        return Path(
+            "configs/experiments/clip3d_constrained_5p0_raw_power_p1_operational.json"
+        )
+
+    def test_operational_evaluator_accepts_measured_boundary_profile(self):
+        """A rank exactly 0.5 remains usable but explicitly non-formal."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "proxy.json"
+            output_path = root / "operational.json"
+            report = self.measured_report()
+            write_json(report_path, report)
+
+            result = evaluate_operational_proxy(
+                report_path, self.operational_config(), output_path
+            )
+
+            self.assertTrue(result["recommendation"]["accepted"])
+            self.assertEqual(result["mode"], "operational")
+            self.assertTrue(result["non_formal"])
+            self.assertEqual(
+                result["recommendation"]["action"],
+                "operational use permitted; non-formal and not promotable",
+            )
+            self.assertEqual(result["source"]["path"], str(report_path.resolve()))
+            self.assertRegex(result["source"]["sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                result["diagnostics"]["leave_one_workload_out"]["stencil"],
+                0.28571428571428575,
+            )
+            self.assertNotIn("leave_one_workload_out", result["checks"])
+            self.assertEqual(read_json(report_path), report)
+            self.assertEqual(read_json(output_path), result)
+
+    def test_operational_evaluator_rejects_low_target_rank_or_parameter_mismatch(self):
+        """A sub-threshold target rank rejects, and a changed config cannot be relabeled."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "proxy.json"
+            output_path = root / "operational.json"
+            write_json(report_path, self.measured_report(target_rank=0.499))
+
+            result = evaluate_operational_proxy(
+                report_path, self.operational_config(), output_path
+            )
+            self.assertFalse(result["recommendation"]["accepted"])
+            self.assertFalse(result["checks"]["target_spatial_rank_at_least_0p5"])
+
+            config = read_json(self.operational_config())
+            config["layout_optimizer"]["alpha"] = 1.5643788695171585 + 1e-9
+            mismatch_config = root / "mismatch.json"
+            write_json(mismatch_config, config)
+            with self.assertRaisesRegex(ValueError, "alpha.*does not match"):
+                evaluate_operational_proxy(report_path, mismatch_config, output_path)
+
+    def test_operational_config_cannot_be_formally_promoted(self):
+        """Accepted-looking synthetic reports cannot turn an operational config formal."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proxy = {
+                "recommendation": {"accepted": True},
+                "strict_p1": {"beta_status": "fixed_unidentifiable_under_p1"},
+                "fit": {"parameters": {"alpha": 0.31, "cross_tier_weight": 0.94}},
+            }
+            wire = {"recommendation": {"accepted": True}, "selected_lambda_wire": 0.125}
+            frequency = {"recommendation": {"accepted": True}}
+            write_json(root / "proxy.json", proxy)
+            write_json(root / "wire.json", wire)
+            write_json(root / "frequency.json", frequency)
+
+            with self.assertRaisesRegex(ValueError, "strict_p1.*exactly true"):
+                promote(
+                    root / "proxy.json", root / "wire.json", root / "frequency.json",
+                    self.operational_config(), root / "formal.json",
+                )
 
 
 class FormalGuardTests(unittest.TestCase):

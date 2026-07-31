@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "name": "constrained_5p0_raw_power_p1_operational",
+  "technology_nm": 45,
+  "mcpat": {
+    "temperature_k": 320,
+    "device_type": 0,
+    "longer_channel_device": 1,
+    "interconnect_projection_type": 1,
+    "opt_for_clk": 0
+  },
+  "cacti": {
+    "value_source": "local CACTI run"
+  },
+  "frequency": {
+    "f0_ghz": 2.0,
+    "fmin_ghz": 0.4,
+    "tsafe_c": 95.0,
+    "ambient_c": 25.0
+  },
+  "physical": {
+    "tiers": 2,
+    "grid_size": 32,
+    "utilization": 0.7,
+    "area_reference_mm2": 150.0,
+    "area_reference_raw_mm2": 45.7538495872,
+    "area_reference_basis": "McPAT non-cache area plus local CACTI L1I/L1D/L2 area for 4-core 32kB/512kB reference",
+    "thermal_stack": {
+      "silicon_resistivity_mk_per_w": 0.01,
+      "tim_resistivity_mk_per_w": 0.25,
+      "interposer_thickness_m": 0.0001,
+      "active_silicon_thickness_m": 0.00005,
+      "tim_thickness_m": 0.00002,
+      "local_resistance_scale": 8.72,
+      "calibration": "Earlier Table III thermal anchor calibration retained; rerun calibration after switching cache geometry to local CACTI before formal claims."
+    },
+    "r_convec_k_per_w": 5.0
+  },
+  "layout_optimizer": {
+    "r_convec_k_per_w": 5.0,
+    "alpha": 1.5643788695171585,
+    "beta": 0.0,
+    "cross_tier_weight": 0.995,
+    "lambda_wire": 0.0,
+    "allowed_l2_tiers": [1],
+    "validation_policy": "paper-single",
+    "wire_objective": "continuous",
+    "require_scipy": true,
+    "parameter_provenance": {
+      "alpha": "non-formal: retained from the measured raw-power P1 fit",
+      "beta": "non-formal: fixed_unidentifiable_under_p1",
+      "cross_tier_weight": "non-formal: retained from the measured held-out selection",
+      "lambda_wire": "non-formal: uncalibrated zero pending R2"
+    },
+    "baseline_guard_bips_tolerance": 1e-09
+  },
+  "comparison_layouts": {
+    "candidate_grid": 11,
+    "top_k_hotspot": 3,
+    "sa_iterations": 600,
+    "sa_seed": 20260725,
+    "sa_selection_lambda": 0.5
+  },
+  "delay": {
+    "tsv_hops": 1,
+    "cycles_per_tsv": 2,
+    "l1_pipeline_cycles": 1,
+    "wire_rounding": "nearest"
+  },
+  "formal_validation": {
+    "strict_p1": false,
+    "accepted": false,
+    "promotion": "forbidden: operational profile"
+  },
+  "operational_validation": {
+    "mode": "operational",
+    "minimum_validation_spatial_spearman": 0.5,
+    "minimum_external_target_spatial_spearman": 0.5,
+    "leave_one_workload_out": "diagnostic_only",
+    "source_proxy_report": "results/parameter_studies/raw_power_strict_20260730/proxy_train_16/calibration_report.json"
+  },
+  "provenance": {
+    "paper": [
+      "45 nm, 4 cores, 2 GHz",
+      "32x32 power grid on each active tier",
+      "70% utilization and 150 mm^2 reference calibration",
+      "T_safe=95 C, T_amb=25 C, f_min=0.4 GHz",
+      "Constrained cooling R_conv=5.0 K/W"
+    ],
+    "reproduction_assumptions": [
+      "This operational profile is non-formal and does not change the rejected strict P1 evidence.",
+      "Alpha, beta, and cross-tier weight are non-formal values from the preserved raw-power P1 report.",
+      "Lambda_wire is a non-formal uncalibrated zero pending the matched R2 study.",
+      "McPAT uses direct gem5 O3 counters; its reported dynamic and leakage powers are consumed without post-processing multipliers.",
+      "Cache delay, area, and aspect-ratio-preserving geometry come only from the local CACTI run; no published cache table values are used.",
+      "The 8.72 effective local stack-resistance factor came from an earlier Table III temperature anchor and should be recalibrated after local-CACTI geometry changes.",
+      "CLIP-3D proposals and fixed-bin are both validated with real HotSpot; a guard prevents a proxy-induced thermal-BIPS regression and records any fallback.",
+      "Cool3D-standard and SA+lambda details are under-specified; their deterministic reproduction algorithms record all parameters and candidates."
+    ]
+  }
+}

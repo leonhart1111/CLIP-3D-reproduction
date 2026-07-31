@@ -155,3 +155,20 @@ python -m workflow.analysis.summarize_layout_study \
 - 表IV至表VII不含 smoke 点或代理 BIPS2。
 
 正式 gem5 R2 与 R1 使用同一指令窗口，耗时会远大于 McPAT、CACTI 和 HotSpot。建议先用 `--jobs 1` 验证一个正式成功点，再根据节点资源提高并行度。
+
+## 6. Raw-power P1 的非正式运行配置
+
+`configs/experiments/clip3d_constrained_5p0_raw_power_p1_operational.json` 只用于运行实验，不是严格/正式复现结果。它保留严格 P1 的原始报告 `results/parameter_studies/raw_power_strict_20260730/proxy_train_16/calibration_report.json` 作为不可修改的证据；该严格报告仍因原有 `0.8` 空间 Spearman 门槛而被拒绝。
+
+运行前用独立评估器生成非正式结论，评估器不会改写配置或源报告：
+
+```bash
+python -m workflow.analysis.evaluate_operational_proxy \
+  --proxy-report results/parameter_studies/raw_power_strict_20260730/proxy_train_16/calibration_report.json \
+  --config configs/experiments/clip3d_constrained_5p0_raw_power_p1_operational.json \
+  --output results/parameter_studies/raw_power_strict_20260730/operational_proxy_report.json
+```
+
+该配置固定使用报告中的 `alpha=1.5643788695171585`、`beta=0.0` 和 `cross_tier_weight=0.995`。接受条件是内部验证及独立 STREAM 目标验证的 RMSE 和中心化 RMSE 都优于默认值，两个空间 Spearman 均不低于 `0.5`，交层权重严格位于 `(0, 1)`，并且 beta 状态为 `fixed_unidentifiable_under_p1`；配置参数必须与源报告在 `1e-12` 内一致。全部 leave-one-workload-out 排名仅作为诊断，最低值 `0.28571428571428575` 不参与该运行许可门槛。
+
+输出会明确标记 `mode=operational` 和 `non_formal=true`，且动作文本为 `operational use permitted; non-formal and not promotable`。`formal_validation.promotion` 明确禁止提升该配置，`promote_validated_config` 也会在读取任何报告前拒绝 `strict_p1` 不为 true 的候选。`lambda_wire=0.0` 仍是待匹配 R2 延迟研究校准前的非正式零值，不能作为已校准线延迟参数引用。
