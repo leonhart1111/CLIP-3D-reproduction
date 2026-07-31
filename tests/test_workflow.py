@@ -55,6 +55,52 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
             f"{indent}Subthreshold Leakage = {sub} W\n{indent}Gate Leakage = {gate} W\n")
 
 
+class WorkflowTests(unittest.TestCase):
+    def test_power_trace_round_trips_values_that_12g_breaks_total_invariant(self):
+        """Raw total/dynamic/leakage files must retain their cell-level sum."""
+        from workflow.floorplan.generate_hotspot_inputs import write_ptrace
+        from workflow.thermal.validate_frequency import validate_total_trace
+
+        dynamic, leakage = 0.00652379565084, 0.00145495463892
+        # A fractional grid allocation can make these computed values larger
+        # than twelve significant digits can preserve within 1e-9 W.
+        dynamic = dynamic * 1e8 / 5.0
+        leakage = leakage * 1e8 / 5.0
+        tiers = [{"cells": [{
+            "name": "cell",
+            "dynamic_power_w": dynamic,
+            "leakage_power_w": leakage,
+            "total_power_w": dynamic + leakage,
+        }]}]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dynamic_path = root / "dynamic.ptrace"
+            leakage_path = root / "leakage.ptrace"
+            total_path = root / "total.ptrace"
+            write_ptrace(dynamic_path, tiers, "dynamic_power_w")
+            write_ptrace(leakage_path, tiers, "leakage_power_w")
+            write_ptrace(total_path, tiers, "total_power_w")
+
+            names, dynamic_values = read_ptrace(dynamic_path)
+            _, leakage_values = read_ptrace(leakage_path)
+            validate_total_trace(names, dynamic_values, leakage_values, total_path)
+
+    def test_local_hotspot_sources_use_high_precision_steady_formats(self):
+        """Steady temperature writers must not quantize calculated values to 0.01 K."""
+        root = Path(__file__).resolve().parents[1]
+        expected_formats = {
+            "tools/src/hotspot/hotspot.c": ('"%.17g\\t"', '"%.17g\\n"'),
+            "tools/src/hotspot/temperature_block.c": ('"%s\\t%.17g\\n"',),
+            "tools/src/hotspot/temperature_grid.c": (
+                '"%d\\t%.17g\\n"', '"%s%s\\t%.17g\\n"', '"%s\\t%.17g\\n"',
+            ),
+        }
+        for relative_path, formats in expected_formats.items():
+            source = (root / relative_path).read_text(encoding="utf-8")
+            for output_format in formats:
+                self.assertIn(output_format, source, msg=relative_path)
+
 class FrequencyTests(unittest.TestCase):
     def test_separated_frequency_trace_scales_only_dynamic_power(self):
         """Changing frequency must not scale per-cell leakage power."""

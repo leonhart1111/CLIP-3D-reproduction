@@ -179,7 +179,7 @@ def write_ptrace(path: Path, tiers: list[dict], field: str) -> None:
     cells = [cell for tier in tiers for cell in tier["cells"]]
     path.write_text(
         "\t".join(cell["name"] for cell in cells) + "\n" +
-        "\t".join(f"{cell[field]:.12g}" for cell in cells) + "\n",
+        "\t".join(f"{cell[field]:.17g}" for cell in cells) + "\n",
         encoding="utf-8",
     )
 

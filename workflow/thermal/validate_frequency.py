@@ -29,7 +29,7 @@ def write_scaled_ptrace(source: Path, destination: Path, scale: float) -> None:
     names, values = read_ptrace(source)
     destination.write_text(
         "\t".join(names) + "\n" +
-        "\t".join(f"{value * scale:.12g}" for value in values) + "\n",
+        "\t".join(f"{value * scale:.17g}" for value in values) + "\n",
         encoding="utf-8",
     )
 
@@ -80,7 +80,7 @@ def compose_separated_ptrace(dynamic_path: Path, leakage_path: Path,
     ]
     destination.write_text(
         "\t".join(names) + "\n" +
-        "\t".join(f"{value:.12g}" for value in composed_values) + "\n",
+        "\t".join(f"{value:.17g}" for value in composed_values) + "\n",
         encoding="utf-8",
     )
     return {
