@@ -57,6 +57,24 @@ def parse_ttrace(path: Path, interval_s: float) -> list[dict]:
     return samples
 
 
+def summarize_temperature_samples(samples: list[dict], initial_peak: dict) -> dict:
+    """Separate trajectory temperatures from the initial thermal state."""
+    if not samples:
+        raise ValueError("temperature trace has no samples")
+    trace_min_peak = min(samples, key=lambda item: item["tmax_c"])
+    trace_peak = max(samples, key=lambda item: item["tmax_c"])
+    final_peak = samples[-1]
+    overall_peak = max([initial_peak, *samples], key=lambda item: item["tmax_c"])
+    return {
+        "trace_min_peak": trace_min_peak,
+        "trace_peak": trace_peak,
+        "final_peak": final_peak,
+        "overall_peak": overall_peak,
+        "trace_peak_minus_initial_c": trace_peak["tmax_c"] - initial_peak["tmax_c"],
+        "final_minus_initial_c": final_peak["tmax_c"] - initial_peak["tmax_c"],
+    }
+
+
 def run_hotspot_transient(case_dir: Path, hotspot: Path = DEFAULT_HOTSPOT,
                           initial_temperature: str = "steady",
                           steady_source: Path | None = None) -> dict:
@@ -126,8 +144,7 @@ def run_hotspot_transient(case_dir: Path, hotspot: Path = DEFAULT_HOTSPOT,
             "tmax_k": peak_k,
             "tmax_c": peak_k - 273.15,
         }
-    trace_peak = max(samples, key=lambda item: item["tmax_c"])
-    overall_peak = max([initial_peak, *samples], key=lambda item: item["tmax_c"])
+    temperature_summary = summarize_temperature_samples(samples, initial_peak)
     with (case_dir / "transient_summary.csv").open(
         "w", encoding="utf-8", newline=""
     ) as stream:
@@ -145,9 +162,8 @@ def run_hotspot_transient(case_dir: Path, hotspot: Path = DEFAULT_HOTSPOT,
         "initial_peak": initial_peak,
         "sample_interval_s": interval_s,
         "sample_count": len(samples),
-        "trace_peak": trace_peak,
-        "overall_peak": overall_peak,
-        "tmax_c": overall_peak["tmax_c"],
+        **temperature_summary,
+        "tmax_c": temperature_summary["overall_peak"]["tmax_c"],
         "temperature_trace": str(ttrace.resolve()),
         "summary_csv": str((case_dir / "transient_summary.csv").resolve()),
         "samples": samples,

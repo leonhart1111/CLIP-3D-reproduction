@@ -7,7 +7,10 @@ from pathlib import Path
 from workflow.common import read_json, write_json
 from workflow.run_lifting_pipeline import boolean_text
 from workflow.transient.generate_hotspot_trace import materialize_trace
-from workflow.transient.run_hotspot_transient import parse_ttrace
+from workflow.transient.run_hotspot_transient import (
+    parse_ttrace,
+    summarize_temperature_samples,
+)
 from workflow.transient.run_transient_r1 import command_from_metadata
 from workflow.transient.stats_windows import BEGIN, END, split_windows
 from workflow.transient.validation import (
@@ -287,6 +290,25 @@ class TransientTraceTests(unittest.TestCase):
             self.assertEqual(samples[0]["time_s"], 0.01)
             self.assertEqual(samples[1]["peak_unit"], "a")
             self.assertAlmostEqual(samples[1]["tmax_c"], 46.85)
+
+    def test_temperature_summary_separates_initial_trace_and_final(self):
+        samples = [
+            {"index": 0, "time_s": 0.01, "peak_unit": "a",
+             "tmax_c": 90.0, "tavg_c": 70.0},
+            {"index": 1, "time_s": 0.02, "peak_unit": "b",
+             "tmax_c": 95.0, "tavg_c": 72.0},
+            {"index": 2, "time_s": 0.03, "peak_unit": "a",
+             "tmax_c": 92.0, "tavg_c": 71.0},
+        ]
+        result = summarize_temperature_samples(
+            samples, {"time_s": 0.0, "peak_unit": "initial", "tmax_c": 100.0}
+        )
+        self.assertEqual(result["trace_min_peak"]["time_s"], 0.01)
+        self.assertEqual(result["trace_peak"]["time_s"], 0.02)
+        self.assertEqual(result["final_peak"]["tmax_c"], 92.0)
+        self.assertEqual(result["overall_peak"]["peak_unit"], "initial")
+        self.assertEqual(result["trace_peak_minus_initial_c"], -5.0)
+        self.assertEqual(result["final_minus_initial_c"], -8.0)
 
     def test_boolean_flag_is_explicit_and_defaults_can_remain_false(self):
         self.assertTrue(boolean_text("true"))
