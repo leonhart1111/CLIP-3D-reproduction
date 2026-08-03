@@ -19,6 +19,10 @@
 所有程序都可以用 `python3 -m workflow.<模块>` 从项目根目录运行。
 完整用法见 `docs/clip3d_pipeline_zh.md`。
 10 ms 瞬态旁路见 `docs/transient_thermal_zh.md`。
+其中 MATMUL 的 fixed-bin/CLIP-3D 双布局命令使用
+`run_dual_layout_validation`，读取既有 operational 稳态输出、生成一个共享的
+周期统计 R1，并在 `comparison/transient_comparison.json` 中报告差异；它是
+non-formal operational 验证，不是论文正式复现。
 
 当前论文严格/多锚点配置是
 `configs/experiments/clip3d_constrained_5p0_multianchor.json`。它将 L2 限定在

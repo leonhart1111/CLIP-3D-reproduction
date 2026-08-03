@@ -712,5 +712,24 @@ class TransientComparisonTests(unittest.TestCase):
                     )
 
 
+class TransientDocumentationTests(unittest.TestCase):
+    def test_dual_layout_experiment_documents_operational_inputs(self):
+        """Prevent losing the reproducible operational validation command."""
+        document = (
+            Path(__file__).resolve().parents[1] / "docs/transient_thermal_zh.md"
+        ).read_text()
+
+        for required in (
+            "clip3d_constrained_5p0_raw_power_p1_operational.json",
+            "runs/architecture_sweep/r1/paper/matmul/l1d_32kB/l2_512kB",
+            "runs/operational_raw_power_p1/pilot_direct_20260731/fixed-bin",
+            "runs/operational_raw_power_p1/pilot_direct_20260731/clip3d",
+            "runs/transient_validation/matmul_32kB_512kB_10ms_20260803",
+            "operational",
+            "non-formal",
+        ):
+            self.assertIn(required, document)
+
+
 if __name__ == "__main__":
     unittest.main()
