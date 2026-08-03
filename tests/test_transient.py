@@ -306,83 +306,91 @@ class TransientTraceTests(unittest.TestCase):
             self.assertNotIn("leakage_scale", result["raw_power_evidence"])
             self.assertIn("power_conservation", result["conservation_evidence"])
 
+    @staticmethod
+    def windowed_mcpat_fixture(root: Path) -> tuple[Path, Path, dict, Path, dict]:
+        source_r1 = root / "source-r1"
+        source_r1.mkdir()
+        write_json(source_r1 / "r1_metadata.json", {"workload": "matmul"})
+        windows = []
+        for index in range(2):
+            window_dir = root / f"window-{index}"
+            window_dir.mkdir()
+            (window_dir / "stats.txt").write_text("stats\n", encoding="utf-8")
+            windows.append({
+                "index": index,
+                "directory": str(window_dir),
+                "stats_sha256": f"sha256:stats-{index}",
+                "start_tick": index * 10,
+                "end_tick": (index + 1) * 10,
+                "duration_ticks": 10,
+                "duration_s": 0.01,
+                "is_partial": False,
+            })
+        manifest = {
+            "source_r1": str(source_r1),
+            "canonical_source_r1": str(source_r1),
+            "nominal_sample_interval_ms": 10.0,
+            "nominal_sample_interval_ticks": 10,
+            "measurement_start_tick": 0,
+            "measurement_end_tick": 20,
+            "windows": windows,
+        }
+        manifest_path = root / "windows_manifest.json"
+        write_json(manifest_path, manifest)
+        mcpat = root / "mcpat"
+        mcpat.write_text("synthetic executable\n", encoding="utf-8")
+        parsed = {
+            "processor": {
+                "area_mm2": 1.0,
+                "dynamic_power_w": 1.0,
+                "subthreshold_leakage_w": 0.15,
+                "gate_leakage_w": 0.05,
+                "leakage_power_w": 0.2,
+                "total_power_w": 1.2,
+            },
+            "modules": [{
+                "name": "chip",
+                "area_mm2": 1.0,
+                "dynamic_power_w": 1.0,
+                "subthreshold_leakage_w": 0.15,
+                "gate_leakage_w": 0.05,
+                "leakage_power_w": 0.2,
+                "total_power_w": 1.2,
+            }],
+            "module_totals": {
+                "area_mm2": 1.0,
+                "dynamic_power_w": 1.0,
+                "leakage_power_w": 0.2,
+                "total_power_w": 1.2,
+            },
+            "checks": {},
+        }
+        return manifest_path, root / "output", {"mcpat": {}}, mcpat, parsed
+
+    @staticmethod
+    def run_synthetic_mcpat(
+        manifest_path: Path, output: Path, config: dict, mcpat: Path, parsed: dict,
+    ) -> tuple[dict, int]:
+        with patch(
+            "workflow.transient.run_windowed_mcpat.convert"
+        ), patch(
+            "workflow.transient.run_windowed_mcpat.parse_mcpat_text",
+            side_effect=lambda _text: copy.deepcopy(parsed),
+        ), patch(
+            "workflow.transient.run_windowed_mcpat.subprocess.run",
+            return_value=type("Process", (), {
+                "returncode": 0,
+                "stdout": "McPAT (version 1.3 results",
+            })(),
+        ) as mcpat_run:
+            result = run_windows(manifest_path, output, config, mcpat)
+        return result, mcpat_run.call_count
+
     def test_windowed_mcpat_records_raw_power_without_calibration(self):
         """Transient window records must expose direct, unscaled McPAT power."""
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source_r1 = root / "source-r1"
-            source_r1.mkdir()
-            write_json(source_r1 / "r1_metadata.json", {"workload": "matmul"})
-            windows = []
-            for index in range(2):
-                window_dir = root / f"window-{index}"
-                window_dir.mkdir()
-                (window_dir / "stats.txt").write_text("stats\n", encoding="utf-8")
-                windows.append({
-                    "index": index,
-                    "directory": str(window_dir),
-                    "stats_sha256": f"sha256:stats-{index}",
-                    "start_tick": index * 10,
-                    "end_tick": (index + 1) * 10,
-                    "duration_ticks": 10,
-                    "duration_s": 0.01,
-                    "is_partial": False,
-                })
-            manifest = {
-                "source_r1": str(source_r1),
-                "canonical_source_r1": str(source_r1),
-                "nominal_sample_interval_ms": 10.0,
-                "nominal_sample_interval_ticks": 10,
-                "measurement_start_tick": 0,
-                "measurement_end_tick": 20,
-                "windows": windows,
-            }
-            manifest_path = root / "windows_manifest.json"
-            write_json(manifest_path, manifest)
-            mcpat = root / "mcpat"
-            mcpat.write_text("synthetic executable\n", encoding="utf-8")
-            parsed = {
-                "processor": {
-                    "area_mm2": 1.0,
-                    "dynamic_power_w": 1.0,
-                    "subthreshold_leakage_w": 0.15,
-                    "gate_leakage_w": 0.05,
-                    "leakage_power_w": 0.2,
-                    "total_power_w": 1.2,
-                },
-                "modules": [{
-                    "name": "chip",
-                    "area_mm2": 1.0,
-                    "dynamic_power_w": 1.0,
-                    "subthreshold_leakage_w": 0.15,
-                    "gate_leakage_w": 0.05,
-                    "leakage_power_w": 0.2,
-                    "total_power_w": 1.2,
-                }],
-                "module_totals": {
-                    "area_mm2": 1.0,
-                    "dynamic_power_w": 1.0,
-                    "leakage_power_w": 0.2,
-                    "total_power_w": 1.2,
-                },
-                "checks": {},
-            }
-
-            with patch(
-                "workflow.transient.run_windowed_mcpat.convert"
-            ), patch(
-                "workflow.transient.run_windowed_mcpat.parse_mcpat_text",
-                side_effect=lambda _text: copy.deepcopy(parsed),
-            ), patch(
-                "workflow.transient.run_windowed_mcpat.subprocess.run",
-                return_value=type("Process", (), {
-                    "returncode": 0,
-                    "stdout": "McPAT (version 1.3 results",
-                })(),
-            ):
-                result = run_windows(
-                    manifest_path, root / "output", {"mcpat": {}}, mcpat
-                )
+            fixture = self.windowed_mcpat_fixture(Path(temporary))
+            result, mcpat_runs = self.run_synthetic_mcpat(*fixture)
 
             for window in result["windows"]:
                 self.assertNotIn("power_calibration", window)
@@ -398,8 +406,53 @@ class TransientTraceTests(unittest.TestCase):
                 self.assertNotIn(
                     "power_calibration", read_json(Path(window["mcpat_json"]))
                 )
+            self.assertEqual(mcpat_runs, 2)
             self.assertNotIn("dynamic_scale", result["run_settings"])
             self.assertNotIn("leakage_scale", result["run_settings"])
+
+    def test_windowed_mcpat_reuses_current_raw_cache_without_mcpat(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.windowed_mcpat_fixture(Path(temporary))
+            created, mcpat_runs = self.run_synthetic_mcpat(*fixture)
+            self.assertEqual(mcpat_runs, 2)
+
+            with patch(
+                "workflow.transient.run_windowed_mcpat.convert",
+                side_effect=AssertionError("cache reuse must not convert input"),
+            ), patch(
+                "workflow.transient.run_windowed_mcpat.parse_mcpat_text",
+                side_effect=AssertionError("cache reuse must not parse McPAT"),
+            ), patch(
+                "workflow.transient.run_windowed_mcpat.subprocess.run",
+                side_effect=AssertionError("cache reuse must not invoke McPAT"),
+            ):
+                reused = run_windows(*fixture[:4])
+
+            self.assertEqual(reused["windows"], created["windows"])
+
+    def test_windowed_mcpat_regenerates_cache_without_raw_provenance(self):
+        for provenance in (None, {"postprocessing": "calibrated"}):
+            with self.subTest(provenance=provenance), tempfile.TemporaryDirectory() as temporary:
+                fixture = self.windowed_mcpat_fixture(Path(temporary))
+                created, mcpat_runs = self.run_synthetic_mcpat(*fixture)
+                self.assertEqual(mcpat_runs, 2)
+                output = fixture[1]
+                for window in created["windows"]:
+                    cached_path = output / f"window_{window['index']:04d}/window_power.json"
+                    cached = read_json(cached_path)
+                    if provenance is None:
+                        cached.pop("power_provenance")
+                    else:
+                        cached["power_provenance"] = provenance
+                    write_json(cached_path, cached)
+
+                regenerated, mcpat_runs = self.run_synthetic_mcpat(*fixture)
+
+                self.assertEqual(mcpat_runs, 2)
+                self.assertEqual(
+                    [window["power_provenance"] for window in regenerated["windows"]],
+                    [created["power_provenance"]] * 2,
+                )
 
     def test_power_windows_reject_corrupted_module_totals(self):
         with tempfile.TemporaryDirectory() as temporary:

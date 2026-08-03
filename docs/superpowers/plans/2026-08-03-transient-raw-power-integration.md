@@ -124,7 +124,7 @@ Run:
 ```bash
 PYTHONPATH=. /home/zyjiang/Agenticflow/CLIP/.venv/bin/python \
   -m unittest -v tests.test_workflow.ParserTests \
-  tests.test_transient.TransientDualLayoutTests
+  tests.test_transient.TransientComparisonTests
 PYTHONPATH=. /home/zyjiang/Agenticflow/CLIP/.venv/bin/python \
   -m unittest discover -s tests -p 'test*.py' -v
 ```
@@ -141,7 +141,8 @@ Parse the existing MATMUL steady `mcpat.out` from the fixed pilot and validate e
 git add tests/test_workflow.py tests/test_transient.py \
   workflow/mcpat/parse_mcpat.py \
   workflow/transient/run_windowed_mcpat.py \
-  workflow/transient/run_transient_pipeline.py
+  workflow/transient/run_transient_pipeline.py \
+  workflow/transient/generate_hotspot_trace.py
 git commit -m "fix: preserve raw transient power conservation"
 ```
 
