@@ -39,6 +39,8 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
     frequency = config["frequency"]
     grid_size = int(physical["grid_size"])
     power_windows = read_json(power_windows_path)
+    windows = power_windows["windows"]
+    power_summary = summarize_power_windows(windows)
     sample_interval_s = float(power_windows["nominal_sample_interval_ms"]) / 1000.0
     materialize(
         modules_path, output_dir, grid_size, float(physical["utilization"]),
@@ -93,7 +95,6 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
     for field, filename in filenames.items():
         write_trace(output_dir / filename, trace_names, rows_by_field[field])
 
-    windows = power_windows["windows"]
     actual_duration_s = sum(float(window["duration_s"]) for window in windows)
     hotspot_duration_s = len(windows) * sample_interval_s
     maximum_grid_residual_w = max(
@@ -117,7 +118,7 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
             "The last partial gem5 window is held constant for one full HotSpot "
             "sampling interval; the padding is recorded explicitly."
         ),
-        "power_summary": summarize_power_windows(windows),
+        "power_summary": power_summary,
         "maximum_grid_residual_w": maximum_grid_residual_w,
         "files": {
             field: str((output_dir / filename).resolve())

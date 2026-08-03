@@ -242,6 +242,43 @@ class TransientTraceTests(unittest.TestCase):
                     root / "power_windows.json", root / "hotspot", config,
                 )
 
+    def test_discontinuous_power_window_timeline_creates_no_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            write_json(root / "modules.json", model)
+            windows = []
+            for index, (start_tick, end_tick) in enumerate(((0, 10), (11, 20))):
+                modules = [dict(module) for module in model["modules"]]
+                windows.append({
+                    "index": index, "start_tick": start_tick,
+                    "end_tick": end_tick, "duration_s": 0.01,
+                    "modules": modules,
+                    "totals": {
+                        field: sum(module[field] for module in modules)
+                        for field in ("dynamic_power_w", "leakage_power_w",
+                                      "total_power_w")
+                    },
+                })
+            write_json(root / "power_windows.json", {
+                "nominal_sample_interval_ms": 10.0,
+                "windows": windows,
+            })
+            config = {
+                "frequency": {"ambient_c": 25.0},
+                "physical": {"grid_size": 4, "utilization": 0.70,
+                             "r_convec_k_per_w": 5.0},
+            }
+            from workflow.floorplan.generate_hotspot_inputs import baseline_layout
+            write_json(root / "layout.json", baseline_layout(model))
+            output_dir = root / "hotspot"
+            with self.assertRaisesRegex(ValueError, "window timeline gap"):
+                materialize_trace(
+                    root / "modules.json", root / "layout.json",
+                    root / "power_windows.json", output_dir, config,
+                )
+            self.assertFalse(output_dir.exists())
+
     def test_temperature_trace_times_start_after_first_interval(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "trace.ttrace"
