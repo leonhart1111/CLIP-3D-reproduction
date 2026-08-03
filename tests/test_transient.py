@@ -10,9 +10,50 @@ from workflow.transient.generate_hotspot_trace import materialize_trace
 from workflow.transient.run_hotspot_transient import parse_ttrace
 from workflow.transient.run_transient_r1 import command_from_metadata
 from workflow.transient.stats_windows import BEGIN, END, split_windows
+from workflow.transient.validation import (
+    summarize_power_windows,
+    validate_power_triplet,
+    validate_window_timeline,
+)
 
 
 class TransientStatisticsTests(unittest.TestCase):
+    def test_power_validation_rejects_invalid_power_values(self):
+        with self.assertRaisesRegex(ValueError, "dynamic.*leakage.*total"):
+            validate_power_triplet(
+                {"dynamic_power_w": 2.0, "leakage_power_w": 1.0,
+                 "total_power_w": 4.0}, "bad"
+            )
+        with self.assertRaises(ValueError):
+            validate_power_triplet(
+                {"dynamic_power_w": -0.001, "leakage_power_w": 1.0,
+                 "total_power_w": 0.999}, "negative"
+            )
+        with self.assertRaises(ValueError):
+            validate_power_triplet(
+                {"dynamic_power_w": float("inf"), "leakage_power_w": 1.0,
+                 "total_power_w": float("inf")}, "infinite"
+            )
+
+    def test_power_summary_is_duration_weighted(self):
+        windows = [
+            {"start_tick": 0, "end_tick": 10, "duration_s": 0.01,
+             "totals": {"dynamic_power_w": 8.0, "leakage_power_w": 2.0,
+                        "total_power_w": 10.0}},
+            {"start_tick": 10, "end_tick": 15, "duration_s": 0.005,
+             "totals": {"dynamic_power_w": 3.0, "leakage_power_w": 1.0,
+                        "total_power_w": 4.0}},
+        ]
+        summary = summarize_power_windows(windows)
+        self.assertAlmostEqual(summary["total_power_w"]["weighted_mean"], 8.0)
+
+    def test_power_timeline_rejects_discontinuous_ticks(self):
+        with self.assertRaises(ValueError):
+            validate_window_timeline({"windows": [
+                {"start_tick": 0, "end_tick": 10, "duration_s": 0.01},
+                {"start_tick": 11, "end_tick": 20, "duration_s": 0.01},
+            ]})
+
     def test_cumulative_sections_become_delta_windows(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
