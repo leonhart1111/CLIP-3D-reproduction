@@ -36,3 +36,4 @@ benchmarks/src/stream/
 .DS_Store
 .vscode/
 .idea/
+.worktrees/
