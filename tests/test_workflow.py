@@ -23,6 +23,7 @@ from workflow.mcpat.parse_mcpat import (
     apply_power_calibration,
     parse_mcpat_text,
     resolve_power_calibration,
+    subtract,
 )
 from workflow.r2.calibrate_lambda_wire import (
     calibrate as calibrate_lambda_wire,
@@ -457,6 +458,47 @@ class FrequencyTests(unittest.TestCase):
 
 
 class ParserTests(unittest.TestCase):
+    def test_subtraction_rebuilds_derived_power_after_rounding_clamp(self):
+        """Primitive rounding residuals must not break derived power sums."""
+        base = {
+            "area_mm2": 1.0,
+            "dynamic_power_w": 1.0,
+            "subthreshold_leakage_w": 0.2,
+            "gate_leakage_w": 0.1,
+            "leakage_power_w": 0.3,
+            "total_power_w": 1.3,
+        }
+        child = {
+            "area_mm2": 0.5,
+            "dynamic_power_w": 1.0000023,
+            "subthreshold_leakage_w": 0.15,
+            "gate_leakage_w": 0.04,
+            "leakage_power_w": 0.19,
+            "total_power_w": 1.1900023,
+        }
+
+        remainder = subtract(base, [child])
+
+        self.assertEqual(remainder["dynamic_power_w"], 0.0)
+        self.assertEqual(
+            remainder["leakage_power_w"],
+            remainder["subthreshold_leakage_w"] + remainder["gate_leakage_w"],
+        )
+        self.assertEqual(
+            remainder["total_power_w"],
+            remainder["dynamic_power_w"] + remainder["leakage_power_w"],
+        )
+        self.assertAlmostEqual(
+            remainder["subtraction_diagnostics"]["raw_residuals"]["total_power_w"],
+            0.1099977,
+        )
+        self.assertAlmostEqual(
+            remainder["subtraction_diagnostics"]["clipped_negative_magnitudes"][
+                "dynamic_power_w"
+            ],
+            0.0000023,
+        )
+
     def test_workload_power_calibration_is_explicitly_resolved(self):
         config = {"power_calibration": {
             "dynamic_scale": 1.1,

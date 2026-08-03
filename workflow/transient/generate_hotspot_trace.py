@@ -17,6 +17,12 @@ from workflow.transient.validation import (
 
 
 POWER_FIELDS = ("dynamic_power_w", "leakage_power_w", "total_power_w")
+RAW_POWER_PROVENANCE = {
+    "dynamic": "McPAT Runtime Dynamic",
+    "subthreshold_leakage": "McPAT Subthreshold Leakage",
+    "gate_leakage": "McPAT Gate Leakage",
+    "postprocessing": "none",
+}
 
 
 def write_trace(path: Path, names: list[str], rows: list[list[float]]) -> None:
@@ -81,12 +87,8 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
     run_settings = power_windows.get("run_settings")
     if not isinstance(run_settings, dict):
         raise ValueError("power windows lack McPAT run settings")
-    dynamic_scale = float(run_settings.get("dynamic_scale", float("nan")))
-    leakage_scale = float(run_settings.get("leakage_scale", float("nan")))
-    if not math.isclose(dynamic_scale, 1.0, rel_tol=0.0, abs_tol=1e-15) or not math.isclose(
-        leakage_scale, 1.0, rel_tol=0.0, abs_tol=1e-15
-    ):
-        raise ValueError("transient trace requires raw-power scales of 1.0")
+    if power_windows.get("power_provenance") != RAW_POWER_PROVENANCE:
+        raise ValueError("power windows raw-power provenance is incompatible")
     # Grid the steady layout before creating the output directory so geometry
     # and conservation failures cannot publish a partial trace case.
     grid_power(layout, grid_size)
@@ -166,9 +168,7 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
         "timeline_audit": timeline_audit,
         "maximum_grid_residual_w": maximum_grid_residual_w,
         "raw_power_evidence": {
-            "dynamic_scale": dynamic_scale,
-            "leakage_scale": leakage_scale,
-            "calibration_provenance": run_settings.get("calibration_provenance"),
+            "power_provenance": RAW_POWER_PROVENANCE,
             "source_stat_hashes": [
                 window["source_stats_sha256"] for window in windows
             ],

@@ -96,11 +96,35 @@ def first_heading_block(text: str, heading: str) -> str:
 
 
 def subtract(base: dict[str, float], children: list[dict[str, float]]) -> dict[str, float]:
+    """Subtract printed McPAT components without breaking power conservation."""
     result = dict(base)
-    keys = ("area_mm2", "dynamic_power_w", "subthreshold_leakage_w",
-            "gate_leakage_w", "leakage_power_w", "total_power_w")
-    for key in keys:
-        result[key] = max(base[key] - sum(child[key] for child in children), 0.0)
+    original_fields = (
+        "area_mm2", "dynamic_power_w", "subthreshold_leakage_w",
+        "gate_leakage_w", "leakage_power_w", "total_power_w",
+    )
+    primitive_fields = (
+        "area_mm2", "dynamic_power_w", "subthreshold_leakage_w",
+        "gate_leakage_w",
+    )
+    raw_residuals = {
+        field: base[field] - sum(child[field] for child in children)
+        for field in original_fields
+    }
+    clipped_negative_magnitudes = {}
+    for field in primitive_fields:
+        raw = raw_residuals[field]
+        result[field] = max(raw, 0.0)
+        clipped_negative_magnitudes[field] = max(-raw, 0.0)
+    result["leakage_power_w"] = (
+        result["subthreshold_leakage_w"] + result["gate_leakage_w"]
+    )
+    result["total_power_w"] = (
+        result["dynamic_power_w"] + result["leakage_power_w"]
+    )
+    result["subtraction_diagnostics"] = {
+        "raw_residuals": raw_residuals,
+        "clipped_negative_magnitudes": clipped_negative_magnitudes,
+    }
     return result
 
 

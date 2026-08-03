@@ -11,7 +11,6 @@ from pathlib import Path
 
 from workflow.common import PROJECT_ROOT, read_json, write_json
 from workflow.floorplan.generate_hotspot_inputs import DEFAULT_THERMAL_STACK
-from workflow.mcpat.parse_mcpat import resolve_power_calibration
 from workflow.transient.generate_hotspot_trace import materialize_trace
 from workflow.transient.run_hotspot_transient import run_hotspot_transient
 from workflow.transient.run_transient_r1 import run as run_transient_r1
@@ -27,6 +26,12 @@ DEFAULT_CONFIG = PROJECT_ROOT / "configs/experiments/clip3d_pipeline.json"
 RAW_POWER_PROVENANCE = {
     "dynamic": "McPAT Runtime Dynamic",
     "leakage": "McPAT Subthreshold Leakage + Gate Leakage",
+    "postprocessing": "none",
+}
+WINDOW_RAW_POWER_PROVENANCE = {
+    "dynamic": "McPAT Runtime Dynamic",
+    "subthreshold_leakage": "McPAT Subthreshold Leakage",
+    "gate_leakage": "McPAT Gate Leakage",
     "postprocessing": "none",
 }
 
@@ -86,8 +91,7 @@ def _validate_raw_power_calibration(value: object, context: str) -> None:
     if not isinstance(value, dict):
         raise ValueError(f"{context}: raw-power calibration must be null or an object")
     for field in ("dynamic_scale", "leakage_scale"):
-        scale = float(value.get(field, 1.0))
-        if not math.isclose(scale, 1.0, rel_tol=0.0, abs_tol=1e-15):
+        if field not in value or float(value[field]) != 1.0:
             raise ValueError(f"{context}: raw-power scale {field} must equal 1.0")
 
 
@@ -137,6 +141,12 @@ def validate_steady_output(steady_output_dir: Path,
         )
     if source_r1_dir is None or config is None:
         return summary
+
+    mcpat_config = config.get("mcpat", {})
+    if isinstance(mcpat_config, dict) and "power_calibration" in mcpat_config:
+        raise ValueError(
+            "selected config must not declare mcpat.power_calibration for transient validation"
+        )
 
     source = validate_source_r1(source_r1_dir)
     source_r1_dir = source_r1_dir.resolve()
@@ -258,12 +268,6 @@ def validate_steady_output(steady_output_dir: Path,
     if mcpat.get("power_provenance") != RAW_POWER_PROVENANCE:
         raise ValueError("McPAT raw-power provenance is incompatible")
     _validate_raw_power_calibration(mcpat.get("power_calibration"), "steady McPAT")
-    resolved = resolve_power_calibration(config.get("mcpat", {}), metadata["workload"])
-    config_scales = {
-        "dynamic_scale": float(resolved.get("dynamic_scale", 1.0)),
-        "leakage_scale": float(resolved.get("leakage_scale", 1.0)),
-    }
-    _validate_raw_power_calibration(config_scales, "selected config")
     if summary.get("power_provenance") != RAW_POWER_PROVENANCE:
         raise ValueError("steady summary raw-power provenance is incompatible")
     module_total = sum(float(module["total_power_w"]) for module in module_records)
@@ -292,7 +296,6 @@ def validate_steady_output(steady_output_dir: Path,
         ],
         "raw_power": {
             "provenance": RAW_POWER_PROVENANCE,
-            **config_scales,
         },
     }
 
@@ -387,7 +390,8 @@ def prepare_power_windows(source_r1_dir: Path, transient_r1_dir: Path,
     run_settings = power_windows.get("run_settings")
     if not isinstance(run_settings, dict):
         raise ValueError("power windows lack McPAT run settings")
-    _validate_raw_power_calibration(run_settings, "transient McPAT")
+    if power_windows.get("power_provenance") != WINDOW_RAW_POWER_PROVENANCE:
+        raise ValueError("power windows raw-power provenance is incompatible")
     actual_duration_s = float(timeline_audit["total_duration_s"])
     power_windows_path = (mcpat_dir / "power_windows.json").resolve()
     return {
@@ -409,9 +413,7 @@ def prepare_power_windows(source_r1_dir: Path, transient_r1_dir: Path,
         "power_trace_identity": power_trace_identity(power_windows),
         "timeline_audit": timeline_audit,
         "raw_power_evidence": {
-            "dynamic_scale": float(run_settings["dynamic_scale"]),
-            "leakage_scale": float(run_settings["leakage_scale"]),
-            "calibration_provenance": run_settings.get("calibration_provenance"),
+            "power_provenance": WINDOW_RAW_POWER_PROVENANCE,
         },
         "acceptance_checks": {
             "checks": {

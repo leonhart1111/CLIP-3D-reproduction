@@ -21,6 +21,7 @@ from workflow.transient.run_dual_layout_validation import run_dual_layout_valida
 from workflow.transient.run_transient_r1 import command_from_metadata
 from workflow.transient.run_transient_pipeline import prepare_power_windows
 from workflow.transient.run_transient_pipeline import run_transient_pipeline
+from workflow.transient.run_windowed_mcpat import run_windows
 from workflow.transient.stats_windows import BEGIN, END, split_windows
 from workflow.transient.validation import (
     summarize_power_windows,
@@ -253,6 +254,12 @@ class TransientTraceTests(unittest.TestCase):
                 "nominal_sample_interval_ticks": 10,
                 "measurement_start_tick": 0,
                 "measurement_end_tick": 20,
+                "power_provenance": {
+                    "dynamic": "McPAT Runtime Dynamic",
+                    "subthreshold_leakage": "McPAT Subthreshold Leakage",
+                    "gate_leakage": "McPAT Gate Leakage",
+                    "postprocessing": "none",
+                },
                 "run_settings": {
                     "dynamic_scale": 1.0, "leakage_scale": 1.0,
                 },
@@ -286,8 +293,113 @@ class TransientTraceTests(unittest.TestCase):
             self.assertFalse(result["paper_equivalent"])
             self.assertTrue(result["acceptance_checks"]["all_passed"])
             self.assertEqual(result["acceptance_checks"]["failure_reasons"], [])
-            self.assertEqual(result["raw_power_evidence"]["dynamic_scale"], 1.0)
+            self.assertEqual(
+                result["raw_power_evidence"]["power_provenance"],
+                {
+                    "dynamic": "McPAT Runtime Dynamic",
+                    "subthreshold_leakage": "McPAT Subthreshold Leakage",
+                    "gate_leakage": "McPAT Gate Leakage",
+                    "postprocessing": "none",
+                },
+            )
+            self.assertNotIn("dynamic_scale", result["raw_power_evidence"])
+            self.assertNotIn("leakage_scale", result["raw_power_evidence"])
             self.assertIn("power_conservation", result["conservation_evidence"])
+
+    def test_windowed_mcpat_records_raw_power_without_calibration(self):
+        """Transient window records must expose direct, unscaled McPAT power."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_r1 = root / "source-r1"
+            source_r1.mkdir()
+            write_json(source_r1 / "r1_metadata.json", {"workload": "matmul"})
+            windows = []
+            for index in range(2):
+                window_dir = root / f"window-{index}"
+                window_dir.mkdir()
+                (window_dir / "stats.txt").write_text("stats\n", encoding="utf-8")
+                windows.append({
+                    "index": index,
+                    "directory": str(window_dir),
+                    "stats_sha256": f"sha256:stats-{index}",
+                    "start_tick": index * 10,
+                    "end_tick": (index + 1) * 10,
+                    "duration_ticks": 10,
+                    "duration_s": 0.01,
+                    "is_partial": False,
+                })
+            manifest = {
+                "source_r1": str(source_r1),
+                "canonical_source_r1": str(source_r1),
+                "nominal_sample_interval_ms": 10.0,
+                "nominal_sample_interval_ticks": 10,
+                "measurement_start_tick": 0,
+                "measurement_end_tick": 20,
+                "windows": windows,
+            }
+            manifest_path = root / "windows_manifest.json"
+            write_json(manifest_path, manifest)
+            mcpat = root / "mcpat"
+            mcpat.write_text("synthetic executable\n", encoding="utf-8")
+            parsed = {
+                "processor": {
+                    "area_mm2": 1.0,
+                    "dynamic_power_w": 1.0,
+                    "subthreshold_leakage_w": 0.15,
+                    "gate_leakage_w": 0.05,
+                    "leakage_power_w": 0.2,
+                    "total_power_w": 1.2,
+                },
+                "modules": [{
+                    "name": "chip",
+                    "area_mm2": 1.0,
+                    "dynamic_power_w": 1.0,
+                    "subthreshold_leakage_w": 0.15,
+                    "gate_leakage_w": 0.05,
+                    "leakage_power_w": 0.2,
+                    "total_power_w": 1.2,
+                }],
+                "module_totals": {
+                    "area_mm2": 1.0,
+                    "dynamic_power_w": 1.0,
+                    "leakage_power_w": 0.2,
+                    "total_power_w": 1.2,
+                },
+                "checks": {},
+            }
+
+            with patch(
+                "workflow.transient.run_windowed_mcpat.convert"
+            ), patch(
+                "workflow.transient.run_windowed_mcpat.parse_mcpat_text",
+                side_effect=lambda _text: copy.deepcopy(parsed),
+            ), patch(
+                "workflow.transient.run_windowed_mcpat.subprocess.run",
+                return_value=type("Process", (), {
+                    "returncode": 0,
+                    "stdout": "McPAT (version 1.3 results",
+                })(),
+            ):
+                result = run_windows(
+                    manifest_path, root / "output", {"mcpat": {}}, mcpat
+                )
+
+            for window in result["windows"]:
+                self.assertNotIn("power_calibration", window)
+                self.assertEqual(
+                    window["power_provenance"],
+                    {
+                        "dynamic": "McPAT Runtime Dynamic",
+                        "subthreshold_leakage": "McPAT Subthreshold Leakage",
+                        "gate_leakage": "McPAT Gate Leakage",
+                        "postprocessing": "none",
+                    },
+                )
+                self.assertNotIn(
+                    "power_calibration", read_json(Path(window["mcpat_json"]))
+                )
+            self.assertNotIn("dynamic_scale", result["run_settings"])
+            self.assertNotIn("leakage_scale", result["run_settings"])
 
     def test_power_windows_reject_corrupted_module_totals(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1114,9 +1226,21 @@ class TransientComparisonTests(unittest.TestCase):
                     "nominal_sample_interval_ticks": 10,
                     "measurement_start_tick": 100,
                     "measurement_end_tick": 115,
+                    "power_provenance": {
+                        "dynamic": "McPAT Runtime Dynamic",
+                        "subthreshold_leakage": "McPAT Subthreshold Leakage",
+                        "gate_leakage": "McPAT Gate Leakage",
+                        "postprocessing": "none",
+                    },
                     "run_settings": {
-                        "dynamic_scale": 1.0,
-                        "leakage_scale": 1.0,
+                        "mcpat_settings": {},
+                        "opt_for_clk": 0,
+                        "power_provenance": {
+                            "dynamic": "McPAT Runtime Dynamic",
+                            "subthreshold_leakage": "McPAT Subthreshold Leakage",
+                            "gate_leakage": "McPAT Gate Leakage",
+                            "postprocessing": "none",
+                        },
                     },
                     "windows": [
                         {
@@ -1319,6 +1443,30 @@ class TransientComparisonTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "raw-power.*scale"):
                     run_dual_layout_validation(
                         source, fixed, clip3d, root / "output", config, 10.0
+                    )
+
+    def test_dual_runner_rejects_config_calibration_before_r1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, fixed, clip3d, config_path = self.provenance_inputs(root)
+            config = read_json(config_path)
+            config["mcpat"]["power_calibration"] = {
+                "dynamic_scale": 1.0,
+                "leakage_scale": 1.0,
+            }
+            write_json(config_path, config)
+            for steady in (fixed, clip3d):
+                run_config = read_json(steady / "run_config.json")
+                run_config["config"] = config
+                write_json(steady / "run_config.json", run_config)
+
+            with patch(
+                "workflow.transient.run_dual_layout_validation.run_transient_r1",
+                side_effect=AssertionError("R1 must not start"),
+            ):
+                with self.assertRaisesRegex(ValueError, "power_calibration"):
+                    run_dual_layout_validation(
+                        source, fixed, clip3d, root / "output", config_path, 10.0
                     )
 
     def test_dual_runner_rejects_output_overlapping_read_only_inputs_without_writes(self):

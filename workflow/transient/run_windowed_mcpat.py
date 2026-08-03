@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert every gem5 time window to a calibrated McPAT module-power sample."""
+"""Convert every gem5 time window to a raw McPAT module-power sample."""
 
 from __future__ import annotations
 
@@ -11,11 +11,7 @@ from pathlib import Path
 
 from workflow.common import PROJECT_ROOT, read_json, write_json
 from workflow.mcpat.gem5_to_mcpat import convert
-from workflow.mcpat.parse_mcpat import (
-    apply_power_calibration,
-    parse_mcpat_text,
-    resolve_power_calibration,
-)
+from workflow.mcpat.parse_mcpat import parse_mcpat_text
 from workflow.transient.validation import (
     power_trace_identity,
     validate_power_triplet,
@@ -25,6 +21,12 @@ from workflow.transient.validation import (
 
 
 DEFAULT_MCPAT = PROJECT_ROOT / "tools/src/mcpat/mcpat"
+RAW_POWER_PROVENANCE = {
+    "dynamic": "McPAT Runtime Dynamic",
+    "subthreshold_leakage": "McPAT Subthreshold Leakage",
+    "gate_leakage": "McPAT Gate Leakage",
+    "postprocessing": "none",
+}
 
 
 def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
@@ -40,21 +42,11 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
             "interconnect_projection_type",
         ) if key in mcpat_config
     }
-    source_metadata = read_json(Path(manifest["source_r1"]) / "r1_metadata.json")
-    calibration = resolve_power_calibration(mcpat_config, source_metadata["workload"])
-    dynamic_scale = float(calibration.get("dynamic_scale", 1.0))
-    leakage_scale = float(calibration.get("leakage_scale", 1.0))
-    if not math.isclose(dynamic_scale, 1.0, rel_tol=0.0, abs_tol=1e-15) or not math.isclose(
-        leakage_scale, 1.0, rel_tol=0.0, abs_tol=1e-15
-    ):
-        raise ValueError("transient validation requires raw-power scales of 1.0")
     opt_for_clk = int(mcpat_config.get("opt_for_clk", 0))
     run_settings = {
         "mcpat_settings": settings,
         "opt_for_clk": opt_for_clk,
-        "dynamic_scale": dynamic_scale,
-        "leakage_scale": leakage_scale,
-        "calibration_provenance": calibration.get("provenance"),
+        "power_provenance": RAW_POWER_PROVENANCE,
     }
     records = []
     expected_names: list[str] | None = None
@@ -71,6 +63,7 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
             if (
                 existing.get("source_stats_sha256") == window["stats_sha256"]
                 and existing.get("run_settings") == run_settings
+                and existing.get("power_provenance") == RAW_POWER_PROVENANCE
             ):
                 validate_power_triplet(
                     existing["totals"], f"cached window {index} totals"
@@ -124,9 +117,7 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
         ):
             raise RuntimeError(f"McPAT failed for window {index}: {window_dir / 'mcpat.out'}")
         parsed = parse_mcpat_text(process.stdout)
-        apply_power_calibration(
-            parsed, dynamic_scale, leakage_scale, calibration.get("provenance")
-        )
+        parsed["power_provenance"] = RAW_POWER_PROVENANCE
         parsed["command"] = command
         write_json(window_dir / "mcpat.json", parsed)
         names = [module["name"] for module in parsed["modules"]]
@@ -152,7 +143,7 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
                 for field in ("dynamic_power_w", "leakage_power_w", "total_power_w")
             },
             "mcpat_json": str((window_dir / "mcpat.json").resolve()),
-            "power_calibration": parsed.get("power_calibration"),
+            "power_provenance": RAW_POWER_PROVENANCE,
         }
         validate_power_triplet(record["totals"], f"window {index} totals")
         write_json(result_path, record)
@@ -175,6 +166,7 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
         "measurement_end_tick": manifest["measurement_end_tick"],
         "module_names": expected_names or [],
         "run_settings": run_settings,
+        "power_provenance": RAW_POWER_PROVENANCE,
         "elapsed_seconds": time.perf_counter() - started,
         "windows": records,
     }
