@@ -1445,6 +1445,26 @@ class TransientComparisonTests(unittest.TestCase):
                         source, fixed, clip3d, root / "output", config, 10.0
                     )
 
+    def test_dual_runner_rejects_non_raw_summary_power_before_r1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, fixed, clip3d, config = self.provenance_inputs(root)
+            summary = read_json(clip3d / "pipeline_summary.json")
+            summary["power_calibration"] = {
+                "dynamic_scale": 1.2,
+                "leakage_scale": 1.0,
+            }
+            write_json(clip3d / "pipeline_summary.json", summary)
+
+            with patch(
+                "workflow.transient.run_dual_layout_validation.run_transient_r1",
+                side_effect=AssertionError("R1 must not start"),
+            ):
+                with self.assertRaisesRegex(ValueError, "raw-power.*scale"):
+                    run_dual_layout_validation(
+                        source, fixed, clip3d, root / "output", config, 10.0
+                    )
+
     def test_dual_runner_rejects_config_calibration_before_r1(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

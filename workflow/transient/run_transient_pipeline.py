@@ -270,6 +270,9 @@ def validate_steady_output(steady_output_dir: Path,
     _validate_raw_power_calibration(mcpat.get("power_calibration"), "steady McPAT")
     if summary.get("power_provenance") != RAW_POWER_PROVENANCE:
         raise ValueError("steady summary raw-power provenance is incompatible")
+    _validate_raw_power_calibration(
+        summary.get("power_calibration"), "steady summary"
+    )
     module_total = sum(float(module["total_power_w"]) for module in module_records)
     if not math.isclose(
         float(summary.get("total_power_w", float("nan"))), module_total,
