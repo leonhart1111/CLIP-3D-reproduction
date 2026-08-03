@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import subprocess
 import time
 from pathlib import Path
@@ -15,6 +16,12 @@ from workflow.mcpat.parse_mcpat import (
     parse_mcpat_text,
     resolve_power_calibration,
 )
+from workflow.transient.validation import (
+    power_trace_identity,
+    validate_power_triplet,
+    validate_power_windows,
+    validate_window_timeline,
+)
 
 
 DEFAULT_MCPAT = PROJECT_ROOT / "tools/src/mcpat/mcpat"
@@ -23,7 +30,7 @@ DEFAULT_MCPAT = PROJECT_ROOT / "tools/src/mcpat/mcpat"
 def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
                 mcpat: Path = DEFAULT_MCPAT) -> dict:
     manifest = read_json(windows_manifest)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    validate_window_timeline(manifest)
     if not mcpat.is_file():
         raise FileNotFoundError(mcpat)
     mcpat_config = config.get("mcpat", {})
@@ -37,6 +44,10 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
     calibration = resolve_power_calibration(mcpat_config, source_metadata["workload"])
     dynamic_scale = float(calibration.get("dynamic_scale", 1.0))
     leakage_scale = float(calibration.get("leakage_scale", 1.0))
+    if not math.isclose(dynamic_scale, 1.0, rel_tol=0.0, abs_tol=1e-15) or not math.isclose(
+        leakage_scale, 1.0, rel_tol=0.0, abs_tol=1e-15
+    ):
+        raise ValueError("transient validation requires raw-power scales of 1.0")
     opt_for_clk = int(mcpat_config.get("opt_for_clk", 0))
     run_settings = {
         "mcpat_settings": settings,
@@ -48,6 +59,7 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
     records = []
     expected_names: list[str] | None = None
     started = time.perf_counter()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     for window in manifest["windows"]:
         index = int(window["index"])
@@ -60,6 +72,26 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
                 existing.get("source_stats_sha256") == window["stats_sha256"]
                 and existing.get("run_settings") == run_settings
             ):
+                validate_power_triplet(
+                    existing["totals"], f"cached window {index} totals"
+                )
+                for module in existing["modules"]:
+                    validate_power_triplet(
+                        module, f"cached window {index} module {module.get('name')}"
+                    )
+                for field in (
+                    "dynamic_power_w", "leakage_power_w", "total_power_w"
+                ):
+                    aggregate = sum(
+                        float(module[field]) for module in existing["modules"]
+                    )
+                    if not math.isclose(
+                        aggregate, float(existing["totals"][field]),
+                        rel_tol=1e-9, abs_tol=1e-9,
+                    ):
+                        raise ValueError(
+                            f"cached window {index} aggregate module power mismatch"
+                        )
                 records.append(existing)
                 names = [module["name"] for module in existing["modules"]]
                 expected_names = expected_names or names
@@ -101,6 +133,8 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
         expected_names = expected_names or names
         if names != expected_names:
             raise ValueError(f"module names changed in window {index}")
+        for module in parsed["modules"]:
+            validate_power_triplet(module, f"window {index} module {module['name']}")
         record = {
             "schema_version": 1,
             "index": index,
@@ -109,6 +143,7 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
             "run_settings": run_settings,
             "start_tick": window["start_tick"],
             "end_tick": window["end_tick"],
+            "duration_ticks": window["duration_ticks"],
             "duration_s": window["duration_s"],
             "is_partial": window["is_partial"],
             "modules": parsed["modules"],
@@ -119,6 +154,7 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
             "mcpat_json": str((window_dir / "mcpat.json").resolve()),
             "power_calibration": parsed.get("power_calibration"),
         }
+        validate_power_triplet(record["totals"], f"window {index} totals")
         write_json(result_path, record)
         records.append(record)
         if (index + 1) % 10 == 0 or index + 1 == len(manifest["windows"]):
@@ -130,13 +166,20 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
     result = {
         "schema_version": 1,
         "source_windows": str(windows_manifest.resolve()),
+        "canonical_source_r1": manifest["canonical_source_r1"],
+        "transient_r1": manifest["source_r1"],
         "window_count": len(records),
         "nominal_sample_interval_ms": manifest["nominal_sample_interval_ms"],
+        "nominal_sample_interval_ticks": manifest["nominal_sample_interval_ticks"],
+        "measurement_start_tick": manifest["measurement_start_tick"],
+        "measurement_end_tick": manifest["measurement_end_tick"],
         "module_names": expected_names or [],
         "run_settings": run_settings,
         "elapsed_seconds": time.perf_counter() - started,
         "windows": records,
     }
+    result["timeline_audit"] = validate_power_windows(result)
+    result["power_trace_identity"] = power_trace_identity(result)
     write_json(output_dir / "power_windows.json", result)
     return result
 

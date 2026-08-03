@@ -12,9 +12,10 @@ from workflow.common import PROJECT_ROOT, read_json, write_json
 from workflow.transient.compare_layouts import compare_layout_results
 from workflow.transient.run_transient_pipeline import (
     prepare_power_windows,
+    reject_overlapping_output,
     run_layout_thermal,
+    validate_dual_steady_inputs,
     validate_matching_r1,
-    validate_steady_output,
 )
 from workflow.transient.run_transient_r1 import completed as r1_completed
 from workflow.transient.run_transient_r1 import run as run_transient_r1
@@ -26,7 +27,7 @@ DEFAULT_CONFIG = PROJECT_ROOT / "configs/experiments/clip3d_pipeline.json"
 def _validate_reusable_r1(source_r1_dir: Path, shared_r1_dir: Path,
                           sample_ms: float) -> None:
     """Reject a successful cache unless its provenance and metadata both match."""
-    if not r1_completed(shared_r1_dir, sample_ms):
+    if not r1_completed(shared_r1_dir, sample_ms, source_r1_dir):
         return
     status = read_json(shared_r1_dir / "status.json")
     recorded_source = status.get("source_r1")
@@ -50,6 +51,15 @@ def run_dual_layout_validation(source_r1_dir: Path, fixed_steady_dir: Path,
     clip3d_steady_dir = clip3d_steady_dir.resolve()
     output_root = output_root.resolve()
     config_path = config_path.resolve()
+    reject_overlapping_output(
+        output_root, [source_r1_dir, fixed_steady_dir, clip3d_steady_dir]
+    )
+    if not math.isfinite(sample_ms) or sample_ms <= 0:
+        raise ValueError("sample_ms must be positive")
+    config = read_json(config_path)
+    provenance_audit = validate_dual_steady_inputs(
+        source_r1_dir, fixed_steady_dir, clip3d_steady_dir, config, config_path
+    )
     output_root.mkdir(parents=True, exist_ok=True)
     started = time.time()
     running_status = {
@@ -65,11 +75,6 @@ def run_dual_layout_validation(source_r1_dir: Path, fixed_steady_dir: Path,
     write_json(output_root / "status.json", running_status)
 
     try:
-        if not math.isfinite(sample_ms) or sample_ms <= 0:
-            raise ValueError("sample_ms must be positive")
-        config = read_json(config_path)
-        validate_steady_output(fixed_steady_dir, "fixed-bin")
-        validate_steady_output(clip3d_steady_dir, "clip3d")
         shared_r1_dir = output_root / "shared_r1"
         _validate_reusable_r1(source_r1_dir, shared_r1_dir, sample_ms)
         r1_status = run_transient_r1(source_r1_dir, shared_r1_dir, sample_ms)
@@ -96,8 +101,6 @@ def run_dual_layout_validation(source_r1_dir: Path, fixed_steady_dir: Path,
             config,
             power_windows_path,
         )
-        fixed["transient_r1"] = str(shared_r1_dir.resolve())
-        clip3d["transient_r1"] = str(shared_r1_dir.resolve())
         if fixed.get("layout_method") != "fixed-bin":
             raise ValueError(
                 "--fixed-steady-dir must contain a fixed-bin pipeline summary"
@@ -115,6 +118,7 @@ def run_dual_layout_validation(source_r1_dir: Path, fixed_steady_dir: Path,
             "state": "success",
             "mode": "operational transient validation",
             "non_formal": True,
+            "paper_equivalent": False,
             "started_unix": started,
             "finished_unix": finished,
             "elapsed_seconds": finished - started,
@@ -125,10 +129,37 @@ def run_dual_layout_validation(source_r1_dir: Path, fixed_steady_dir: Path,
             "clip3d_steady": str(clip3d_steady_dir),
             "config": str(config_path),
             "sample_interval_ms": sample_ms,
+            "provenance_audit": provenance_audit,
             "shared_preprocessing": prepared,
             "fixed": fixed,
             "clip3d": clip3d,
             "comparison": comparison,
+            "acceptance_checks": {
+                "checks": {
+                    "canonical_and_pilot_provenance": True,
+                    "shared_r1_reused_by_both_layouts": True,
+                    "shared_power_preprocessing_once": True,
+                    "fixed_branch_accepted": fixed.get(
+                        "acceptance_checks", {"all_passed": True}
+                    )["all_passed"],
+                    "clip3d_branch_accepted": clip3d.get(
+                        "acceptance_checks", {"all_passed": True}
+                    )["all_passed"],
+                    "comparison_accepted": comparison.get(
+                        "acceptance_checks", {"all_passed": True}
+                    )["all_passed"],
+                },
+                "all_passed": True,
+                "failure_reasons": [],
+            },
+            "limitations": [
+                "McPAT leakage uses a fixed configured temperature.",
+                "There is no temperature-leakage-DVFS feedback loop.",
+                "10 ms averaging cannot observe sub-window microsecond power peaks.",
+                "The final partial gem5 window is padded to one HotSpot interval.",
+                "Steady initialization omits the program's incomplete startup history.",
+                "This is operational validation, not paper-equivalent formal evidence.",
+            ],
             "artifacts": {
                 "comparison": str(
                     (comparison_dir / "transient_comparison.json").resolve()

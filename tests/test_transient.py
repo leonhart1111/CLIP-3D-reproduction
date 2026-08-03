@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,8 +11,10 @@ from workflow.common import read_json, write_json
 from workflow.run_lifting_pipeline import boolean_text
 from workflow.transient.compare_layouts import compare_layout_results
 from workflow.transient.generate_hotspot_trace import materialize_trace
+from workflow.transient.generate_hotspot_trace import write_trace
 from workflow.transient.run_hotspot_transient import (
     parse_ttrace,
+    run_hotspot_transient,
     summarize_temperature_samples,
 )
 from workflow.transient.run_dual_layout_validation import run_dual_layout_validation
@@ -27,6 +30,19 @@ from workflow.transient.validation import (
 
 
 class TransientStatisticsTests(unittest.TestCase):
+    @staticmethod
+    def timeline(windows: list[dict]) -> dict:
+        return {
+            "nominal_sample_interval_ticks": 10,
+            "nominal_sample_interval_ms": 10.0,
+            "measurement_start_tick": 100,
+            "measurement_end_tick": 100 + sum(
+                int(window["end_tick"]) - int(window["start_tick"])
+                for window in windows
+            ),
+            "windows": windows,
+        }
+
     def test_power_validation_rejects_invalid_power_values(self):
         with self.assertRaisesRegex(ValueError, "dynamic.*leakage.*total"):
             validate_power_triplet(
@@ -58,12 +74,48 @@ class TransientStatisticsTests(unittest.TestCase):
 
     def test_power_timeline_rejects_discontinuous_ticks(self):
         with self.assertRaisesRegex(ValueError, "window timeline gap"):
-            validate_window_timeline({"windows": [
+            validate_window_timeline(self.timeline([
                 {"index": 0, "start_tick": 0, "end_tick": 10,
                  "duration_s": 0.01},
                 {"index": 1, "start_tick": 11, "end_tick": 20,
                  "duration_s": 0.009},
-            ]})
+            ]))
+
+    def test_timeline_requires_at_least_two_windows(self):
+        with self.assertRaisesRegex(ValueError, "at least two"):
+            validate_window_timeline(self.timeline([
+                {"index": 0, "start_tick": 100, "end_tick": 105,
+                 "duration_s": 0.005},
+            ]))
+
+    def test_timeline_rejects_internal_partial_window(self):
+        with self.assertRaisesRegex(ValueError, "non-final.*nominal"):
+            validate_window_timeline(self.timeline([
+                {"index": 0, "start_tick": 100, "end_tick": 105,
+                 "duration_s": 0.005},
+                {"index": 1, "start_tick": 105, "end_tick": 115,
+                 "duration_s": 0.01},
+            ]))
+
+    def test_timeline_rejects_overlong_final_window(self):
+        with self.assertRaisesRegex(ValueError, "final.*nominal"):
+            validate_window_timeline(self.timeline([
+                {"index": 0, "start_tick": 100, "end_tick": 110,
+                 "duration_s": 0.01},
+                {"index": 1, "start_tick": 110, "end_tick": 121,
+                 "duration_s": 0.011},
+            ]))
+
+    def test_timeline_uses_independent_roi_end_tick(self):
+        manifest = self.timeline([
+            {"index": 0, "start_tick": 100, "end_tick": 110,
+             "duration_s": 0.01},
+            {"index": 1, "start_tick": 110, "end_tick": 115,
+             "duration_s": 0.005},
+        ])
+        manifest["measurement_end_tick"] = 116
+        with self.assertRaisesRegex(ValueError, "measurement end tick"):
+            validate_window_timeline(manifest)
 
     def test_cumulative_sections_become_delta_windows(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -73,9 +125,11 @@ class TransientStatisticsTests(unittest.TestCase):
             write_json(source / "r1_metadata.json", {
                 "transient_statistics": True,
                 "transient_stats_mode": "cumulative",
+                "canonical_source_r1": str((root / "canonical-r1").resolve()),
                 "sample_interval_ticks": 10,
                 "sample_interval_s": 0.01,
                 "measurement_start_tick": 100,
+                "measurement_end_tick": 120,
             })
             sections = [
                 {"finalTick": 90, "simFreq": 1000,
@@ -99,12 +153,13 @@ class TransientStatisticsTests(unittest.TestCase):
             (source / "stats.txt").write_text("\n".join(text) + "\n")
             result = split_windows(source, root / "windows")
             self.assertEqual(result["window_count"], 2)
-            self.assertEqual(result["timeline_audit"], {
-                "window_count": 2,
-                "total_duration_s": 0.02,
-                "first_tick": 100,
-                "last_tick": 120,
-            })
+            self.assertEqual(result["timeline_audit"]["window_count"], 2)
+            self.assertEqual(result["timeline_audit"]["total_duration_s"], 0.02)
+            self.assertEqual(result["timeline_audit"]["first_tick"], 100)
+            self.assertEqual(result["timeline_audit"]["last_tick"], 120)
+            self.assertEqual(
+                result["timeline_audit"]["independent_roi_duration_ticks"], 20
+            )
             self.assertEqual(
                 read_json(root / "windows/windows_manifest.json")["timeline_audit"],
                 result["timeline_audit"],
@@ -184,6 +239,8 @@ class TransientTraceTests(unittest.TestCase):
                 windows.append({
                     "index": index, "start_tick": index * 10,
                     "end_tick": (index + 1) * 10, "duration_s": 0.01,
+                    "duration_ticks": 10,
+                    "source_stats_sha256": f"sha256:stats-{index}",
                     "modules": modules,
                     "totals": {
                         field: sum(module[field] for module in modules)
@@ -193,6 +250,12 @@ class TransientTraceTests(unittest.TestCase):
                 })
             write_json(root / "power_windows.json", {
                 "nominal_sample_interval_ms": 10.0,
+                "nominal_sample_interval_ticks": 10,
+                "measurement_start_tick": 0,
+                "measurement_end_tick": 20,
+                "run_settings": {
+                    "dynamic_scale": 1.0, "leakage_scale": 1.0,
+                },
                 "windows": windows,
             })
             config = {
@@ -218,6 +281,13 @@ class TransientTraceTests(unittest.TestCase):
             )
             self.assertIn("-sampling_intvl 0.01",
                           (root / "hotspot/hotspot.config").read_text())
+            self.assertEqual(result["mode"], "operational transient validation")
+            self.assertTrue(result["non_formal"])
+            self.assertFalse(result["paper_equivalent"])
+            self.assertTrue(result["acceptance_checks"]["all_passed"])
+            self.assertEqual(result["acceptance_checks"]["failure_reasons"], [])
+            self.assertEqual(result["raw_power_evidence"]["dynamic_scale"], 1.0)
+            self.assertIn("power_conservation", result["conservation_evidence"])
 
     def test_power_windows_reject_corrupted_module_totals(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -228,15 +298,29 @@ class TransientTraceTests(unittest.TestCase):
             corrupted[0]["total_power_w"] = 99.0
             write_json(root / "power_windows.json", {
                 "nominal_sample_interval_ms": 10.0,
-                "windows": [{
-                    "index": 0, "start_tick": 0, "end_tick": 10,
-                    "duration_s": 0.01, "modules": corrupted,
-                    "totals": {
-                        field: sum(module[field] for module in corrupted)
-                        for field in ("dynamic_power_w", "leakage_power_w",
-                                      "total_power_w")
-                    },
-                }],
+                "nominal_sample_interval_ticks": 10,
+                "measurement_start_tick": 0,
+                "measurement_end_tick": 20,
+                "run_settings": {
+                    "dynamic_scale": 1.0, "leakage_scale": 1.0,
+                },
+                "windows": [
+                    {
+                        "index": index,
+                        "start_tick": index * 10,
+                        "end_tick": (index + 1) * 10,
+                        "duration_ticks": 10,
+                        "duration_s": 0.01,
+                        "source_stats_sha256": f"sha256:stats-{index}",
+                        "modules": copy.deepcopy(corrupted),
+                        "totals": {
+                            field: sum(module[field] for module in corrupted)
+                            for field in ("dynamic_power_w", "leakage_power_w",
+                                          "total_power_w")
+                        },
+                    }
+                    for index in range(2)
+                ],
             })
             config = {
                 "frequency": {"ambient_c": 25.0},
@@ -251,6 +335,188 @@ class TransientTraceTests(unittest.TestCase):
                     root / "power_windows.json", root / "hotspot", config,
                 )
 
+    def test_power_windows_reject_aggregate_mismatch_without_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            write_json(root / "modules.json", model)
+            modules = [dict(module) for module in model["modules"]]
+            windows = []
+            for index in range(2):
+                windows.append({
+                    "index": index,
+                    "start_tick": index * 10,
+                    "end_tick": (index + 1) * 10,
+                    "duration_ticks": 10,
+                    "duration_s": 0.01,
+                    "source_stats_sha256": f"sha256:stats-{index}",
+                    "modules": copy.deepcopy(modules),
+                    "totals": {
+                        "dynamic_power_w": 1.0,
+                        "leakage_power_w": 0.5,
+                        "total_power_w": 1.5,
+                    },
+                })
+            write_json(root / "power_windows.json", {
+                "nominal_sample_interval_ms": 10.0,
+                "nominal_sample_interval_ticks": 10,
+                "measurement_start_tick": 0,
+                "measurement_end_tick": 20,
+                "run_settings": {
+                    "dynamic_scale": 1.0,
+                    "leakage_scale": 1.0,
+                },
+                "windows": windows,
+            })
+            config = {
+                "frequency": {"ambient_c": 25.0},
+                "physical": {"grid_size": 4, "utilization": 0.70,
+                             "r_convec_k_per_w": 5.0},
+            }
+            from workflow.floorplan.generate_hotspot_inputs import baseline_layout
+            write_json(root / "layout.json", baseline_layout(model))
+            output_dir = root / "hotspot"
+
+            with self.assertRaisesRegex(ValueError, "aggregate module power"):
+                materialize_trace(
+                    root / "modules.json", root / "layout.json",
+                    root / "power_windows.json", output_dir, config,
+                )
+
+            self.assertFalse(output_dir.exists())
+
+    def test_module_name_mismatch_creates_no_trace_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            write_json(root / "modules.json", model)
+            modules = [dict(module) for module in model["modules"]]
+            modules[-1]["name"] = "wrong-name"
+            totals = {
+                field: sum(module[field] for module in modules)
+                for field in ("dynamic_power_w", "leakage_power_w", "total_power_w")
+            }
+            windows = [
+                {
+                    "index": index,
+                    "start_tick": index * 10,
+                    "end_tick": (index + 1) * 10,
+                    "duration_ticks": 10,
+                    "duration_s": 0.01,
+                    "source_stats_sha256": f"sha256:stats-{index}",
+                    "modules": copy.deepcopy(modules),
+                    "totals": totals,
+                }
+                for index in range(2)
+            ]
+            write_json(root / "power_windows.json", {
+                "nominal_sample_interval_ms": 10.0,
+                "nominal_sample_interval_ticks": 10,
+                "measurement_start_tick": 0,
+                "measurement_end_tick": 20,
+                "run_settings": {
+                    "dynamic_scale": 1.0,
+                    "leakage_scale": 1.0,
+                },
+                "windows": windows,
+            })
+            config = {
+                "frequency": {"ambient_c": 25.0},
+                "physical": {"grid_size": 4, "utilization": 0.70,
+                             "r_convec_k_per_w": 5.0},
+            }
+            from workflow.floorplan.generate_hotspot_inputs import baseline_layout
+            write_json(root / "layout.json", baseline_layout(model))
+            output_dir = root / "hotspot"
+
+            with self.assertRaisesRegex(ValueError, "module mismatch"):
+                materialize_trace(
+                    root / "modules.json", root / "layout.json",
+                    root / "power_windows.json", output_dir, config,
+                )
+
+            self.assertFalse(output_dir.exists())
+
+    def test_power_trace_serialization_round_trips_conserving_values(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "power.ptrace"
+            values = [1.2345678901234567, 0.10000000000000002]
+            write_trace(path, ["a", "b"], [values])
+            round_trip = [float(value) for value in path.read_text().splitlines()[1].split()]
+            self.assertEqual(round_trip, values)
+            self.assertEqual(sum(round_trip), sum(values))
+
+    def test_power_identity_ignores_elapsed_and_paths_but_detects_science(self):
+        from workflow.transient.validation import power_trace_identity
+
+        modules = [
+            {
+                "name": "core0",
+                "dynamic_power_w": 2.0,
+                "leakage_power_w": 1.0,
+                "total_power_w": 3.0,
+            }
+        ]
+        manifest = {
+            "source_windows": "/machine-a/windows.json",
+            "elapsed_seconds": 12.5,
+            "nominal_sample_interval_ms": 10.0,
+            "nominal_sample_interval_ticks": 10,
+            "measurement_start_tick": 100,
+            "measurement_end_tick": 120,
+            "run_settings": {
+                "mcpat_settings": {"temperature_k": 320},
+                "opt_for_clk": 0,
+                "dynamic_scale": 1.0,
+                "leakage_scale": 1.0,
+                "mcpat_binary_path": "/machine-a/tools/mcpat",
+            },
+            "windows": [
+                {
+                    "index": index,
+                    "source_stats": f"/machine-a/window-{index}/stats.txt",
+                    "source_stats_sha256": f"sha256:stats-{index}",
+                    "mcpat_json": f"/machine-a/window-{index}/mcpat.json",
+                    "start_tick": 100 + index * 10,
+                    "end_tick": 110 + index * 10,
+                    "duration_ticks": 10,
+                    "duration_s": 0.01,
+                    "is_partial": False,
+                    "modules": copy.deepcopy(modules),
+                    "totals": {
+                        "dynamic_power_w": 2.0,
+                        "leakage_power_w": 1.0,
+                        "total_power_w": 3.0,
+                    },
+                }
+                for index in range(2)
+            ],
+        }
+        relocated = copy.deepcopy(manifest)
+        relocated["source_windows"] = "/machine-b/windows.json"
+        relocated["elapsed_seconds"] = 99.0
+        relocated["run_settings"]["mcpat_binary_path"] = "/machine-b/tools/mcpat"
+        for index, window in enumerate(relocated["windows"]):
+            window["source_stats"] = f"/machine-b/window-{index}/stats.txt"
+            window["mcpat_json"] = f"/machine-b/window-{index}/mcpat.json"
+
+        self.assertEqual(
+            power_trace_identity(manifest), power_trace_identity(relocated)
+        )
+
+        changed = copy.deepcopy(relocated)
+        changed["windows"][0]["modules"][0].update({
+            "dynamic_power_w": 2.5,
+            "total_power_w": 3.5,
+        })
+        changed["windows"][0]["totals"].update({
+            "dynamic_power_w": 2.5,
+            "total_power_w": 3.5,
+        })
+        self.assertNotEqual(
+            power_trace_identity(manifest), power_trace_identity(changed)
+        )
+
     def test_discontinuous_power_window_timeline_creates_no_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -262,6 +528,8 @@ class TransientTraceTests(unittest.TestCase):
                 windows.append({
                     "index": index, "start_tick": start_tick,
                     "end_tick": end_tick, "duration_s": 0.01,
+                    "duration_ticks": end_tick - start_tick,
+                    "source_stats_sha256": f"sha256:stats-{index}",
                     "modules": modules,
                     "totals": {
                         field: sum(module[field] for module in modules)
@@ -271,6 +539,12 @@ class TransientTraceTests(unittest.TestCase):
                 })
             write_json(root / "power_windows.json", {
                 "nominal_sample_interval_ms": 10.0,
+                "nominal_sample_interval_ticks": 10,
+                "measurement_start_tick": 0,
+                "measurement_end_tick": 20,
+                "run_settings": {
+                    "dynamic_scale": 1.0, "leakage_scale": 1.0,
+                },
                 "windows": windows,
             })
             config = {
@@ -316,6 +590,56 @@ class TransientTraceTests(unittest.TestCase):
         self.assertEqual(result["trace_peak_minus_initial_c"], -5.0)
         self.assertEqual(result["final_minus_initial_c"], -8.0)
 
+    def test_thermal_result_has_standard_classification_and_acceptance_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hotspot = root / "hotspot"
+            hotspot.write_text("synthetic executable")
+            write_json(root / "transient_trace_manifest.json", {
+                "sample_interval_s": 0.01,
+                "window_count": 2,
+                "timeline_audit": {
+                    "window_count": 2,
+                    "total_duration_s": 0.02,
+                },
+                "raw_power_evidence": {
+                    "dynamic_scale": 1.0,
+                    "leakage_scale": 1.0,
+                },
+                "conservation_evidence": {
+                    "maximum_grid_residual_w": 0.0,
+                },
+            })
+            write_json(root / "hotspot_manifest.json", {"ambient_c": 25.0})
+            steady = root / "steady.txt"
+            steady.write_text("unit 300\n")
+
+            def fake_hotspot(*_args, **kwargs):
+                cwd = Path(kwargs["cwd"])
+                (cwd / "transient.ttrace").write_text(
+                    "unit\n301\n302\n"
+                )
+                return type("Process", (), {"returncode": 0, "stdout": "ok"})()
+
+            with patch(
+                "workflow.transient.run_hotspot_transient.subprocess.run",
+                side_effect=fake_hotspot,
+            ):
+                result = run_hotspot_transient(
+                    root, hotspot=hotspot, steady_source=steady
+                )
+
+            self.assertEqual(result["mode"], "operational transient validation")
+            self.assertTrue(result["non_formal"])
+            self.assertFalse(result["paper_equivalent"])
+            self.assertTrue(result["acceptance_checks"]["all_passed"])
+            self.assertEqual(result["acceptance_checks"]["failure_reasons"], [])
+            for field in (
+                "initial_peak", "trace_min_peak", "trace_peak", "final_peak",
+                "overall_peak",
+            ):
+                self.assertIn(field, result)
+
     def test_boolean_flag_is_explicit_and_defaults_can_remain_false(self):
         self.assertTrue(boolean_text("true"))
         self.assertFalse(boolean_text("false"))
@@ -326,6 +650,11 @@ class TransientTraceTests(unittest.TestCase):
 class TransientComparisonTests(unittest.TestCase):
     @staticmethod
     def identity(path: Path) -> str:
+        from workflow.transient.validation import power_trace_identity
+        return power_trace_identity(read_json(path))
+
+    @staticmethod
+    def file_hash(path: Path) -> str:
         return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
     @staticmethod
@@ -338,16 +667,183 @@ class TransientComparisonTests(unittest.TestCase):
         })
 
     @staticmethod
+    def canonical_metadata() -> dict:
+        return {
+            "stage": "CLIP-3D R1",
+            "workload": "matmul",
+            "binary": "/tmp/matmul",
+            "command": ["/tmp/matmul", "-n", "16", "-t", "4"],
+            "environment": [],
+            "stdin": None,
+            "num_cores": 4,
+            "cpu_type": "X86O3CPU",
+            "cpu_clock": "2GHz",
+            "issue_width": 4,
+            "rob_entries": 192,
+            "l1i_size": "32kB",
+            "l1d_size": "32kB",
+            "l1_associativity": 2,
+            "l2_size": "512kB",
+            "l2_associativity": 8,
+            "cache_line_bytes": 64,
+            "memory_size": "2GiB",
+            "latencies": {},
+            "warmup_insts_cpu0": 1,
+            "measure_insts_cpu0": 2,
+            "warmup_insts": 1,
+            "measure_insts": 2,
+            "instruction_window_scope": "cpu0",
+            "stop_anchor": "CPU0 thread 0",
+            "thread_mapping": "synthetic",
+        }
+
+    @staticmethod
+    def operational_config() -> dict:
+        return {
+            "schema_version": 1,
+            "name": "constrained_5p0_raw_power_p1_operational",
+            "mcpat": {
+                "temperature_k": 320,
+                "device_type": 0,
+                "longer_channel_device": 1,
+                "interconnect_projection_type": 1,
+                "opt_for_clk": 0,
+            },
+            "frequency": {"ambient_c": 25.0},
+            "physical": {
+                "tiers": 2,
+                "grid_size": 4,
+                "utilization": 0.7,
+                "r_convec_k_per_w": 5.0,
+                "thermal_stack": {
+                    "silicon_resistivity_mk_per_w": 0.01,
+                    "tim_resistivity_mk_per_w": 0.25,
+                    "interposer_thickness_m": 0.0001,
+                    "active_silicon_thickness_m": 0.00005,
+                    "tim_thickness_m": 0.00002,
+                    "local_resistance_scale": 8.72,
+                },
+            },
+        }
+
+    @classmethod
+    def provenance_inputs(cls, root: Path) -> tuple[Path, Path, Path, Path]:
+        source = root / "source"
+        fixed = root / "fixed"
+        clip3d = root / "clip3d"
+        config_path = root / "config.json"
+        source.mkdir(parents=True)
+        metadata = cls.canonical_metadata()
+        write_json(source / "r1_metadata.json", metadata)
+        write_json(source / "status.json", {"state": "success"})
+        (source / "stats.txt").write_text("canonical stats\n")
+        config = cls.operational_config()
+        write_json(config_path, config)
+        raw_provenance = {
+            "dynamic": "McPAT Runtime Dynamic",
+            "leakage": "McPAT Subthreshold Leakage + Gate Leakage",
+            "postprocessing": "none",
+        }
+        modules = TransientTraceTests.model()
+        modules.update({
+            "source_r1": str(source.resolve()),
+            "architecture": metadata,
+            "power_provenance": raw_provenance,
+            "power_calibration": None,
+        })
+        from workflow.floorplan.generate_hotspot_inputs import baseline_layout
+        layout = baseline_layout(modules)
+        stack = {
+            **config["physical"]["thermal_stack"],
+            "silicon_resistance_scale": 1.0,
+            "tim_resistance_scale": 1.0,
+            "effective_silicon_resistivity_mk_per_w": 0.0872,
+            "effective_tim_resistivity_mk_per_w": 2.18,
+        }
+        total_power = sum(
+            module["total_power_w"] for module in modules["modules"]
+        )
+        for path, layout_method in ((fixed, "fixed-bin"), (clip3d, "clip3d")):
+            (path / "hotspot").mkdir(parents=True)
+            (path / "mcpat").mkdir(parents=True)
+            pilot_modules = copy.deepcopy(modules)
+            pilot_modules["source_mcpat"] = str((path / "mcpat/mcpat.json").resolve())
+            write_json(path / "modules.json", pilot_modules)
+            write_json(path / "hotspot/layout.json", layout)
+            (path / "hotspot/steady.txt").write_text("unit 300\n")
+            write_json(path / "hotspot/hotspot_manifest.json", {
+                "schema_version": 1,
+                "ambient_c": 25.0,
+                "r_convec_k_per_w": 5.0,
+                "grid_size": 4,
+                "thermal_stack": stack,
+            })
+            write_json(path / "mcpat/mcpat.json", {
+                "schema_version": 1,
+                "power_provenance": raw_provenance,
+                "power_calibration": None,
+                "modules": copy.deepcopy(modules["modules"]),
+            })
+            write_json(path / "run_config.json", {
+                "schema_version": 1,
+                "source": str(config_path.resolve()),
+                "layout_method": layout_method,
+                "config": config,
+            })
+            write_json(path / "pipeline_summary.json", {
+                "schema_version": 2,
+                "r1": str(source.resolve()),
+                "output": str(path.resolve()),
+                "experiment": config["name"],
+                "workload": "matmul",
+                "l1d_size": "32kB",
+                "l2_size": "512kB",
+                "layout_method": layout_method,
+                "layout_mode": layout_method,
+                "cooling": {"r_convec_k_per_w": 5.0, "ambient_c": 25.0},
+                "module_count": len(modules["modules"]),
+                "total_power_w": total_power,
+                "power_provenance": raw_provenance,
+                "tmax_c": 90.0,
+                "artifacts": {
+                    "config": str((path / "run_config.json").resolve()),
+                    "modules": str((path / "modules.json").resolve()),
+                    "layout": str((path / "hotspot/layout.json").resolve()),
+                    "hotspot_manifest": str(
+                        (path / "hotspot/hotspot_manifest.json").resolve()
+                    ),
+                    "mcpat_json": str((path / "mcpat/mcpat.json").resolve()),
+                },
+            })
+        return source, fixed, clip3d, config_path
+
+    @staticmethod
     def summary(root: Path, layout: str, steady: float, trace: float,
                 final: float, peak_time: float) -> dict:
         power_windows = root / "shared/windows/mcpat/power_windows.json"
         if not power_windows.is_file():
             write_json(power_windows, {
                 "nominal_sample_interval_ms": 10.0,
+                "nominal_sample_interval_ticks": 10,
+                "measurement_start_tick": 0,
+                "measurement_end_tick": 20,
+                "run_settings": {
+                    "mcpat_settings": {"temperature_k": 320},
+                    "opt_for_clk": 0,
+                    "dynamic_scale": 1.0,
+                    "leakage_scale": 1.0,
+                },
                 "windows": [
                     {
                         "index": 0, "start_tick": 0, "end_tick": 10,
-                        "duration_s": 0.01,
+                        "duration_ticks": 10, "duration_s": 0.01,
+                        "source_stats_sha256": "sha256:stats-0",
+                        "modules": [{
+                            "name": "chip",
+                            "dynamic_power_w": 8.0,
+                            "leakage_power_w": 2.0,
+                            "total_power_w": 10.0,
+                        }],
                         "totals": {
                             "dynamic_power_w": 8.0,
                             "leakage_power_w": 2.0,
@@ -356,7 +852,14 @@ class TransientComparisonTests(unittest.TestCase):
                     },
                     {
                         "index": 1, "start_tick": 10, "end_tick": 20,
-                        "duration_s": 0.01,
+                        "duration_ticks": 10, "duration_s": 0.01,
+                        "source_stats_sha256": "sha256:stats-1",
+                        "modules": [{
+                            "name": "chip",
+                            "dynamic_power_w": 11.0,
+                            "leakage_power_w": 2.0,
+                            "total_power_w": 13.0,
+                        }],
                         "totals": {
                             "dynamic_power_w": 11.0,
                             "leakage_power_w": 2.0,
@@ -366,6 +869,9 @@ class TransientComparisonTests(unittest.TestCase):
                 ],
             })
         return {
+            "mode": "operational transient validation",
+            "non_formal": True,
+            "paper_equivalent": False,
             "layout_method": layout,
             "source_r1": str((root / "source_r1").resolve()),
             "transient_r1": str((root / "shared_r1").resolve()),
@@ -385,14 +891,45 @@ class TransientComparisonTests(unittest.TestCase):
             },
             "steady_tmax_c": steady,
             "temperature": {
+                "initial_peak": {
+                    "peak_unit": "initial", "tmax_c": steady, "time_s": 0.0,
+                },
+                "trace_min_peak": {
+                    "peak_unit": "cell0", "tmax_c": trace - 1.0,
+                    "time_s": 0.01,
+                },
                 "trace_peak": {"tmax_c": trace, "time_s": peak_time},
                 "final_peak": {"tmax_c": final, "time_s": 0.02},
+                "overall_peak": {
+                    "peak_unit": "cell1" if trace >= steady else "initial",
+                    "tmax_c": max(trace, steady),
+                    "time_s": peak_time if trace >= steady else 0.0,
+                },
                 "samples": [
                     {"index": 0, "time_s": 0.01, "tmax_c": trace - 1.0,
                      "tavg_c": trace - 4.0},
                     {"index": 1, "time_s": 0.02, "tmax_c": final,
                      "tavg_c": final - 4.0},
                 ],
+            },
+            "raw_power_evidence": {
+                "dynamic_scale": 1.0,
+                "leakage_scale": 1.0,
+                "power_provenance": {
+                    "dynamic": "McPAT Runtime Dynamic",
+                    "leakage": "McPAT Subthreshold Leakage + Gate Leakage",
+                    "postprocessing": "none",
+                },
+            },
+            "conservation_evidence": {
+                "maximum_grid_residual_w": 0.0,
+                "module_to_window_totals": True,
+                "grid_conservation": True,
+            },
+            "acceptance_checks": {
+                "checks": {"synthetic_branch": True},
+                "all_passed": True,
+                "failure_reasons": [],
             },
             "artifacts": {"power_windows": str(power_windows.resolve())},
         }
@@ -439,6 +976,32 @@ class TransientComparisonTests(unittest.TestCase):
                 "clip3d_peak_c,clip3d_average_c",
             )
 
+    def test_comparison_carries_complete_audit_classification_and_limitations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixed = self.summary(root, "fixed-bin", 91.0, 95.0, 93.0, 0.02)
+            clip3d = self.summary(root, "clip3d", 89.0, 93.5, 91.0, 0.01)
+
+            result = compare_layout_results(fixed, clip3d, root / "comparison")
+
+            self.assertEqual(result["mode"], "operational transient validation")
+            self.assertTrue(result["non_formal"])
+            self.assertFalse(result["paper_equivalent"])
+            self.assertTrue(result["acceptance_checks"]["all_passed"])
+            self.assertEqual(result["acceptance_checks"]["failure_reasons"], [])
+            for layout in ("fixed", "clip3d"):
+                values = result["temperature_c"][layout]
+                for field in (
+                    "initial_peak", "trace_min_peak", "trace_peak", "final_peak",
+                    "overall_peak", "trace_peak_minus_steady_c",
+                ):
+                    self.assertIn(field, values)
+            self.assertIn("fixed", result["raw_power_evidence"])
+            self.assertIn("clip3d", result["conservation_evidence"])
+            limitations = " ".join(result["model_limitations"])
+            self.assertIn("10 ms averaging", limitations)
+            self.assertIn("startup history", limitations)
+
     def test_comparison_rejects_mismatched_shared_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -472,6 +1035,10 @@ class TransientComparisonTests(unittest.TestCase):
                 "leakage_power_w": 2.0,
                 "total_power_w": 11.0,
             }
+            changed["windows"][0]["modules"][0].update({
+                "dynamic_power_w": 9.0,
+                "total_power_w": 11.0,
+            })
             write_json(power_path, changed)
 
             with self.assertRaisesRegex(ValueError, "power trace identity"):
@@ -484,6 +1051,9 @@ class TransientComparisonTests(unittest.TestCase):
             clip3d = self.summary(root, "clip3d", 89.0, 93.5, 91.0, 0.02)
             power_path = Path(fixed["artifacts"]["power_windows"])
             power = read_json(power_path)
+            power["measurement_end_tick"] = 15
+            power["windows"][1]["end_tick"] = 15
+            power["windows"][1]["duration_ticks"] = 5
             power["windows"][1]["duration_s"] = 0.005
             write_json(power_path, power)
             identity = self.identity(power_path)
@@ -527,6 +1097,8 @@ class TransientComparisonTests(unittest.TestCase):
             def fake_split(_source: Path, output: Path) -> dict:
                 result = {
                     "window_count": 2,
+                    "canonical_source_r1": str(source_r1.resolve()),
+                    "transient_r1": str(transient_r1.resolve()),
                     "nominal_sample_interval_ms": 10.0,
                     "windows": [],
                 }
@@ -536,9 +1108,43 @@ class TransientComparisonTests(unittest.TestCase):
             def fake_mcpat(_manifest: Path, output: Path, _config: dict) -> dict:
                 result = {
                     "window_count": 2,
+                    "canonical_source_r1": str(source_r1.resolve()),
+                    "transient_r1": str(transient_r1.resolve()),
                     "nominal_sample_interval_ms": 10.0,
+                    "nominal_sample_interval_ticks": 10,
+                    "measurement_start_tick": 100,
+                    "measurement_end_tick": 115,
+                    "run_settings": {
+                        "dynamic_scale": 1.0,
+                        "leakage_scale": 1.0,
+                    },
                     "windows": [
-                        {"duration_s": 0.01}, {"duration_s": 0.005},
+                        {
+                            "index": 0, "start_tick": 100, "end_tick": 110,
+                            "duration_ticks": 10, "duration_s": 0.01,
+                            "source_stats_sha256": "sha256:stats-0",
+                            "modules": [{
+                                "name": "chip", "dynamic_power_w": 2.0,
+                                "leakage_power_w": 1.0, "total_power_w": 3.0,
+                            }],
+                            "totals": {
+                                "dynamic_power_w": 2.0, "leakage_power_w": 1.0,
+                                "total_power_w": 3.0,
+                            },
+                        },
+                        {
+                            "index": 1, "start_tick": 110, "end_tick": 115,
+                            "duration_ticks": 5, "duration_s": 0.005,
+                            "source_stats_sha256": "sha256:stats-1",
+                            "modules": [{
+                                "name": "chip", "dynamic_power_w": 1.0,
+                                "leakage_power_w": 1.0, "total_power_w": 2.0,
+                            }],
+                            "totals": {
+                                "dynamic_power_w": 1.0, "leakage_power_w": 1.0,
+                                "total_power_w": 2.0,
+                            },
+                        },
                     ],
                 }
                 write_json(output / "power_windows.json", result)
@@ -565,18 +1171,8 @@ class TransientComparisonTests(unittest.TestCase):
     def test_dual_runner_records_status_and_prepares_shared_power_once(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            source = root / "source"
-            fixed_steady = root / "fixed-steady"
-            clip_steady = root / "clip-steady"
+            source, fixed_steady, clip_steady, config = self.provenance_inputs(root)
             output = root / "output"
-            source.mkdir()
-            fixed_steady.mkdir()
-            clip_steady.mkdir()
-            self.steady(fixed_steady, "fixed-bin")
-            self.steady(clip_steady, "clip3d")
-            config = root / "config.json"
-            write_json(config, {})
-            write_json(source / "r1_metadata.json", {"workload": "matmul"})
             stage_calls = []
 
             def fake_r1(source_dir: Path, output_dir: Path, sample_ms: float) -> dict:
@@ -668,19 +1264,11 @@ class TransientComparisonTests(unittest.TestCase):
     def test_dual_runner_failure_status_preserves_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            source = root / "source"
-            source.mkdir()
+            source, fixed_steady, clip_steady, config = self.provenance_inputs(root)
             output = root / "output"
             output.mkdir()
             sentinel = output / "keep.txt"
             sentinel.write_text("keep")
-            config = root / "config.json"
-            write_json(config, {})
-            fixed_steady = root / "fixed"
-            clip_steady = root / "clip"
-            self.steady(fixed_steady, "fixed-bin")
-            self.steady(clip_steady, "clip3d")
-
             with patch(
                 "workflow.transient.run_dual_layout_validation.run_transient_r1",
                 side_effect=RuntimeError("synthetic R1 failure"),
@@ -696,6 +1284,79 @@ class TransientComparisonTests(unittest.TestCase):
             self.assertEqual(status["exception_message"], "synthetic R1 failure")
             self.assertEqual(sentinel.read_text(), "keep")
 
+    def test_dual_runner_rejects_wrong_pilot_source_before_r1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, fixed, clip3d, config = self.provenance_inputs(root)
+            summary = read_json(fixed / "pipeline_summary.json")
+            summary["r1"] = str((root / "different-r1").resolve())
+            write_json(fixed / "pipeline_summary.json", summary)
+
+            with patch(
+                "workflow.transient.run_dual_layout_validation.run_transient_r1",
+                side_effect=AssertionError("R1 must not start"),
+            ):
+                with self.assertRaisesRegex(ValueError, "source R1"):
+                    run_dual_layout_validation(
+                        source, fixed, clip3d, root / "output", config, 10.0
+                    )
+
+    def test_dual_runner_rejects_non_raw_pilot_power_before_r1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, fixed, clip3d, config = self.provenance_inputs(root)
+            modules = read_json(clip3d / "modules.json")
+            modules["power_calibration"] = {
+                "dynamic_scale": 1.2,
+                "leakage_scale": 1.0,
+            }
+            write_json(clip3d / "modules.json", modules)
+
+            with patch(
+                "workflow.transient.run_dual_layout_validation.run_transient_r1",
+                side_effect=AssertionError("R1 must not start"),
+            ):
+                with self.assertRaisesRegex(ValueError, "raw-power.*scale"):
+                    run_dual_layout_validation(
+                        source, fixed, clip3d, root / "output", config, 10.0
+                    )
+
+    def test_dual_runner_rejects_output_overlapping_read_only_inputs_without_writes(self):
+        relationships = ("equal", "ancestor", "descendant")
+        for relationship in relationships:
+            with self.subTest(relationship=relationship), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source, fixed, clip3d, config = self.provenance_inputs(root / "inputs")
+                sentinels = [
+                    source / "r1_metadata.json",
+                    fixed / "pipeline_summary.json",
+                    clip3d / "pipeline_summary.json",
+                ]
+                before = {path: self.file_hash(path) for path in sentinels}
+                if relationship == "equal":
+                    output = fixed
+                elif relationship == "ancestor":
+                    output = root / "inputs"
+                else:
+                    output = source / "transient-output"
+
+                with patch(
+                    "workflow.transient.run_dual_layout_validation.run_transient_r1",
+                    side_effect=AssertionError("R1 must not start"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "read-only input"):
+                        run_dual_layout_validation(
+                            source, fixed, clip3d, output, config, 10.0
+                        )
+
+                self.assertEqual(
+                    {path: self.file_hash(path) for path in sentinels}, before
+                )
+                if relationship == "descendant":
+                    self.assertFalse(output.exists())
+                elif relationship == "ancestor":
+                    self.assertFalse((output / "status.json").exists())
+
     def test_single_runner_rejects_missing_steady_input_before_r1(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -710,6 +1371,83 @@ class TransientComparisonTests(unittest.TestCase):
                         root / "source", root / "missing-steady",
                         root / "output", config,
                     )
+
+
+class TransientR1CacheTests(unittest.TestCase):
+    @staticmethod
+    def source(path: Path, workload: str = "matmul") -> dict:
+        path.mkdir(parents=True)
+        metadata = {
+            **TransientComparisonTests.canonical_metadata(),
+            "workload": workload,
+        }
+        write_json(path / "r1_metadata.json", metadata)
+        write_json(path / "status.json", {"state": "success"})
+        (path / "stats.txt").write_text("canonical stats\n")
+        return metadata
+
+    @staticmethod
+    def cache(path: Path, source: Path, metadata: dict) -> None:
+        path.mkdir(parents=True)
+        write_json(path / "status.json", {
+            "state": "success",
+            "source_r1": str(source.resolve()),
+            "sample_interval_ms": 10.0,
+        })
+        write_json(path / "r1_metadata.json", {
+            **metadata,
+            "transient_statistics": True,
+            "transient_stats_mode": "cumulative",
+            "sample_interval_ms": 10.0,
+            "sample_interval_s": 0.01,
+            "sample_interval_ticks": 10,
+            "measurement_start_tick": 100,
+            "measurement_end_tick": 120,
+            "canonical_source_r1": str(source.resolve()),
+        })
+        (path / "stats.txt").write_text("transient stats\n")
+
+    def test_wrapper_reuses_compatible_successful_shared_r1(self):
+        from workflow.transient.run_transient_r1 import run
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            metadata = self.source(source)
+            cache = root / "shared-r1"
+            self.cache(cache, source, metadata)
+            gem5 = root / "gem5.opt"
+            gem5.write_text("synthetic executable")
+
+            with patch(
+                "workflow.transient.run_transient_r1.subprocess.run",
+                side_effect=AssertionError("compatible cache must be reused"),
+            ):
+                result = run(source, cache, 10.0, gem5=gem5)
+
+            self.assertEqual(result["state"], "success")
+            self.assertEqual(Path(result["source_r1"]), source.resolve())
+
+    def test_wrapper_rejects_successful_cache_from_another_source(self):
+        from workflow.transient.run_transient_r1 import run
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            metadata = self.source(source)
+            other_source = root / "other-source"
+            self.source(other_source, workload="stencil")
+            cache = root / "shared-r1"
+            self.cache(cache, other_source, metadata)
+            gem5 = root / "gem5.opt"
+            gem5.write_text("synthetic executable")
+
+            with patch(
+                "workflow.transient.run_transient_r1.subprocess.run",
+                side_effect=AssertionError("incompatible cache must not run"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "different source R1"):
+                    run(source, cache, 10.0, gem5=gem5)
 
 
 class TransientDocumentationTests(unittest.TestCase):

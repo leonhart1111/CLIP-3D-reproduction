@@ -60,9 +60,15 @@ def split_windows(transient_r1_dir: Path, output_dir: Path) -> dict:
         raise ValueError("R1 metadata does not identify a transient-statistics run")
     if metadata.get("transient_stats_mode") != "cumulative":
         raise ValueError("only cumulative periodic statistics are supported")
+    canonical_source_r1 = metadata.get("canonical_source_r1")
+    if not isinstance(canonical_source_r1, str) or not canonical_source_r1:
+        raise ValueError("transient R1 metadata lacks canonical_source_r1 provenance")
     sample_ticks = int(metadata["sample_interval_ticks"])
     sample_s = float(metadata["sample_interval_s"])
     measurement_start = int(metadata["measurement_start_tick"])
+    if "measurement_end_tick" not in metadata:
+        raise ValueError("transient R1 metadata lacks independent measurement_end_tick")
+    measurement_end = int(metadata["measurement_end_tick"])
     sections = parse_sections(transient_r1_dir / "stats.txt")
     if not sections:
         raise ValueError("stats.txt contains no simulation-statistics sections")
@@ -147,11 +153,13 @@ def split_windows(transient_r1_dir: Path, output_dir: Path) -> dict:
     manifest = {
         "schema_version": 1,
         "source_r1": str(transient_r1_dir),
+        "canonical_source_r1": str(Path(canonical_source_r1).resolve()),
         "source_stats": str((transient_r1_dir / "stats.txt").resolve()),
         "stats_mode": "cumulative snapshots converted to per-window deltas",
         "nominal_sample_interval_ms": sample_s * 1000.0,
         "nominal_sample_interval_ticks": sample_ticks,
         "measurement_start_tick": measurement_start,
+        "measurement_end_tick": measurement_end,
         "window_count": len(windows),
         "total_duration_s": sum(window["duration_s"] for window in windows),
         "windows": windows,
