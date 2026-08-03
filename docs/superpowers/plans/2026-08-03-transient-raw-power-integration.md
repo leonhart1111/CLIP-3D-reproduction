@@ -27,6 +27,7 @@
 - Modify: `workflow/mcpat/parse_mcpat.py`
 - Modify: `workflow/transient/run_windowed_mcpat.py`
 - Modify: `workflow/transient/run_transient_pipeline.py`
+- Modify: `workflow/transient/generate_hotspot_trace.py`
 - Modify: `tests/test_transient.py`
 
 **Interfaces:**
@@ -107,6 +108,12 @@ Store the unmodified signed residuals for all six original fields and negative-c
 In `run_windowed_mcpat.py`, remove `resolve_power_calibration`, `apply_power_calibration`, scale fields, calibration provenance, and emitted `power_calibration` keys. Record `power_provenance` equal to raw McPAT dynamic and leakage definitions plus `postprocessing="none"`.
 
 In `run_transient_pipeline.py`, stop resolving selected-config calibration. Reject any selected config that actually declares `mcpat.power_calibration`, continue accepting historical steady artifacts only when their calibration field is null or both scales equal exactly `1.0`, and report raw-power provenance without synthetic scale fields.
+
+In `generate_hotspot_trace.py`, stop requiring unit-valued scale keys in
+`run_settings` and remove scale/calibration fields from `raw_power_evidence`.
+Keep the existing conservation gates and record the direct McPAT dynamic,
+subthreshold-leakage, gate-leakage, and `postprocessing="none"` provenance plus
+the source-stat hashes.
 
 Update transient tests to assert the externally visible behavior: non-unit steady-pilot calibration is rejected before R1, a config declaring calibration is rejected before R1, and raw window records contain no `power_calibration` field.
 
