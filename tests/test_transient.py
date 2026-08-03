@@ -48,10 +48,12 @@ class TransientStatisticsTests(unittest.TestCase):
         self.assertAlmostEqual(summary["total_power_w"]["weighted_mean"], 8.0)
 
     def test_power_timeline_rejects_discontinuous_ticks(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "window timeline gap"):
             validate_window_timeline({"windows": [
-                {"start_tick": 0, "end_tick": 10, "duration_s": 0.01},
-                {"start_tick": 11, "end_tick": 20, "duration_s": 0.01},
+                {"index": 0, "start_tick": 0, "end_tick": 10,
+                 "duration_s": 0.01},
+                {"index": 1, "start_tick": 11, "end_tick": 20,
+                 "duration_s": 0.009},
             ]})
 
     def test_cumulative_sections_become_delta_windows(self):
@@ -88,6 +90,16 @@ class TransientStatisticsTests(unittest.TestCase):
             (source / "stats.txt").write_text("\n".join(text) + "\n")
             result = split_windows(source, root / "windows")
             self.assertEqual(result["window_count"], 2)
+            self.assertEqual(result["timeline_audit"], {
+                "window_count": 2,
+                "total_duration_s": 0.02,
+                "first_tick": 100,
+                "last_tick": 120,
+            })
+            self.assertEqual(
+                read_json(root / "windows/windows_manifest.json")["timeline_audit"],
+                result["timeline_audit"],
+            )
             self.assertEqual(len(result["dropped_sections"]), 2)
             second = (root / "windows/window_0001/stats.txt").read_text()
             self.assertIn("system.cpu0.numCycles", second)
@@ -161,8 +173,14 @@ class TransientTraceTests(unittest.TestCase):
                     )
                     modules.append(module)
                 windows.append({
-                    "index": index, "duration_s": 0.01,
+                    "index": index, "start_tick": index * 10,
+                    "end_tick": (index + 1) * 10, "duration_s": 0.01,
                     "modules": modules,
+                    "totals": {
+                        field: sum(module[field] for module in modules)
+                        for field in ("dynamic_power_w", "leakage_power_w",
+                                      "total_power_w")
+                    },
                 })
             write_json(root / "power_windows.json", {
                 "nominal_sample_interval_ms": 10.0,
@@ -180,12 +198,49 @@ class TransientTraceTests(unittest.TestCase):
                 root / "power_windows.json", root / "hotspot", config,
             )
             self.assertEqual(result["window_count"], 2)
+            self.assertAlmostEqual(
+                result["power_summary"]["total_power_w"]["weighted_mean"],
+                6.96,
+            )
+            self.assertLessEqual(result["maximum_grid_residual_w"], 1e-10)
             self.assertEqual(
                 len((root / "hotspot/power_transient.ptrace").read_text().splitlines()),
                 3,
             )
             self.assertIn("-sampling_intvl 0.01",
                           (root / "hotspot/hotspot.config").read_text())
+
+    def test_power_windows_reject_corrupted_module_totals(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            write_json(root / "modules.json", model)
+            corrupted = [dict(module) for module in model["modules"]]
+            corrupted[0]["total_power_w"] = 99.0
+            write_json(root / "power_windows.json", {
+                "nominal_sample_interval_ms": 10.0,
+                "windows": [{
+                    "index": 0, "start_tick": 0, "end_tick": 10,
+                    "duration_s": 0.01, "modules": corrupted,
+                    "totals": {
+                        field: sum(module[field] for module in corrupted)
+                        for field in ("dynamic_power_w", "leakage_power_w",
+                                      "total_power_w")
+                    },
+                }],
+            })
+            config = {
+                "frequency": {"ambient_c": 25.0},
+                "physical": {"grid_size": 4, "utilization": 0.70,
+                             "r_convec_k_per_w": 5.0},
+            }
+            from workflow.floorplan.generate_hotspot_inputs import baseline_layout
+            write_json(root / "layout.json", baseline_layout(model))
+            with self.assertRaisesRegex(ValueError, "dynamic_power_w.*total_power_w"):
+                materialize_trace(
+                    root / "modules.json", root / "layout.json",
+                    root / "power_windows.json", root / "hotspot", config,
+                )
 
     def test_temperature_trace_times_start_after_first_interval(self):
         with tempfile.TemporaryDirectory() as temporary:

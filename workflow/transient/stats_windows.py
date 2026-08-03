@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 
 from workflow.common import read_json, write_json
+from workflow.transient.validation import validate_window_timeline
 
 
 BEGIN = "---------- Begin Simulation Statistics ----------"
@@ -160,6 +161,7 @@ def split_windows(transient_r1_dir: Path, output_dir: Path) -> dict:
             "The McPAT mapping consumes additive event/cycle counters."
         ),
     }
+    manifest["timeline_audit"] = validate_window_timeline(manifest)
     write_json(output_dir / "windows_manifest.json", manifest)
     return manifest
 

@@ -74,7 +74,9 @@ def validate_window_timeline(manifest: dict) -> dict:
         if end_tick <= start_tick:
             raise ValueError(f"{context}: end_tick must be greater than start_tick")
         if previous_end_tick is not None and start_tick != previous_end_tick:
-            raise ValueError(f"{context}: start_tick must equal previous end_tick")
+            raise ValueError(
+                f"window timeline gap: {context} start_tick must equal previous end_tick"
+            )
         total_duration_s += _duration(window, context)
         previous_end_tick = end_tick
         first_tick = start_tick if first_tick is None else first_tick

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from workflow.common import read_json, write_json
 from workflow.floorplan.generate_hotspot_inputs import grid_power, materialize
+from workflow.transient.validation import summarize_power_windows, validate_power_triplet
 
 
 POWER_FIELDS = ("dynamic_power_w", "leakage_power_w", "total_power_w")
@@ -63,6 +64,9 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
         for source in layout["modules"]:
             module = dict(source)
             powers = by_name[module["name"]]
+            validate_power_triplet(
+                powers, f"window {window['index']} module {module['name']}"
+            )
             for field in POWER_FIELDS:
                 module[field] = float(powers[field])
             window_layout["modules"].append(module)
@@ -92,6 +96,12 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
     windows = power_windows["windows"]
     actual_duration_s = sum(float(window["duration_s"]) for window in windows)
     hotspot_duration_s = len(windows) * sample_interval_s
+    maximum_grid_residual_w = max(
+        abs(tier[field]["residual"])
+        for window in conservation
+        for tier in window["tiers"]
+        for field in POWER_FIELDS
+    )
     result = {
         "schema_version": 1,
         "source_modules": str(modules_path.resolve()),
@@ -107,6 +117,8 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
             "The last partial gem5 window is held constant for one full HotSpot "
             "sampling interval; the padding is recorded explicitly."
         ),
+        "power_summary": summarize_power_windows(windows),
+        "maximum_grid_residual_w": maximum_grid_residual_w,
         "files": {
             field: str((output_dir / filename).resolve())
             for field, filename in filenames.items()
