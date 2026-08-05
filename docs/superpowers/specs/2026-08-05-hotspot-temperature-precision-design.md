@@ -23,10 +23,12 @@ Human-readable diagnostic output such as ambient temperature and package
 thickness is outside this change because it is not parsed as a temperature
 trajectory.
 
-The Python transient path will print reported temperatures with six decimal
-places. Temperature CSV files will also use six decimal places for Celsius
-values. JSON values remain JSON numbers; fixed-width decimal formatting is a
-textual presentation concern, not part of JSON number semantics.
+The complete Python steady/transient lifting path will print reported
+temperatures with at least six decimal places. Temperature-bearing CSV fields
+in the lifting, transient-comparison, and thermal-proxy reports will use six
+decimal places for Celsius values. JSON values remain JSON numbers;
+fixed-width decimal formatting is a textual presentation concern, not part of
+JSON number semantics.
 
 Every live limitation string will interpolate the actual `sample_ms` value.
 The command-line default remains 10 ms for backward compatibility, while a
@@ -74,10 +76,13 @@ Tests will be added before implementation to establish these contracts:
 1. a 2 ms transient summary contains a 2 ms sampling limitation and contains
    no stale 10 ms limitation;
 2. the dual-layout and comparison summaries follow the same rule;
-3. temperature CSV presentation uses six digits after the decimal point;
-4. the tracked HotSpot patch changes each machine-readable temperature format
+3. steady and transient CLI temperature presentation uses six digits after
+   the decimal point;
+4. temperature-bearing CSV presentation uses six digits after the decimal
+   point throughout the lifting, comparison, and proxy-report paths;
+5. the tracked HotSpot patch changes each machine-readable temperature format
    to six decimal places; and
-5. a rebuilt HotSpot executable emits six-decimal temperature tokens in a
+6. a rebuilt HotSpot executable emits six-decimal temperature tokens in a
    small real invocation.
 
 Verification consists of the focused transient test module, the complete

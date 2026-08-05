@@ -20,11 +20,15 @@
 
 ## File Structure
 
+- `workflow/common.py`: owns consistent six-decimal temperature text/CSV formatting.
 - `workflow/transient/validation.py`: owns the pure sampling-limit wording helper.
 - `workflow/transient/run_transient_pipeline.py`: uses the helper in single-layout summaries and prints six-decimal temperatures.
 - `workflow/transient/compare_layouts.py`: uses the helper in comparison summaries.
 - `workflow/transient/run_dual_layout_validation.py`: uses the helper in experiment summaries and prints six-decimal layout deltas.
 - `workflow/transient/run_hotspot_transient.py`: writes six-decimal Celsius CSV values and six-decimal CLI output.
+- `workflow/thermal/run_hotspot.py`: prints steady HotSpot peak temperature with six decimals.
+- `workflow/analysis/summarize_sweep.py`: writes lifting-sweep `tmax_c` with six decimals.
+- `workflow/thermal/calibrate_proxy.py`: writes all temperature-bearing proxy CSV fields with six decimals.
 - `tests/test_transient.py`: covers the helper, 2 ms summary propagation, and CSV presentation.
 - `patches/hotspot/0001-six-decimal-temperature-output.patch`: reproducible third-party source change.
 - `tools/src/hotspot/{hotspot.c,temperature_grid.c,temperature_block.c}`: ignored local checkout to which the tracked patch is applied.
@@ -34,19 +38,26 @@
 
 ---
 
-### Task 1: Parameterize live sampling reports and format Python temperature output
+### Task 1: Parameterize live sampling reports and format all Python temperature output
 
 **Files:**
 - Modify: `tests/test_transient.py`
+- Modify: `tests/test_workflow.py`
+- Modify: `workflow/common.py`
 - Modify: `workflow/transient/validation.py`
 - Modify: `workflow/transient/run_transient_pipeline.py`
 - Modify: `workflow/transient/compare_layouts.py`
 - Modify: `workflow/transient/run_dual_layout_validation.py`
 - Modify: `workflow/transient/run_hotspot_transient.py`
+- Modify: `workflow/thermal/run_hotspot.py`
+- Modify: `workflow/analysis/summarize_sweep.py`
+- Modify: `workflow/thermal/calibrate_proxy.py`
 - Modify: `workflow/run_lifting_pipeline.py`
 
 **Interfaces:**
 - Produces: `sampling_resolution_limitation(sample_ms: float) -> str` in `workflow.transient.validation`.
+- Produces: `format_temperature_c(value: float) -> str` and
+  `format_temperature_csv_row(record: dict) -> dict` in `workflow.common`.
 - Consumes: existing `sample_ms`, `trace["sample_interval_s"]`, and temperature sample dictionaries.
 - Preserves: existing summary keys and JSON numeric types.
 
@@ -61,6 +72,19 @@ def test_sampling_limitation_uses_actual_interval(self):
     message = sampling_resolution_limitation(2.0)
     self.assertIn("2 ms averaging", message)
     self.assertNotIn("10 ms averaging", message)
+```
+
+Add formatting contracts to `tests/test_workflow.py`:
+
+```python
+def test_temperature_text_and_csv_fields_use_six_decimals(self):
+    from workflow.common import format_temperature_c, format_temperature_csv_row
+
+    self.assertEqual(format_temperature_c(116.25), "116.250000")
+    self.assertEqual(
+        format_temperature_csv_row({"tmax_c": 116.25, "ipc1": 3.4}),
+        {"tmax_c": "116.250000", "ipc1": 3.4},
+    )
 ```
 
 Extend the mocked `run_hotspot_transient` test so the generated trace contains
@@ -88,14 +112,34 @@ Run:
 python -m unittest \
   tests.test_transient.TransientComparisonTests.test_comparison_carries_complete_audit_classification_and_limitations \
   tests.test_transient.TransientTraceTests.test_sampling_limitation_uses_actual_interval \
-  tests.test_transient.TransientTraceTests.test_thermal_result_has_standard_classification_and_acceptance_evidence -v
+  tests.test_transient.TransientTraceTests.test_thermal_result_has_standard_classification_and_acceptance_evidence \
+  tests.test_workflow.WorkflowTests.test_temperature_text_and_csv_fields_use_six_decimals -v
 ```
 
-Expected: failure because `sampling_resolution_limitation` does not exist,
-the comparison still says 10 ms, and CSV temperatures are not fixed to six
+Expected: failure because the new helper functions do not exist, the
+comparison still says 10 ms, and CSV temperatures are not fixed to six
 decimal places.
 
 - [ ] **Step 3: Implement the pure limitation helper**
+
+Add to `workflow/common.py`:
+
+```python
+def format_temperature_c(value: float) -> str:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("temperature must be finite")
+    return f"{number:.6f}"
+
+
+def format_temperature_csv_row(record: dict) -> dict:
+    return {
+        key: format_temperature_c(value)
+        if key.endswith("_c") and isinstance(value, Real) and not isinstance(value, bool)
+        else value
+        for key, value in record.items()
+    }
+```
 
 Add to `workflow/transient/validation.py`:
 
@@ -126,24 +170,30 @@ sample_ms = float(trace["sample_interval_s"]) * 1000.0
 
 - [ ] **Step 4: Format CSV and CLI temperature presentation**
 
-In `run_hotspot_transient.py`, retain numeric in-memory samples but render the
-CSV temperature fields explicitly:
+In `run_hotspot_transient.py`, retain numeric in-memory samples but pass each
+CSV row through `format_temperature_csv_row(...)`:
 
 ```python
-writer.writerow({
+writer.writerow(format_temperature_csv_row({
     "index": sample["index"],
     "time_s": sample["time_s"],
     "peak_unit": sample["peak_unit"],
-    "tmax_c": f"{sample['tmax_c']:.6f}",
-    "tavg_c": f"{sample['tavg_c']:.6f}",
-})
+    "tmax_c": sample["tmax_c"],
+    "tavg_c": sample["tavg_c"],
+}))
 ```
 
-Change transient temperature and layout-delta CLI format specifiers from
-`.3f` to `.6f` in `run_hotspot_transient.py`, `run_transient_pipeline.py`,
-`run_dual_layout_validation.py`, and the transient-specific output in
-`workflow/run_lifting_pipeline.py`. Leave unrelated steady pipeline display
-formatting unchanged.
+Use `format_temperature_c(...)` for every steady/transient temperature or
+temperature-delta CLI value in `run_hotspot_transient.py`,
+`run_transient_pipeline.py`, `run_dual_layout_validation.py`,
+`workflow/thermal/run_hotspot.py`, and both steady/transient output lines in
+`workflow/run_lifting_pipeline.py`.
+
+Pass temperature-bearing CSV rows through `format_temperature_csv_row(...)`
+in `workflow/transient/compare_layouts.py`,
+`workflow/analysis/summarize_sweep.py`, and
+`workflow/thermal/calibrate_proxy.py`. Fields without names ending in `_c`
+must retain their prior numeric/string representation.
 
 - [ ] **Step 5: Run focused tests and verify GREEN**
 
@@ -156,23 +206,27 @@ Expected: all selected tests pass.
 Run:
 
 ```bash
-rg -n '10 ms averaging|Tmax=.*\.3f|trace_peak_clip_minus_fixed.*\.3f' \
-  workflow/transient workflow/run_lifting_pipeline.py
+rg -n '10 ms averaging|Tmax=.*\.3f|tmax_c.*\.3f|peak_c.*\.3f|temperature.*\.3f' \
+  workflow
 ```
 
-Expected: no live hard-coded limitation or three-decimal transient temperature
-display remains. Definitions with a default value of `10.0` are allowed.
+Expected: no live hard-coded limitation or three-decimal temperature display
+remains. Definitions with a default value of `10.0` and unrelated three-digit
+area/power formatting are allowed.
 
 - [ ] **Step 7: Commit Task 1**
 
 ```bash
-git add tests/test_transient.py workflow/transient/validation.py \
+git add tests/test_transient.py tests/test_workflow.py workflow/common.py \
+  workflow/transient/validation.py \
   workflow/transient/run_transient_pipeline.py \
   workflow/transient/compare_layouts.py \
   workflow/transient/run_dual_layout_validation.py \
   workflow/transient/run_hotspot_transient.py \
+  workflow/thermal/run_hotspot.py workflow/analysis/summarize_sweep.py \
+  workflow/thermal/calibrate_proxy.py \
   workflow/run_lifting_pipeline.py
-git commit -m "fix: preserve transient report precision"
+git commit -m "fix: preserve temperature report precision"
 ```
 
 ### Task 2: Version and apply the six-decimal HotSpot output patch
