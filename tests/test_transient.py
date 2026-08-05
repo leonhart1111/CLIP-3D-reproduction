@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import copy
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -1770,22 +1771,69 @@ class HotSpotPrecisionPatchTests(unittest.TestCase):
             self.assertEqual(format_changes[filename]["-"], list(removed))
             self.assertEqual(format_changes[filename]["+"], list(added))
 
-        source_root = Path(__file__).resolve().parents[1] / "tools/src/hotspot"
-        if not source_root.exists():
-            return
-        source_text = "\n".join(
-            (source_root / filename).read_text(encoding="utf-8")
-            for filename in (
-                "hotspot.c",
-                "temperature_grid.c",
-                "temperature_block.c",
+    def test_hotspot_patch_applies_and_reverse_checks_on_recorded_hunk_fixture(self):
+        """The tracked patch must round-trip against its recorded preimage hunks.
+
+        The vendor archive is intentionally not committed, so this fixture contains
+        only the exact removed hunk lines at their recorded source line numbers.
+        It verifies patch applicability without a network or vendor snapshot.
+        It cannot prove that an arbitrary downloaded archive matches outside these
+        hunks; the recorded source-archive checksum remains that compatibility gate.
+        """
+        patch_path = (
+            Path(__file__).resolve().parents[1]
+            / "patches/hotspot/0001-six-decimal-temperature-output.patch"
+        )
+        source_lines = {
+            "hotspot.c": {
+                263: '    fprintf(fp, "%.2f\\t", vals[i]);\n',
+                264: '  fprintf(fp, "%.2f\\n", vals[i]);\n',
+            },
+            "temperature_grid.c": {
+                1287: '          fprintf(fp, "%d\\t%.2f\\n", i*model->cols+j,\n',
+                1313: ('        fprintf(grid_transient_fp, "%d\\t%.2f\\n", '
+                       'i*model->cols + j, model->last_trans->cuboid[l][i][j]);\n'),
+                1432: '        fprintf(fp, "%s%s\\t%.2f\\n", str,\n',
+                1443: '      fprintf(fp, "%s\\t%.2f\\n", str, temp[base+i]);\n',
+            },
+            "temperature_block.c": {
+                553: '\t\tfprintf(fp, "%s\\t%.2f\\n", flp->units[i].name, temp[i]);\n',
+                557: ('\t\tfprintf(fp, "iface_%s\\t%.2f\\n", flp->units[i].name, '
+                      'temp[IFACE*flp->n_units+i]);\n'),
+                561: ('\t\tfprintf(fp, "hsp_%s\\t%.2f\\n", flp->units[i].name, '
+                      'temp[HSP*flp->n_units+i]);\n'),
+                565: ('\t\tfprintf(fp, "hsink_%s\\t%.2f\\n", flp->units[i].name, '
+                      'temp[HSINK*flp->n_units+i]);\n'),
+                570: '\t\tfprintf(fp, "%s\\t%.2f\\n", str, temp[i+NL*flp->n_units]);\n',
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            source_root = Path(temporary) / "hotspot"
+            source_root.mkdir()
+            for filename, replacements in source_lines.items():
+                lines = ["/* fixture */\n"] * max(replacements)
+                for line_number, text in replacements.items():
+                    lines[line_number - 1] = text
+                (source_root / filename).write_text("".join(lines), encoding="utf-8")
+
+            dry_run = subprocess.run(
+                ["patch", "-d", str(source_root), "-p1", "--dry-run", "-i", str(patch_path)],
+                text=True, capture_output=True, check=False,
             )
-        )
-        machine_readable_lines = "\n".join(
-            line for line in source_text.splitlines()
-            if "fprintf(" in line and ("fp," in line or "grid_transient_fp," in line)
-        )
-        self.assertNotIn("%.2f", machine_readable_lines)
+            self.assertEqual(dry_run.returncode, 0, dry_run.stdout + dry_run.stderr)
+            applied = subprocess.run(
+                ["patch", "-d", str(source_root), "-p1", "-i", str(patch_path)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+            reverse_dry_run = subprocess.run(
+                ["patch", "-d", str(source_root), "-p1", "--dry-run", "-R", "-i", str(patch_path)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(
+                reverse_dry_run.returncode, 0,
+                reverse_dry_run.stdout + reverse_dry_run.stderr,
+            )
 
 
 class TransientDocumentationTests(unittest.TestCase):

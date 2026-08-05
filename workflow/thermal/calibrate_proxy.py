@@ -20,6 +20,7 @@ from pathlib import Path
 
 from workflow.common import (
     PROJECT_ROOT,
+    format_temperature_c,
     format_temperature_csv_row,
     read_json,
     write_json,
@@ -883,8 +884,9 @@ def main() -> None:
     validation = report["evaluations"]["cross_validated_training_fit"]["validation"]
     print(
         "Fitted alpha={alpha:.6g}, beta={beta:.6g}, cross_tier_weight={cross_tier_weight:.6g}; "
-        "validation RMSE={rmse:.4f} C, spatial Spearman={spearman}".format(
-            **values, rmse=validation["rmse_c"], spearman=validation["spatial_spearman"]
+        "validation RMSE={rmse} C, spatial Spearman={spearman}".format(
+            **values, rmse=format_temperature_c(validation["rmse_c"]),
+            spearman=validation["spatial_spearman"],
         )
     )
 

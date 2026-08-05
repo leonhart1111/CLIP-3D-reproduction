@@ -4,7 +4,9 @@ import math
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from copy import deepcopy
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -104,6 +106,34 @@ class WorkflowTests(unittest.TestCase):
             text=True, capture_output=True, check=False,
         )
         self.assertNotEqual(completed.returncode, 0)
+
+    def test_proxy_calibration_cli_prints_temperature_rmse_with_six_decimals(self):
+        """A shortened RMSE presentation would lose calibrated temperature precision."""
+        from workflow.thermal.calibrate_proxy import main as calibrate_proxy_main
+
+        report = {
+            "fit": {"parameters": {
+                "alpha": 0.3, "beta": 0.0, "cross_tier_weight": 0.7,
+            }},
+            "evaluations": {"cross_validated_training_fit": {"validation": {
+                "rmse_c": 12.3456789, "spatial_spearman": 0.8,
+            }}},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "modules.json"
+            model.write_text("{}", encoding="utf-8")
+            output = StringIO()
+            argv = [
+                "calibrate_proxy", "--model", f"fixture={model}",
+                "--output-dir", str(root / "output"),
+            ]
+            with patch("sys.argv", argv), \
+                 patch("workflow.thermal.calibrate_proxy.calibrate", return_value=report), \
+                 redirect_stdout(output):
+                calibrate_proxy_main()
+
+        self.assertIn("validation RMSE=12.345679 C", output.getvalue())
 
 class FrequencyTests(unittest.TestCase):
     def test_separated_frequency_trace_scales_only_dynamic_power(self):

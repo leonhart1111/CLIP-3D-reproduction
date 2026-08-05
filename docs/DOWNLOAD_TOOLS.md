@@ -73,18 +73,23 @@ HotSpot 新下载完成后，应用仓库跟踪的补丁以保留温度输出的
 文本温度输出的格式精度，不改变 HotSpot 的热模型、方程或内部 `double` 计算。由于
 `tools/src/` 不受 Git 跟踪，必须在每次重新下载 HotSpot 后重新应用此补丁并重建。
 
-先用反向 dry-run 检查补丁是否已经应用；命令成功表示已经应用，无需再次操作：
+使用下列三路检查和重建。反向 dry-run 成功时，源码已经打过补丁；反向检查
+失败时，必须再由正向 dry-run 确认源码确实兼容后才可应用。两种 dry-run 都
+失败表示源码已部分修改或版本不兼容，此时必须中止，不能让 `make` 使用该源码。
+无论补丁原先已应用还是刚成功应用，都必须重建，以免使用旧的 `hotspot` 二进制。
 
 ```bash
-patch -d tools/src/hotspot -p1 --dry-run -R \
-  < patches/hotspot/0001-six-decimal-temperature-output.patch
-```
+patch_file=patches/hotspot/0001-six-decimal-temperature-output.patch
 
-如果该检查失败，则只应用一次补丁，然后重建可执行文件：
+if patch -d tools/src/hotspot -p1 --dry-run -R < "$patch_file"; then
+  echo "HotSpot six-decimal patch is already applied."
+elif patch -d tools/src/hotspot -p1 --dry-run < "$patch_file"; then
+  patch -d tools/src/hotspot -p1 < "$patch_file" || exit 1
+else
+  echo "HotSpot source is partially patched or incompatible; aborting." >&2
+  exit 1
+fi
 
-```bash
-patch -d tools/src/hotspot -p1 \
-  < patches/hotspot/0001-six-decimal-temperature-output.patch
 make -C tools/src/hotspot hotspot
 ```
 
