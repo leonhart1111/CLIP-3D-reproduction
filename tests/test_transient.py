@@ -1688,6 +1688,37 @@ class TransientR1CacheTests(unittest.TestCase):
                     run(source, cache, 10.0, gem5=gem5)
 
 
+class HotSpotPrecisionPatchTests(unittest.TestCase):
+    def test_hotspot_patch_tracks_six_decimal_temperature_outputs(self):
+        patch_path = (
+            Path(__file__).resolve().parents[1]
+            / "patches/hotspot/0001-six-decimal-temperature-output.patch"
+        )
+        text = patch_path.read_text(encoding="utf-8")
+        self.assertNotIn('+    fprintf(fp, "%.2f', text)
+        self.assertGreaterEqual(text.count("%.6f"), 11)
+        self.assertIn("hotspot.c", text)
+        self.assertIn("temperature_grid.c", text)
+        self.assertIn("temperature_block.c", text)
+
+        source_root = Path(__file__).resolve().parents[1] / "tools/src/hotspot"
+        if not source_root.exists():
+            return
+        source_text = "\n".join(
+            (source_root / filename).read_text(encoding="utf-8")
+            for filename in (
+                "hotspot.c",
+                "temperature_grid.c",
+                "temperature_block.c",
+            )
+        )
+        machine_readable_lines = "\n".join(
+            line for line in source_text.splitlines()
+            if "fprintf(" in line and ("fp," in line or "grid_transient_fp," in line)
+        )
+        self.assertNotIn("%.2f", machine_readable_lines)
+
+
 class TransientDocumentationTests(unittest.TestCase):
     def test_dual_layout_experiment_documents_operational_inputs(self):
         """Prevent losing the reproducible operational validation command."""
