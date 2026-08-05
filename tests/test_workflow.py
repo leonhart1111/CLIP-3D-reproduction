@@ -21,7 +21,11 @@ from workflow.floorplan.build_module_model import (
     extract_communication_profile,
 )
 from workflow.floorplan.generate_hotspot_inputs import baseline_layout, grid_power, materialize
-from workflow.floorplan.layout_metrics import derive_layout_delays
+from workflow.floorplan.layout_metrics import (
+    aggregate_wire_cycles,
+    communication_weights_from_model,
+    derive_layout_delays,
+)
 from workflow.floorplan.optimize_layout import optimize, proxy_temperature
 from workflow.mcpat.parse_mcpat import parse_mcpat_text
 from workflow.r2.calibrate_lambda_wire import (
@@ -955,6 +959,105 @@ class GridTests(unittest.TestCase):
         same_tier = {**layout, "modules": [dict(module) for module in layout["modules"]]}
         next(module for module in same_tier["modules"] if module["kind"] == "l2")["tier"] = 0
         self.assertEqual(derive_layout_delays(same_tier)["tsv_hops"], 0)
+
+    def test_equal_traffic_weights_exactly_reproduce_arithmetic_mean(self):
+        per_core = [
+            {"core": core, "delay_cycles": value}
+            for core, value in enumerate((1.0, 2.0, 3.0, 4.0))
+        ]
+        self.assertEqual(
+            aggregate_wire_cycles(
+                per_core, "traffic-weighted",
+                {0: 0.25, 1: 0.25, 2: 0.25, 3: 0.25},
+            ),
+            2.5,
+        )
+
+    def test_dominant_core_shifts_traffic_weighted_delay(self):
+        per_core = [
+            {"core": core, "delay_cycles": value}
+            for core, value in enumerate((1.0, 2.0, 3.0, 4.0))
+        ]
+        self.assertAlmostEqual(
+            aggregate_wire_cycles(
+                per_core, "traffic-weighted",
+                {0: 0.7, 1: 0.1, 2: 0.1, 3: 0.1},
+            ),
+            1.6,
+        )
+
+    def test_traffic_weight_validation_rejects_malformed_mappings(self):
+        per_core = [
+            {"core": core, "delay_cycles": value}
+            for core, value in enumerate((1.0, 2.0))
+        ]
+        cases = {
+            "missing": ({0: 1.0}, "keys must exactly match"),
+            "extra": ({0: 0.5, 1: 0.5, 2: 0.0}, "keys must exactly match"),
+            "negative": ({0: 1.1, 1: -0.1}, "finite and non-negative"),
+            "nonfinite": ({0: math.inf, 1: 0.0}, "finite and non-negative"),
+            "not normalized": ({0: 0.4, 1: 0.4}, "sum to one"),
+        }
+        for label, (weights, message) in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, message):
+                    aggregate_wire_cycles(per_core, "traffic-weighted", weights)
+
+    def test_zero_traffic_weight_is_valid_when_mapping_is_normalized(self):
+        per_core = [
+            {"core": 0, "delay_cycles": 1.0},
+            {"core": 1, "delay_cycles": 8.0},
+        ]
+        self.assertEqual(
+            aggregate_wire_cycles(
+                per_core, "traffic-weighted", {"0": 1.0, "1": 0.0}
+            ),
+            1.0,
+        )
+
+    def test_derive_layout_delays_records_weighted_contributions(self):
+        layout = baseline_layout(self.model())
+        weights = {0: 0.7, 1: 0.1, 2: 0.1, 3: 0.1}
+        delays = derive_layout_delays(
+            layout, communication_weights=weights
+        )
+        expected = sum(
+            weights[item["core"]] * item["delay_cycles"]
+            for item in delays["per_core"]
+        )
+        self.assertAlmostEqual(
+            delays["traffic_weighted_wire_cycles_unrounded"], expected
+        )
+        self.assertEqual(
+            delays["traffic_weighted_wire_cycles"],
+            int(math.floor(expected + 0.5)),
+        )
+        for item in delays["per_core"]:
+            self.assertEqual(item["communication_weight"], weights[item["core"]])
+            self.assertAlmostEqual(
+                item["weighted_delay_cycles_contribution"],
+                weights[item["core"]] * item["delay_cycles"],
+            )
+
+    def test_communication_weights_are_read_only_from_available_profile(self):
+        model = self.model()
+        model["communication_profile"] = {
+            "status": "available",
+            "per_core": {
+                "0": {"normalized_weight": 0.7},
+                "1": {"normalized_weight": 0.1},
+                "2": {"normalized_weight": 0.1},
+                "3": {"normalized_weight": 0.1},
+            },
+        }
+        self.assertEqual(
+            communication_weights_from_model(model, required=True),
+            {0: 0.7, 1: 0.1, 2: 0.1, 3: 0.1},
+        )
+        model["communication_profile"]["status"] = "unavailable"
+        self.assertIsNone(communication_weights_from_model(model, required=False))
+        with self.assertRaisesRegex(ValueError, "communication profile unavailable"):
+            communication_weights_from_model(model, required=True)
 
     def test_area_quadrature_proxy_is_finite_and_geometry_sensitive(self):
         layout = baseline_layout(self.model())
