@@ -1695,11 +1695,80 @@ class HotSpotPrecisionPatchTests(unittest.TestCase):
             / "patches/hotspot/0001-six-decimal-temperature-output.patch"
         )
         text = patch_path.read_text(encoding="utf-8")
-        self.assertNotIn('+    fprintf(fp, "%.2f', text)
-        self.assertGreaterEqual(text.count("%.6f"), 11)
-        self.assertIn("hotspot.c", text)
-        self.assertIn("temperature_grid.c", text)
-        self.assertIn("temperature_block.c", text)
+        expected_changes = {
+            "hotspot.c": (
+                (
+                    '    fprintf(fp, "%.2f\\t", vals[i]);',
+                    '  fprintf(fp, "%.2f\\n", vals[i]);',
+                ),
+                (
+                    '    fprintf(fp, "%.6f\\t", vals[i]);',
+                    '  fprintf(fp, "%.6f\\n", vals[i]);',
+                ),
+            ),
+            "temperature_grid.c": (
+                (
+                    '          fprintf(fp, "%d\\t%.2f\\n", i*model->cols+j,',
+                    '        fprintf(grid_transient_fp, "%d\\t%.2f\\n", i*model->cols + j, model->last_trans->cuboid[l][i][j]);',
+                    '        fprintf(fp, "%s%s\\t%.2f\\n", str,',
+                    '      fprintf(fp, "%s\\t%.2f\\n", str, temp[base+i]);',
+                ),
+                (
+                    '          fprintf(fp, "%d\\t%.6f\\n", i*model->cols+j,',
+                    '        fprintf(grid_transient_fp, "%d\\t%.6f\\n", i*model->cols + j, model->last_trans->cuboid[l][i][j]);',
+                    '        fprintf(fp, "%s%s\\t%.6f\\n", str,',
+                    '      fprintf(fp, "%s\\t%.6f\\n", str, temp[base+i]);',
+                ),
+            ),
+            "temperature_block.c": (
+                (
+                    '\t\tfprintf(fp, "%s\\t%.2f\\n", flp->units[i].name, temp[i]);',
+                    '\t\tfprintf(fp, "iface_%s\\t%.2f\\n", flp->units[i].name, temp[IFACE*flp->n_units+i]);',
+                    '\t\tfprintf(fp, "hsp_%s\\t%.2f\\n", flp->units[i].name, temp[HSP*flp->n_units+i]);',
+                    '\t\tfprintf(fp, "hsink_%s\\t%.2f\\n", flp->units[i].name, temp[HSINK*flp->n_units+i]);',
+                    '\t\tfprintf(fp, "%s\\t%.2f\\n", str, temp[i+NL*flp->n_units]);',
+                ),
+                (
+                    '\t\tfprintf(fp, "%s\\t%.6f\\n", flp->units[i].name, temp[i]);',
+                    '\t\tfprintf(fp, "iface_%s\\t%.6f\\n", flp->units[i].name, temp[IFACE*flp->n_units+i]);',
+                    '\t\tfprintf(fp, "hsp_%s\\t%.6f\\n", flp->units[i].name, temp[HSP*flp->n_units+i]);',
+                    '\t\tfprintf(fp, "hsink_%s\\t%.6f\\n", flp->units[i].name, temp[HSINK*flp->n_units+i]);',
+                    '\t\tfprintf(fp, "%s\\t%.6f\\n", str, temp[i+NL*flp->n_units]);',
+                ),
+            ),
+        }
+        patch_files = []
+        format_changes = {}
+        current_file = None
+        for line in text.splitlines():
+            if line.startswith("diff --git "):
+                _, _, old_path, new_path = line.split()
+                self.assertTrue(old_path.startswith("a/"))
+                self.assertTrue(new_path.startswith("b/"))
+                self.assertEqual(old_path[2:], new_path[2:])
+                current_file = new_path[2:]
+                patch_files.append(current_file)
+                format_changes[current_file] = {"-": [], "+": []}
+            elif (
+                current_file is not None
+                and line[:1] in {"-", "+"}
+                and not line.startswith(("---", "+++"))
+                and any(
+                    marker in line
+                    for marker in ("fprintf(", "printf(", "sprintf(", "snprintf(", "%")
+                )
+            ):
+                format_changes[current_file][line[0]].append(line[1:])
+
+        self.assertEqual(patch_files, list(expected_changes))
+        self.assertEqual(
+            {filename: len(changes["+"]) for filename, changes in format_changes.items()},
+            {"hotspot.c": 2, "temperature_grid.c": 4, "temperature_block.c": 5},
+        )
+        self.assertEqual(sum(len(changes["+"]) for changes in format_changes.values()), 11)
+        for filename, (removed, added) in expected_changes.items():
+            self.assertEqual(format_changes[filename]["-"], list(removed))
+            self.assertEqual(format_changes[filename]["+"], list(added))
 
         source_root = Path(__file__).resolve().parents[1] / "tools/src/hotspot"
         if not source_root.exists():
