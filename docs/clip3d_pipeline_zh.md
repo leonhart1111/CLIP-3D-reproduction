@@ -227,6 +227,42 @@ BIPS2 = IPC2 × f_sus_GHz
 
 因为 IPC 的单位是“指令/周期”，GHz 是“十亿周期/秒”，两者相乘正好是“十亿指令/秒”。
 
+#### 可选的通信频率加权模式
+
+默认和论文对齐的模式仍是四条核心到 L2 路径的算术平均。非正式探索配置还可设置：
+
+```json
+"delay": {
+  "wire_aggregation": "traffic-weighted"
+}
+```
+
+程序从已完成 R1 的最终 `stats.txt` 中读取：
+
+```text
+system.l2.demandAccesses::cpu<i>.data
+system.l2.demandAccesses::cpu<i>.inst
+```
+
+同一核心同时存在两项时先求和，令该核心的访问量为 `A_i`，然后计算：
+
+```text
+q_i = A_i / sum_j(A_j)
+tau_traffic = sum_i(q_i * tau_i)
+```
+
+其中 `tau_i` 仍由该核心到 L2 的实际布局距离和 `0.69×R×C×L_i²` 得到。
+同一个 `tau_traffic` 同时进入公式(15)的优化器线延迟项和最终 `r2_latency.json`。
+因此不需要重跑 R1；每次 lifting 新生成的 `modules.json` 会保存原始访问次数、
+精确 counter 名、归一化权重、总访问次数、源 `stats.txt` 以及
+`instruction_window_scope`，便于审计。
+
+该模式有三项边界。第一，它是 profile-guided 研究扩展，不是论文严格验收数据，
+任何 `formal_validation.accepted=true` 配置都会拒绝它。第二，缺失任一核心、负数、
+非有限数或全零画像都会显式失败，绝不回退到等权。第三，当前 gem5 拓扑只有一个
+共享 `L2XBar`，所以 R2 注入的是访问频率加权后的单一整数周期，不是每核心独立
+延迟。通信次数也不等同于“某条路径增加一周期会造成多少 IPC 损失”的因果敏感度。
+
 ### 3.9 解析式布局器
 
 程序：`workflow/floorplan/optimize_layout.py`
@@ -253,7 +289,7 @@ BIPS2 = IPC2 × f_sus_GHz
 | `mcpat/input.xml` | 从 gem5 统计生成的四核心 McPAT 输入 |
 | `mcpat/mcpat.json` | 可机读的逐模块面积和功耗 |
 | `cacti/cacti_characterization.json` | CACTI ns、周期、能耗和面积 |
-| `modules.json` | 统一模块模型、IPC1、面积校准和 gamma |
+| `modules.json` | 统一模块模型、IPC1、面积校准、gamma，以及可审计的逐核心共享L2通信画像 |
 | `hotspot/layout.json` | 每个模块的 `(x,y,w,h,tier)` |
 | `hotspot/power_grid.json` | 每个单元的动态/泄漏/总功耗 |
 | `hotspot/hotspot_manifest.json` | HotSpot 文件路径、论文参数、假设和守恒残差 |

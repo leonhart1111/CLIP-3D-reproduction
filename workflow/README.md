@@ -25,3 +25,11 @@
 - `thermal/calibrate_stack_components.py`：硅与TIM热阻有限差分可辨识性检查；
 - `thermal/calibrate_proxy.py`：布局位置代理拟合，并显式拒绝没有跨层样本时对
   beta 的伪辨识。这些工具不会修改 McPAT 输出功耗。
+
+可选的通信频率加权扩展由
+`configs/experiments/clip3d_constrained_5p0_raw_power_p1_lambda0020119_traffic_weighted_exploratory.json`
+启用。它直接复用完成的 R1 中每个 CPU 的共享 L2 `demandAccesses`，令
+`q_i=A_i/sum(A)`，并以 `sum(q_i*tau_i)` 替代公式(15)和 R2 中的算术平均线延迟。
+`modules.json` 会保留原始计数、精确 counter 名、权重、统计文件和测量窗口。
+这是非正式研究扩展；R2 仍把结果作为一个标量写入共享 `L2XBar`，不能解释为
+每核心独立延迟或 IPC 因果敏感度。

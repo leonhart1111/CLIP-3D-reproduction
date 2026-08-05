@@ -1506,6 +1506,22 @@ class FormalGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "maximum.*R2 sensitivity"):
             validate_config(config, "clip3d")
 
+    def test_traffic_weighted_exploratory_config_is_non_formal(self):
+        config = read_json(Path(
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_"
+            "lambda0020119_traffic_weighted_exploratory.json"
+        ))
+        self.assertEqual(
+            config["delay"]["wire_aggregation"], "traffic-weighted"
+        )
+        self.assertTrue(config["experiment_classification"]["non_formal"])
+        self.assertFalse(config["experiment_classification"]["paper_equivalent"])
+        self.assertFalse(config["formal_validation"]["accepted"])
+        self.assertGreater(config["layout_optimizer"]["lambda_wire"], 0.0)
+        self.assertEqual(config["layout_optimizer"]["allowed_l2_tiers"], [1])
+        validate_config(config, "clip3d")
+
     def test_promotion_rejects_failed_proxy(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
