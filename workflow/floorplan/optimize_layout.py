@@ -16,6 +16,8 @@ from pathlib import Path
 from workflow.common import read_json, write_json
 from workflow.floorplan.generate_hotspot_inputs import baseline_layout, check_geometry, overlap
 from workflow.floorplan.layout_metrics import (
+    aggregate_wire_cycles,
+    communication_weights_from_model,
     derive_layout_delays,
     mean_wire_cycles as layout_mean_wire_cycles,
     round_wire_cycles,
@@ -113,7 +115,8 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
              proxy_spatial_model: str = "center",
              proxy_quadrature_order: int = 2,
              wire_objective: str = "continuous",
-             wire_rounding: str = "nearest") -> dict:
+             wire_rounding: str = "nearest",
+             wire_aggregation: str = "mean") -> dict:
     model = read_json(model_path)
     base = baseline_layout(model, utilization)
     side = base["die_width_mm"]
@@ -124,6 +127,14 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
         raise ValueError("L2 geometry does not fit inside the die")
     if wire_objective not in ("continuous", "r2-quantized"):
         raise ValueError("wire_objective must be continuous or r2-quantized")
+    if wire_aggregation not in ("mean", "traffic-weighted"):
+        raise ValueError(
+            "optimizer wire_aggregation must be mean or traffic-weighted; "
+            "maximum is only a conservative R2 sensitivity mode"
+        )
+    communication_weights = communication_weights_from_model(
+        model, required=wire_aggregation == "traffic-weighted"
+    )
     starts = ((0.0, 0.0), (upper[0] / 2.0, upper[1] / 2.0), upper)
     candidates = []
     try:
@@ -155,7 +166,16 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
     baseline_frequency = closed_form_frequency(
         baseline_proxy, model["gamma"], f0_ghz, fmin_ghz, tsafe, ambient
     )[0]
-    baseline_delays = derive_layout_delays(base, f0_ghz, wire_rounding)
+    baseline_delays = derive_layout_delays(
+        base, f0_ghz, wire_rounding, communication_weights
+    )
+
+    def selected_wire_cycles(modules: list[dict]) -> tuple[float, float]:
+        mean_cycles, per_core = layout_mean_wire_cycles(modules, f0_ghz)
+        selected_cycles = aggregate_wire_cycles(
+            per_core, wire_aggregation, communication_weights
+        )
+        return mean_cycles, selected_cycles
 
     for tier in tiers:
         def objective(point):
@@ -167,7 +187,7 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                                       proxy_quadrature_order)
             frequency = closed_form_frequency(proxy, model["gamma"], f0_ghz,
                                                fmin_ghz, tsafe, ambient)[0]
-            wire = layout_mean_wire_cycles(modules, f0_ghz)[0]
+            _, wire = selected_wire_cycles(modules)
             objective_wire = (
                 wire if wire_objective == "continuous"
                 else round_wire_cycles(wire, wire_rounding)
@@ -197,21 +217,25 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                 1.0 - model["gamma"]
             ) * (fmin_ghz / f0_ghz)
             tmax_at_floor = ambient + (proxy - ambient) * floor_scale
-            wire = layout_mean_wire_cycles(modules, f0_ghz)[0]
+            mean_wire, wire = selected_wire_cycles(modules)
             objective_wire = (
                 wire if wire_objective == "continuous"
                 else round_wire_cycles(wire, wire_rounding)
             )
-            candidates.append({"tier": tier, "start": start_name, "x_mm": point[0],
-                               "y_mm": point[1], "loss": value, "evaluations": evaluations,
-                               "collision_mm2": collision, "proxy_tmax_c": proxy,
-                               "proxy_frequency_ghz": frequency,
-                               "proxy_unclamped_frequency_ghz": raw_frequency,
-                               "proxy_frequency_state": frequency_state,
-                               "proxy_tmax_at_fmin_c": tmax_at_floor,
-                               "proxy_thermal_feasible_at_fmin": tmax_at_floor <= tsafe,
-                               "mean_wire_cycles": wire,
-                               "wire_objective_cycles": objective_wire})
+            candidate = {"tier": tier, "start": start_name, "x_mm": point[0],
+                         "y_mm": point[1], "loss": value, "evaluations": evaluations,
+                         "collision_mm2": collision, "proxy_tmax_c": proxy,
+                         "proxy_frequency_ghz": frequency,
+                         "proxy_unclamped_frequency_ghz": raw_frequency,
+                         "proxy_frequency_state": frequency_state,
+                         "proxy_tmax_at_fmin_c": tmax_at_floor,
+                         "proxy_thermal_feasible_at_fmin": tmax_at_floor <= tsafe,
+                         "mean_wire_cycles": mean_wire,
+                         "wire_aggregation": wire_aggregation,
+                         "wire_objective_cycles": objective_wire}
+            if wire_aggregation == "traffic-weighted":
+                candidate["traffic_weighted_wire_cycles"] = wire
+            candidates.append(candidate)
     legal = [candidate for candidate in candidates if candidate["collision_mm2"] <= 1e-8]
     if not legal:
         raise RuntimeError("layout optimizer found no non-overlapping L2 placement")
@@ -221,7 +245,9 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
     optimized["modules"] = fixed + [dict(original, tier=best["tier"],
                                           x_mm=best["x_mm"], y_mm=best["y_mm"])]
     check_geometry(optimized["modules"], side)
-    optimized_delays = derive_layout_delays(optimized, f0_ghz, wire_rounding)
+    optimized_delays = derive_layout_delays(
+        optimized, f0_ghz, wire_rounding, communication_weights
+    )
     write_json(output_layout, optimized)
     total_power = float(model["totals"]["total_power_w"])
     movable_power = float(original["total_power_w"])
@@ -233,16 +259,23 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
         baseline_delays["maximum_wire_cycles"]
         != optimized_delays["maximum_wire_cycles"]
     )
+    selected_cycle_field = (
+        "traffic_weighted_wire_cycles"
+        if wire_aggregation == "traffic-weighted" else "wire_cycles"
+    )
+    selected_cycle_changed = (
+        baseline_delays[selected_cycle_field] != optimized_delays[selected_cycle_field]
+    )
     cautions = []
     if movable_fraction < 0.05:
         cautions.append(
             "Movable L2 power is below 5% of total power; large thermal gains "
             "are not supported unless the fixed high-power blocks or inputs change."
         )
-    if not mean_cycle_changed:
+    if not selected_cycle_changed:
         cautions.append(
-            "Continuous mean wire delay changed without changing the rounded mean "
-            "cycle used by paper-mode gem5 R2."
+            f"Continuous {wire_aggregation} wire delay changed without changing "
+            "the rounded cycle used by gem5 R2."
         )
     if maximum_cycle_changed and not mean_cycle_changed:
         cautions.append(
@@ -261,6 +294,7 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                        "proxy_spatial_model": proxy_spatial_model,
                        "proxy_quadrature_order": proxy_quadrature_order,
                        "wire_objective": wire_objective,
+                       "wire_aggregation": wire_aggregation,
                        "wire_rounding": wire_rounding,
                        "wire_r_ohm_per_mm": 50.0, "wire_c_f_per_mm": 200e-15},
         "baseline": {
@@ -290,11 +324,23 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
             "movable_l2_power_fraction": movable_fraction,
             "paper_mean_r2_cycle_changed": mean_cycle_changed,
             "conservative_maximum_r2_cycle_changed": maximum_cycle_changed,
+            "selected_r2_cycle_changed": selected_cycle_changed,
             "optimized_layout_delays": optimized_delays,
             "cautions": cautions,
         },
         "warning": "proxy_tmax_c guides search only; run HotSpot on output_layout for reportable Tmax.",
     }
+    if wire_aggregation == "traffic-weighted":
+        report["predicted_deltas"].update({
+            "traffic_weighted_wire_cycles_unrounded": (
+                optimized_delays["traffic_weighted_wire_cycles_unrounded"]
+                - baseline_delays["traffic_weighted_wire_cycles_unrounded"]
+            ),
+            "traffic_weighted_wire_cycles_rounded": (
+                optimized_delays["traffic_weighted_wire_cycles"]
+                - baseline_delays["traffic_weighted_wire_cycles"]
+            ),
+        })
     write_json(report_path, report)
     return report
 
@@ -326,6 +372,9 @@ def main() -> None:
         default="continuous",
     )
     parser.add_argument("--wire-rounding", choices=("nearest", "ceil", "floor"), default="nearest")
+    parser.add_argument(
+        "--wire-aggregation", choices=("mean", "traffic-weighted"), default="mean"
+    )
     args = parser.parse_args()
     result = optimize(args.modules, args.output_layout, args.report, args.utilization,
                       args.ambient_c, args.r_convec, args.alpha, args.beta,
@@ -335,7 +384,8 @@ def main() -> None:
                       proxy_spatial_model=args.proxy_spatial_model,
                       proxy_quadrature_order=args.proxy_quadrature_order,
                       wire_objective=args.wire_objective,
-                      wire_rounding=args.wire_rounding)
+                      wire_rounding=args.wire_rounding,
+                      wire_aggregation=args.wire_aggregation)
     selected = result["selected"]
     print(f"Selected tier={selected['tier']} x={selected['x_mm']:.4f} y={selected['y_mm']:.4f} mm")
 

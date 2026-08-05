@@ -33,6 +33,7 @@ from workflow.r2.calibrate_lambda_wire import (
     calibrate_series as calibrate_lambda_wire_series,
     main as calibrate_lambda_wire_main,
 )
+from workflow.r2.build_latency_vector import build_vector
 from workflow.r2.run_wire_sensitivity import (
     build_sensitivity_vectors,
     run_series,
@@ -1058,6 +1059,89 @@ class GridTests(unittest.TestCase):
         self.assertIsNone(communication_weights_from_model(model, required=False))
         with self.assertRaisesRegex(ValueError, "communication profile unavailable"):
             communication_weights_from_model(model, required=True)
+
+    def test_optimizer_and_r2_use_the_same_traffic_weighted_aggregate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            model["architecture"] = {
+                "num_cores": 4,
+                "l1i_size": "32kB",
+                "l1d_size": "32kB",
+                "l2_size": "512kB",
+            }
+            weights = {0: 0.7, 1: 0.1, 2: 0.1, 3: 0.1}
+            model["communication_profile"] = {
+                "status": "available",
+                "source_stats": "/tmp/r1/stats.txt",
+                "instruction_window_scope": "roi",
+                "counter_family": "system.l2.demandAccesses per CPU requestor",
+                "per_core": {
+                    str(core): {
+                        "matched_counters": [
+                            f"system.l2.demandAccesses::cpu{core}.data"
+                        ],
+                        "raw_demand_accesses": weight * 100.0,
+                        "normalized_weight": weight,
+                    }
+                    for core, weight in weights.items()
+                },
+                "total_demand_accesses": 100.0,
+                "missing_cores": [],
+                "diagnostics": [],
+            }
+            modules_path = root / "modules.json"
+            write_json(modules_path, model)
+            layout_path = root / "layout.json"
+            report = optimize(
+                modules_path, layout_path, root / "optimizer.json",
+                allowed_l2_tiers=[1], require_scipy=False,
+                wire_aggregation="traffic-weighted",
+            )
+            cacti_path = root / "cacti.json"
+            write_json(cacti_path, {
+                "frequency_ghz": 2.0,
+                "records": [
+                    {"level": "l1d", "size": "32kB",
+                     "size_bytes": 32 * 1024, "access_cycles": 2},
+                    {"level": "l2", "size": "512kB",
+                     "size_bytes": 512 * 1024, "access_cycles": 4},
+                ],
+            })
+            vector = build_vector(
+                modules_path, cacti_path, root / "latency.json",
+                layout_path=layout_path, wire_aggregation="traffic-weighted",
+            )
+            optimized_delays = report["observability_diagnostics"][
+                "optimized_layout_delays"
+            ]
+            self.assertEqual(
+                vector["components_cycles"]["layout_wire"],
+                vector["layout_delays"]["traffic_weighted_wire_cycles"],
+            )
+            self.assertEqual(
+                optimized_delays["traffic_weighted_wire_cycles"],
+                vector["layout_delays"]["traffic_weighted_wire_cycles"],
+            )
+            self.assertAlmostEqual(
+                report["selected"]["wire_objective_cycles"],
+                report["selected"]["traffic_weighted_wire_cycles"],
+            )
+            self.assertEqual(
+                vector["wire_cycle_aggregation_for_r2"], "traffic-weighted"
+            )
+            expected_xbar = (
+                vector["components_cycles"]["l2_arbitration"]
+                + vector["components_cycles"]["tsv"]
+                + vector["components_cycles"]["layout_wire"]
+            )
+            self.assertEqual(
+                vector["gem5_overrides"]["xbar_forward_latency"], expected_xbar
+            )
+            self.assertTrue(any(
+                "one scalar shared-L2XBar latency" in assumption
+                for assumption in vector["reproduction_assumptions"]
+            ))
 
     def test_area_quadrature_proxy_is_finite_and_geometry_sensitive(self):
         layout = baseline_layout(self.model())

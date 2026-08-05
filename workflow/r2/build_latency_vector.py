@@ -7,7 +7,10 @@ import argparse
 from pathlib import Path
 
 from workflow.common import parse_size_bytes, read_json, write_json
-from workflow.floorplan.layout_metrics import derive_layout_delays
+from workflow.floorplan.layout_metrics import (
+    communication_weights_from_model,
+    derive_layout_delays,
+)
 
 
 def lookup(cacti: dict, level: str, size: str) -> dict:
@@ -32,21 +35,28 @@ def build_vector(modules: Path, cacti_path: Path, output: Path,
     l1d = lookup(cacti, "l1d", metadata["l1d_size"])
     l2 = lookup(cacti, "l2", metadata["l2_size"])
     cores = int(metadata["num_cores"])
-    if wire_aggregation not in ("mean", "maximum"):
-        raise ValueError("wire_aggregation must be 'mean' or 'maximum'")
+    if wire_aggregation not in ("mean", "maximum", "traffic-weighted"):
+        raise ValueError(
+            "wire_aggregation must be 'mean', 'maximum', or 'traffic-weighted'"
+        )
+    communication_weights = communication_weights_from_model(
+        model, required=wire_aggregation == "traffic-weighted"
+    )
     layout_delays = None
     if layout_path is not None:
         layout_delays = derive_layout_delays(
-            read_json(layout_path), float(cacti["frequency_ghz"]), wire_rounding
+            read_json(layout_path), float(cacti["frequency_ghz"]), wire_rounding,
+            communication_weights,
         )
         if tsv_hops is None:
             tsv_hops = int(layout_delays["tsv_hops"])
         if wire_cycles is None:
-            wire_cycles = int(
-                layout_delays["wire_cycles"]
-                if wire_aggregation == "mean"
-                else layout_delays["maximum_wire_cycles"]
-            )
+            selected_fields = {
+                "mean": "wire_cycles",
+                "maximum": "maximum_wire_cycles",
+                "traffic-weighted": "traffic_weighted_wire_cycles",
+            }
+            wire_cycles = int(layout_delays[selected_fields[wire_aggregation]])
     if tsv_hops is None:
         tsv_hops = 1
     if wire_cycles is None:
@@ -92,11 +102,20 @@ def build_vector(modules: Path, cacti_path: Path, output: Path,
         "reproduction_assumptions": [
             "CACTI tag/data values are both assigned the rounded array access cycles.",
             "Arbitration, TSV, and layout wire penalties are placed in xbar forward_latency only.",
-            (
-                "Mean Bakoglu-Meindl wire delay is used for the paper equation-(15) mode."
-                if wire_aggregation == "mean" else
-                "Maximum core-to-L2 wire delay is used as a conservative shared-xbar timing bound."
-            ),
+            {
+                "mean": (
+                    "Mean Bakoglu-Meindl wire delay is used for the paper "
+                    "equation-(15) mode."
+                ),
+                "maximum": (
+                    "Maximum core-to-L2 wire delay is used as a conservative "
+                    "shared-xbar timing bound."
+                ),
+                "traffic-weighted": (
+                    "Demand-access-weighted core-to-L2 delay is represented by "
+                    "one scalar shared-L2XBar latency; per-core latency is not modeled."
+                ),
+            }[wire_aggregation],
             "The selected wire delay is discretized using the recorded rounding policy.",
         ],
     }
@@ -117,7 +136,10 @@ def main() -> None:
     parser.add_argument("--wire-rounding", choices=("nearest", "ceil", "floor"), default="nearest")
     parser.add_argument("--cycles-per-tsv", type=int, default=2)
     parser.add_argument("--l1-pipeline-cycles", type=int, default=1)
-    parser.add_argument("--wire-aggregation", choices=("mean", "maximum"), default="mean")
+    parser.add_argument(
+        "--wire-aggregation", choices=("mean", "maximum", "traffic-weighted"),
+        default="mean",
+    )
     args = parser.parse_args()
     result = build_vector(args.modules, args.cacti, args.output,
                           args.tsv_hops, args.wire_cycles,
