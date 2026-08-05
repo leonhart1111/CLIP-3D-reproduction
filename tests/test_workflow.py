@@ -13,9 +13,13 @@ from workflow.analysis.summarize_sweep import summarize
 from workflow.analysis.prepare_raw_power_validation import prepare
 from workflow.analysis.evaluate_operational_proxy import evaluate as evaluate_operational_proxy
 from workflow.analysis.promote_validated_config import promote
-from workflow.common import read_json, write_json
+from workflow.common import parse_gem5_stats, read_json, write_json
 from workflow.floorplan.comparison_layouts import generate as generate_comparison_layouts
-from workflow.floorplan.build_module_model import apply_physical_areas
+from workflow.floorplan.build_module_model import (
+    apply_physical_areas,
+    build_model,
+    extract_communication_profile,
+)
 from workflow.floorplan.generate_hotspot_inputs import baseline_layout, grid_power, materialize
 from workflow.floorplan.layout_metrics import derive_layout_delays
 from workflow.floorplan.optimize_layout import optimize, proxy_temperature
@@ -453,6 +457,150 @@ class FrequencyTests(unittest.TestCase):
 
 
 class ParserTests(unittest.TestCase):
+    def test_stats_parser_can_preserve_nonfinite_values_for_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            stats_path = Path(temporary) / "stats.txt"
+            stats_path.write_text(
+                "finite.counter 12\nnonfinite.counter inf\n", encoding="utf-8"
+            )
+            self.assertEqual(parse_gem5_stats(stats_path), {"finite.counter": 12.0})
+            self.assertEqual(
+                parse_gem5_stats(stats_path, include_nonfinite=True),
+                {"finite.counter": 12.0, "nonfinite.counter": math.inf},
+            )
+
+    def test_communication_profile_sums_data_and_instruction_counters(self):
+        stats = {
+            "system.l2.demandAccesses::cpu0.data": 30.0,
+            "system.l2.demandAccesses::cpu0.inst": 10.0,
+            "system.l2.demandAccesses::cpu1.data": 60.0,
+        }
+        profile = extract_communication_profile(
+            stats, 2, Path("/tmp/r1/stats.txt"), "roi", required=True
+        )
+        self.assertEqual(profile["status"], "available")
+        self.assertEqual(profile["total_demand_accesses"], 100.0)
+        self.assertEqual(profile["per_core"]["0"]["raw_demand_accesses"], 40.0)
+        self.assertEqual(profile["per_core"]["0"]["normalized_weight"], 0.4)
+        self.assertEqual(profile["per_core"]["1"]["normalized_weight"], 0.6)
+        self.assertEqual(profile["per_core"]["0"]["matched_counters"], [
+            "system.l2.demandAccesses::cpu0.data",
+            "system.l2.demandAccesses::cpu0.inst",
+        ])
+        self.assertEqual(profile["source_stats"], "/tmp/r1/stats.txt")
+        self.assertEqual(profile["instruction_window_scope"], "roi")
+        self.assertEqual(
+            profile["counter_family"],
+            "system.l2.demandAccesses per CPU requestor",
+        )
+
+    def test_optional_communication_profile_records_invalid_inputs(self):
+        cases = {
+            "missing core": (
+                {"system.l2.demandAccesses::cpu0.data": 1.0},
+                "missing shared-L2 demand counter for core 1",
+            ),
+            "negative": ({
+                "system.l2.demandAccesses::cpu0.data": -1.0,
+                "system.l2.demandAccesses::cpu1.data": 2.0,
+            }, "negative"),
+            "non-finite": ({
+                "system.l2.demandAccesses::cpu0.data": math.inf,
+                "system.l2.demandAccesses::cpu1.data": 2.0,
+            }, "non-finite"),
+            "all zero": ({
+                "system.l2.demandAccesses::cpu0.data": 0.0,
+                "system.l2.demandAccesses::cpu1.data": 0.0,
+            }, "total demand accesses must be positive"),
+        }
+        for label, (stats, message) in cases.items():
+            with self.subTest(label=label):
+                profile = extract_communication_profile(
+                    stats, 2, Path("/tmp/stats.txt"), "roi", required=False
+                )
+                self.assertEqual(profile["status"], "unavailable")
+                self.assertTrue(
+                    any(message in item for item in profile["diagnostics"]),
+                    profile["diagnostics"],
+                )
+
+    def test_required_communication_profile_rejects_invalid_inputs(self):
+        cases = ({
+            "system.l2.demandAccesses::cpu0.data": 1.0,
+        }, {
+            "system.l2.demandAccesses::cpu0.data": -1.0,
+            "system.l2.demandAccesses::cpu1.data": 2.0,
+        }, {
+            "system.l2.demandAccesses::cpu0.data": math.nan,
+            "system.l2.demandAccesses::cpu1.data": 2.0,
+        }, {
+            "system.l2.demandAccesses::cpu0.data": 0.0,
+            "system.l2.demandAccesses::cpu1.data": 0.0,
+        })
+        for stats in cases:
+            with self.subTest(stats=stats):
+                with self.assertRaisesRegex(
+                        ValueError, "communication profile unavailable"):
+                    extract_communication_profile(
+                        stats, 2, Path("/tmp/stats.txt"), "roi", required=True
+                    )
+
+    def test_build_model_writes_available_communication_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            r1_dir = root / "r1"
+            r1_dir.mkdir()
+            write_json(r1_dir / "r1_metadata.json", {
+                "num_cores": 2,
+                "l1i_size": "32kB",
+                "l1d_size": "32kB",
+                "l2_size": "512kB",
+                "instruction_window_scope": "roi",
+            })
+            (r1_dir / "stats.txt").write_text(
+                "system.cpu0.commitStats0.numInsts 100\n"
+                "system.cpu1.commitStats0.numInsts 100\n"
+                "system.cpu0.numCycles 100\n"
+                "system.cpu1.numCycles 100\n"
+                "system.l2.demandAccesses::cpu0.data 25\n"
+                "system.l2.demandAccesses::cpu1.data 75\n",
+                encoding="utf-8",
+            )
+            mcpat_path = root / "mcpat.json"
+            write_json(mcpat_path, {
+                "modules": [
+                    {"name": "core0_logic", "kind": "core_logic", "core": 0,
+                     "area_mm2": 1.0, "dynamic_power_w": 1.0,
+                     "leakage_power_w": 0.1, "total_power_w": 1.1},
+                    {"name": "core1_logic", "kind": "core_logic", "core": 1,
+                     "area_mm2": 1.0, "dynamic_power_w": 1.0,
+                     "leakage_power_w": 0.1, "total_power_w": 1.1},
+                    {"name": "shared_l2", "kind": "l2", "area_mm2": 1.0,
+                     "dynamic_power_w": 0.1, "leakage_power_w": 0.1,
+                     "total_power_w": 0.2},
+                ],
+                "power_provenance": {"postprocessing": "none"},
+            })
+            cacti_path = root / "cacti.json"
+            write_json(cacti_path, {"records": [
+                {"level": "l1d", "size": "32kB", "size_bytes": 32 * 1024,
+                 "area_mm2": 0.2, "width_mm": 0.5, "height_mm": 0.4},
+                {"level": "l2", "size": "512kB", "size_bytes": 512 * 1024,
+                 "area_mm2": 1.0, "width_mm": 1.0, "height_mm": 1.0},
+            ]})
+            output = root / "modules.json"
+            model = build_model(
+                r1_dir, mcpat_path, cacti_path, output, area_scale=1.0,
+                require_communication_profile=True,
+            )
+            self.assertEqual(model, read_json(output))
+            self.assertEqual(model["communication_profile"]["status"], "available")
+            self.assertEqual(
+                model["communication_profile"]["per_core"]["1"]
+                     ["normalized_weight"],
+                0.75,
+            )
+
     def test_cacti_parser(self):
         text = """Access time (ns): 1.5
 Cycle time (ns): 2.0

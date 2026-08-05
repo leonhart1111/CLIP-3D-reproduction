@@ -51,8 +51,14 @@ def parse_frequency_ghz(text: str | int | float) -> float:
     return value if match.group(2).lower() == "ghz" else value / 1000.0
 
 
-def parse_gem5_stats(path: Path | str) -> dict[str, float]:
-    """Read the last statistics section into a flat name -> finite-number map."""
+def parse_gem5_stats(path: Path | str,
+                     include_nonfinite: bool = False) -> dict[str, float]:
+    """Read the last statistics section into a flat name -> number map.
+
+    Normal workflow consumers retain the historical finite-only behavior.
+    Validation code may request non-finite values so malformed counters are
+    distinguished from counters that are absent.
+    """
     sections = Path(path).read_text(encoding="utf-8").split(
         "---------- Begin Simulation Statistics ----------"
     )
@@ -68,7 +74,7 @@ def parse_gem5_stats(path: Path | str) -> dict[str, float]:
             value = float(fields[1])
         except ValueError:
             continue
-        if math.isfinite(value):
+        if math.isfinite(value) or include_nonfinite:
             result[fields[0]] = value
     return result
 
@@ -89,4 +95,3 @@ def aggregate_ipc(stats: dict[str, float], cores: int = 4) -> float:
 
 def positive(value: float, floor: float = 0.0) -> float:
     return max(float(value), floor)
-
