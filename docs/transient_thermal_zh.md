@@ -1,4 +1,4 @@
-# 10 ms瞬态热仿真旁路
+# 可配置时间窗瞬态热仿真旁路
 
 该功能是论文稳态复现之外的可选验证。默认关闭，不改变原来的：
 
@@ -9,7 +9,7 @@ R1 → McPAT → 布局 → 稳态HotSpot → f_sus → R2
 开启后，稳态流水线完成后再执行独立旁路：
 
 ```text
-专用瞬态R1（10 ms累计统计）
+专用瞬态R1（按 --sample-ms 设置的周期累计统计）
 → 相邻快照相减得到窗口统计
 → 每窗口McPAT
 → 按最终布局栅格化多行功耗
@@ -32,7 +32,7 @@ python -m workflow.run_lifting_pipeline \
   --config "$CFG" \
   --layout-method fixed-bin \
   --transient true \
-  --transient-sample-ms 10 \
+  --transient-sample-ms 2 \
   --transient-initial-temperature steady
 ```
 
@@ -53,7 +53,7 @@ $OUT/transient/r1/
 python -m workflow.transient.run_transient_r1 \
   --source-r1-dir "$R1" \
   --output-dir runs/transient_r1/matmul_32k_512k \
-  --sample-ms 10
+  --sample-ms 2
 ```
 
 再由主入口复用：
@@ -65,7 +65,7 @@ python -m workflow.run_lifting_pipeline \
   --config "$CFG" \
   --layout-method fixed-bin \
   --transient true \
-  --transient-sample-ms 10 \
+  --transient-sample-ms 2 \
   --transient-r1-dir runs/transient_r1/matmul_32k_512k
 ```
 
@@ -77,7 +77,7 @@ python -m workflow.transient.run_transient_pipeline \
   --steady-output-dir "$OUT" \
   --output-dir "$OUT/transient" \
   --config "$CFG" \
-  --sample-ms 10 \
+  --sample-ms 2 \
   --transient-r1-dir runs/transient_r1/matmul_32k_512k
 ```
 
@@ -88,7 +88,7 @@ $OUT/transient/
 ├── r1/                              # 独立周期统计R1（如未外部提供）
 ├── windows/gem5/
 │   ├── windows_manifest.json
-│   └── window_XXXX/stats.txt        # 每10 ms增量统计
+│   └── window_XXXX/stats.txt        # 按所选采样间隔生成增量统计
 ├── windows/mcpat/
 │   ├── power_windows.json
 │   └── window_XXXX/                 # XML、McPAT输出和模块功耗
@@ -108,7 +108,7 @@ $OUT/transient/
 
 ## MATMUL 双布局 operational 验证
 
-下面命令复现实验室当前的 MATMUL 32kB L1D / 512kB L2、10 ms 瞬态比较。
+下面命令复现实验室当前的 MATMUL 32kB L1D / 512kB L2、2 ms 瞬态比较。
 这是 `operational` 验证，明确是 `non-formal`：它不构成论文等价复现、严格
 复现或正式参数证据。规范 R1 和已经完成的两个稳态 pilot 都是只读输入；不要
 覆盖它们，也不要因为这个瞬态分支重跑 R2。
@@ -121,9 +121,9 @@ python -m workflow.transient.run_dual_layout_validation \
   --source-r1-dir runs/architecture_sweep/r1/paper/matmul/l1d_32kB/l2_512kB \
   --fixed-steady-dir runs/operational_raw_power_p1/pilot_direct_20260731/fixed-bin \
   --clip3d-steady-dir runs/operational_raw_power_p1/pilot_direct_20260731/clip3d \
-  --output-root runs/transient_validation/matmul_32kB_512kB_10ms_20260803 \
+  --output-root runs/transient_validation/matmul_32kB_512kB_2ms_20260803 \
   --config configs/experiments/clip3d_constrained_5p0_raw_power_p1_operational.json \
-  --sample-ms 10
+  --sample-ms 2
 ```
 
 输出根目录中的 `shared_r1/` 是为本次比较新建的周期统计 R1；fixed-bin 与
@@ -137,11 +137,11 @@ CLIP-3D 共享该 R1 和同一份逐窗口功耗轨迹。因此它与规范 R1
 
 ```bash
 python -m json.tool \
-  runs/transient_validation/matmul_32kB_512kB_10ms_20260803/status.json
+  runs/transient_validation/matmul_32kB_512kB_2ms_20260803/status.json
 python -m json.tool \
-  runs/transient_validation/matmul_32kB_512kB_10ms_20260803/experiment_summary.json
+  runs/transient_validation/matmul_32kB_512kB_2ms_20260803/experiment_summary.json
 python -m json.tool \
-  runs/transient_validation/matmul_32kB_512kB_10ms_20260803/comparison/transient_comparison.json
+  runs/transient_validation/matmul_32kB_512kB_2ms_20260803/comparison/transient_comparison.json
 ```
 
 解读时以 `comparison/transient_comparison.json` 的一致性检查为准：两种布局必须
@@ -150,3 +150,11 @@ python -m json.tool \
 `clip_minus_fixed` 温差，并同时检查功耗峰值到温度峰值的时间滞后、最后窗口填充
 时长和模型限制。该差异只说明此 operational、non-formal 条件下的瞬态热响应，
 不能外推为正式论文结论。
+
+## 采样间隔与历史比较
+
+采样间隔由 `--sample-ms`（独立旁路）或 `--transient-sample-ms`（主入口）设置，默认值
+仍为 10 ms。此前的比较使用 10 ms；上面的当前实验使用 2 ms，以获得更高的时间分辨率。
+此前比较的结果根目录为
+`runs/transient_validation/matmul_32kB_512kB_10ms_20260803`。历史设计和计划文档
+保留其原始 10 ms 记录，作为当时实验的溯源，不应改写。

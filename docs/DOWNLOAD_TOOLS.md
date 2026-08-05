@@ -67,6 +67,27 @@ git clone --depth 1 --branch master --recurse-submodules \
 
 本工程已经提前建立了四个空目标目录。Git 允许克隆到现有的空目录；如果其中已经存在文件，应先检查文件来源，不要直接覆盖。
 
+### HotSpot 温度输出精度补丁与重建
+
+HotSpot 新下载完成后，应用仓库跟踪的补丁以保留温度输出的六位小数。该补丁只改变
+文本温度输出的格式精度，不改变 HotSpot 的热模型、方程或内部 `double` 计算。由于
+`tools/src/` 不受 Git 跟踪，必须在每次重新下载 HotSpot 后重新应用此补丁并重建。
+
+先用反向 dry-run 检查补丁是否已经应用；命令成功表示已经应用，无需再次操作：
+
+```bash
+patch -d tools/src/hotspot -p1 --dry-run -R \
+  < patches/hotspot/0001-six-decimal-temperature-output.patch
+```
+
+如果该检查失败，则只应用一次补丁，然后重建可执行文件：
+
+```bash
+patch -d tools/src/hotspot -p1 \
+  < patches/hotspot/0001-six-decimal-temperature-output.patch
+make -C tools/src/hotspot hotspot
+```
+
 ## 4. 指定其他版本
 
 下载脚本接受环境变量。例如：
@@ -137,4 +158,3 @@ tools/versions/mcpat.version
 tools/versions/cacti.version
 tools/versions/hotspot.version
 ```
-
