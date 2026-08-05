@@ -14,6 +14,18 @@ _NEGATIVE_TOLERANCE = -1e-12
 _OMIT = object()
 
 
+def sampling_resolution_limitation(sample_ms: float) -> str:
+    if isinstance(sample_ms, bool) or not isinstance(sample_ms, Real):
+        raise ValueError("sample_ms must be a finite positive number")
+    value = float(sample_ms)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("sample_ms must be a finite positive number")
+    return (
+        f"{value:g} ms averaging cannot observe sub-window microsecond "
+        "power peaks."
+    )
+
+
 def _power_value(record: dict, field: str, context: str) -> float:
     value = record.get(field)
     if isinstance(value, bool) or not isinstance(value, Real):

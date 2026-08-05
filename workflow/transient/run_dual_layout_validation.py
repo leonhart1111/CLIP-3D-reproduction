@@ -8,7 +8,7 @@ import math
 import time
 from pathlib import Path
 
-from workflow.common import PROJECT_ROOT, read_json, write_json
+from workflow.common import PROJECT_ROOT, format_temperature_c, read_json, write_json
 from workflow.transient.compare_layouts import compare_layout_results
 from workflow.transient.run_transient_pipeline import (
     prepare_power_windows,
@@ -19,6 +19,7 @@ from workflow.transient.run_transient_pipeline import (
 )
 from workflow.transient.run_transient_r1 import completed as r1_completed
 from workflow.transient.run_transient_r1 import run as run_transient_r1
+from workflow.transient.validation import sampling_resolution_limitation
 
 
 DEFAULT_CONFIG = PROJECT_ROOT / "configs/experiments/clip3d_pipeline.json"
@@ -155,7 +156,7 @@ def run_dual_layout_validation(source_r1_dir: Path, fixed_steady_dir: Path,
             "limitations": [
                 "McPAT leakage uses a fixed configured temperature.",
                 "There is no temperature-leakage-DVFS feedback loop.",
-                "10 ms averaging cannot observe sub-window microsecond power peaks.",
+                sampling_resolution_limitation(sample_ms),
                 "The final partial gem5 window is padded to one HotSpot interval.",
                 "Steady initialization omits the program's incomplete startup history.",
                 "This is operational validation, not paper-equivalent formal evidence.",
@@ -214,7 +215,7 @@ def main() -> None:
     print(
         "Dual-layout transient validation complete: "
         f"CLIP-minus-fixed trace peak="
-        f"{comparison['trace_peak_clip_minus_fixed']:.3f} C"
+        f"{format_temperature_c(comparison['trace_peak_clip_minus_fixed'])} C"
     )
 
 

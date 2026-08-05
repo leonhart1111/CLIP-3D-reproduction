@@ -7,9 +7,10 @@ import csv
 import math
 from pathlib import Path
 
-from workflow.common import read_json, write_json
+from workflow.common import format_temperature_csv_row, read_json, write_json
 from workflow.transient.validation import (
     power_trace_identity,
+    sampling_resolution_limitation,
     summarize_power_windows,
     validate_power_windows,
 )
@@ -123,7 +124,7 @@ def _write_csv(path: Path, fields: tuple[str, ...], rows: list[dict]) -> None:
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(format_temperature_csv_row(row) for row in rows)
 
 
 def compare_layout_results(fixed: dict, clip3d: dict, output_dir: Path) -> dict:
@@ -366,7 +367,7 @@ def compare_layout_results(fixed: dict, clip3d: dict, output_dir: Path) -> dict:
         "model_limitations": [
             "McPAT leakage is evaluated at its configured fixed operating temperature.",
             "There is no temperature-leakage-DVFS feedback loop.",
-            "10 ms averaging cannot observe sub-window microsecond power peaks.",
+            sampling_resolution_limitation(sample_ms),
             "The final partial gem5 window is padded to one full HotSpot interval.",
             "Steady-temperature initialization omits the program's incomplete startup history.",
             "This operational validation is not a formal proof of thermal optimality.",

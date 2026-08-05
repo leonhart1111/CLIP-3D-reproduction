@@ -9,7 +9,7 @@ import math
 import time
 from pathlib import Path
 
-from workflow.common import PROJECT_ROOT, read_json, write_json
+from workflow.common import PROJECT_ROOT, format_temperature_c, read_json, write_json
 from workflow.floorplan.generate_hotspot_inputs import DEFAULT_THERMAL_STACK
 from workflow.transient.generate_hotspot_trace import materialize_trace
 from workflow.transient.run_hotspot_transient import run_hotspot_transient
@@ -18,6 +18,7 @@ from workflow.transient.run_windowed_mcpat import run_windows
 from workflow.transient.stats_windows import split_windows
 from workflow.transient.validation import (
     power_trace_identity,
+    sampling_resolution_limitation,
     validate_power_windows,
 )
 
@@ -475,6 +476,7 @@ def run_layout_thermal(source_r1_dir: Path, steady_output_dir: Path,
         config,
     )
     stage_seconds["power_trace_mapping"] = time.perf_counter() - started
+    sample_ms = float(trace["sample_interval_s"]) * 1000.0
 
     started = time.perf_counter()
     print("Transient branch: running one multi-row detailed-3D HotSpot solve", flush=True)
@@ -496,7 +498,7 @@ def run_layout_thermal(source_r1_dir: Path, steady_output_dir: Path,
         "output": str(output_dir),
         "workload": steady_summary["workload"],
         "layout_method": steady_summary["layout_method"],
-        "sample_interval_ms": float(trace["sample_interval_s"]) * 1000.0,
+        "sample_interval_ms": sample_ms,
         "window_count": int(trace["window_count"]),
         "actual_gem5_duration_s": float(trace["actual_gem5_duration_s"]),
         "hotspot_trace_duration_s": float(trace["hotspot_trace_duration_s"]),
@@ -552,7 +554,7 @@ def run_layout_thermal(source_r1_dir: Path, steady_output_dir: Path,
         "limitations": [
             "McPAT leakage uses a fixed configured temperature.",
             "There is no temperature-leakage-DVFS feedback loop.",
-            "10 ms averaging cannot observe sub-window microsecond power peaks.",
+            sampling_resolution_limitation(sample_ms),
             "The final partial gem5 window is padded to one HotSpot interval.",
             "Steady initialization omits the program's incomplete startup history.",
         ],
@@ -635,7 +637,7 @@ def run_transient_pipeline(source_r1_dir: Path, steady_output_dir: Path,
             "McPAT leakage is evaluated at its configured fixed operating temperature.",
             "There is no temperature-leakage-DVFS feedback loop in this validation branch.",
             "A final partial gem5 window is padded to one full HotSpot interval.",
-            "10 ms averaging cannot observe sub-window microsecond power peaks.",
+            sampling_resolution_limitation(sample_ms),
             "Steady initialization omits the program's incomplete startup history.",
         ],
     })
@@ -663,7 +665,7 @@ def main() -> None:
     )
     print(
         f"Transient pipeline complete: windows={result['window_count']}, "
-        f"Tmax={result['transient_tmax_c']:.3f} C"
+        f"Tmax={format_temperature_c(result['transient_tmax_c'])} C"
     )
 
 

@@ -6,11 +6,28 @@ from __future__ import annotations
 import json
 import math
 import re
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def format_temperature_c(value: float) -> str:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("temperature must be finite")
+    return f"{number:.6f}"
+
+
+def format_temperature_csv_row(record: dict) -> dict:
+    return {
+        key: format_temperature_c(value)
+        if key.endswith("_c") and isinstance(value, Real) and not isinstance(value, bool)
+        else value
+        for key, value in record.items()
+    }
 
 
 def read_json(path: Path | str) -> Any:
@@ -89,4 +106,3 @@ def aggregate_ipc(stats: dict[str, float], cores: int = 4) -> float:
 
 def positive(value: float, floor: float = 0.0) -> float:
     return max(float(value), floor)
-

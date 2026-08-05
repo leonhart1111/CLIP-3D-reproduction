@@ -59,6 +59,15 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_temperature_text_and_csv_fields_use_six_decimals(self):
+        from workflow.common import format_temperature_c, format_temperature_csv_row
+
+        self.assertEqual(format_temperature_c(116.25), "116.250000")
+        self.assertEqual(
+            format_temperature_csv_row({"tmax_c": 116.25, "ipc1": 3.4}),
+            {"tmax_c": "116.250000", "ipc1": 3.4},
+        )
+
     def test_power_trace_round_trips_values_that_12g_breaks_total_invariant(self):
         """Raw total/dynamic/leakage files must retain their cell-level sum."""
         from workflow.floorplan.generate_hotspot_inputs import write_ptrace

@@ -9,7 +9,7 @@ import math
 from collections import defaultdict
 from pathlib import Path
 
-from workflow.common import read_json, write_json
+from workflow.common import format_temperature_csv_row, read_json, write_json
 
 
 def kendall_tau(first: list[float], second: list[float]) -> float:
@@ -66,7 +66,9 @@ def summarize(root: Path, csv_path: Path, json_path: Path,
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            writer.writerow({field: row.get(field) for field in fields})
+            writer.writerow(format_temperature_csv_row({
+                field: row.get(field) for field in fields
+            }))
 
     by_workload = defaultdict(list)
     for row in rows:

@@ -10,7 +10,13 @@ import subprocess
 import time
 from pathlib import Path
 
-from workflow.common import PROJECT_ROOT, read_json, write_json
+from workflow.common import (
+    PROJECT_ROOT,
+    format_temperature_c,
+    format_temperature_csv_row,
+    read_json,
+    write_json,
+)
 
 
 DEFAULT_HOTSPOT = PROJECT_ROOT / "tools/src/hotspot/hotspot"
@@ -152,7 +158,10 @@ def run_hotspot_transient(case_dir: Path, hotspot: Path = DEFAULT_HOTSPOT,
             stream, fieldnames=("index", "time_s", "peak_unit", "tmax_c", "tavg_c")
         )
         writer.writeheader()
-        writer.writerows({key: sample[key] for key in writer.fieldnames} for sample in samples)
+        writer.writerows(
+            format_temperature_csv_row({key: sample[key] for key in writer.fieldnames})
+            for sample in samples
+        )
     result = {
         "schema_version": 1,
         "mode": "operational transient validation",
@@ -205,7 +214,7 @@ def main() -> None:
         args.steady_source.resolve() if args.steady_source else None,
     )
     print(
-        f"Transient HotSpot Tmax={result['tmax_c']:.3f} C over "
+        f"Transient HotSpot Tmax={format_temperature_c(result['tmax_c'])} C over "
         f"{result['sample_count']} samples"
     )
 

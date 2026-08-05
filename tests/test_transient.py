@@ -782,7 +782,7 @@ class TransientTraceTests(unittest.TestCase):
             def fake_hotspot(*_args, **kwargs):
                 cwd = Path(kwargs["cwd"])
                 (cwd / "transient.ttrace").write_text(
-                    "unit\n301\n302\n"
+                    "unit\n301.000000\n302.000000\n"
                 )
                 return type("Process", (), {"returncode": 0, "stdout": "ok"})()
 
@@ -804,6 +804,16 @@ class TransientTraceTests(unittest.TestCase):
                 "overall_peak",
             ):
                 self.assertIn(field, result)
+            csv_text = (root / "transient_summary.csv").read_text(encoding="utf-8")
+            self.assertIn("27.850000", csv_text)
+            self.assertIn("28.850000", csv_text)
+
+    def test_sampling_limitation_uses_actual_interval(self):
+        from workflow.transient.validation import sampling_resolution_limitation
+
+        message = sampling_resolution_limitation(2.0)
+        self.assertIn("2 ms averaging", message)
+        self.assertNotIn("10 ms averaging", message)
 
     def test_boolean_flag_is_explicit_and_defaults_can_remain_false(self):
         self.assertTrue(boolean_text("true"))
@@ -984,11 +994,13 @@ class TransientComparisonTests(unittest.TestCase):
 
     @staticmethod
     def summary(root: Path, layout: str, steady: float, trace: float,
-                final: float, peak_time: float) -> dict:
+                final: float, peak_time: float, sample_ms: float = 10.0) -> dict:
+        sample_s = sample_ms / 1000.0
+        total_s = 2.0 * sample_s
         power_windows = root / "shared/windows/mcpat/power_windows.json"
         if not power_windows.is_file():
             write_json(power_windows, {
-                "nominal_sample_interval_ms": 10.0,
+                "nominal_sample_interval_ms": sample_ms,
                 "nominal_sample_interval_ticks": 10,
                 "measurement_start_tick": 0,
                 "measurement_end_tick": 20,
@@ -1001,7 +1013,7 @@ class TransientComparisonTests(unittest.TestCase):
                 "windows": [
                     {
                         "index": 0, "start_tick": 0, "end_tick": 10,
-                        "duration_ticks": 10, "duration_s": 0.01,
+                        "duration_ticks": 10, "duration_s": sample_s,
                         "source_stats_sha256": "sha256:stats-0",
                         "modules": [{
                             "name": "chip",
@@ -1017,7 +1029,7 @@ class TransientComparisonTests(unittest.TestCase):
                     },
                     {
                         "index": 1, "start_tick": 10, "end_tick": 20,
-                        "duration_ticks": 10, "duration_s": 0.01,
+                        "duration_ticks": 10, "duration_s": sample_s,
                         "source_stats_sha256": "sha256:stats-1",
                         "modules": [{
                             "name": "chip",
@@ -1040,10 +1052,10 @@ class TransientComparisonTests(unittest.TestCase):
             "layout_method": layout,
             "source_r1": str((root / "source_r1").resolve()),
             "transient_r1": str((root / "shared_r1").resolve()),
-            "sample_interval_ms": 10.0,
+            "sample_interval_ms": sample_ms,
             "window_count": 2,
-            "actual_gem5_duration_s": 0.02,
-            "hotspot_trace_duration_s": 0.02,
+            "actual_gem5_duration_s": total_s,
+            "hotspot_trace_duration_s": total_s,
             "padded_final_duration_s": 0.0,
             "power_trace_identity": TransientComparisonTests.identity(power_windows),
             "power_summary": {
@@ -1061,19 +1073,19 @@ class TransientComparisonTests(unittest.TestCase):
                 },
                 "trace_min_peak": {
                     "peak_unit": "cell0", "tmax_c": trace - 1.0,
-                    "time_s": 0.01,
+                    "time_s": sample_s,
                 },
                 "trace_peak": {"tmax_c": trace, "time_s": peak_time},
-                "final_peak": {"tmax_c": final, "time_s": 0.02},
+                "final_peak": {"tmax_c": final, "time_s": total_s},
                 "overall_peak": {
                     "peak_unit": "cell1" if trace >= steady else "initial",
                     "tmax_c": max(trace, steady),
                     "time_s": peak_time if trace >= steady else 0.0,
                 },
                 "samples": [
-                    {"index": 0, "time_s": 0.01, "tmax_c": trace - 1.0,
+                    {"index": 0, "time_s": sample_s, "tmax_c": trace - 1.0,
                      "tavg_c": trace - 4.0},
-                    {"index": 1, "time_s": 0.02, "tmax_c": final,
+                    {"index": 1, "time_s": total_s, "tmax_c": final,
                      "tavg_c": final - 4.0},
                 ],
             },
@@ -1144,8 +1156,12 @@ class TransientComparisonTests(unittest.TestCase):
     def test_comparison_carries_complete_audit_classification_and_limitations(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            fixed = self.summary(root, "fixed-bin", 91.0, 95.0, 93.0, 0.02)
-            clip3d = self.summary(root, "clip3d", 89.0, 93.5, 91.0, 0.01)
+            fixed = self.summary(
+                root, "fixed-bin", 91.0, 95.0, 93.0, 0.004, sample_ms=2.0
+            )
+            clip3d = self.summary(
+                root, "clip3d", 89.0, 93.5, 91.0, 0.002, sample_ms=2.0
+            )
 
             result = compare_layout_results(fixed, clip3d, root / "comparison")
 
@@ -1164,7 +1180,8 @@ class TransientComparisonTests(unittest.TestCase):
             self.assertIn("fixed", result["raw_power_evidence"])
             self.assertIn("clip3d", result["conservation_evidence"])
             limitations = " ".join(result["model_limitations"])
-            self.assertIn("10 ms averaging", limitations)
+            self.assertIn("2 ms averaging", limitations)
+            self.assertNotIn("10 ms averaging", limitations)
             self.assertIn("startup history", limitations)
 
     def test_comparison_rejects_mismatched_shared_inputs(self):

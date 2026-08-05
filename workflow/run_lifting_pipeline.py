@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from workflow.cacti.characterize_cache import characterize
-from workflow.common import PROJECT_ROOT, read_json, write_json
+from workflow.common import PROJECT_ROOT, format_temperature_c, read_json, write_json
 from workflow.floorplan.build_module_model import build_model
 from workflow.floorplan.comparison_layouts import METHODS as COMPARISON_METHODS
 from workflow.floorplan.comparison_layouts import generate as generate_comparison_layouts
@@ -790,12 +790,12 @@ def main() -> None:
         }
         write_json(args.output_dir / "pipeline_summary.json", summary)
     print(f"Pipeline complete: method={summary['layout_method']}, "
-          f"Tmax={summary['tmax_c']:.3f} C, "
+          f"Tmax={format_temperature_c(summary['tmax_c'])} C, "
           f"f_sus={summary['sustainable_frequency_ghz']:.6f} GHz")
     if args.transient:
         print(
             f"Transient thermal complete: windows={transient['window_count']}, "
-            f"Tmax={transient['transient_tmax_c']:.3f} C"
+            f"Tmax={format_temperature_c(transient['transient_tmax_c'])} C"
         )
 
 
