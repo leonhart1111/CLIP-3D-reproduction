@@ -43,7 +43,7 @@ def completed(output: Path, config: dict, layout_method: str,
     except Exception:
         return False
     # Cooling alone is not a sufficient cache key: McPAT activity mapping,
-    # CACTI Table-II mode, area calibration, or layer materials may change
+    # local CACTI geometry, area calibration, or layer materials may change
     # while R_conv stays identical.
     if recorded_config != config:
         return False

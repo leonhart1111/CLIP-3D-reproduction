@@ -8,7 +8,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from workflow.cacti.characterize_cache import PAPER_TABLE_II, parse_cacti_output
+from workflow.cacti.characterize_cache import parse_cacti_output
 from workflow.analysis.summarize_sweep import summarize
 from workflow.analysis.prepare_raw_power_validation import prepare
 from workflow.analysis.evaluate_operational_proxy import evaluate as evaluate_operational_proxy
@@ -19,11 +19,7 @@ from workflow.floorplan.build_module_model import apply_physical_areas
 from workflow.floorplan.generate_hotspot_inputs import baseline_layout, grid_power, materialize
 from workflow.floorplan.layout_metrics import derive_layout_delays
 from workflow.floorplan.optimize_layout import optimize, proxy_temperature
-from workflow.mcpat.parse_mcpat import (
-    apply_power_calibration,
-    parse_mcpat_text,
-    resolve_power_calibration,
-)
+from workflow.mcpat.parse_mcpat import parse_mcpat_text
 from workflow.r2.calibrate_lambda_wire import (
     calibrate as calibrate_lambda_wire,
     calibrate_series as calibrate_lambda_wire_series,
@@ -153,12 +149,12 @@ class FrequencyTests(unittest.TestCase):
             self.assertEqual(run["trace_sums_w"]["dynamic"], 12.0)
             self.assertEqual(run["trace_sums_w"]["leakage"], 8.0)
             self.assertEqual(run["trace_sums_w"]["composed"], 14.0)
-            self.assertIn("max_abs_uniform_gamma_comparison_error_c", result)
-            self.assertNotIn("max_abs_linear_error_c", result)
             self.assertEqual(run["trace_sums_w"]["total_at_f0"], 20.0)
             self.assertEqual(
                 run["uniform_gamma_comparison"]["scaling_mode"], "paper-uniform-gamma"
             )
+            self.assertIn("max_abs_uniform_gamma_comparison_error_c", result)
+            self.assertNotIn("max_abs_linear_error_c", result)
             self.assertFalse(result["recommendation"]["accepted"])
 
     def test_below_f0_hotspot_failure_writes_a_rejected_validation_result(self):
@@ -457,21 +453,6 @@ class FrequencyTests(unittest.TestCase):
 
 
 class ParserTests(unittest.TestCase):
-    def test_workload_power_calibration_is_explicitly_resolved(self):
-        config = {"power_calibration": {
-            "dynamic_scale": 1.1,
-            "leakage_scale": 1.2,
-            "by_workload": {
-                "fft": {"dynamic_scale": 0.9, "leakage_scale": 1.05}
-            },
-        }}
-        fft = resolve_power_calibration(config, "fft")
-        matmul = resolve_power_calibration(config, "matmul")
-        self.assertEqual(fft["dynamic_scale"], 0.9)
-        self.assertTrue(fft["selection"]["used_workload_override"])
-        self.assertEqual(matmul["dynamic_scale"], 1.1)
-        self.assertFalse(matmul["selection"]["used_workload_override"])
-
     def test_cacti_parser(self):
         text = """Access time (ns): 1.5
 Cycle time (ns): 2.0
@@ -496,12 +477,9 @@ Cache height x width (mm): 2 x 4
         logic = result["modules"][0]
         self.assertAlmostEqual(logic["area_mm2"], 5.0)
         self.assertAlmostEqual(logic["dynamic_power_w"], 2.5)
-
-        apply_power_calibration(result, dynamic_scale=2.0, leakage_scale=3.0,
-                                provenance={"kind": "unit test"})
-        self.assertAlmostEqual(result["modules"][0]["dynamic_power_w"], 5.0)
-        self.assertAlmostEqual(result["modules"][0]["leakage_power_w"], 1.5)
-        self.assertAlmostEqual(result["modules"][0]["raw_power"]["total_power_w"], 3.0)
+        self.assertAlmostEqual(logic["leakage_power_w"], 0.5)
+        self.assertAlmostEqual(logic["total_power_w"], 3.0)
+        self.assertEqual(result["power_provenance"]["postprocessing"], "none")
 
     def test_detailed_mcpat_preserves_functional_core_blocks(self):
         sep = "*" * 40
@@ -530,10 +508,6 @@ Cache height x width (mm): 2 x 4
             "McPAT top-level functional blocks",
         )
 
-    def test_paper_table_ii_anchor(self):
-        self.assertEqual(PAPER_TABLE_II[("l1d", 64 * 1024)]["area_mm2"], 1.16)
-        self.assertEqual(PAPER_TABLE_II[("l2", 1024 * 1024)]["access_time_ns"], 1.984)
-
     def test_module_model_consumes_cacti_cache_geometry(self):
         modules = [
             {"name": "core0_logic", "kind": "core_logic", "area_mm2": 10.0,
@@ -548,23 +522,35 @@ Cache height x width (mm): 2 x 4
         metadata = {"l1i_size": "32kB", "l1d_size": "64kB", "l2_size": "512kB"}
         cacti = {"records": [
             {"level": "l1d", "size": "32kB", "size_bytes": 32 * 1024,
-             "area_mm2": 0.74, "width_mm": 1.0, "height_mm": 0.74,
-             "value_source": "paper Table II"},
+             "area_mm2": 0.20, "width_mm": 0.50, "height_mm": 0.40,
+             "value_source": "local CACTI run"},
             {"level": "l1d", "size": "64kB", "size_bytes": 64 * 1024,
-             "area_mm2": 1.16, "width_mm": 1.45, "height_mm": 0.8,
-             "value_source": "paper Table II"},
+             "area_mm2": 0.30, "width_mm": 0.60, "height_mm": 0.50,
+             "value_source": "local CACTI run"},
             {"level": "l2", "size": "512kB", "size_bytes": 512 * 1024,
-             "area_mm2": 10.01, "width_mm": 5.0, "height_mm": 2.002,
-             "value_source": "paper Table II"},
+             "area_mm2": 2.50, "width_mm": 2.50, "height_mm": 1.00,
+             "value_source": "local CACTI run"},
         ]}
         physical = apply_physical_areas(modules, metadata, cacti, 2.0)
         by_kind = {module["kind"]: module for module in physical}
         self.assertAlmostEqual(by_kind["core_logic"]["area_mm2"], 20.0)
         self.assertEqual(by_kind["core_logic"]["area_source"], "McPAT")
-        self.assertAlmostEqual(by_kind["l1d"]["area_mm2"], 2.32)
+        self.assertAlmostEqual(by_kind["l1d"]["area_mm2"], 0.60)
         self.assertAlmostEqual(by_kind["l1d"]["raw_area_mm2"], 30.0)
-        self.assertEqual(by_kind["l1d"]["area_source"], "paper Table II")
-        self.assertAlmostEqual(by_kind["l2"]["preferred_width_mm"], 5.0 * math.sqrt(2.0))
+        self.assertEqual(by_kind["l1d"]["area_source"], "local CACTI run")
+        self.assertAlmostEqual(by_kind["l2"]["preferred_width_mm"], 2.5 * math.sqrt(2.0))
+
+    def test_pipeline_rejects_removed_paper_table_ii_switch(self):
+        config = {
+            "schema_version": 1,
+            "cacti": {"use_paper_table_ii": True},
+            "physical": {"r_convec_k_per_w": 5.0},
+            "layout_optimizer": {"r_convec_k_per_w": 5.0},
+            "mcpat": {},
+            "delay": {},
+        }
+        with self.assertRaisesRegex(ValueError, "use_paper_table_ii has been removed"):
+            validate_config(config, "fixed-bin")
 
 
 class GridTests(unittest.TestCase):

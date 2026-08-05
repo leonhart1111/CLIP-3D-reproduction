@@ -16,35 +16,6 @@ METRIC_RE = re.compile(
 )
 
 
-def resolve_power_calibration(mcpat_config: dict, workload: str) -> dict:
-    """Resolve a documented default calibration plus an optional workload fit.
-
-    McPAT XML details are not published by CLIP-3D.  A single global scale is
-    therefore the preferred default, while Table-III anchor experiments may
-    supply an explicit per-workload override.  Keeping the merge here makes
-    the selected provenance visible in every mcpat.json instead of silently
-    changing power later in the thermal flow.
-    """
-    base = dict(mcpat_config.get("power_calibration", {}))
-    overrides = base.pop("by_workload", {})
-    if overrides and not isinstance(overrides, dict):
-        raise ValueError("mcpat.power_calibration.by_workload must be an object")
-    selected = overrides.get(workload, {}) if overrides else {}
-    if selected and not isinstance(selected, dict):
-        raise ValueError(f"power calibration for {workload!r} must be an object")
-    result = {**base, **selected}
-    selection = {
-        "workload": workload,
-        "used_workload_override": bool(selected),
-        "available_workload_overrides": sorted(overrides),
-    }
-    provenance = dict(result.get("provenance") or {"kind": "unspecified"})
-    provenance["selection"] = selection
-    result["provenance"] = provenance
-    result["selection"] = selection
-    return result
-
-
 def metrics(text: str) -> dict[str, float]:
     found = {}
     for name, value, _unit in METRIC_RE.findall(text):
@@ -148,54 +119,6 @@ def granular_core_logic(chunk: str, core_total: dict[str, float],
     return pieces
 
 
-def apply_power_calibration(result: dict, dynamic_scale: float = 1.0,
-                            leakage_scale: float = 1.0,
-                            provenance: dict | None = None) -> dict:
-    """Apply one documented global calibration to every parsed module.
-
-    The paper does not publish its McPAT XML.  A calibration is therefore
-    allowed only as an explicit experiment setting; raw values are retained
-    next to calibrated values so it cannot silently turn into a fitting knob.
-    """
-    if dynamic_scale <= 0 or leakage_scale <= 0:
-        raise ValueError("McPAT power calibration scales must be positive")
-
-    def scale(item: dict) -> None:
-        item["raw_power"] = {
-            "dynamic_power_w": item["dynamic_power_w"],
-            "subthreshold_leakage_w": item["subthreshold_leakage_w"],
-            "gate_leakage_w": item["gate_leakage_w"],
-            "leakage_power_w": item["leakage_power_w"],
-            "total_power_w": item["total_power_w"],
-        }
-        item["dynamic_power_w"] *= dynamic_scale
-        item["subthreshold_leakage_w"] *= leakage_scale
-        item["gate_leakage_w"] *= leakage_scale
-        item["leakage_power_w"] = (
-            item["subthreshold_leakage_w"] + item["gate_leakage_w"]
-        )
-        item["total_power_w"] = item["dynamic_power_w"] + item["leakage_power_w"]
-
-    scale(result["processor"])
-    for module in result["modules"]:
-        scale(module)
-    result["raw_module_totals"] = dict(result["module_totals"])
-    result["module_totals"] = {
-        key: sum(module[key] for module in result["modules"])
-        for key in ("area_mm2", "dynamic_power_w", "leakage_power_w", "total_power_w")
-    }
-    result["checks"]["module_power_minus_processor_w"] = (
-        result["module_totals"]["total_power_w"] - result["processor"]["total_power_w"]
-    )
-    result["power_calibration"] = {
-        "dynamic_scale": dynamic_scale,
-        "leakage_scale": leakage_scale,
-        "provenance": provenance or {"kind": "unspecified"},
-        "raw_values_retained": True,
-    }
-    return result
-
-
 def parse_mcpat_text(text: str) -> dict:
     technology = re.search(r"Technology\s+([0-9.]+)\s+nm", text)
     clock = re.search(r"Core clock Rate\(MHz\)\s+([0-9.]+)", text)
@@ -241,6 +164,11 @@ def parse_mcpat_text(text: str) -> dict:
         "schema_version": 1,
         "technology_nm": float(technology.group(1)) if technology else None,
         "clock_mhz": float(clock.group(1)) if clock else None,
+        "power_provenance": {
+            "dynamic": "McPAT Runtime Dynamic",
+            "leakage": "McPAT Subthreshold Leakage + Gate Leakage",
+            "postprocessing": "none",
+        },
         "processor": processor,
         "modules": modules,
         "module_totals": totals,

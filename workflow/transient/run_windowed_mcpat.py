@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert every gem5 time window to a calibrated McPAT module-power sample."""
+"""Convert every gem5 time window to a McPAT module-power sample."""
 
 from __future__ import annotations
 
@@ -10,11 +10,7 @@ from pathlib import Path
 
 from workflow.common import PROJECT_ROOT, read_json, write_json
 from workflow.mcpat.gem5_to_mcpat import convert
-from workflow.mcpat.parse_mcpat import (
-    apply_power_calibration,
-    parse_mcpat_text,
-    resolve_power_calibration,
-)
+from workflow.mcpat.parse_mcpat import parse_mcpat_text
 
 
 DEFAULT_MCPAT = PROJECT_ROOT / "tools/src/mcpat/mcpat"
@@ -27,23 +23,23 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
     if not mcpat.is_file():
         raise FileNotFoundError(mcpat)
     mcpat_config = config.get("mcpat", {})
+    allowed_mcpat = {
+        "temperature_k", "device_type", "longer_channel_device",
+        "interconnect_projection_type", "opt_for_clk",
+    }
+    unknown_mcpat = set(mcpat_config) - allowed_mcpat
+    if unknown_mcpat:
+        raise ValueError(f"unsupported mcpat settings: {sorted(unknown_mcpat)}")
     settings = {
         key: mcpat_config[key] for key in (
             "temperature_k", "device_type", "longer_channel_device",
             "interconnect_projection_type",
         ) if key in mcpat_config
     }
-    source_metadata = read_json(Path(manifest["source_r1"]) / "r1_metadata.json")
-    calibration = resolve_power_calibration(mcpat_config, source_metadata["workload"])
-    dynamic_scale = float(calibration.get("dynamic_scale", 1.0))
-    leakage_scale = float(calibration.get("leakage_scale", 1.0))
     opt_for_clk = int(mcpat_config.get("opt_for_clk", 0))
     run_settings = {
         "mcpat_settings": settings,
         "opt_for_clk": opt_for_clk,
-        "dynamic_scale": dynamic_scale,
-        "leakage_scale": leakage_scale,
-        "calibration_provenance": calibration.get("provenance"),
     }
     records = []
     expected_names: list[str] | None = None
@@ -92,9 +88,6 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
         ):
             raise RuntimeError(f"McPAT failed for window {index}: {window_dir / 'mcpat.out'}")
         parsed = parse_mcpat_text(process.stdout)
-        apply_power_calibration(
-            parsed, dynamic_scale, leakage_scale, calibration.get("provenance")
-        )
         parsed["command"] = command
         write_json(window_dir / "mcpat.json", parsed)
         names = [module["name"] for module in parsed["modules"]]
@@ -117,7 +110,6 @@ def run_windows(windows_manifest: Path, output_dir: Path, config: dict,
                 for field in ("dynamic_power_w", "leakage_power_w", "total_power_w")
             },
             "mcpat_json": str((window_dir / "mcpat.json").resolve()),
-            "power_calibration": parsed.get("power_calibration"),
         }
         write_json(result_path, record)
         records.append(record)

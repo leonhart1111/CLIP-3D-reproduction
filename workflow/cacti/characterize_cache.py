@@ -15,22 +15,6 @@ from workflow.common import PROJECT_ROOT, parse_size_bytes, write_json
 DEFAULT_CACTI = PROJECT_ROOT / "tools/src/cacti/cacti"
 DEFAULT_CONFIG = PROJECT_ROOT / "tools/src/cacti/cache.cfg"
 
-# Published CACTI outputs from Table II.  The exact CACTI version/organization
-# used by the authors is not disclosed; keeping the measured local-tool result
-# alongside these effective values makes the reproduction both exact and
-# auditable.
-PAPER_TABLE_II = {
-    ("l1d", 16 * 1024): {"access_time_ns": 0.486, "area_mm2": 0.52},
-    ("l1d", 32 * 1024): {"access_time_ns": 0.506, "area_mm2": 0.74},
-    ("l1d", 64 * 1024): {"access_time_ns": 0.566, "area_mm2": 1.16},
-    ("l1d", 128 * 1024): {"access_time_ns": 0.736, "area_mm2": 2.25},
-    ("l2", 128 * 1024): {"access_time_ns": 1.333, "area_mm2": 2.72},
-    ("l2", 256 * 1024): {"access_time_ns": 1.393, "area_mm2": 6.29},
-    ("l2", 512 * 1024): {"access_time_ns": 1.573, "area_mm2": 10.01},
-    ("l2", 1024 * 1024): {"access_time_ns": 1.984, "area_mm2": 16.68},
-    ("l2", 2048 * 1024): {"access_time_ns": 2.486, "area_mm2": 36.99},
-}
-
 
 def replace_directive(text: str, directive: str, value: str) -> str:
     pattern = re.compile(
@@ -49,9 +33,8 @@ def make_config(base: str, size_bytes: int, associativity: int) -> str:
     text = replace_directive(text, "block size (bytes)", "64")
     text = replace_directive(text, "associativity", str(associativity))
     text = replace_directive(text, "technology (u)", "0.045")
-    # Use a full 64-byte line for the local audit run.  Formal reproduction
-    # takes effective delay/area from Table II because its exact organization
-    # and CACTI revision are not published.
+    # Use a full 64-byte cache line and keep the local CACTI result as the
+    # single source of cache area and latency.
     text = replace_directive(text, "output/input bus width", "512")
     text = replace_directive(text, "Core count", "4")
     return text
@@ -80,8 +63,8 @@ def parse_cacti_output(text: str) -> dict[str, float]:
 
 
 def characterize(cacti: Path, base_config: Path, output_dir: Path,
-                 l1_sizes: list[str], l2_sizes: list[str], frequency_ghz: float,
-                 use_paper_table_ii: bool = False) -> dict:
+                 l1_sizes: list[str], l2_sizes: list[str],
+                 frequency_ghz: float) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     base = base_config.read_text(encoding="utf-8", errors="replace")
     records = []
@@ -103,21 +86,6 @@ def characterize(cacti: Path, base_config: Path, output_dir: Path,
                 raise RuntimeError(f"CACTI failed for {level} {size_text}; see {raw}")
             values = parse_cacti_output(process.stdout)
             value_source = "local CACTI run"
-            if use_paper_table_ii:
-                key = (level, size_bytes)
-                if key not in PAPER_TABLE_II:
-                    raise KeyError(f"Table II has no {level} entry for {size_text}")
-                published = PAPER_TABLE_II[key]
-                measured = dict(values)
-                values.update({f"measured_{name}": value for name, value in measured.items()})
-                # Table II publishes area but not aspect ratio.  Preserve the
-                # local CACTI aspect ratio while matching its published area.
-                dimension_scale = math.sqrt(published["area_mm2"] / measured["area_mm2"])
-                values["height_mm"] = measured["height_mm"] * dimension_scale
-                values["width_mm"] = measured["width_mm"] * dimension_scale
-                values["area_mm2"] = published["area_mm2"]
-                values["access_time_ns"] = published["access_time_ns"]
-                value_source = "paper Table II; local CACTI result retained as measured_*"
             clock_ns = 1.0 / frequency_ghz
             records.append({
                 "level": level, "size": size_text, "size_bytes": size_bytes,
@@ -131,10 +99,10 @@ def characterize(cacti: Path, base_config: Path, output_dir: Path,
             })
     result = {
         "schema_version": 1, "frequency_ghz": frequency_ghz,
-        "use_paper_table_ii": use_paper_table_ii,
+        "cache_value_source": "local CACTI run",
         "rounding": "nearest integer, floor(x + 0.5), minimum one cycle",
         "records": records,
-        "paper_parameters": ["45 nm", "L1 associativity 2", "L2 associativity 8"],
+        "cacti_parameters": ["45 nm", "L1 associativity 2", "L2 associativity 8"],
     }
     write_json(output_dir / "cacti_characterization.json", result)
     return result
@@ -148,11 +116,9 @@ def main() -> None:
     parser.add_argument("--l1-sizes", nargs="+", default=["16kB", "32kB", "64kB", "128kB"])
     parser.add_argument("--l2-sizes", nargs="+", default=["128kB", "256kB", "512kB", "1024kB", "2048kB"])
     parser.add_argument("--frequency-ghz", type=float, default=2.0)
-    parser.add_argument("--use-paper-table-ii", action="store_true")
     args = parser.parse_args()
     result = characterize(args.cacti, args.base_config, args.output_dir,
-                          args.l1_sizes, args.l2_sizes, args.frequency_ghz,
-                          args.use_paper_table_ii)
+                          args.l1_sizes, args.l2_sizes, args.frequency_ghz)
     print(f"CACTI characterized {len(result['records'])} cache geometries")
 
 

@@ -15,12 +15,11 @@ from workflow.common import (
 )
 
 
-# The reference pre-scale area combines McPAT non-cache logic with the
-# published CACTI/Table-II cache areas for the paper reference architecture
-# (4 cores, 32-kB L1I/L1D, 512-kB shared L2).  The previous 78.9409-mm^2
-# denominator used McPAT cache areas and therefore silently discarded the
-# CACTI geometry produced by the preceding pipeline stage.
-DEFAULT_REFERENCE_RAW_AREA_MM2 = 57.713078
+# The reference pre-scale area combines McPAT non-cache logic with local CACTI
+# cache areas for the paper reference architecture (4 cores, 32-kB L1I/L1D,
+# 512-kB shared L2).  Cache area and delay must come from the local CACTI run,
+# not from paper tables.
+DEFAULT_REFERENCE_RAW_AREA_MM2 = 45.7538495872
 DEFAULT_AREA_SCALE = 150.0 / DEFAULT_REFERENCE_RAW_AREA_MM2
 
 
@@ -109,6 +108,7 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
         "source_cacti": str(cacti_json.resolve()),
         "architecture": metadata,
         "ipc1": aggregate_ipc(stats, int(metadata.get("num_cores", 4))),
+        "power_provenance": mcpat["power_provenance"],
         "area_calibration": {
             "scale_factor": area_scale,
             "reference_target_mm2": 150.0,
@@ -116,12 +116,10 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
             "reference_architecture": "4 cores, L1D=32kB, L2=512kB, 45nm",
             "pre_scale_sources": {
                 "core_logic_and_interconnect": "McPAT",
-                "l1i_l1d_l2": "CACTI effective geometry (paper Table II in formal mode)",
+                "l1i_l1d_l2": "local CACTI run",
             },
             "scope": "global area scale only; power is not scaled",
         },
-        "power_calibration": mcpat.get("power_calibration"),
-        "raw_mcpat_module_totals": mcpat.get("raw_module_totals"),
         "power_distribution": {
             "by_kind": by_kind,
             "movable_kinds": ["l2"],

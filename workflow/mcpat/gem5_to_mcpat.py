@@ -41,11 +41,10 @@ MUL_CLASSES = ("IntMult", "IntDiv", "FloatMult", "FloatMultAcc", "FloatDiv",
                "SimdMult", "SimdMultAcc", "SimdDiv", "SimdFloatMult",
                "SimdFloatMultAcc", "SimdFloatDiv")
 
-# McPAT accepts temperatures only on a 10 K grid.  The paper does not publish
-# its XML, but its FFT 64-kB/1-MB anchor (gamma=0.446) is much closer to the
-# 320 K HP model than to the former 370 K setting (which had incorrectly been
-# inferred from T_safe).  T_safe is a DVFS threshold, not the McPAT operating
-# temperature.
+# McPAT accepts temperatures only on a 10 K grid.  The fixed 320 K setting is
+# an explicit device operating-point assumption; T_safe is a DVFS threshold,
+# not the McPAT device temperature.  McPAT outputs are consumed without any
+# post-hoc power multipliers.
 DEFAULT_MCPAT_SETTINGS = {
     "temperature_k": 320,
     "device_type": 0,

@@ -7,22 +7,10 @@
     "device_type": 0,
     "longer_channel_device": 1,
     "interconnect_projection_type": 1,
-    "opt_for_clk": 0,
-    "power_calibration": {
-      "dynamic_scale": 1.0048407808352322,
-      "leakage_scale": 1.057660210276437,
-      "provenance": {
-        "kind": "global Table III anchor calibration",
-        "anchor": "FFT, L1D=64kB, L2=1MB, f0=2GHz",
-        "target_total_power_w": 16.24,
-        "target_gamma": 0.446,
-        "raw_dynamic_power_w": 8.9536175,
-        "raw_leakage_power_w": 6.84817291
-      }
-    }
+    "opt_for_clk": 0
   },
   "cacti": {
-    "use_paper_table_ii": true
+    "value_source": "local CACTI run"
   },
   "frequency": {
     "f0_ghz": 2.0,
@@ -35,8 +23,8 @@
     "grid_size": 32,
     "utilization": 0.70,
     "area_reference_mm2": 150.0,
-    "area_reference_raw_mm2": 57.713078,
-    "area_reference_basis": "McPAT non-cache area plus Table II L1I/L1D/L2 area for 4-core 32kB/512kB reference",
+    "area_reference_raw_mm2": 45.7538495872,
+    "area_reference_basis": "McPAT non-cache area plus local CACTI L1I/L1D/L2 area for 4-core 32kB/512kB reference",
     "thermal_stack": {
       "silicon_resistivity_mk_per_w": 0.01,
       "tim_resistivity_mk_per_w": 0.25,
@@ -44,7 +32,7 @@
       "active_silicon_thickness_m": 0.00005,
       "tim_thickness_m": 0.00002,
       "local_resistance_scale": 8.72,
-      "calibration": "Recalibrated after CACTI/Table-II cache geometry fix: Table III FFT 64kB/1MB gives 124.39 C at R_conv=5.0 K/W; validate against remaining anchors"
+      "calibration": "Earlier Table III thermal anchor calibration retained; rerun calibration after switching cache geometry to local CACTI before formal claims."
     },
     "r_convec_k_per_w": 5.0
   },
@@ -80,9 +68,9 @@
     ],
     "reproduction_assumptions": [
       "alpha, beta, cross-tier weight, and lambda_wire are not numerically disclosed by the paper; defaults are explicit and configurable.",
-      "McPAT uses direct gem5 O3 counters and a documented global Table III FFT-anchor calibration; raw powers remain in mcpat.json.",
-      "CACTI effective delay, area, and aspect-ratio-preserving geometry come from published Table II plus the local CACTI shape; local raw outputs remain as measured_* fields.",
-      "The 8.72 effective local stack-resistance factor was recalibrated after cache geometry began using CACTI/Table-II areas; it reconstructs an unpublished Cool-3D material stack from the Table III FFT anchor and requires cross-anchor validation.",
+      "McPAT uses direct gem5 O3 counters; its reported dynamic and leakage powers are consumed without post-processing multipliers.",
+      "Cache delay, area, and aspect-ratio-preserving geometry come only from the local CACTI run; no published cache table values are used.",
+      "The 8.72 effective local stack-resistance factor came from an earlier Table III temperature anchor and should be recalibrated after local-CACTI geometry changes.",
       "CLIP-3D proposals and fixed-bin are both validated with real HotSpot; a guard prevents a proxy-induced thermal-BIPS regression and records any fallback.",
       "Cool3D-standard and SA+lambda details are under-specified; their deterministic reproduction algorithms record all parameters and candidates."
     ]

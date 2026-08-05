@@ -74,4 +74,4 @@ python3 -m workflow.run_lifting_pipeline \
   --output-dir runs/lifting_smoke/matmul_baseline
 ```
 
-完整方法说明见 [docs/clip3d_pipeline_zh.md](docs/clip3d_pipeline_zh.md)，严格正式执行顺序见 [docs/formal_reproduction_zh.md](docs/formal_reproduction_zh.md)，可选10 ms瞬态热仿真见 [docs/transient_thermal_zh.md](docs/transient_thermal_zh.md)。FFT 64 kB/1 MB 校准单点的完整重跑命令见 [docs/fft_single_point_rerun_zh.md](docs/fft_single_point_rerun_zh.md)。
+完整方法说明见 [docs/clip3d_pipeline_zh.md](docs/clip3d_pipeline_zh.md)，严格正式执行顺序见 [docs/formal_reproduction_zh.md](docs/formal_reproduction_zh.md)，可选10 ms瞬态热仿真见 [docs/transient_thermal_zh.md](docs/transient_thermal_zh.md)。热代理和线延迟参数的独立验证方法见 [docs/surrogate_parameter_validation_zh.md](docs/surrogate_parameter_validation_zh.md)。

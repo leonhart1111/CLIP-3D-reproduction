@@ -1,9 +1,6 @@
 # Workflow modules
 
 这里是 CLIP-3D 自己的实现，不包含四个第三方工具的源码。
-当前参数恢复、代理迁移和布局收益的验收结论见
-`docs/improvement_investigation_20260729.md`；在解释优化器 loss 前应先检查该报告。
-
 - `run_lifting_pipeline.py`：一个 R1 点的端到端流水线；
 - `run_lifting_sweep.py`：发现、续跑、并行处理所有成功 R1 点；
 - `mcpat/`：gem5 到四核 McPAT XML 的转换和详细输出解析；
@@ -20,15 +17,11 @@
 完整用法见 `docs/clip3d_pipeline_zh.md`。
 10 ms 瞬态旁路见 `docs/transient_thermal_zh.md`。
 
-当前论文严格/多锚点配置是
-`configs/experiments/clip3d_constrained_5p0_multianchor.json`。它将 L2 限定在
-P1 顶层、按算法1只运行一次最终 HotSpot，并让 R2 使用公式(15)的平均线延迟。
-`delay.wire_aggregation=maximum` 只用于共享总线最坏路径敏感性检查，不应和
-论文 `mean` 结果混在同一张表中。
+当前受限冷却配置是 `configs/experiments/clip3d_constrained_5p0.json`。
+动态功耗和漏电功耗直接来自 McPAT，不使用论文结果拟合的乘数。
 
-表III参数工具：
+参数研究工具：
 
-- `thermal/calibrate_paper_anchors.py`：功耗/gamma/固定布局Tmax多锚点拟合；
 - `thermal/calibrate_stack_components.py`：硅与TIM热阻有限差分可辨识性检查；
 - `thermal/calibrate_proxy.py`：布局位置代理拟合，并显式拒绝没有跨层样本时对
-  beta 的伪辨识。
+  beta 的伪辨识。这些工具不会修改 McPAT 输出功耗。

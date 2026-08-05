@@ -20,11 +20,7 @@ from workflow.floorplan.generate_hotspot_inputs import materialize
 from workflow.floorplan.layout_metrics import derive_layout_delays
 from workflow.floorplan.optimize_layout import optimize
 from workflow.mcpat.gem5_to_mcpat import convert
-from workflow.mcpat.parse_mcpat import (
-    apply_power_calibration,
-    parse_mcpat_text,
-    resolve_power_calibration,
-)
+from workflow.mcpat.parse_mcpat import parse_mcpat_text
 from workflow.r2.build_latency_vector import build_vector
 from workflow.r2.run_r2 import run as run_r2
 from workflow.thermal.run_hotspot import run_hotspot
@@ -157,6 +153,12 @@ def validate_config(config: dict, layout_method: str) -> None:
         raise ValueError("unsupported CLIP-3D pipeline config schema")
     if layout_method not in LAYOUT_METHODS:
         raise ValueError(f"unknown layout method: {layout_method}")
+    cacti_config = config.get("cacti", {})
+    if "use_paper_table_ii" in cacti_config:
+        raise ValueError(
+            "cacti.use_paper_table_ii has been removed; cache area and latency "
+            "must come from the local CACTI run"
+        )
     physical_r = float(config["physical"]["r_convec_k_per_w"])
     optimizer_r = float(config["layout_optimizer"]["r_convec_k_per_w"])
     if layout_method != "fixed-bin" and not abs(physical_r - optimizer_r) < 1e-12:
@@ -164,16 +166,13 @@ def validate_config(config: dict, layout_method: str) -> None:
             "layout search and final HotSpot must use the same R_conv: "
             f"optimizer={optimizer_r}, physical={physical_r}"
         )
-    calibration = config.get("mcpat", {}).get("power_calibration", {})
-    calibrations = [("default", calibration)] + list(
-        calibration.get("by_workload", {}).items()
-    )
-    for label, values in calibrations:
-        for name in ("dynamic_scale", "leakage_scale"):
-            if float(values.get(name, 1.0)) <= 0:
-                raise ValueError(
-                    f"mcpat.power_calibration[{label}].{name} must be positive"
-                )
+    allowed_mcpat = {
+        "temperature_k", "device_type", "longer_channel_device",
+        "interconnect_projection_type", "opt_for_clk",
+    }
+    unknown_mcpat = set(config.get("mcpat", {})) - allowed_mcpat
+    if unknown_mcpat:
+        raise ValueError(f"unsupported mcpat settings: {sorted(unknown_mcpat)}")
     tolerance = float(config.get("layout_optimizer", {}).get(
         "baseline_guard_bips_tolerance", 1e-9
     ))
@@ -474,7 +473,6 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     frequency = config["frequency"]
     physical = config["physical"]
     mcpat_config = config.get("mcpat", {})
-    cacti_config = config.get("cacti", {})
     metadata = read_json(r1_dir / "r1_metadata.json")
     tools = {
         "mcpat": PROJECT_ROOT / "tools/src/mcpat/mcpat",
@@ -511,12 +509,6 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     if process.returncode != 0 or "McPAT (version 1.3" not in mcpat_text or "results" not in mcpat_text:
         raise RuntimeError(f"McPAT failed; see {mcpat_dir / 'mcpat.out'}")
     parsed_mcpat = parse_mcpat_text(mcpat_text)
-    calibration = resolve_power_calibration(mcpat_config, metadata["workload"])
-    apply_power_calibration(
-        parsed_mcpat, float(calibration.get("dynamic_scale", 1.0)),
-        float(calibration.get("leakage_scale", 1.0)),
-        calibration.get("provenance"),
-    )
     parsed_mcpat["command"] = command
     write_json(mcpat_dir / "mcpat.json", parsed_mcpat)
     stage_seconds["mcpat"] = time.perf_counter() - started
@@ -526,13 +518,12 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     characterize(
         tools["cacti"], tools["cacti_config"], output_dir / "cacti",
         l1_sizes, [metadata["l2_size"]], frequency["f0_ghz"],
-        bool(cacti_config.get("use_paper_table_ii", False)),
     )
     stage_seconds["cacti"] = time.perf_counter() - started
 
     started = time.perf_counter()
     modules_path = output_dir / "modules.json"
-    reference_raw = float(physical.get("area_reference_raw_mm2", 57.713078))
+    reference_raw = float(physical.get("area_reference_raw_mm2", 45.7538495872))
     area_scale = float(physical["area_reference_mm2"]) / reference_raw
     cacti_json = output_dir / "cacti/cacti_characterization.json"
     model = build_model(
@@ -683,10 +674,7 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
         "cooling": {"r_convec_k_per_w": physical["r_convec_k_per_w"],
                     "ambient_c": frequency["ambient_c"]},
         "module_count": len(model["modules"]), "total_power_w": model["totals"]["total_power_w"],
-        "raw_total_power_w": (
-            model.get("raw_mcpat_module_totals") or {}
-        ).get("total_power_w"),
-        "power_calibration": model.get("power_calibration"),
+        "power_provenance": model["power_provenance"],
         "area_calibration": model.get("area_calibration"),
         "power_distribution": model.get("power_distribution"),
         "gamma": model["gamma"], "tmax_c": thermal["tmax_c"],
