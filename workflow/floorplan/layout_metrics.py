@@ -144,6 +144,26 @@ def aggregate_wire_cycles(per_core: list[dict], aggregation: str = "mean",
     return sum(weights[core] * delays[core] for core in sorted(delays))
 
 
+def select_rounded_wire_cycles(layout_delays: dict, aggregation: str) -> int:
+    """Select the one rounded layout-wire cycle consumed by shared-xbar R2."""
+    fields = {
+        "mean": "wire_cycles",
+        "maximum": "maximum_wire_cycles",
+        "traffic-weighted": "traffic_weighted_wire_cycles",
+    }
+    if aggregation not in fields:
+        raise ValueError(f"unknown wire-cycle aggregation: {aggregation}")
+    field = fields[aggregation]
+    if field not in layout_delays:
+        raise ValueError(
+            f"layout delays lack {field} required by {aggregation} aggregation"
+        )
+    value = int(layout_delays[field])
+    if value < 0:
+        raise ValueError("selected rounded wire delay cannot be negative")
+    return value
+
+
 def round_wire_cycles(value: float, policy: str = "nearest") -> int:
     if value < 0:
         raise ValueError("wire delay cannot be negative")

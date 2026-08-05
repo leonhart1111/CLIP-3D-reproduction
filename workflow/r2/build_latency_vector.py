@@ -10,6 +10,7 @@ from workflow.common import parse_size_bytes, read_json, write_json
 from workflow.floorplan.layout_metrics import (
     communication_weights_from_model,
     derive_layout_delays,
+    select_rounded_wire_cycles,
 )
 
 
@@ -51,12 +52,9 @@ def build_vector(modules: Path, cacti_path: Path, output: Path,
         if tsv_hops is None:
             tsv_hops = int(layout_delays["tsv_hops"])
         if wire_cycles is None:
-            selected_fields = {
-                "mean": "wire_cycles",
-                "maximum": "maximum_wire_cycles",
-                "traffic-weighted": "traffic_weighted_wire_cycles",
-            }
-            wire_cycles = int(layout_delays[selected_fields[wire_aggregation]])
+            wire_cycles = select_rounded_wire_cycles(
+                layout_delays, wire_aggregation
+            )
     if tsv_hops is None:
         tsv_hops = 1
     if wire_cycles is None:

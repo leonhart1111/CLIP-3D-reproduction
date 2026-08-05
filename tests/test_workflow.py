@@ -25,6 +25,7 @@ from workflow.floorplan.layout_metrics import (
     aggregate_wire_cycles,
     communication_weights_from_model,
     derive_layout_delays,
+    select_rounded_wire_cycles,
 )
 from workflow.floorplan.optimize_layout import optimize, proxy_temperature
 from workflow.mcpat.parse_mcpat import parse_mcpat_text
@@ -1040,6 +1041,18 @@ class GridTests(unittest.TestCase):
                 weights[item["core"]] * item["delay_cycles"],
             )
 
+    def test_selected_rounded_wire_cycle_uses_requested_aggregation(self):
+        delays = {
+            "wire_cycles": 2,
+            "maximum_wire_cycles": 5,
+            "traffic_weighted_wire_cycles": 3,
+        }
+        self.assertEqual(select_rounded_wire_cycles(delays, "mean"), 2)
+        self.assertEqual(select_rounded_wire_cycles(delays, "maximum"), 5)
+        self.assertEqual(
+            select_rounded_wire_cycles(delays, "traffic-weighted"), 3
+        )
+
     def test_communication_weights_are_read_only_from_available_profile(self):
         model = self.model()
         model["communication_profile"] = {
@@ -1458,6 +1471,40 @@ class FormalGuardTests(unittest.TestCase):
         self.assertEqual(config["layout_optimizer"]["beta"], 0.0)
         self.assertFalse(config["formal_validation"]["accepted"])
         validate_config(config, "clip3d")
+
+    def test_nonformal_config_accepts_traffic_weighted_extension(self):
+        config = read_json(Path(
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_lambda0020119_exploratory.json"
+        ))
+        config["delay"]["wire_aggregation"] = "traffic-weighted"
+        validate_config(config, "clip3d")
+
+    def test_accepted_formal_config_rejects_traffic_weighted_extension_first(self):
+        config = read_json(Path(
+            "configs/experiments/clip3d_constrained_5p0_raw_power_p1_candidate.json"
+        ))
+        config["formal_validation"]["accepted"] = True
+        config["delay"]["wire_aggregation"] = "traffic-weighted"
+        with self.assertRaisesRegex(ValueError, "non-formal research extension"):
+            validate_config(config, "clip3d")
+
+    def test_default_mean_aggregation_remains_valid(self):
+        config = read_json(Path(
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_lambda0020119_exploratory.json"
+        ))
+        config["delay"].pop("wire_aggregation", None)
+        validate_config(config, "clip3d")
+
+    def test_clip3d_optimizer_rejects_conservative_maximum_mode(self):
+        config = read_json(Path(
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_lambda0020119_exploratory.json"
+        ))
+        config["delay"]["wire_aggregation"] = "maximum"
+        with self.assertRaisesRegex(ValueError, "maximum.*R2 sensitivity"):
+            validate_config(config, "clip3d")
 
     def test_promotion_rejects_failed_proxy(self):
         with tempfile.TemporaryDirectory() as temporary:
