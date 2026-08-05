@@ -205,6 +205,11 @@ def validate_config(config: dict, layout_method: str) -> None:
             "maximum wire aggregation is only a conservative R2 sensitivity mode, "
             "not a CLIP-3D optimizer objective"
         )
+    if aggregation == "traffic-weighted" and layout_method in COMPARISON_METHODS:
+        raise ValueError(
+            "traffic-weighted aggregation is not supported by comparison layout "
+            "methods because their candidate selection uses a different objective"
+        )
     if config.get("formal_validation", {}).get("strict_p1") is True:
         if list(allowed_tiers) != [1]:
             raise ValueError("strict P1 requires layout_optimizer.allowed_l2_tiers == [1]")

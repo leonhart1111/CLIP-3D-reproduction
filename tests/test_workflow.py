@@ -1156,6 +1156,50 @@ class GridTests(unittest.TestCase):
                 for assumption in vector["reproduction_assumptions"]
             ))
 
+    def test_traffic_weighted_r2_rejects_missing_layout_and_manual_override(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            model["architecture"] = {
+                "num_cores": 4,
+                "l1i_size": "32kB",
+                "l1d_size": "32kB",
+                "l2_size": "512kB",
+            }
+            model["communication_profile"] = {
+                "status": "available",
+                "per_core": {
+                    str(core): {"normalized_weight": 0.25}
+                    for core in range(4)
+                },
+            }
+            modules_path = root / "modules.json"
+            write_json(modules_path, model)
+            cacti_path = root / "cacti.json"
+            write_json(cacti_path, {
+                "frequency_ghz": 2.0,
+                "records": [
+                    {"level": "l1d", "size": "32kB",
+                     "size_bytes": 32 * 1024, "access_cycles": 2},
+                    {"level": "l2", "size": "512kB",
+                     "size_bytes": 512 * 1024, "access_cycles": 4},
+                ],
+            })
+            with self.assertRaisesRegex(ValueError, "requires a final layout"):
+                build_vector(
+                    modules_path, cacti_path, root / "missing_layout.json",
+                    wire_aggregation="traffic-weighted",
+                )
+
+            layout_path = root / "layout.json"
+            write_json(layout_path, baseline_layout(model))
+            with self.assertRaisesRegex(ValueError, "cannot override"):
+                build_vector(
+                    modules_path, cacti_path, root / "manual_override.json",
+                    wire_cycles=99, layout_path=layout_path,
+                    wire_aggregation="traffic-weighted",
+                )
+
     def test_area_quadrature_proxy_is_finite_and_geometry_sensitive(self):
         layout = baseline_layout(self.model())
         center = proxy_temperature(
@@ -1505,6 +1549,17 @@ class FormalGuardTests(unittest.TestCase):
         config["delay"]["wire_aggregation"] = "maximum"
         with self.assertRaisesRegex(ValueError, "maximum.*R2 sensitivity"):
             validate_config(config, "clip3d")
+
+    def test_comparison_layouts_reject_traffic_weighted_selection(self):
+        config = read_json(Path(
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_lambda0020119_exploratory.json"
+        ))
+        config["delay"]["wire_aggregation"] = "traffic-weighted"
+        for method in ("cool3d-standard", "sa-lambda"):
+            with self.subTest(method=method), self.assertRaisesRegex(
+                    ValueError, "comparison layout methods"):
+                validate_config(config, method)
 
     def test_traffic_weighted_exploratory_config_is_non_formal(self):
         config = read_json(Path(

@@ -40,6 +40,10 @@ def build_vector(modules: Path, cacti_path: Path, output: Path,
         raise ValueError(
             "wire_aggregation must be 'mean', 'maximum', or 'traffic-weighted'"
         )
+    if wire_aggregation == "traffic-weighted" and layout_path is None:
+        raise ValueError(
+            "traffic-weighted R2 requires a final layout to derive wire cycles"
+        )
     communication_weights = communication_weights_from_model(
         model, required=wire_aggregation == "traffic-weighted"
     )
@@ -51,10 +55,16 @@ def build_vector(modules: Path, cacti_path: Path, output: Path,
         )
         if tsv_hops is None:
             tsv_hops = int(layout_delays["tsv_hops"])
-        if wire_cycles is None:
-            wire_cycles = select_rounded_wire_cycles(
-                layout_delays, wire_aggregation
+        derived_wire_cycles = select_rounded_wire_cycles(
+            layout_delays, wire_aggregation
+        )
+        if (wire_aggregation == "traffic-weighted" and wire_cycles is not None
+                and int(wire_cycles) != derived_wire_cycles):
+            raise ValueError(
+                "traffic-weighted R2 cannot override the layout-derived wire cycles"
             )
+        if wire_cycles is None:
+            wire_cycles = derived_wire_cycles
     if tsv_hops is None:
         tsv_hops = 1
     if wire_cycles is None:
