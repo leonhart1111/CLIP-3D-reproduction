@@ -18,7 +18,7 @@ class CanonicalFixtureTests(unittest.TestCase):
     def make_grid_fixture(self) -> tuple[Path, Path]:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name) / "r1"
+        root = Path(temporary.name) / "paper"
         experiment = Path(temporary.name) / "r1_cache_sweep.json"
         grid = {
             "workloads": ["fft", "matmul"],
@@ -217,7 +217,10 @@ class CanonicalAuditTests(CanonicalFixtureTests):
 
         def write_plan(command, **_kwargs):
             self.assertNotIn("--execute", command)
-            write_json(root / "planned_jobs.json", {"job_count": 4, "jobs": []})
+            output_root = Path(command[command.index("--output-root") + 1])
+            profile = command[command.index("--profile") + 1]
+            write_json(output_root / profile / "planned_jobs.json",
+                       {"job_count": 4, "jobs": []})
             return CompletedProcess(command, 0)
 
         with patch("workflow.analysis.refresh_r1_plan.subprocess.run",
@@ -230,6 +233,22 @@ class CanonicalAuditTests(CanonicalFixtureTests):
         self.assertTrue(result["canonical_artifacts_unchanged"])
         self.assertEqual(result["plan_count"], 4)
         self.assertNotIn("--execute", result["command"])
+        output_root = Path(result["command"][result["command"].index("--output-root") + 1])
+        self.assertEqual(output_root / result["profile"], root)
+
+    def test_refresh_requires_root_to_be_the_selected_profile_directory(self):
+        """A planner cannot refresh a root different from its profile output path."""
+        from workflow.analysis.refresh_r1_plan import refresh
+
+        root, experiment = self.make_grid_fixture()
+        wrong_root = root.parent / "not_the_paper_profile"
+        root.rename(wrong_root)
+
+        with patch("workflow.analysis.refresh_r1_plan.subprocess.run",
+                   return_value=CompletedProcess([], 0)):
+            with self.assertRaisesRegex(ValueError,
+                                        "root directory must match profile"):
+                refresh(wrong_root, experiment, "paper", wrong_root.parent / "refresh")
 
     def test_refresh_aborts_if_any_canonical_hash_changes(self):
         """Changing a canonical stats file during refresh invalidates the result."""
@@ -255,6 +274,49 @@ class CanonicalAuditTests(CanonicalFixtureTests):
                                         "canonical R1 artifacts changed"):
                 refresh(root, experiment, "paper", output)
         self.assertTrue((output / "canonical_r1_after.sha256.json").is_file())
+
+    def test_refresh_reports_mutation_before_a_failed_planner(self):
+        """A failed planner cannot mask a changed canonical R1 artifact."""
+        from workflow.analysis.refresh_r1_plan import refresh
+
+        root, experiment = self.make_grid_fixture()
+        output = root.parent / "refresh"
+
+        def mutate_stats_and_return_failure(command, **_kwargs):
+            stats_path = root / "fft/l1d_16kB/l2_128kB/stats.txt"
+            stats_path.write_text(
+                stats_path.read_text(encoding="utf-8").replace(
+                    "system.cpu0.numCycles 50", "system.cpu0.numCycles 0"
+                ),
+                encoding="utf-8",
+            )
+            return CompletedProcess(command, 9)
+
+        with patch("workflow.analysis.refresh_r1_plan.subprocess.run",
+                   side_effect=mutate_stats_and_return_failure):
+            with self.assertRaisesRegex(RuntimeError,
+                                        "canonical R1 artifacts changed"):
+                refresh(root, experiment, "paper", output)
+
+        before = read_json(output / "canonical_r1_before.sha256.json")
+        after = read_json(output / "canonical_r1_after.sha256.json")
+        self.assertNotEqual(before, after)
+
+    def test_refresh_reports_failed_planner_after_writing_unchanged_hashes(self):
+        """An unchanged failed planner still records its two immutable manifests."""
+        from workflow.analysis.refresh_r1_plan import refresh
+
+        root, experiment = self.make_grid_fixture()
+        output = root.parent / "refresh"
+
+        with patch("workflow.analysis.refresh_r1_plan.subprocess.run",
+                   return_value=CompletedProcess([], 7)):
+            with self.assertRaisesRegex(RuntimeError, "exit status 7"):
+                refresh(root, experiment, "paper", output)
+
+        before = read_json(output / "canonical_r1_before.sha256.json")
+        after = read_json(output / "canonical_r1_after.sha256.json")
+        self.assertEqual(before, after)
 
 
 if __name__ == "__main__":

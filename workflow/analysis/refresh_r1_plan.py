@@ -29,6 +29,10 @@ def refresh(root: Path, experiment_path: Path, profile: str, output: Path) -> di
     root = Path(root).resolve()
     experiment_path = Path(experiment_path).resolve()
     output = Path(output).resolve()
+    if root.name != profile:
+        raise ValueError(
+            f"root directory must match profile: {root.name!r} != {profile!r}"
+        )
     catalogue = _require_complete_catalogue(root, experiment_path, profile)
     before_path = output / "canonical_r1_before.sha256.json"
     after_path = output / "canonical_r1_after.sha256.json"
@@ -43,14 +47,14 @@ def refresh(root: Path, experiment_path: Path, profile: str, output: Path) -> di
         "--output-root", str(root.parent),
     ]
     completed = subprocess.run(command, cwd=PROJECT_ROOT, check=False)
-    if completed.returncode:
-        raise RuntimeError(f"R1 plan refresh failed with exit status {completed.returncode}")
 
     after_catalogue = build_catalogue(root, experiment_path, profile=profile)
     after = snapshot_canonical_artifacts(after_catalogue)
     write_json(after_path, after)
     if before != after:
         raise RuntimeError("canonical R1 artifacts changed during plan refresh")
+    if completed.returncode:
+        raise RuntimeError(f"R1 plan refresh failed with exit status {completed.returncode}")
     if not after_catalogue["complete"]:
         raise RuntimeError("canonical R1 catalogue is incomplete or invalid after plan refresh")
 
