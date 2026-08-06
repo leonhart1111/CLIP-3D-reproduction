@@ -314,7 +314,7 @@
 
 **Interfaces:**
 - Consumes: two complete canonical layout roots, canonical grid config, and exploratory experiment config.
-- Produces: `load_selection(path: Path) -> dict`, `selection_keys(manifest: dict) -> list[ArchitectureKey]`, `validate_selection(manifest: dict, grid: dict) -> dict`, and `validate_layout_roots(fixed_root: Path, clip_root: Path, keys: list[ArchitectureKey], config_path: Path, require_layout_only: bool = True) -> dict`.
+- Produces: `load_selection(path: Path) -> dict`, `selection_keys(manifest: dict) -> list[ArchitectureKey]`, `validate_selection(manifest: dict, grid: dict) -> dict`, and `validate_layout_roots(fixed_root: Path, clip_root: Path, keys: list[ArchitectureKey], config_path: Path, require_layout_only: bool = True, existing_r2_validator: Callable[[str, ArchitectureKey, Path], dict] | None = None) -> dict`.
 
 - [ ] **Step 1: Write failing deterministic-selection tests**
 
@@ -347,7 +347,7 @@
 
 - [ ] **Step 4: Implement selection and layout-root validation**
 
-  `validate_layout_roots` verifies every selected point and also scans each root to prove it represents the same complete 100-point canonical key set. It verifies the embedded `run_config.json["config"]` equals the selected experiment config, the SHA-256 matches, required files exist, fixed/CLIP methods are correct, classification is non-formal, and communication weights are present. With `require_layout_only=True`, summaries containing IPC2/BIPS2 are rejected so the initial 200-output checkpoint proves that no R2 was mixed into layout generation. With `require_layout_only=False`, an existing R2 is allowed only when Task 5's local-result or exact-reuse validator accepts its provenance; this mode exists solely so a one-pair smoke run and interrupted full run can resume safely. Return a JSON-serializable preflight report with 100/100 root counts, 50 selected pairs, the mode, and any validated existing R2 counts.
+  `validate_layout_roots` verifies every selected point and also scans each root to prove it represents the same complete 100-point canonical key set. It verifies the embedded `run_config.json["config"]` equals the selected experiment config, the SHA-256 matches, required files exist, fixed/CLIP methods are correct, classification is non-formal, and communication weights are present. With `require_layout_only=True`, summaries containing IPC2/BIPS2 are rejected so the initial 200-output checkpoint proves that no R2 was mixed into layout generation. With `require_layout_only=False`, every existing R2 point must be passed to `existing_r2_validator`; finding R2 without a validator is an error. Task 6 injects an adapter over Task 5's local-result and exact-reuse validators, avoiding duplicated provenance logic or a circular import. This mode exists solely so a one-pair smoke run and interrupted full run can resume safely. Return a JSON-serializable preflight report with 100/100 root counts, 50 selected pairs, the mode, and validated existing R2 counts.
 
 - [ ] **Step 5: Run selection/preflight tests**
 
@@ -495,7 +495,7 @@
 
   Each pair writes `<status_root>/<workload>/l1d_<L1D>/l2_<L2>/pair_status.json` with `running`, then `success` or `failed`. A successful record includes vector hashes, whether reuse occurred, physical run count, IPC2/BIPS2 values, and artifact paths. `run_pair` first validates or produces fixed R2, then compares/validates CLIP. Compatible existing results must pass the same validators as newly generated results.
 
-  `run_sweep` validates the complete layout roots with `require_layout_only=False` before creating jobs, uses `ProcessPoolExecutor(max_workers=jobs)` plus `as_completed` for independent architecture pairs, and atomically rewrites experiment `status.json` after each returned pair. Thus the initial invocation accepts pure layout roots, while later invocations accept only provenance-validated R2 artifacts left by the same experiment. The final status records exactly 50 selected pairs, completed/failed counts, reuse count, separate-CLIP count `K`, and physical run count `50 + K` when complete. A positive smoke-test limit records `limited_run=true` and can succeed for the selected subset, but can never mark the full experiment complete.
+  `run_sweep` validates the complete layout roots with `require_layout_only=False` and an `existing_r2_validator` adapter over Task 5 before creating jobs, uses `ProcessPoolExecutor(max_workers=jobs)` plus `as_completed` for independent architecture pairs, and atomically rewrites experiment `status.json` after each returned pair. Thus the initial invocation accepts pure layout roots, while later invocations accept only provenance-validated R2 artifacts left by the same experiment. The final status records exactly 50 selected pairs, completed/failed counts, reuse count, separate-CLIP count `K`, and physical run count `50 + K` when complete. A positive smoke-test limit records `limited_run=true` and can succeed for the selected subset, but can never mark the full experiment complete.
 
 - [ ] **Step 4: Add the CLI**
 
