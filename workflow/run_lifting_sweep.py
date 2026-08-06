@@ -9,12 +9,16 @@ from pathlib import Path
 
 from workflow.common import PROJECT_ROOT, read_json, sha256_file, write_json
 from workflow.r1_catalog import build_catalogue, canonical_directories
-from workflow.run_lifting_pipeline import DEFAULT_CONFIG, LAYOUT_METHODS, run_pipeline
+from workflow.run_lifting_pipeline import LAYOUT_METHODS, run_pipeline
 
 
 DEFAULT_R1_ROOT = PROJECT_ROOT / "runs/architecture_sweep/r1/paper"
 DEFAULT_OUTPUT = PROJECT_ROOT / "runs/architecture_sweep/lifting"
 DEFAULT_R1_EXPERIMENT = PROJECT_ROOT / "configs/experiments/r1_cache_sweep.json"
+DEFAULT_SWEEP_CONFIG = PROJECT_ROOT / (
+    "configs/experiments/"
+    "clip3d_constrained_5p0_raw_power_p1_lambda0020119_traffic_weighted_exploratory.json"
+)
 
 
 required_artifacts = (
@@ -29,6 +33,20 @@ required_artifacts = (
     "pipeline_summary.json",
 )
 CLIP3D_REQUIRED_ARTIFACTS = ("optimizer_report.json", "layout_selection.json")
+
+
+def require_nonformal_classification(config: dict) -> dict:
+    """Return the explicit exploratory classification required for every sweep."""
+    classification = config.get("experiment_classification")
+    if not isinstance(classification, dict):
+        raise ValueError("experiment_classification must be an object")
+    if not isinstance(classification.get("mode"), str) or not classification["mode"]:
+        raise ValueError("experiment_classification must include a nonempty mode")
+    if (classification.get("non_formal") is not True
+            or classification.get("paper_equivalent") is not False
+            or classification.get("shared_parameter_accepted") is not False):
+        raise ValueError("experiment_classification must be non-formal exploratory")
+    return classification
 
 
 def discover(root: Path, experiment_path: Path, profile: str = "paper",
@@ -98,7 +116,7 @@ def main() -> None:
     parser.add_argument("--r1-profile", default="paper")
     parser.add_argument("--allow-incomplete-canonical", action="store_true")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--config", type=Path, default=DEFAULT_SWEEP_CONFIG)
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--workloads", nargs="+")
     parser.add_argument("--layout-method", choices=LAYOUT_METHODS, default="fixed-bin")
@@ -124,6 +142,7 @@ def main() -> None:
     output_root = args.output_root.resolve()
     config_path = args.config.resolve()
     config = read_json(config_path)
+    classification = require_nonformal_classification(config)
     reuse_root = args.reuse_r2_root.resolve() if args.reuse_r2_root else None
     points, catalogue = discover(
         r1_root, r1_experiment, args.r1_profile,
@@ -156,8 +175,10 @@ def main() -> None:
     contains_r2 = any(summary.get("ipc2") is not None or summary.get("bips2") is not None
                       for summary in all_summaries)
     layout_only = not args.run_r2 and reuse_root is None
-    if layout_only and contains_r2:
-        raise RuntimeError("layout-only lifting sweep contains R2 performance results")
+    validation_error = (
+        "layout-only lifting sweep contains R2 performance results"
+        if layout_only and contains_r2 else None
+    )
     failed = sum(result["state"] == "failed" for result in results)
     report = {
         "schema_version": 3, "r1_root": str(r1_root),
@@ -165,10 +186,11 @@ def main() -> None:
         "output_root": str(output_root), "config": str(config_path),
         "config_sha256": sha256_file(config_path),
         "experiment": config.get("name", config_path.stem),
-        "classification": config.get("experiment_classification"),
+        "classification": classification,
         "layout_method": args.layout_method, "run_r2": args.run_r2,
         "reuse_r2_root": str(reuse_root) if reuse_root else None,
         "contains_r2": contains_r2,
+        "validation_error": validation_error,
         "workloads": args.workloads,
         "selected_workload_count": len({
             point.relative_to(r1_root).parts[0] for point in points
@@ -187,7 +209,7 @@ def main() -> None:
     success = sum(result["state"] == "success" for result in results)
     print(f"lifting sweep: discovered={len(points)} success={success} "
           f"failed={failed} skipped={len(skipped)}")
-    if failed:
+    if failed or validation_error:
         raise SystemExit(1)
 
 

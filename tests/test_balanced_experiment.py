@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import sys
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -323,6 +323,13 @@ class CanonicalAuditTests(CanonicalFixtureTests):
 
 
 class CanonicalLiftingTests(CanonicalFixtureTests):
+    classification = {
+        "mode": "operational-exploratory-traffic-weighted",
+        "non_formal": True,
+        "paper_equivalent": False,
+        "shared_parameter_accepted": False,
+    }
+
     def _add_noncanonical_duplicate(self, root: Path) -> None:
         source = root / "fft/l1d_16kB/l2_128kB"
         duplicate = root / "fft/l1d_16kB/l2_128kB.corrupt_duplicate_fixture"
@@ -332,6 +339,39 @@ class CanonicalLiftingTests(CanonicalFixtureTests):
             (source / "stats.txt").read_text(encoding="utf-8"),
             encoding="utf-8",
         )
+
+    def _write_config(self, root: Path, classification: dict | None = None) -> Path:
+        config = root / "lifting_config.json"
+        payload = {
+            "name": "fixture_layout_only",
+            "physical": {"r_convec_k_per_w": 5.0},
+        }
+        if classification is not None:
+            payload["experiment_classification"] = classification
+        write_json(config, payload)
+        return config
+
+    def _write_completed_layout_output(self, output: Path, config: dict,
+                                       layout_method: str = "fixed-bin") -> None:
+        from workflow.run_lifting_sweep import required_artifacts
+
+        for artifact in required_artifacts:
+            write_json(output / artifact, {})
+        write_json(output / "run_config.json", {"config": config})
+        write_json(output / "pipeline_summary.json", {
+            "layout_method": layout_method,
+            "cooling": {"r_convec_k_per_w": 5.0},
+            "ipc2": None,
+            "bips2": None,
+        })
+
+    def _cli_argv(self, root: Path, experiment: Path, output: Path,
+                  config: Path) -> list[str]:
+        return [
+            "run_lifting_sweep.py", "--r1-root", str(root),
+            "--r1-experiment", str(experiment), "--r1-profile", "paper",
+            "--output-root", str(output), "--config", str(config),
+        ]
 
     def test_discover_uses_only_valid_canonical_catalogue_points(self):
         """A metadata-bearing sibling is excluded instead of becoming a fifth job."""
@@ -375,18 +415,7 @@ class CanonicalLiftingTests(CanonicalFixtureTests):
         root, experiment = self.make_grid_fixture()
         self._add_noncanonical_duplicate(root)
         output = root.parent / "lifting"
-        config = root.parent / "lifting_config.json"
-        classification = {
-            "mode": "operational-exploratory-traffic-weighted",
-            "non_formal": True,
-            "paper_equivalent": False,
-            "shared_parameter_accepted": False,
-        }
-        write_json(config, {
-            "name": "fixture_layout_only",
-            "experiment_classification": classification,
-            "physical": {"r_convec_k_per_w": 5.0},
-        })
+        config = self._write_config(root.parent, self.classification)
 
         def layout_only_job(job):
             r1, destination, *_rest = job
@@ -395,20 +424,15 @@ class CanonicalLiftingTests(CanonicalFixtureTests):
                 "summary": {"ipc2": None, "bips2": None},
             }
 
-        argv = [
-            "run_lifting_sweep.py", "--r1-root", str(root),
-            "--r1-experiment", str(experiment), "--r1-profile", "paper",
-            "--output-root", str(output), "--config", str(config),
-        ]
         with patch("workflow.run_lifting_sweep.one_job", side_effect=layout_only_job):
-            with patch.object(sys, "argv", argv), redirect_stdout(StringIO()):
+            with patch.object(sys, "argv", self._cli_argv(root, experiment, output, config)), redirect_stdout(StringIO()):
                 main()
 
         report = read_json(output / "sweep_status.json")
         self.assertEqual(report["schema_version"], 3)
         self.assertEqual(report["config"], str(config.resolve()))
         self.assertEqual(report["config_sha256"], sha256_file(config))
-        self.assertEqual(report["classification"], classification)
+        self.assertEqual(report["classification"], self.classification)
         self.assertEqual(report["canonical_expected"], 4)
         self.assertEqual(report["canonical_selected"], 4)
         self.assertEqual(len(report["excluded_noncanonical"]), 1)
@@ -435,6 +459,101 @@ class CanonicalLiftingTests(CanonicalFixtureTests):
             })
 
             self.assertFalse(completed(output, config, "fixed-bin", False))
+
+    def test_cli_reports_then_exits_for_layout_only_r2_result(self):
+        """A layout-only R2 result is persisted as a controlled sweep failure."""
+        from workflow.run_lifting_sweep import main
+
+        root, experiment = self.make_grid_fixture()
+        output = root.parent / "lifting"
+        config = self._write_config(root.parent, self.classification)
+
+        def r2_job(job):
+            r1, destination, *_rest = job
+            return {
+                "r1": str(r1), "output": str(destination), "state": "success",
+                "summary": {"ipc2": 1.0, "bips2": 2.0},
+            }
+
+        stderr = StringIO()
+        with patch("workflow.run_lifting_sweep.one_job", side_effect=r2_job):
+            with patch.object(sys, "argv", self._cli_argv(root, experiment, output, config)):
+                with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as raised:
+                        main()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        report = read_json(output / "sweep_status.json")
+        self.assertEqual(report["schema_version"], 3)
+        self.assertTrue(report["contains_r2"])
+        self.assertEqual(report["validation_error"],
+                         "layout-only lifting sweep contains R2 performance results")
+
+    def test_cli_rejects_missing_or_malformed_classification_before_jobs(self):
+        """Every sweep must have a complete non-formal source classification."""
+        from workflow.run_lifting_sweep import main
+
+        root, experiment = self.make_grid_fixture()
+        malformed = {"mode": "operational-exploratory-traffic-weighted",
+                     "non_formal": True}
+
+        def layout_only_job(job):
+            r1, destination, *_rest = job
+            return {
+                "r1": str(r1), "output": str(destination), "state": "success",
+                "summary": {"ipc2": None, "bips2": None},
+            }
+
+        for index, classification in enumerate((None, malformed)):
+            config = self._write_config(root.parent / str(index), classification)
+            output = root.parent / f"lifting-{index}"
+            with patch("workflow.run_lifting_sweep.one_job", side_effect=layout_only_job) as one_job:
+                with patch.object(sys, "argv", self._cli_argv(root, experiment, output, config)):
+                    with self.assertRaisesRegex(ValueError, "experiment_classification"):
+                        main()
+            one_job.assert_not_called()
+            self.assertFalse((output / "sweep_status.json").exists())
+
+    def test_completed_clip3d_requires_optimizer_and_layout_selection(self):
+        """CLIP resume state is incomplete until both selection artifacts exist."""
+        from workflow.run_lifting_sweep import completed
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            config = {"physical": {"r_convec_k_per_w": 5.0}}
+            self._write_completed_layout_output(output, config, "clip3d")
+
+            self.assertFalse(completed(output, config, "clip3d", False))
+            write_json(output / "optimizer_report.json", {})
+            self.assertFalse(completed(output, config, "clip3d", False))
+            write_json(output / "layout_selection.json", {})
+            self.assertTrue(completed(output, config, "clip3d", False))
+
+    def test_cli_counts_valid_skipped_layout_only_outputs_without_r2(self):
+        """All valid completed layout-only outputs are skipped and remain R2-free."""
+        from workflow.run_lifting_sweep import main
+
+        root, experiment = self.make_grid_fixture()
+        output = root.parent / "lifting"
+        config_path = self._write_config(root.parent, self.classification)
+        config = read_json(config_path)
+        for workload in ("fft", "matmul"):
+            for l1d_size in ("16kB", "32kB"):
+                self._write_completed_layout_output(
+                    output / workload / f"l1d_{l1d_size}" / "l2_128kB", config
+                )
+
+        with patch("workflow.run_lifting_sweep.one_job") as one_job:
+            with patch.object(sys, "argv", self._cli_argv(root, experiment, output, config_path)):
+                with redirect_stdout(StringIO()):
+                    main()
+
+        one_job.assert_not_called()
+        report = read_json(output / "sweep_status.json")
+        self.assertEqual(report["executed"], 0)
+        self.assertEqual(report["skipped_count"], 4)
+        self.assertFalse(report["contains_r2"])
 
 
 if __name__ == "__main__":
