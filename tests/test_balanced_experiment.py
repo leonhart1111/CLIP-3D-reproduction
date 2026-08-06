@@ -556,5 +556,236 @@ class CanonicalLiftingTests(CanonicalFixtureTests):
         self.assertFalse(report["contains_r2"])
 
 
+class BalancedSelectionTests(unittest.TestCase):
+    """Exercise the predeclared sample against complete temporary layout roots."""
+
+    expected_pairs = [
+        ("16kB", "128kB"), ("16kB", "512kB"), ("16kB", "2048kB"),
+        ("32kB", "256kB"), ("32kB", "1024kB"),
+        ("64kB", "128kB"), ("64kB", "512kB"), ("64kB", "2048kB"),
+        ("128kB", "256kB"), ("128kB", "1024kB"),
+    ]
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.grid_path = Path(__file__).resolve().parents[1] / (
+            "configs/experiments/r1_cache_sweep.json"
+        )
+        self.grid = read_json(self.grid_path)
+        self.config_path = self.root / "traffic_weighted.json"
+        self.config = read_json(Path(__file__).resolve().parents[1] / (
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_lambda0020119_"
+            "traffic_weighted_exploratory.json"
+        ))
+        write_json(self.config_path, self.config)
+
+    @property
+    def manifest_path(self) -> Path:
+        return Path(__file__).resolve().parents[1] / (
+            "configs/experiments/balanced50_traffic_weighted.json"
+        )
+
+    def _write_layout_roots(self) -> tuple[Path, Path]:
+        """Create real, complete 100-point roots with layout-only artifacts."""
+        from workflow.r1_catalog import expected_keys
+        from workflow.run_lifting_sweep import (
+            CLIP3D_REQUIRED_ARTIFACTS,
+            required_artifacts,
+        )
+
+        fixed_root = self.root / "fixed"
+        clip_root = self.root / "clip"
+        for root, method in ((fixed_root, "fixed-bin"), (clip_root, "clip3d")):
+            for key in expected_keys(self.grid):
+                point = root / key.relative_path()
+                for artifact in required_artifacts:
+                    write_json(point / artifact, {})
+                if method == "clip3d":
+                    for artifact in CLIP3D_REQUIRED_ARTIFACTS:
+                        write_json(point / artifact, {})
+                write_json(point / "run_config.json", {
+                    "schema_version": 1,
+                    "source": str(self.config_path.resolve()),
+                    "layout_method": method,
+                    "config": self.config,
+                })
+                write_json(point / "pipeline_summary.json", {
+                    "layout_method": method,
+                    "layout_mode": method,
+                    "ipc2": None,
+                    "bips2": None,
+                    "communication_profile": {
+                        "status": "available",
+                        "per_core": {
+                            str(core): {"normalized_weight": 0.25}
+                            for core in range(4)
+                        },
+                    },
+                })
+        return fixed_root, clip_root
+
+    def _selection(self):
+        from workflow.experiments.balanced50 import load_selection, selection_keys
+
+        manifest = load_selection(self.manifest_path)
+        return manifest, selection_keys(manifest)
+
+    def test_tracked_manifest_has_the_exact_balanced_order_and_coverage(self):
+        """An outcome-dependent or reordered sample cannot silently replace Balanced-50."""
+        from workflow.experiments.balanced50 import validate_selection
+
+        manifest, keys = self._selection()
+        result = validate_selection(manifest, self.grid)
+
+        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(result["selected_count"], 50)
+        self.assertEqual(result["workload_count"], 5)
+        self.assertEqual(len(set(keys)), 50)
+        for workload in self.grid["workloads"]:
+            pairs = [(key.l1d_size, key.l2_size) for key in keys
+                     if key.workload == workload]
+            self.assertEqual(pairs, self.expected_pairs)
+            self.assertEqual(len(set(pairs)), 10)
+            self.assertEqual({pair[0] for pair in pairs}, set(self.grid["l1d_sizes"]))
+            self.assertEqual({pair[1] for pair in pairs}, set(self.grid["l2_sizes"]))
+
+    def test_preflight_reports_two_complete_layout_only_roots(self):
+        """The selected 50 may proceed only after both whole 100-point roots validate."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        _manifest, keys = self._selection()
+        fixed_root, clip_root = self._write_layout_roots()
+
+        report = validate_layout_roots(
+            fixed_root, clip_root, keys, self.config_path,
+        )
+
+        self.assertEqual(report["mode"], "layout-only")
+        self.assertEqual(report["selected_count"], 50)
+        self.assertEqual(report["fixed"]["canonical_count"], 100)
+        self.assertEqual(report["clip3d"]["canonical_count"], 100)
+        self.assertEqual(report["fixed"]["existing_r2_count"], 0)
+        self.assertEqual(report["clip3d"]["existing_r2_count"], 0)
+        self.assertEqual(report["config_sha256"], sha256_file(self.config_path))
+
+    def test_preflight_rejects_a_missing_unselected_canonical_point(self):
+        """Checking only the selected 50 would hide an incomplete layout generation."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        _manifest, keys = self._selection()
+        fixed_root, clip_root = self._write_layout_roots()
+        missing = fixed_root / "fft/l1d_16kB/l2_256kB/run_config.json"
+        missing.unlink()
+
+        with self.assertRaisesRegex(ValueError, "fixed-bin root.*100"):
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path)
+
+    def test_preflight_rejects_mismatched_layout_method(self):
+        """A fixed output must never be mistaken for the CLIP-3D branch."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        _manifest, keys = self._selection()
+        fixed_root, clip_root = self._write_layout_roots()
+        point = clip_root / keys[0].relative_path()
+        summary = read_json(point / "pipeline_summary.json")
+        summary["layout_method"] = "fixed-bin"
+        write_json(point / "pipeline_summary.json", summary)
+
+        with self.assertRaisesRegex(ValueError, "clip3d.*layout method"):
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path)
+
+    def test_preflight_rejects_changed_embedded_run_config(self):
+        """A point regenerated with different lifting parameters cannot join the root."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        _manifest, keys = self._selection()
+        fixed_root, clip_root = self._write_layout_roots()
+        point = fixed_root / keys[0].relative_path()
+        run_config = read_json(point / "run_config.json")
+        run_config["config"]["physical"]["r_convec_k_per_w"] = 4.0
+        write_json(point / "run_config.json", run_config)
+
+        with self.assertRaisesRegex(ValueError, "embedded config"):
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path)
+
+    def test_preflight_rejects_wrong_experiment_classification(self):
+        """The non-formal traffic-weighted classification is part of the experiment identity."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        _manifest, keys = self._selection()
+        self.config["experiment_classification"]["non_formal"] = False
+        write_json(self.config_path, self.config)
+        fixed_root, clip_root = self._write_layout_roots()
+
+        with self.assertRaisesRegex(ValueError, "experiment classification"):
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path)
+
+    def test_preflight_rejects_missing_traffic_communication_profile(self):
+        """Traffic-weighted layouts require recorded, usable per-core communication weights."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        _manifest, keys = self._selection()
+        fixed_root, clip_root = self._write_layout_roots()
+        point = fixed_root / keys[0].relative_path()
+        summary = read_json(point / "pipeline_summary.json")
+        summary.pop("communication_profile")
+        write_json(point / "pipeline_summary.json", summary)
+
+        with self.assertRaisesRegex(ValueError, "communication profile"):
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path)
+
+    def test_layout_only_preflight_rejects_existing_r2_results(self):
+        """The 200-output layout checkpoint must contain no measured R2 performance."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        _manifest, keys = self._selection()
+        fixed_root, clip_root = self._write_layout_roots()
+        point = fixed_root / keys[0].relative_path()
+        summary = read_json(point / "pipeline_summary.json")
+        summary["ipc2"] = 1.25
+        summary["bips2"] = 2.5
+        write_json(point / "pipeline_summary.json", summary)
+
+        with self.assertRaisesRegex(ValueError, "layout-only.*R2"):
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path)
+
+    def test_resume_preflight_requires_and_uses_an_existing_r2_validator(self):
+        """Resume mode delegates all existing R2 provenance decisions to its caller."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        _manifest, keys = self._selection()
+        fixed_root, clip_root = self._write_layout_roots()
+        point = fixed_root / keys[0].relative_path()
+        summary = read_json(point / "pipeline_summary.json")
+        summary["ipc2"] = 1.25
+        summary["bips2"] = 2.5
+        write_json(point / "pipeline_summary.json", summary)
+
+        with self.assertRaisesRegex(ValueError, "existing_r2_validator"):
+            validate_layout_roots(
+                fixed_root, clip_root, keys, self.config_path,
+                require_layout_only=False,
+            )
+
+        calls = []
+
+        def validator(method, key, output):
+            calls.append((method, key, output))
+            return {"accepted": True}
+
+        report = validate_layout_roots(
+            fixed_root, clip_root, keys, self.config_path,
+            require_layout_only=False, existing_r2_validator=validator,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "fixed-bin")
+        self.assertEqual(calls[0][1], keys[0])
+        self.assertEqual(report["fixed"]["existing_r2_count"], 1)
+        self.assertEqual(report["clip3d"]["existing_r2_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
