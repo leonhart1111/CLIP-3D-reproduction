@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -43,6 +44,14 @@ def write_json(path: Path | str, value: Any) -> None:
         json.dump(value, stream, indent=2, ensure_ascii=False)
         stream.write("\n")
     temporary.replace(path)
+
+
+def sha256_file(path: Path | str) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def parse_size_bytes(text: str | int | float) -> int:
