@@ -25,7 +25,111 @@ def _paired_process_smoke(key, status_root):
     return _pending_pair(key, status_root)
 
 
+class AtomicJsonPublicationTests(unittest.TestCase):
+    """Shared JSON publication must not collide or leave partial state."""
+
+    def test_write_json_does_not_reuse_another_writers_legacy_temp(self):
+        """A deterministic sibling temp must remain owned by its original writer."""
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            destination = root / "status.json"
+            legacy_temp = root / "status.json.tmp"
+            legacy_temp.write_text("other writer\n", encoding="utf-8")
+
+            write_json(destination, {"state": "success"})
+
+            self.assertEqual(read_json(destination), {"state": "success"})
+            self.assertTrue(legacy_temp.is_file())
+            self.assertEqual(
+                legacy_temp.read_text(encoding="utf-8"), "other writer\n"
+            )
+
+    def test_write_json_serialization_failure_leaves_no_partial_temp(self):
+        """A failed serialization must preserve the old file and directory contents."""
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            destination = root / "status.json"
+            write_json(destination, {"state": "old"})
+            before = {path.name: path.read_bytes() for path in root.iterdir()}
+
+            with self.assertRaises(TypeError):
+                write_json(destination, {"not_json": object()})
+
+            self.assertEqual(read_json(destination), {"state": "old"})
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in root.iterdir()}, before
+            )
+
+    def test_attachment_byte_publication_never_exposes_a_torn_destination(self):
+        """Readers must observe either the old attachment JSON or the complete new JSON."""
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        from workflow.r2.attach_result import _publish_bytes
+
+        with tempfile.TemporaryDirectory() as name:
+            destination = Path(name) / "performance.json"
+            old = b'{"state": "old"}\n'
+            new = b'{"state": "new", "padding": "0123456789"}\n'
+            destination.write_bytes(old)
+            half_written = threading.Event()
+            finish_write = threading.Event()
+            real_write_bytes = Path.write_bytes
+
+            def slow_destination_write(path, data):
+                if Path(path).resolve() != destination.resolve():
+                    return real_write_bytes(path, data)
+                with Path(path).open("wb") as stream:
+                    stream.write(data[:len(data) // 2])
+                    stream.flush()
+                    half_written.set()
+                    if not finish_write.wait(2):
+                        raise TimeoutError("reader never sampled partial publication")
+                    stream.write(data[len(data) // 2:])
+                return len(data)
+
+            with patch.object(Path, "write_bytes", new=slow_destination_write), \
+                    ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_publish_bytes, destination, new)
+                exposed = None
+                if half_written.wait(0.2):
+                    exposed = destination.read_bytes()
+                    finish_write.set()
+                published_digest = future.result(timeout=2)
+
+            if exposed is None:
+                exposed = destination.read_bytes()
+            self.assertIn(exposed, (old, new))
+            self.assertEqual(destination.read_bytes(), new)
+            self.assertEqual(published_digest, sha256_file(destination))
+
+
 class CanonicalFixtureTests(unittest.TestCase):
+    def write_canonical_plan(self, root: Path, experiment: Path,
+                             profile: str = "paper") -> dict:
+        grid = read_json(experiment)
+        jobs = []
+        for workload in grid["workloads"]:
+            for l1d_size in grid["l1d_sizes"]:
+                for l2_size in grid["l2_sizes"]:
+                    output_dir = (
+                        root / workload / f"l1d_{l1d_size}" / f"l2_{l2_size}"
+                    )
+                    jobs.append({
+                        "workload": workload,
+                        "l1d_size": l1d_size,
+                        "l2_size": l2_size,
+                        "profile": profile,
+                        "output_dir": str(output_dir.resolve()),
+                    })
+        plan = {
+            "experiment": grid.get("name", "fixture"),
+            "profile": profile,
+            "job_count": len(jobs),
+            "jobs": jobs,
+        }
+        write_json(root / "planned_jobs.json", plan)
+        return plan
+
     def make_grid_fixture(self) -> tuple[Path, Path]:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -72,6 +176,7 @@ class CanonicalFixtureTests(unittest.TestCase):
         extra = root / "fft/l1d_16kB/l2_128kB.corrupt_duplicate_fixture"
         extra.mkdir(parents=True)
         write_json(extra / "status.json", {"state": "success"})
+        self.write_canonical_plan(root, experiment)
         return root, experiment
 
 
@@ -191,6 +296,82 @@ class CanonicalCatalogueTests(CanonicalFixtureTests):
 
 
 class CanonicalAuditTests(CanonicalFixtureTests):
+    def test_audit_requires_planned_jobs_file(self):
+        """Canonical artifacts alone cannot certify an absent execution plan."""
+        from workflow.analysis.audit_r1 import audit
+
+        root, experiment = self.make_grid_fixture()
+        (root / "planned_jobs.json").unlink()
+
+        result = audit(root, root.parent / "audit.json", experiment, "paper",
+                       expected_points=4)
+
+        self.assertFalse(result["complete"])
+        self.assertFalse(result["canonical_plan_valid"])
+        self.assertIn("missing planned_jobs.json", result["canonical_plan_errors"])
+
+    def test_audit_rejects_duplicate_jobs_even_when_job_count_matches(self):
+        """A duplicated key cannot stand in for another canonical plan entry."""
+        from workflow.analysis.audit_r1 import audit
+
+        root, experiment = self.make_grid_fixture()
+        plan = read_json(root / "planned_jobs.json")
+        plan["jobs"][1] = deepcopy(plan["jobs"][0])
+        write_json(root / "planned_jobs.json", plan)
+
+        result = audit(root, root.parent / "audit.json", experiment, "paper",
+                       expected_points=4)
+
+        self.assertFalse(result["complete"])
+        self.assertFalse(result["canonical_plan_valid"])
+        self.assertTrue(any("ordered canonical job" in error
+                            for error in result["canonical_plan_errors"]))
+
+    def test_audit_rejects_quarantined_plan_output(self):
+        """A canonical key cannot redirect execution into a quarantine directory."""
+        from workflow.analysis.audit_r1 import audit
+
+        root, experiment = self.make_grid_fixture()
+        plan = read_json(root / "planned_jobs.json")
+        plan["jobs"][0]["output_dir"] = str(
+            (root / "fft/l1d_16kB/l2_128kB.corrupt_duplicate_fixture").resolve()
+        )
+        write_json(root / "planned_jobs.json", plan)
+
+        result = audit(root, root.parent / "audit.json", experiment, "paper",
+                       expected_points=4)
+
+        self.assertFalse(result["complete"])
+        self.assertTrue(any("output_dir" in error
+                            for error in result["canonical_plan_errors"]))
+
+    def test_audit_rejects_missing_extra_reordered_or_wrong_profile_jobs(self):
+        """Count-preserving plan edits cannot change the exact canonical order."""
+        from workflow.analysis.audit_r1 import audit
+
+        mutations = {
+            "missing": lambda plan: plan["jobs"].pop(),
+            "extra": lambda plan: plan["jobs"].append(deepcopy(plan["jobs"][-1])),
+            "reordered": lambda plan: plan["jobs"].reverse(),
+            "wrong-profile": lambda plan: plan["jobs"][0].__setitem__(
+                "profile", "smoke"
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                root, experiment = self.make_grid_fixture()
+                plan = read_json(root / "planned_jobs.json")
+                mutate(plan)
+                write_json(root / "planned_jobs.json", plan)
+
+                result = audit(
+                    root, root.parent / f"audit-{label}.json", experiment,
+                    "paper", expected_points=4,
+                )
+
+                self.assertFalse(result["complete"])
+                self.assertFalse(result["canonical_plan_valid"])
+
     def test_audit_counts_canonical_and_excluded_separately(self):
         """A stray status must be reported, not treated as a fifth R1 point."""
         from workflow.analysis.audit_r1 import audit
@@ -230,8 +411,7 @@ class CanonicalAuditTests(CanonicalFixtureTests):
             self.assertNotIn("--execute", command)
             output_root = Path(command[command.index("--output-root") + 1])
             profile = command[command.index("--profile") + 1]
-            write_json(output_root / profile / "planned_jobs.json",
-                       {"job_count": 4, "jobs": []})
+            self.write_canonical_plan(output_root / profile, experiment, profile)
             return CompletedProcess(command, 0)
 
         with patch("workflow.analysis.refresh_r1_plan.subprocess.run",
@@ -970,6 +1150,7 @@ class StrictR2ReuseTests(unittest.TestCase):
         self._write_source_result()
 
     def _write_point(self, point: Path, method: str, frequency: float) -> None:
+        ipc1 = 9.7
         vector = {
             "schema_version": 1,
             "equation": 6,
@@ -1012,7 +1193,7 @@ class StrictR2ReuseTests(unittest.TestCase):
             "schema_version": 2,
             "source_r1": str(self.r1.resolve()),
             "architecture": deepcopy(self.metadata),
-            "ipc1": 2.75,
+            "ipc1": ipc1,
             "gamma": 0.2,
             "totals": {
                 "dynamic_power_w": 80.0,
@@ -1020,7 +1201,22 @@ class StrictR2ReuseTests(unittest.TestCase):
                 "total_power_w": 100.0,
                 "area_mm2": 45.0,
             },
-            "modules": [],
+            "modules": [{
+                "name": "fixture-total",
+                "dynamic_power_w": 80.0,
+                "leakage_power_w": 20.0,
+                "total_power_w": 100.0,
+            }],
+        })
+        hotspot = point / "hotspot"
+        hotspot.mkdir(parents=True, exist_ok=True)
+        (hotspot / "steady.txt").write_text(
+            "core0 407.525\n", encoding="utf-8"
+        )
+        write_json(hotspot / "hotspot_manifest.json", {
+            "schema_version": 1,
+            "ambient_c": 25.0,
+            "r_convec_k_per_w": 5.0,
         })
         write_json(point / "hotspot/thermal_result.json", {
             "schema_version": 1,
@@ -1053,8 +1249,8 @@ class StrictR2ReuseTests(unittest.TestCase):
             "thermal_feasible_at_fmin": True,
             "floor_power_scale": 0.36,
             "state": "thermally_limited",
-            "ipc1": 2.75,
-            "bips1_thermal": 2.75 * frequency,
+            "ipc1": ipc1,
+            "bips1_thermal": ipc1 * frequency,
         })
         write_json(point / "pipeline_summary.json", {
             "schema_version": 2,
@@ -1069,8 +1265,8 @@ class StrictR2ReuseTests(unittest.TestCase):
             "gamma": 0.2,
             "tmax_c": 134.375,
             "sustainable_frequency_ghz": frequency,
-            "ipc1": 2.75,
-            "bips1_thermal": 2.75 * frequency,
+            "ipc1": ipc1,
+            "bips1_thermal": ipc1 * frequency,
             "ipc2": None,
             "bips2": None,
             "r2_source": None,
@@ -1526,6 +1722,175 @@ class StrictR2ReuseTests(unittest.TestCase):
         self.assertTrue(any("return_code" in reason for reason in decision["reasons"]),
                         decision["reasons"])
 
+    def test_local_attach_recomputes_every_derived_summary_field(self):
+        """Local attachment publishes one coherent physical/R2 summary snapshot."""
+        from workflow.r2.attach_result import attach
+
+        performance_path = self.fixed / "performance.json"
+        performance = read_json(performance_path)
+        performance.update({
+            "gamma": 0.9,
+            "tmax_f0_c": 999.0,
+            "sustainable_frequency_ghz": 9.0,
+            "ipc1": 99.0,
+            "bips1_thermal": 891.0,
+            "ipc2": 3.25,
+            "bips2": 29.25,
+        })
+        write_json(performance_path, performance)
+        summary_path = self.fixed / "pipeline_summary.json"
+        summary = read_json(summary_path)
+        summary.update({
+            "gamma": 0.9,
+            "tmax_c": 999.0,
+            "sustainable_frequency_ghz": 9.0,
+            "ipc1": 99.0,
+            "bips1_thermal": 891.0,
+            "ipc2": 99.0,
+            "bips2": 891.0,
+            "r2_source": str((self.root / "forged-result.json").resolve()),
+            "total_pipeline_seconds": 999.0,
+        })
+        summary["stage_seconds"]["gem5_r2"] = 999.0
+        for artifact in (
+                "config", "modules", "thermal", "performance", "r2_latency",
+                "r2_result"):
+            summary["artifacts"][artifact] = str(
+                (self.root / f"forged-{artifact}").resolve()
+            )
+        write_json(summary_path, summary)
+
+        attached = attach(self.fixed)
+        published = read_json(performance_path)
+
+        for summary_field, performance_field in (
+                ("gamma", "gamma"), ("tmax_c", "tmax_f0_c"),
+                ("sustainable_frequency_ghz", "sustainable_frequency_ghz"),
+                ("ipc1", "ipc1"), ("bips1_thermal", "bips1_thermal"),
+                ("ipc2", "ipc2"), ("bips2", "bips2")):
+            self.assertEqual(attached[summary_field], published[performance_field])
+        result_path = (self.fixed / "gem5_r2/r2_result.json").resolve()
+        self.assertEqual(attached["r2_source"], str(result_path))
+        self.assertEqual(attached["artifacts"], {
+            "config": str((self.fixed / "run_config.json").resolve()),
+            "modules": str((self.fixed / "modules.json").resolve()),
+            "thermal": str(
+                (self.fixed / "hotspot/thermal_result.json").resolve()
+            ),
+            "performance": str((self.fixed / "performance.json").resolve()),
+            "r2_latency": str((self.fixed / "r2_latency.json").resolve()),
+            "r2_result": str(result_path),
+        })
+        self.assertEqual(attached["stage_seconds"]["gem5_r2"], 17.5)
+        self.assertEqual(
+            attached["total_pipeline_seconds"],
+            sum(attached["stage_seconds"].values()),
+        )
+
+    def test_local_attach_rejects_invalid_module_and_thermal_inputs(self):
+        """Attachment cannot normalize corrupt architecture or HotSpot provenance."""
+        from workflow.r2.attach_result import attach
+
+        cases = {
+            "module-architecture": (
+                self.fixed / "modules.json",
+                lambda value: value["architecture"].__setitem__("l2_size", "1MB"),
+            ),
+            "module-gamma": (
+                self.fixed / "modules.json",
+                lambda value: value.__setitem__("gamma", 0.9),
+            ),
+            "thermal-temperature": (
+                self.fixed / "hotspot/thermal_result.json",
+                lambda value: value.__setitem__("tmax_k", 999.0),
+            ),
+            "thermal-provenance": (
+                self.fixed / "hotspot/thermal_result.json",
+                lambda value: value.__setitem__(
+                    "power_trace", str((self.root / "forged.ptrace").resolve())
+                ),
+            ),
+        }
+        originals = {path: path.read_bytes() for path, _mutate in cases.values()}
+        for label, (path, mutate) in cases.items():
+            with self.subTest(label=label):
+                for original_path, data in originals.items():
+                    original_path.write_bytes(data)
+                value = read_json(path)
+                mutate(value)
+                write_json(path, value)
+                with self.assertRaises(ValueError):
+                    attach(self.fixed)
+
+    def test_local_attach_rejects_coherent_ipc1_not_derived_from_r1_stats(self):
+        """Attachment must not legitimize an IPC1 forged across all derived files."""
+        from workflow.r2.attach_result import attach
+
+        modules_path = self.fixed / "modules.json"
+        modules = read_json(modules_path)
+        modules["ipc1"] = 99.0
+        write_json(modules_path, modules)
+
+        with self.assertRaisesRegex(ValueError, "IPC1|R1 stats"):
+            attach(self.fixed)
+
+    def test_local_attach_rejects_coherent_tmax_not_derived_from_steady_output(self):
+        """Attachment must not legitimize a thermal peak forged above HotSpot output."""
+        from workflow.r2.attach_result import attach
+
+        thermal_path = self.fixed / "hotspot/thermal_result.json"
+        thermal = read_json(thermal_path)
+        thermal["tmax_c"] = 999.0
+        thermal["tmax_k"] = 1272.15
+        write_json(thermal_path, thermal)
+
+        with self.assertRaisesRegex(ValueError, "steady|thermal|Tmax"):
+            attach(self.fixed)
+
+    def test_local_attach_rejects_thermal_identity_not_derived_from_steady_output(self):
+        """Peak name and sample count must describe the captured steady samples."""
+        from workflow.r2.attach_result import attach
+
+        thermal_path = self.fixed / "hotspot/thermal_result.json"
+        original = thermal_path.read_bytes()
+        for field, value in (("peak_unit", "forged"), ("sample_count", 99)):
+            with self.subTest(field=field):
+                thermal_path.write_bytes(original)
+                thermal = read_json(thermal_path)
+                thermal[field] = value
+                write_json(thermal_path, thermal)
+                with self.assertRaisesRegex(ValueError, "steady|peak|sample"):
+                    attach(self.fixed)
+
+    def test_local_attach_rejects_hotspot_manifest_not_bound_to_config(self):
+        """Thermal JSON cannot remain certified beside a conflicting manifest."""
+        from workflow.r2.attach_result import attach
+
+        manifest_path = self.fixed / "hotspot/hotspot_manifest.json"
+        manifest = read_json(manifest_path)
+        manifest["ambient_c"] = 30.0
+        write_json(manifest_path, manifest)
+
+        with self.assertRaisesRegex(ValueError, "manifest|ambient"):
+            attach(self.fixed)
+
+    def test_local_attach_rejects_power_totals_not_derived_from_module_records(self):
+        """Attachment must not legitimize totals forged above unchanged modules."""
+        from workflow.r2.attach_result import attach
+
+        modules_path = self.fixed / "modules.json"
+        modules = read_json(modules_path)
+        modules["totals"].update({
+            "dynamic_power_w": 160.0,
+            "leakage_power_w": 40.0,
+            "total_power_w": 200.0,
+        })
+        modules["gamma"] = 0.2
+        write_json(modules_path, modules)
+
+        with self.assertRaisesRegex(ValueError, "power|module"):
+            attach(self.fixed)
+
     def test_reuse_rejects_one_different_override(self):
         """Matching aggregate latency cannot hide one changed gem5 override."""
         from workflow.r2.reuse_result import validate_reuse
@@ -1539,6 +1904,67 @@ class StrictR2ReuseTests(unittest.TestCase):
 
         self.assertFalse(decision["accepted"])
         self.assertTrue(any("gem5_overrides" in reason for reason in decision["reasons"]))
+
+    def test_override_schema_rejects_loose_types_keys_and_cycle_bounds(self):
+        """Only complete positive uint64 integer latency overrides are renderable."""
+        from workflow.r2.run_r2 import canonical_gem5_args
+
+        invalid = {}
+        fractional = deepcopy(self.overrides)
+        fractional["xbar_forward_latency"] = 8.0
+        invalid["float"] = fractional
+        boolean = deepcopy(self.overrides)
+        boolean["l1i_response_latency"] = True
+        invalid["boolean"] = boolean
+        zero = deepcopy(self.overrides)
+        zero["l1d_response_latency"] = 0
+        invalid["zero"] = zero
+        overflow = deepcopy(self.overrides)
+        overflow["l2_tag_latency"] = 1 << 64
+        invalid["uint64-overflow"] = overflow
+        missing = deepcopy(self.overrides)
+        missing.pop("xbar_response_latency")
+        invalid["missing-key"] = missing
+        extra = deepcopy(self.overrides)
+        extra["unexpected_latency"] = 1
+        invalid["extra-key"] = extra
+
+        for label, overrides in invalid.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                canonical_gem5_args(overrides)
+        self.assertEqual(canonical_gem5_args(deepcopy(self.overrides)), self.gem5_args)
+
+    def test_reuse_rejects_integer_float_equality_and_argument_spelling(self):
+        """Equal numeric values with `8` versus `8.0` are different vectors."""
+        from workflow.r2.reuse_result import validate_reuse
+
+        vector_path = self.clip / "r2_latency.json"
+        vector = read_json(vector_path)
+        vector["gem5_overrides"]["xbar_forward_latency"] = 8.0
+        vector["gem5_args"][21] = "8.0"
+        write_json(vector_path, vector)
+
+        decision = validate_reuse(self.fixed, self.clip, self.r1, self.config_path)
+
+        self.assertFalse(decision["accepted"])
+        self.assertTrue(any("non-boolean integer" in reason
+                            for reason in decision["reasons"]), decision["reasons"])
+
+    def test_reuse_rejects_boolean_integer_equality(self):
+        """Python's `True == 1` rule cannot make two latency vectors reusable."""
+        from workflow.r2.reuse_result import validate_reuse
+
+        vector_path = self.clip / "r2_latency.json"
+        vector = read_json(vector_path)
+        vector["gem5_overrides"]["l1i_response_latency"] = True
+        vector["gem5_args"][5] = "True"
+        write_json(vector_path, vector)
+
+        decision = validate_reuse(self.fixed, self.clip, self.r1, self.config_path)
+
+        self.assertFalse(decision["accepted"])
+        self.assertTrue(any("non-boolean integer" in reason
+                            for reason in decision["reasons"]), decision["reasons"])
 
     def test_reuse_rejects_noncanonical_gem5_args_even_when_overrides_match(self):
         """Stored args must be the complete ordered rendering of their own overrides."""
@@ -2227,6 +2653,19 @@ class PairedR2RunnerTests(unittest.TestCase):
         vector["gem5_args"] = canonical_gem5_args(vector["gem5_overrides"])
         write_json(vector_path, vector)
 
+    def test_scheduler_rejects_type_loose_vector_before_branch_selection(self):
+        """Pair branching must use the same strict vector contract as gem5/reuse."""
+        from workflow.r2.run_paired_sweep import _validated_vectors
+
+        vector_path = self.fixture.clip / "r2_latency.json"
+        vector = read_json(vector_path)
+        vector["gem5_overrides"]["xbar_forward_latency"] = 8.0
+        vector["gem5_args"][21] = "8.0"
+        write_json(vector_path, vector)
+
+        with self.assertRaisesRegex(ValueError, "non-boolean integer"):
+            _validated_vectors(self.fixture.fixed, self.fixture.clip)
+
     def _ordered_boundaries(self, events):
         import workflow.r2.attach_result as attach_result
         import workflow.r2.reuse_result as reuse_result
@@ -2337,6 +2776,31 @@ class PairedR2RunnerTests(unittest.TestCase):
             )
 
         self.assertEqual(second, first)
+
+    def test_completed_local_pair_rejects_a_different_selected_config_source(self):
+        """A self-coherent local attachment must still bind the selected config."""
+        from workflow.r2.run_paired_sweep import run_pair
+
+        self._make_vectors_unequal()
+        with patch("workflow.r2.run_r2.subprocess.run",
+                   side_effect=self._complete_gem5):
+            first = run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+        self.assertEqual(first["state"], "success")
+        run_config_path = self.fixture.clip / "run_config.json"
+        run_config = read_json(run_config_path)
+        run_config["source"] = str((self.root / "different-config.json").resolve())
+        write_json(run_config_path, run_config)
+
+        second = run_pair(
+            self.key, self.r1_root, self.fixed_root, self.clip_root,
+            self.config_path, status_root=self.status_root,
+        )
+
+        self.assertEqual(second["state"], "failed")
+        self.assertIn("validation", second["error"])
 
     def test_completed_pair_with_tampered_reuse_marker_is_reattached(self):
         """Marker existence alone must not make a damaged reused pair skippable."""
@@ -2498,6 +2962,121 @@ class PairedR2RunnerTests(unittest.TestCase):
         self.assertEqual(result["state"], "failed")
         self.assertIn("local attachment", result["error"])
 
+    def test_local_resume_rejects_all_physical_and_derived_mutations(self):
+        """One physical validator binds modules, thermal, performance, and summary."""
+        from workflow.r2.attach_result import attach
+        from workflow.r2.run_paired_sweep import _validate_local_attachment
+
+        attach(self.fixture.fixed)
+        point = self.fixture.fixed
+        paths = {
+            "modules": point / "modules.json",
+            "thermal": point / "hotspot/thermal_result.json",
+            "performance": point / "performance.json",
+            "summary": point / "pipeline_summary.json",
+        }
+        originals = {name: path.read_bytes() for name, path in paths.items()}
+
+        def module_ipc1(values):
+            values["modules"]["ipc1"] = 99.0
+
+        def module_gamma(values):
+            values["modules"]["gamma"] = 0.9
+
+        def module_architecture(values):
+            values["modules"]["architecture"]["l1d_size"] = "128kB"
+
+        def thermal_tmax(values):
+            values["thermal"]["tmax_c"] = 999.0
+            values["thermal"]["tmax_k"] = 1272.15
+
+        def thermal_provenance(values):
+            values["thermal"]["steady_file"] = str(
+                (self.root / "forged.steady").resolve()
+            )
+
+        def performance_frequency(values):
+            values["performance"]["sustainable_frequency_ghz"] = 9.0
+            values["performance"]["bips2"] = 3.25 * 9.0
+            values["summary"]["sustainable_frequency_ghz"] = 9.0
+            values["summary"]["bips2"] = 3.25 * 9.0
+
+        def performance_bips(values):
+            values["performance"]["sustainable_frequency_ghz"] = 8.0
+            values["performance"]["bips2"] = 26.0
+            values["summary"]["sustainable_frequency_ghz"] = 8.0
+            values["summary"]["bips2"] = 26.0
+
+        def summary_tmax(values):
+            values["summary"]["tmax_c"] = 999.0
+
+        def summary_gamma(values):
+            values["summary"]["gamma"] = 0.9
+
+        def summary_ipc1(values):
+            values["summary"]["ipc1"] = 99.0
+            values["summary"]["bips1_thermal"] = 99.0 * values[
+                "summary"
+            ]["sustainable_frequency_ghz"]
+
+        cases = {
+            "module-ipc1": module_ipc1,
+            "module-gamma": module_gamma,
+            "module-architecture": module_architecture,
+            "thermal-tmax": thermal_tmax,
+            "thermal-provenance": thermal_provenance,
+            "performance-frequency": performance_frequency,
+            "performance-bips": performance_bips,
+            "summary-tmax": summary_tmax,
+            "summary-gamma": summary_gamma,
+            "summary-ipc1": summary_ipc1,
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                for name, data in originals.items():
+                    paths[name].write_bytes(data)
+                values = {name: read_json(path) for name, path in paths.items()}
+                mutate(values)
+                for name, value in values.items():
+                    write_json(paths[name], value)
+
+                self.assertIsNone(
+                    _validate_local_attachment(self.fixture.r1, point, "fixed-bin")
+                )
+
+        for name, data in originals.items():
+            paths[name].write_bytes(data)
+        self.assertIsNotNone(
+            _validate_local_attachment(self.fixture.r1, point, "fixed-bin")
+        )
+
+    def test_scheduler_metrics_use_the_shared_validator_snapshot(self):
+        """A post-validation summary replacement cannot supply scheduler metrics."""
+        import workflow.r2.run_paired_sweep as paired
+        from workflow.r2.attach_result import attach, validate_local_attachment
+
+        attach(self.fixture.fixed)
+        decision = validate_local_attachment(
+            self.fixture.fixed, self.fixture.r1, self.config_path
+        )
+        self.assertTrue(decision["accepted"], decision["reasons"])
+        expected_bips2 = decision["summary"]["bips2"]
+        summary_path = self.fixture.fixed / "pipeline_summary.json"
+        replaced = read_json(summary_path)
+        replaced["bips2"] = 999.0
+        write_json(summary_path, replaced)
+
+        with patch.object(
+                paired.attach_result, "validate_local_attachment",
+                return_value=decision):
+            validated = paired._validate_local_attachment(
+                self.fixture.r1, self.fixture.fixed, "fixed-bin",
+                self.config_path,
+            )
+
+        self.assertIsNotNone(validated)
+        self.assertEqual(validated[1]["bips2"], expected_bips2)
+
     def test_completed_separate_clip_with_corrupt_performance_is_reattached(self):
         """Resume validation must bind local performance before skipping a pair."""
         from workflow.r2.run_paired_sweep import run_pair
@@ -2527,6 +3106,393 @@ class PairedR2RunnerTests(unittest.TestCase):
         self.assertEqual(events, ["clip-run", "clip-attach"])
         self.assertAlmostEqual(read_json(performance_path)["bips2"], 3.575)
 
+    def test_sweep_lock_fails_fast_before_preflight_or_worker_launch(self):
+        """A second sweep cannot inspect or mutate roots owned by an active sweep."""
+        import fcntl
+        import os
+        import workflow.r2.run_paired_sweep as paired
+
+        lock_path = self.fixed_root / ".paired-r2-sweep.lock"
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            with patch.object(paired, "load_selection", return_value={}), \
+                    patch.object(paired, "selection_keys", return_value=[]), \
+                    patch.object(paired, "validate_layout_roots",
+                                 return_value={"mode": "resume"}), \
+                    self.assertRaisesRegex(RuntimeError, "sweep.*active|lock"):
+                paired.run_sweep(
+                    self.r1_root, self.fixed_root, self.clip_root,
+                    self.root / "selection.json", self.config_path,
+                    self.status_root,
+                )
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def test_sweep_lock_remains_held_while_pair_workers_run(self):
+        """The sweep lock must enclose worker execution and status publication."""
+        from concurrent.futures import Future
+        import fcntl
+        import os
+        import workflow.r2.run_paired_sweep as paired
+
+        observations = []
+        publication_observations = []
+        status_root = self.status_root
+        lock_paths = [
+            self.fixed_root / ".paired-r2-sweep.lock",
+            self.clip_root / ".paired-r2-sweep.lock",
+        ]
+
+        def lock_is_held(path):
+            descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                return False
+            finally:
+                os.close(descriptor)
+
+        class InspectingExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def submit(self, _function, key, *_args, **_kwargs):
+                observations.append(all(lock_is_held(path) for path in lock_paths))
+                pair_path = status_root / key.relative_path() / "pair_status.json"
+                record = {
+                    "schema_version": 1,
+                    "state": "failed",
+                    "key": {"workload": key.workload,
+                            "l1d_size": key.l1d_size,
+                            "l2_size": key.l2_size},
+                    "pair_status": str(pair_path.resolve()),
+                    "fixed_complete": False,
+                    "physical_r2_runs": 0,
+                    "error": "intentional fixture failure",
+                }
+                write_json(pair_path, record)
+                future = Future()
+                future.set_result(record)
+                return future
+
+        real_write = paired.write_json
+
+        def observe_publication(path, value):
+            if Path(path).resolve() == (status_root / "status.json").resolve():
+                publication_observations.append(
+                    all(lock_is_held(lock_path) for lock_path in lock_paths)
+                )
+            return real_write(path, value)
+
+        with patch.object(paired, "load_selection", return_value={}), \
+                patch.object(paired, "selection_keys", return_value=[self.key]), \
+                patch.object(paired, "validate_layout_roots",
+                             return_value={"mode": "resume"}), \
+                patch.object(paired, "ProcessPoolExecutor", InspectingExecutor), \
+                patch.object(paired, "write_json", side_effect=observe_publication), \
+                redirect_stdout(StringIO()):
+            paired.run_sweep(
+                self.r1_root, self.fixed_root, self.clip_root,
+                self.root / "selection.json", self.config_path,
+                self.status_root, limit=1,
+            )
+
+        self.assertEqual(observations, [True])
+        self.assertTrue(publication_observations)
+        self.assertTrue(all(publication_observations))
+
+    def test_pair_lock_serializes_before_cached_status_validation(self):
+        """A second direct pair attempt must wait before trusting shared status."""
+        from concurrent.futures import ThreadPoolExecutor
+        import fcntl
+        import os
+        import threading
+        import workflow.r2.run_paired_sweep as paired
+
+        pair_dir = self.status_root / self.key.relative_path()
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        pair_path = pair_dir / "pair_status.json"
+        previous = {"schema_version": 1, "state": "success", "sentinel": True}
+        write_json(pair_path, previous)
+        lock_path = self.fixture.fixed / ".paired-r2-pair.lock"
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        attempted = threading.Event()
+        validation_started = threading.Event()
+
+        def invoke():
+            attempted.set()
+            return paired.run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        def validate(*_args, **_kwargs):
+            validation_started.set()
+            return True
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            with patch.object(paired, "_validate_completed", side_effect=validate):
+                future = executor.submit(invoke)
+                self.assertTrue(attempted.wait(1))
+                reached_while_locked = validation_started.wait(0.2)
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                self.assertTrue(validation_started.wait(1))
+                result = future.result(timeout=2)
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+                executor.shutdown(wait=True)
+
+        self.assertFalse(reached_while_locked)
+        self.assertEqual(result, previous)
+
+    def test_pair_lock_identity_is_shared_across_status_roots(self):
+        """Different status destinations cannot permit overlapping physical work."""
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        import workflow.r2.run_paired_sweep as paired
+
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        active = 0
+        maximum_active = 0
+
+        def inspect_body(*_args, status_root=None, **_kwargs):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            try:
+                if Path(status_root).name == "status-a":
+                    first_entered.set()
+                    self.assertTrue(release_first.wait(2))
+                else:
+                    second_entered.set()
+                return {"state": "success", "status_root": str(status_root)}
+            finally:
+                active -= 1
+
+        with patch.object(paired, "_run_pair_locked", side_effect=inspect_body), \
+                ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(
+                paired.run_pair, self.key, self.r1_root, self.fixed_root,
+                self.clip_root, self.config_path,
+                status_root=self.root / "status-a",
+            )
+            self.assertTrue(first_entered.wait(1))
+            second = executor.submit(
+                paired.run_pair, self.key, self.r1_root, self.fixed_root,
+                self.clip_root, self.config_path,
+                status_root=self.root / "status-b",
+            )
+            overlapped = second_entered.wait(0.2)
+            release_first.set()
+            first.result(timeout=2)
+            second.result(timeout=2)
+
+        self.assertFalse(overlapped)
+        self.assertEqual(maximum_active, 1)
+
+    def test_direct_pair_waits_until_physical_sweep_lock_is_released(self):
+        """A direct pair cannot mutate evidence during final sweep publication."""
+        from concurrent.futures import ThreadPoolExecutor
+        import fcntl
+        import os
+        import threading
+        import workflow.r2.run_paired_sweep as paired
+
+        lock_path = self.fixed_root / ".paired-r2-sweep.lock"
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        attempted = threading.Event()
+        entered = threading.Event()
+
+        def invoke():
+            attempted.set()
+            return paired.run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        def inspect_body(*_args, **_kwargs):
+            entered.set()
+            return {"state": "success"}
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            with patch.object(paired, "_run_pair_locked",
+                              side_effect=inspect_body):
+                future = executor.submit(invoke)
+                self.assertTrue(attempted.wait(1))
+                reached_while_locked = entered.wait(0.2)
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                self.assertTrue(entered.wait(1))
+                future.result(timeout=2)
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+                executor.shutdown(wait=True)
+
+        self.assertFalse(reached_while_locked)
+
+    def test_pair_lock_precedes_each_physical_attachment_lock(self):
+        """Local and reuse attachment boundaries must run inside the pair lock."""
+        import fcntl
+        import os
+        import workflow.r2.run_paired_sweep as paired
+
+        lock_path = self.fixture.fixed / ".paired-r2-pair.lock"
+        observations = []
+        real_local_attach = paired.attach_result.attach
+        real_reuse_attach = paired.reuse_result.attach_reused_result
+
+        def pair_lock_is_held():
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                return False
+            finally:
+                os.close(descriptor)
+
+        def inspect_local(*args, **kwargs):
+            observations.append(("local", pair_lock_is_held()))
+            return real_local_attach(*args, **kwargs)
+
+        def inspect_reuse(*args, **kwargs):
+            observations.append(("reuse", pair_lock_is_held()))
+            return real_reuse_attach(*args, **kwargs)
+
+        with patch.object(paired.attach_result, "attach",
+                          side_effect=inspect_local), \
+                patch.object(paired.reuse_result, "attach_reused_result",
+                             side_effect=inspect_reuse):
+            result = paired.run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        self.assertEqual(result["state"], "success")
+        self.assertEqual(observations, [("local", True), ("reuse", True)])
+
+    def test_clear_reuse_attachment_holds_the_physical_point_lock(self):
+        """Clearing reuse state is one serialized physical-point mutation."""
+        from concurrent.futures import ThreadPoolExecutor
+        import fcntl
+        import os
+        import threading
+        import workflow.r2.run_paired_sweep as paired
+
+        descriptor = os.open(
+            self.fixture.clip, os.O_RDONLY | os.O_DIRECTORY
+        )
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        attempted = threading.Event()
+        mutation_started = threading.Event()
+        real_read = paired.read_json
+
+        def observe_read(path):
+            mutation_started.set()
+            return real_read(path)
+
+        def invoke():
+            attempted.set()
+            paired._clear_reuse_attachment(self.fixture.clip)
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            with patch.object(paired, "read_json", side_effect=observe_read):
+                future = executor.submit(invoke)
+                self.assertTrue(attempted.wait(1))
+                reached_while_locked = mutation_started.wait(0.2)
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                self.assertTrue(mutation_started.wait(1))
+                future.result(timeout=2)
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+                executor.shutdown(wait=True)
+
+        self.assertFalse(reached_while_locked)
+
+    def test_final_status_rejects_worker_return_after_persisted_tamper(self):
+        """A worker's return value cannot certify evidence changed on disk."""
+        from concurrent.futures import Future
+        import workflow.r2.run_paired_sweep as paired
+
+        status_root = self.status_root
+
+        class TamperingExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def submit(self, function, *args, **kwargs):
+                returned = function(*args, **kwargs)
+                pair_path = Path(returned["pair_status"])
+                persisted = read_json(pair_path)
+                persisted["fixed_bips2"] = 999.0
+                write_json(pair_path, persisted)
+                future = Future()
+                future.set_result(deepcopy(returned))
+                return future
+
+        with patch.object(paired, "load_selection", return_value={}), \
+                patch.object(paired, "selection_keys", return_value=[self.key]), \
+                patch.object(paired, "validate_layout_roots",
+                             return_value={"mode": "resume"}), \
+                patch.object(paired, "ProcessPoolExecutor", TamperingExecutor), \
+                redirect_stdout(StringIO()):
+            result = paired.run_sweep(
+                self.r1_root, self.fixed_root, self.clip_root,
+                self.root / "selection.json", self.config_path,
+                status_root, limit=1,
+            )
+
+        pair_path = status_root / self.key.relative_path() / "pair_status.json"
+        self.assertEqual(read_json(pair_path)["state"], "success")
+        self.assertFalse(result["selected_results_valid"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["pairs"][0]["state"], "failed")
+        self.assertEqual(result["completion_revalidation"], {
+            "performed": True,
+            "accepted_pair_count": 0,
+            "rejected_pair_count": 1,
+            "rejections": [{
+                "key": {"workload": "fft", "l1d_size": "32kB",
+                        "l2_size": "512kB"},
+                "pair_status": str(pair_path.resolve()),
+                "reason": "persisted success record failed live evidence validation",
+            }],
+        })
+
     def test_sweep_retains_a_failed_pair_while_another_completes(self):
         """One returned failure must not cancel or erase a completed pair."""
         from concurrent.futures import Future
@@ -2552,7 +3518,8 @@ class PairedR2RunnerTests(unittest.TestCase):
             def submit(self, _function, key, *_args, **_kwargs):
                 future = Future()
                 state = "failed" if key == keys[0] else "success"
-                future.set_result({
+                pair_path = status_root / key.relative_path() / "pair_status.json"
+                record = {
                     "schema_version": 1,
                     "state": state,
                     "key": {
@@ -2562,15 +3529,22 @@ class PairedR2RunnerTests(unittest.TestCase):
                     },
                     "clip3d_reused_fixed_r2": state == "success",
                     "physical_r2_runs": 1 if state == "success" else 0,
-                    "pair_status": str(
-                        status_root / key.relative_path() / "pair_status.json"
-                    ),
-                })
+                    "pair_status": str(pair_path.resolve()),
+                }
+                write_json(pair_path, record)
+                future.set_result(record)
                 return future
 
         with patch.object(paired, "ProcessPoolExecutor", ImmediateExecutor), \
                 patch.object(paired, "validate_layout_roots",
-                             return_value={"mode": "resume"}):
+                             return_value={"mode": "resume"}), \
+                patch.object(
+                    paired, "_validate_completed",
+                    side_effect=lambda record, *_args: (
+                        isinstance(record, dict)
+                        and record.get("state") == "success"
+                    ),
+                ):
             result = paired.run_sweep(
                 self.r1_root, self.fixed_root, self.clip_root, selection_path,
                 self.config_path, self.status_root, jobs=2, limit=2,
@@ -2610,7 +3584,10 @@ class PairedR2RunnerTests(unittest.TestCase):
                 if key == keys[0]:
                     future.set_exception(RuntimeError("worker process crashed"))
                 else:
-                    future.set_result({
+                    pair_path = (
+                        status_root / key.relative_path() / "pair_status.json"
+                    )
+                    record = {
                         "schema_version": 1,
                         "state": "success",
                         "key": {"workload": key.workload,
@@ -2618,10 +3595,10 @@ class PairedR2RunnerTests(unittest.TestCase):
                                 "l2_size": key.l2_size},
                         "clip3d_reused_fixed_r2": True,
                         "physical_r2_runs": 1,
-                        "pair_status": str(
-                            status_root / key.relative_path() / "pair_status.json"
-                        ),
-                    })
+                        "pair_status": str(pair_path.resolve()),
+                    }
+                    write_json(pair_path, record)
+                    future.set_result(record)
                 return future
 
         real_write = paired.write_json
@@ -2635,6 +3612,13 @@ class PairedR2RunnerTests(unittest.TestCase):
         with patch.object(paired, "ProcessPoolExecutor", ImmediateExecutor), \
                 patch.object(paired, "validate_layout_roots",
                              return_value={"mode": "resume"}), \
+                patch.object(
+                    paired, "_validate_completed",
+                    side_effect=lambda record, *_args: (
+                        isinstance(record, dict)
+                        and record.get("state") == "success"
+                    ),
+                ), \
                 patch.object(paired, "write_json", side_effect=capture_status), \
                 redirect_stdout(StringIO()):
             result = paired.run_sweep(
@@ -2981,23 +3965,31 @@ class PairedR2RunnerTests(unittest.TestCase):
 
             def submit(self, _function, key, *_args, **_kwargs):
                 observed.append(key)
-                future = Future()
-                future.set_result({
+                pair_path = status_root / key.relative_path() / "pair_status.json"
+                record = {
                     "schema_version": 1,
                     "state": "success",
                     "key": {"workload": key.workload,
                             "l1d_size": key.l1d_size, "l2_size": key.l2_size},
                     "clip3d_reused_fixed_r2": True,
                     "physical_r2_runs": 1,
-                    "pair_status": str(
-                        status_root / key.relative_path() / "pair_status.json"
-                    ),
-                })
+                    "pair_status": str(pair_path.resolve()),
+                }
+                write_json(pair_path, record)
+                future = Future()
+                future.set_result(record)
                 return future
 
         with patch.object(paired, "ProcessPoolExecutor", ImmediateExecutor), \
                 patch.object(paired, "validate_layout_roots",
-                             return_value={"mode": "resume"}):
+                             return_value={"mode": "resume"}), \
+                patch.object(
+                    paired, "_validate_completed",
+                    side_effect=lambda record, *_args: (
+                        isinstance(record, dict)
+                        and record.get("state") == "success"
+                    ),
+                ):
             result = paired.run_sweep(
                 self.r1_root, self.fixed_root, self.clip_root, selection_path,
                 self.config_path, self.status_root, limit=1,
@@ -3019,6 +4011,10 @@ class PairedR2RunnerTests(unittest.TestCase):
         )
         submitted = 0
         status_root = self.status_root
+        config_path = self.config_path
+        r1_root = self.r1_root
+        fixed_root = self.fixed_root
+        clip_root = self.clip_root
 
         class ImmediateExecutor:
             def __init__(self, max_workers):
@@ -3034,29 +4030,96 @@ class PairedR2RunnerTests(unittest.TestCase):
                 nonlocal submitted
                 separate = submitted < 7
                 submitted += 1
-                future = Future()
-                future.set_result({
+                pair_path = (
+                    status_root / key.relative_path() / "pair_status.json"
+                )
+                record = {
                     "schema_version": 1,
                     "state": "success",
+                    "phase": "complete",
                     "key": {"workload": key.workload,
-                            "l1d_size": key.l1d_size, "l2_size": key.l2_size},
+                            "l1d_size": key.l1d_size,
+                            "l2_size": key.l2_size},
+                    "config": str(config_path.resolve()),
+                    "config_sha256": sha256_file(config_path),
+                    "r1_directory": str(
+                        (r1_root / key.relative_path()).resolve()
+                    ),
+                    "fixed_point": str(
+                        (fixed_root / key.relative_path()).resolve()
+                    ),
+                    "clip3d_point": str(
+                        (clip_root / key.relative_path()).resolve()
+                    ),
+                    "fixed_complete": True,
+                    "fixed_ipc2": 2.0,
+                    "fixed_bips2": 3.0,
+                    "clip3d_ipc2": 2.0,
+                    "clip3d_bips2": 3.0,
                     "clip3d_reused_fixed_r2": not separate,
                     "physical_r2_runs": 2 if separate else 1,
-                    "pair_status": str(
-                        status_root / key.relative_path() / "pair_status.json"
-                    ),
-                })
+                    "pair_status": str(pair_path.resolve()),
+                }
+                write_json(pair_path, record)
+                future = Future()
+                future.set_result(record)
                 return future
+
+        def validate_persisted(record, key, paths, config_path):
+            import fcntl
+            import os
+
+            lock_path = paths["fixed"] / ".paired-r2-pair.lock"
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pair_lock_held = True
+                else:
+                    pair_lock_held = False
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+            return (
+                pair_lock_held
+                and record == read_json(paths["status"])
+                and record.get("state") == "success"
+                and record.get("key") == {
+                    "workload": key.workload,
+                    "l1d_size": key.l1d_size,
+                    "l2_size": key.l2_size,
+                }
+                and record.get("config") == str(config_path)
+                and record.get("pair_status") == str(paths["status"])
+            )
+
+        real_write = paired.write_json
+        experiment_snapshots = []
+
+        def capture_experiment_status(path, value):
+            real_write(path, value)
+            if Path(path).resolve() == (status_root / "status.json").resolve():
+                experiment_snapshots.append(deepcopy(value))
 
         with patch.object(paired, "ProcessPoolExecutor", ImmediateExecutor), \
                 patch.object(paired, "validate_layout_roots",
                              return_value={"mode": "resume"}), \
+                patch.object(paired, "_validate_completed",
+                             side_effect=validate_persisted) as validate_completed, \
+                patch.object(paired, "write_json",
+                             side_effect=capture_experiment_status), \
                 redirect_stdout(StringIO()):
             result = paired.run_sweep(
                 self.r1_root, self.fixed_root, self.clip_root, selection_path,
                 self.config_path, self.status_root, jobs=4,
             )
 
+        self.assertTrue(experiment_snapshots[-1]["complete"])
+        self.assertFalse(any(
+            snapshot["complete"] for snapshot in experiment_snapshots[:-1]
+        ))
+        self.assertEqual(validate_completed.call_count, 50)
         self.assertTrue(result["complete"])
         self.assertEqual(result["selected_pair_count"], 50)
         self.assertEqual(result["completed_pair_count"], 50)
@@ -3064,6 +4127,12 @@ class PairedR2RunnerTests(unittest.TestCase):
         self.assertEqual(result["reuse_pair_count"], 43)
         self.assertEqual(result["physical_r2_runs"], 57)
         self.assertEqual(len(result["pairs"]), 50)
+        self.assertEqual(result["completion_revalidation"], {
+            "performed": True,
+            "accepted_pair_count": 50,
+            "rejected_pair_count": 0,
+            "rejections": [],
+        })
 
     def test_inconsistent_fifty_pair_results_never_mark_complete(self):
         """Success labels alone cannot override key/branch/run-count invariants."""
@@ -3183,6 +4252,7 @@ class PairedAggregationTests(unittest.TestCase):
     def _write_point(self, root: Path, key: dict, method: str, ipc2: float,
                      tmax_c: float) -> Path:
         from workflow.r2 import run_r2
+        from workflow.thermal.sustainable_frequency import derive
 
         r1 = self.r1_root / key["workload"] / f"l1d_{key['l1d_size']}" / (
             f"l2_{key['l2_size']}"
@@ -3216,8 +4286,59 @@ class PairedAggregationTests(unittest.TestCase):
         }
         vector["gem5_args"] = run_r2.canonical_gem5_args(vector["gem5_overrides"])
         write_json(point / "r2_latency.json", vector)
-        frequency = 1.5
-        bips2 = ipc2 * frequency
+        ipc1 = 8.0
+        modules = {
+            "schema_version": 2,
+            "source_r1": str(r1.resolve()),
+            "architecture": metadata,
+            "ipc1": ipc1,
+            "gamma": 0.2,
+            "totals": {
+                "dynamic_power_w": 80.0,
+                "leakage_power_w": 20.0,
+                "total_power_w": 100.0,
+            },
+            "modules": [{
+                "name": "fixture-total",
+                "dynamic_power_w": 80.0,
+                "leakage_power_w": 20.0,
+                "total_power_w": 100.0,
+            }],
+        }
+        hotspot = point / "hotspot"
+        hotspot.mkdir(parents=True, exist_ok=True)
+        peak_k = tmax_c + 273.15
+        (hotspot / "steady.txt").write_text(
+            f"core0 {peak_k:.17g}\n", encoding="utf-8"
+        )
+        write_json(hotspot / "hotspot_manifest.json", {
+            "schema_version": 1,
+            "ambient_c": self.config["frequency"]["ambient_c"],
+            "r_convec_k_per_w": self.config["physical"]["r_convec_k_per_w"],
+        })
+        thermal = {
+            "schema_version": 1,
+            "return_code": 0,
+            "power_trace": str((point / "hotspot/power.ptrace").resolve()),
+            "steady_file": str((point / "hotspot/steady.txt").resolve()),
+            "grid_steady_file": str((point / "hotspot/grid.steady.txt").resolve()),
+            "tmax_k": peak_k,
+            "tmax_c": tmax_c,
+            "peak_unit": "core0",
+            "sample_count": 1,
+            "ambient_c": self.config["frequency"]["ambient_c"],
+            "r_convec_k_per_w": self.config["physical"]["r_convec_k_per_w"],
+        }
+        performance = derive(
+            modules, thermal, **{
+                "f0_ghz": self.config["frequency"]["f0_ghz"],
+                "fmin_ghz": self.config["frequency"]["fmin_ghz"],
+                "tsafe_c": self.config["frequency"]["tsafe_c"],
+                "ambient_c": self.config["frequency"]["ambient_c"],
+            }, ipc2=ipc2,
+        )
+        frequency = performance["sustainable_frequency_ghz"]
+        bips2 = performance["bips2"]
         local_result = point / "gem5_r2/r2_result.json"
         local_result.parent.mkdir(exist_ok=True)
         r2_stats = local_result.parent / "stats.txt"
@@ -3260,24 +4381,34 @@ class PairedAggregationTests(unittest.TestCase):
             "config": self.config,
             "source": str(self.config_path.resolve()),
         })
-        write_json(point / "performance.json", {
-            "ipc2": ipc2,
-            "bips2": bips2,
-            "sustainable_frequency_ghz": frequency,
-            "tmax_f0_c": tmax_c,
-        })
+        write_json(point / "modules.json", modules)
+        write_json(point / "hotspot/thermal_result.json", thermal)
+        write_json(point / "performance.json", performance)
         write_json(point / "pipeline_summary.json", {
             "layout_method": method,
             "experiment_classification": self.classification,
             "workload": key["workload"], "l1d_size": key["l1d_size"],
             "l2_size": key["l2_size"], "r1": str(r1.resolve()),
+            "output": str(point.resolve()),
+            "gamma": performance["gamma"],
             "tmax_c": tmax_c,
             "sustainable_frequency_ghz": frequency,
+            "ipc1": performance["ipc1"],
+            "bips1_thermal": performance["bips1_thermal"],
             "r2_critical_path_cycles": vector["critical_l1d_to_l2_cycles"],
             "ipc2": ipc2,
             "bips2": bips2,
             "r2_source": str(local_result.resolve()),
-            "artifacts": {"r2_result": str(local_result.resolve())},
+            "stage_seconds": {"layout": 1.0, "gem5_r2": 1.0},
+            "total_pipeline_seconds": 2.0,
+            "artifacts": {
+                "config": str((point / "run_config.json").resolve()),
+                "modules": str((point / "modules.json").resolve()),
+                "thermal": str((point / "hotspot/thermal_result.json").resolve()),
+                "performance": str((point / "performance.json").resolve()),
+                "r2_latency": str((point / "r2_latency.json").resolve()),
+                "r2_result": str(local_result.resolve()),
+            },
         })
         return point
 
@@ -3285,11 +4416,15 @@ class PairedAggregationTests(unittest.TestCase):
         selection = read_json(self.selection_path)
         for index, key in enumerate(selection["points"]):
             fixed = self._write_point(
-                self.fixed_root, key, "fixed-bin", 2.0, 80.123456 + index
+                self.fixed_root, key, "fixed-bin", 2.0,
+                80.123456 + index * 0.1,
             )
             clip = self._write_point(
-                self.clip_root, key, "clip3d", 2.4, 81.654321 + index
+                self.clip_root, key, "clip3d", 2.4,
+                81.654321 + index * 0.1,
             )
+            fixed_summary = read_json(fixed / "pipeline_summary.json")
+            clip_summary = read_json(clip / "pipeline_summary.json")
             status_path = self.status_root / key["workload"] / (
                 f"l1d_{key['l1d_size']}"
             ) / f"l2_{key['l2_size']}" / "pair_status.json"
@@ -3307,9 +4442,9 @@ class PairedAggregationTests(unittest.TestCase):
                 "fixed_vector_sha256": sha256_file(fixed / "r2_latency.json"),
                 "clip3d_vector_sha256": sha256_file(clip / "r2_latency.json"),
                 "fixed_ipc2": 2.0,
-                "fixed_bips2": 3.0,
+                "fixed_bips2": fixed_summary["bips2"],
                 "clip3d_ipc2": 2.4,
-                "clip3d_bips2": 3.6,
+                "clip3d_bips2": clip_summary["bips2"],
                 "clip3d_reused_fixed_r2": False,
                 "physical_r2_runs": 2,
                 "pair_status": str(status_path.resolve()),
@@ -3444,6 +4579,138 @@ class PairedAggregationTests(unittest.TestCase):
         self.assertIn("81.654321", rows[1])
         self.assertEqual(read_json(json_path), result)
 
+    def test_report_accepts_the_runner_explicit_status_root(self):
+        """Reporting must consume the same caller-selected status namespace."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        csv_path, json_path = self._make_complete_fixture()
+        alternate = self.root / "alternate-paired-status"
+        shutil.copytree(self.status_root, alternate)
+        for key in read_json(self.selection_path)["points"]:
+            status_path = alternate / key["workload"] / (
+                f"l1d_{key['l1d_size']}/l2_{key['l2_size']}/pair_status.json"
+            )
+            status = read_json(status_path)
+            status["pair_status"] = str(status_path.resolve())
+            write_json(status_path, status)
+
+        result = summarize(
+            self.fixed_root, self.clip_root, self.selection_path,
+            self.config_path, csv_path, json_path, status_root=alternate,
+        )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["status_root"], str(alternate.resolve()))
+
+    def test_report_rejects_fabricated_summary_and_performance_temperature(self):
+        """Matching derived files cannot override the target HotSpot evidence."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        csv_path, json_path = self._make_complete_fixture()
+        key = read_json(self.selection_path)["points"][0]
+        point = self.fixed_root / key["workload"] / (
+            f"l1d_{key['l1d_size']}"
+        ) / f"l2_{key['l2_size']}"
+        from workflow.thermal.sustainable_frequency import derive
+
+        thermal_path = point / "hotspot/thermal_result.json"
+        thermal = read_json(thermal_path)
+        thermal.update({"tmax_c": 999.0, "tmax_k": 1272.15})
+        write_json(thermal_path, thermal)
+        modules = read_json(point / "modules.json")
+        old_performance = read_json(point / "performance.json")
+        frequency = self.config["frequency"]
+        performance = derive(
+            modules, thermal, frequency["f0_ghz"], frequency["fmin_ghz"],
+            frequency["tsafe_c"], frequency["ambient_c"],
+            old_performance["ipc2"],
+        )
+        write_json(point / "performance.json", performance)
+        summary = read_json(point / "pipeline_summary.json")
+        summary.update({
+            "gamma": performance["gamma"],
+            "tmax_c": performance["tmax_f0_c"],
+            "sustainable_frequency_ghz": performance[
+                "sustainable_frequency_ghz"
+            ],
+            "ipc1": performance["ipc1"],
+            "bips1_thermal": performance["bips1_thermal"],
+            "ipc2": performance["ipc2"],
+            "bips2": performance["bips2"],
+        })
+        write_json(point / "pipeline_summary.json", summary)
+        status_path = self.status_root / key["workload"] / (
+            f"l1d_{key['l1d_size']}/l2_{key['l2_size']}/pair_status.json"
+        )
+        status = read_json(status_path)
+        status["fixed_bips2"] = performance["bips2"]
+        write_json(status_path, status)
+
+        with self.assertRaisesRegex(ValueError, "thermal|Tmax|physical"):
+            summarize(self.fixed_root, self.clip_root, self.selection_path,
+                      self.config_path, csv_path, json_path)
+
+    def test_report_rejects_a_local_snapshot_replaced_between_validation_layers(self):
+        """Report metrics and the shared physical decision must bind one snapshot."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+        import workflow.analysis.summarize_paired_sweep as reporting
+        from workflow.thermal.sustainable_frequency import derive
+
+        csv_path, json_path = self._make_complete_fixture()
+        key = read_json(self.selection_path)["points"][0]
+        point = self.clip_root / key["workload"] / (
+            f"l1d_{key['l1d_size']}/l2_{key['l2_size']}"
+        )
+        real_validate = reporting.attach_result.validate_local_attachment
+        replaced = False
+
+        def replace_before_shared_validation(point_dir, *args, **kwargs):
+            nonlocal replaced
+            if Path(point_dir).resolve() == point.resolve() and not replaced:
+                replaced = True
+                modules = read_json(point / "modules.json")
+                thermal_path = point / "hotspot/thermal_result.json"
+                thermal = read_json(thermal_path)
+                thermal["tmax_c"] += 0.25
+                thermal["tmax_k"] = thermal["tmax_c"] + 273.15
+                write_json(thermal_path, thermal)
+                (point / "hotspot/steady.txt").write_text(
+                    f"{thermal['peak_unit']} {thermal['tmax_k']:.17g}\n",
+                    encoding="utf-8",
+                )
+                old_performance = read_json(point / "performance.json")
+                frequency = self.config["frequency"]
+                performance = derive(
+                    modules, thermal, frequency["f0_ghz"],
+                    frequency["fmin_ghz"], frequency["tsafe_c"],
+                    frequency["ambient_c"], old_performance["ipc2"],
+                )
+                write_json(point / "performance.json", performance)
+                summary_path = point / "pipeline_summary.json"
+                summary = read_json(summary_path)
+                summary.update({
+                    "gamma": performance["gamma"],
+                    "tmax_c": performance["tmax_f0_c"],
+                    "sustainable_frequency_ghz": performance[
+                        "sustainable_frequency_ghz"
+                    ],
+                    "ipc1": performance["ipc1"],
+                    "bips1_thermal": performance["bips1_thermal"],
+                    "ipc2": performance["ipc2"],
+                    "bips2": performance["bips2"],
+                })
+                write_json(summary_path, summary)
+            return real_validate(point_dir, *args, **kwargs)
+
+        with patch.object(
+                reporting.attach_result, "validate_local_attachment",
+                side_effect=replace_before_shared_validation), \
+                self.assertRaisesRegex(ValueError, "snapshot|changed"):
+            summarize(
+                self.fixed_root, self.clip_root, self.selection_path,
+                self.config_path, csv_path, json_path,
+            )
+
     def test_report_rejects_rows_without_measured_bips2_or_with_proxy_marker(self):
         """A proxy or a missing measured score must not enter paired statistics."""
         from workflow.analysis.summarize_paired_sweep import summarize
@@ -3474,10 +4741,15 @@ class PairedAggregationTests(unittest.TestCase):
         point = self.clip_root / key["workload"] / (
             f"l1d_{key['l1d_size']}/l2_{key['l2_size']}"
         )
+        clip_ipc2 = 1.6
+        clip_frequency = read_json(point / "performance.json")[
+            "sustainable_frequency_ghz"
+        ]
+        clip_bips2 = clip_ipc2 * clip_frequency
         for name in ("pipeline_summary.json", "performance.json"):
             payload = read_json(point / name)
-            payload["ipc2"] = 1.6
-            payload["bips2"] = 2.4
+            payload["ipc2"] = clip_ipc2
+            payload["bips2"] = clip_bips2
             write_json(point / name, payload)
         r2_dir = point / "gem5_r2"
         r2_stats = r2_dir / "stats.txt"
@@ -3492,7 +4764,7 @@ class PairedAggregationTests(unittest.TestCase):
         result_path = r2_dir / "r2_result.json"
         result = read_json(result_path)
         result.update({
-            "ipc2": 1.6,
+            "ipc2": clip_ipc2,
             "per_core": [
                 {"core": core, "instructions": 40, "cycles": 100, "ipc": 0.4}
                 for core in range(4)
@@ -3502,7 +4774,7 @@ class PairedAggregationTests(unittest.TestCase):
         write_json(result_path, result)
         r2_status = read_json(r2_dir / "status.json")
         r2_status.update({
-            "ipc2": 1.6,
+            "ipc2": clip_ipc2,
             "stats_sha256": sha256_file(r2_stats),
             "r2_result_sha256": sha256_file(result_path),
         })
@@ -3511,14 +4783,19 @@ class PairedAggregationTests(unittest.TestCase):
             f"l1d_{key['l1d_size']}/l2_{key['l2_size']}/pair_status.json"
         )
         status = read_json(status_path)
-        status["clip3d_ipc2"] = 1.6
-        status["clip3d_bips2"] = 2.4
+        status["clip3d_ipc2"] = clip_ipc2
+        status["clip3d_bips2"] = clip_bips2
         write_json(status_path, status)
 
         result = summarize(self.fixed_root, self.clip_root, self.selection_path,
                            self.config_path, csv_path, json_path)
 
-        self.assertAlmostEqual(result["rows"][0]["absolute_bips2_difference"], 0.6)
+        fixed_bips2 = result["rows"][0]["fixed_bips2"]
+        self.assertLess(clip_bips2, fixed_bips2)
+        self.assertAlmostEqual(
+            result["rows"][0]["absolute_bips2_difference"],
+            fixed_bips2 - clip_bips2,
+        )
 
     def test_report_rejects_a_local_r2_result_with_stale_vector_provenance(self):
         """A locally attached score must retain the Task-5 R1/vector identity."""

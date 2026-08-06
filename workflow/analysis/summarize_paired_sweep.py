@@ -20,7 +20,7 @@ from workflow.experiments.balanced50 import (
     selection_keys,
     validate_selection,
 )
-from workflow.r2 import reuse_result, run_r2
+from workflow.r2 import attach_result, reuse_result, run_r2
 
 
 SCORE_DEFINITION = "paired measured BIPS2=IPC2*f_sus; exact validated reuse allowed"
@@ -159,7 +159,9 @@ def _validate_point(point: Path, method: str, key: object, config: dict,
         _validate_reuse(fixed_point, point, r1_dir, config_path, summary,
                         performance, ipc2, bips2)
     else:
-        _validate_local(r1_dir, point, summary, ipc2, bips2)
+        _validate_local(
+            r1_dir, point, summary, performance, ipc2, bips2
+        )
     return {
         "tmax_c": tmax_c,
         "frequency_ghz": frequency,
@@ -170,17 +172,25 @@ def _validate_point(point: Path, method: str, key: object, config: dict,
     }
 
 
-def _validate_local(r1_dir: Path, point: Path, summary: dict, ipc2: float,
-                    bips2: float) -> None:
+def _validate_local(r1_dir: Path, point: Path, summary: dict,
+                    performance: dict, ipc2: float, bips2: float) -> None:
     result_path = (point / "gem5_r2/r2_result.json").resolve()
     status_path = result_path.parent / "status.json"
-    decision = run_r2.validate_local_result(
-        r1_dir, point / "r2_latency.json", result_path.parent
+    run_config = _read_object(point / "run_config.json", "local run config")
+    config_source = run_config.get("source")
+    decision = attach_result.validate_local_attachment(
+        point, r1_dir,
+        Path(config_source) if isinstance(config_source, str) else None,
     )
     if decision.get("accepted") is not True:
         raise ValueError("local R2 provenance rejected: " + "; ".join(
             decision.get("reasons", [])
         ))
+    if (decision.get("summary") != summary
+            or decision.get("performance") != performance):
+        raise ValueError(
+            "local physical snapshot changed between report validation layers"
+        )
     if summary.get("r2_reused") is True or (point / "r2_reuse.json").exists():
         raise ValueError("separate CLIP/local row is marked as reuse")
     _path(summary.get("r2_source"), result_path, "local R2 source")
@@ -378,11 +388,16 @@ def _publish_reports(csv_path: Path, json_path: Path, csv_bytes: bytes,
 
 
 def summarize(fixed_root: Path, clip_root: Path, selection_path: Path,
-              config_path: Path, csv_path: Path, json_path: Path) -> dict:
+              config_path: Path, csv_path: Path, json_path: Path, *,
+              status_root: Path | None = None) -> dict:
     """Validate exactly the tracked pairs, then write deterministic CSV and JSON reports."""
     fixed_root = Path(fixed_root).resolve()
     clip_root = Path(clip_root).resolve()
     config_path = Path(config_path).resolve()
+    status_root = (
+        fixed_root.parent / PAIR_STATUS_DIRECTORY
+        if status_root is None else Path(status_root).resolve()
+    )
     selection = load_selection(Path(selection_path))
     grid_reference = selection["canonical_grid_config"]["path"]
     grid_path = Path(__file__).resolve().parents[2] / grid_reference
@@ -398,7 +413,7 @@ def summarize(fixed_root: Path, clip_root: Path, selection_path: Path,
     keys = selection_keys(selection)
     if len(keys) != 50 or len(set(keys)) != 50:
         raise ValueError("selection must contain exactly 50 unique keys")
-    statuses = _load_statuses(fixed_root.parent / PAIR_STATUS_DIRECTORY, keys,
+    statuses = _load_statuses(status_root, keys,
                               config_path, fixed_root, clip_root)
     rows = []
     for key in keys:
@@ -453,6 +468,7 @@ def summarize(fixed_root: Path, clip_root: Path, selection_path: Path,
         "score_definition": SCORE_DEFINITION,
         "point_count": len(rows),
         "selection": str(Path(selection_path).resolve()),
+        "status_root": str(status_root),
         "config": str(config_path),
         "config_sha256": sha256_file(config_path),
         "classification": config["experiment_classification"],
@@ -489,12 +505,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--clip-root", type=Path, required=True)
     parser.add_argument("--selection", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--status-root", type=Path)
     parser.add_argument("--csv", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         result = summarize(args.fixed_root, args.clip_root, args.selection,
-                           args.config, args.csv, args.output)
+                           args.config, args.csv, args.output,
+                           status_root=args.status_root)
     except (OSError, ValueError) as error:
         print(f"paired summary failed: {error}")
         return 1

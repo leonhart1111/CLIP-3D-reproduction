@@ -9,8 +9,12 @@ import sys
 from pathlib import Path
 
 from workflow.analysis.audit_r1 import audit
-from workflow.common import read_json, write_json
-from workflow.r1_catalog import build_catalogue, snapshot_canonical_artifacts
+from workflow.common import write_json
+from workflow.r1_catalog import (
+    build_catalogue,
+    snapshot_canonical_artifacts,
+    validate_canonical_plan,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -58,15 +62,13 @@ def refresh(root: Path, experiment_path: Path, profile: str, output: Path) -> di
     if not after_catalogue["complete"]:
         raise RuntimeError("canonical R1 catalogue is incomplete or invalid after plan refresh")
 
-    planned_path = root / "planned_jobs.json"
-    if not planned_path.is_file():
-        raise RuntimeError("R1 plan refresh did not write planned_jobs.json")
-    planned = read_json(planned_path)
-    planned_count = int(planned["job_count"])
     expected_count = after_catalogue["expected_count"]
-    if planned_count != expected_count:
+    plan_validation = validate_canonical_plan(root, after_catalogue)
+    planned_count = plan_validation["job_count"]
+    if not plan_validation["valid"]:
         raise RuntimeError(
-            f"planned_jobs.json contains {planned_count} jobs; expected {expected_count}"
+            "planned_jobs.json is not the exact canonical plan: "
+            + "; ".join(plan_validation["errors"])
         )
 
     audit_path = output / "audit.json"

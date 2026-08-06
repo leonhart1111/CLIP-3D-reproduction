@@ -176,6 +176,108 @@ def canonical_directories(catalogue: dict) -> list[Path]:
             if record["valid"]]
 
 
+def validate_canonical_plan(root: Path, catalogue: dict,
+                            planned_path: Path | None = None) -> dict:
+    """Bind one plan exactly to the catalogue's ordered canonical job list."""
+    root = Path(root).resolve()
+    planned_path = Path(planned_path or root / "planned_jobs.json").resolve()
+    errors: list[str] = []
+    if not planned_path.is_file():
+        return {
+            "valid": False,
+            "path": str(planned_path),
+            "job_count": 0,
+            "errors": ["missing planned_jobs.json"],
+        }
+    try:
+        plan = read_json(planned_path)
+    except (OSError, ValueError) as error:
+        return {
+            "valid": False,
+            "path": str(planned_path),
+            "job_count": 0,
+            "errors": [f"cannot read planned_jobs.json: {error}"],
+        }
+    if not isinstance(plan, dict):
+        return {
+            "valid": False,
+            "path": str(planned_path),
+            "job_count": 0,
+            "errors": ["planned_jobs.json must contain an object"],
+        }
+
+    expected_profile = catalogue["profile"]
+    if plan.get("profile") != expected_profile:
+        errors.append(
+            f"plan profile {plan.get('profile')!r} does not match {expected_profile!r}"
+        )
+    jobs = plan.get("jobs")
+    if not isinstance(jobs, list):
+        errors.append("planned jobs must be a list")
+        jobs = []
+    job_count = plan.get("job_count")
+    if not isinstance(job_count, int) or isinstance(job_count, bool) or job_count < 0:
+        errors.append("plan job_count must be a non-boolean non-negative integer")
+        reported_count = 0
+    else:
+        reported_count = job_count
+        if job_count != len(jobs):
+            errors.append(
+                f"plan job_count {job_count} does not match jobs length {len(jobs)}"
+            )
+
+    expected_records = catalogue["canonical_records"]
+    if len(jobs) != len(expected_records):
+        errors.append(
+            f"planned jobs length {len(jobs)} does not match canonical length "
+            f"{len(expected_records)}"
+        )
+    seen_keys: set[tuple[object, object, object]] = set()
+    for index, job in enumerate(jobs):
+        if not isinstance(job, dict):
+            errors.append(f"job {index} must contain an object")
+            continue
+        actual_key = tuple(job.get(field) for field in (
+            "workload", "l1d_size", "l2_size"
+        ))
+        if actual_key in seen_keys:
+            errors.append(f"job {index} duplicates canonical key {actual_key!r}")
+        seen_keys.add(actual_key)
+        if index >= len(expected_records):
+            errors.append(f"job {index} is an extra noncanonical job")
+            continue
+        record = expected_records[index]
+        expected_key = tuple(record["key"][field] for field in (
+            "workload", "l1d_size", "l2_size"
+        ))
+        if actual_key != expected_key:
+            errors.append(
+                f"job {index} does not match ordered canonical job: "
+                f"{actual_key!r} != {expected_key!r}"
+            )
+        if job.get("profile") != expected_profile:
+            errors.append(
+                f"job {index} profile {job.get('profile')!r} does not match "
+                f"{expected_profile!r}"
+            )
+        output_dir = job.get("output_dir")
+        expected_output = Path(record["directory"]).resolve()
+        if (not isinstance(output_dir, str) or not output_dir
+                or Path(output_dir).resolve() != expected_output):
+            errors.append(
+                f"job {index} output_dir does not match canonical output "
+                f"{expected_output}"
+            )
+
+    return {
+        "valid": not errors,
+        "path": str(planned_path),
+        "job_count": reported_count,
+        "jobs_length": len(jobs),
+        "errors": errors,
+    }
+
+
 def snapshot_canonical_artifacts(catalogue: dict) -> dict[str, str]:
     """Hash the required provenance artifacts of each valid canonical point."""
     snapshot = {}

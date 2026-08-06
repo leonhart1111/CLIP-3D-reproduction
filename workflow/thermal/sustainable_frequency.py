@@ -27,12 +27,10 @@ def closed_form_frequency(tmax_c: float, gamma: float, f0_ghz: float = 2.0,
     ), unconstrained
 
 
-def evaluate(module_model: Path, thermal_result: Path, output: Path,
-             f0_ghz: float = 2.0, fmin_ghz: float = 0.4,
-             tsafe_c: float = 95.0, ambient_c: float = 25.0,
-             ipc2: float | None = None) -> dict:
-    model = read_json(module_model)
-    thermal = read_json(thermal_result)
+def derive(model: dict, thermal: dict, f0_ghz: float = 2.0,
+           fmin_ghz: float = 0.4, tsafe_c: float = 95.0,
+           ambient_c: float = 25.0, ipc2: float | None = None) -> dict:
+    """Derive equation (13) without performing file I/O."""
     gamma = model["gamma"]
     frequency, state, raw = closed_form_frequency(
         thermal["tmax_c"], gamma, f0_ghz, fmin_ghz, tsafe_c, ambient_c
@@ -57,6 +55,18 @@ def evaluate(module_model: Path, thermal_result: Path, output: Path,
     if ipc2 is not None:
         result["ipc2"] = ipc2
         result["bips2"] = ipc2 * frequency
+    return result
+
+
+def evaluate(module_model: Path, thermal_result: Path, output: Path,
+             f0_ghz: float = 2.0, fmin_ghz: float = 0.4,
+             tsafe_c: float = 95.0, ambient_c: float = 25.0,
+             ipc2: float | None = None) -> dict:
+    model = read_json(module_model)
+    thermal = read_json(thermal_result)
+    result = derive(
+        model, thermal, f0_ghz, fmin_ghz, tsafe_c, ambient_c, ipc2
+    )
     write_json(output, result)
     return result
 

@@ -3,19 +3,24 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from copy import deepcopy
-import fcntl
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import tempfile
 
-from workflow.common import write_json
-from workflow.r2.run_r2 import canonical_gem5_args, validate_local_result
-from workflow.thermal.sustainable_frequency import closed_form_frequency, evaluate
+from workflow.common import atomic_write_bytes, write_json
+from workflow.r2.attachment_validation import (
+    exclusive_point_lock,
+    validate_physical_coherence,
+)
+from workflow.r2.run_r2 import (
+    strict_latency_vectors_equal,
+    validate_latency_vector,
+    validate_local_result,
+)
+from workflow.thermal.sustainable_frequency import evaluate
 
 
 def _capture_file(path: Path, reasons: list[str], label: str,
@@ -82,10 +87,7 @@ def _record_changed_snapshots(snapshots: dict[Path, dict],
 
 def _replace_bytes(path: Path, data: bytes) -> None:
     """Atomically restore exact authoritative bytes without JSON reformatting."""
-    path = Path(path)
-    temporary = path.with_suffix(path.suffix + ".rollback.tmp")
-    temporary.write_bytes(data)
-    temporary.replace(path)
+    atomic_write_bytes(path, data)
 
 
 def _current_sha256(path: Path) -> str | None:
@@ -100,18 +102,6 @@ def _restore_if_still_published(path: Path, published_sha256: str,
     """Restore bytes still owned by this attachment under the point lock."""
     if _current_sha256(path) == published_sha256:
         _replace_bytes(path, previous_bytes)
-
-
-@contextmanager
-def _exclusive_point_lock(point: Path):
-    """Serialize validation, publication, marker commit, and rollback per point."""
-    descriptor = os.open(Path(point), os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
 
 
 def _accepted_marker_bytes(path: Path, performance_path: Path,
@@ -154,169 +144,6 @@ def _path_matches(value: object, expected: Path) -> bool:
     if not isinstance(value, str) or not value:
         return False
     return Path(value).resolve() == expected.resolve()
-
-
-def _finite_number(value: object) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value)))
-
-
-def _matches_expected(value: object, expected: object) -> bool:
-    if isinstance(expected, bool):
-        return value is expected
-    if isinstance(expected, int):
-        return (isinstance(value, int) and not isinstance(value, bool)
-                and value == expected)
-    if isinstance(expected, float):
-        return (_finite_number(value) and math.isclose(
-            float(value), expected, rel_tol=1e-12, abs_tol=1e-12
-        ))
-    return value == expected
-
-
-def _derived_target_performance(modules: dict, thermal: dict,
-                                config: dict) -> dict:
-    """Derive the evaluator's complete non-R2 performance contract."""
-    frequency_config = config["frequency"]
-    gamma = float(modules["gamma"])
-    f0_ghz = float(frequency_config["f0_ghz"])
-    fmin_ghz = float(frequency_config["fmin_ghz"])
-    tsafe_c = float(frequency_config["tsafe_c"])
-    ambient_c = float(frequency_config["ambient_c"])
-    tmax_c = float(thermal["tmax_c"])
-    frequency, state, raw = closed_form_frequency(
-        tmax_c, gamma, f0_ghz, fmin_ghz, tsafe_c, ambient_c
-    )
-    floor_power_scale = gamma + (1.0 - gamma) * (fmin_ghz / f0_ghz)
-    estimated_tmax_at_fmin = ambient_c + (
-        tmax_c - ambient_c
-    ) * floor_power_scale
-    ipc1 = float(modules["ipc1"])
-    return {
-        "schema_version": 1,
-        "equation": 13,
-        "gamma": gamma,
-        "leakage_power_w": float(modules["totals"]["leakage_power_w"]),
-        "dynamic_power_w": float(modules["totals"]["dynamic_power_w"]),
-        "tmax_f0_c": tmax_c,
-        "ambient_c": ambient_c,
-        "tsafe_c": tsafe_c,
-        "f0_ghz": f0_ghz,
-        "fmin_ghz": fmin_ghz,
-        "unclamped_solution_ghz": raw,
-        "sustainable_frequency_ghz": frequency,
-        "estimated_tmax_at_fmin_c": estimated_tmax_at_fmin,
-        "thermal_feasible_at_fmin": estimated_tmax_at_fmin <= tsafe_c,
-        "floor_power_scale": floor_power_scale,
-        "state": state,
-        "ipc1": ipc1,
-        "bips1_thermal": ipc1 * frequency,
-    }
-
-
-def _validate_target_inputs(metadata: dict, config: dict, modules: dict,
-                            thermal: dict, performance: dict, summary: dict,
-                            r1_dir: Path,
-                            clip_point: Path,
-                            reasons: list[str]) -> None:
-    architecture = modules.get("architecture")
-    if not isinstance(architecture, dict):
-        reasons.append("target modules architecture is missing")
-    else:
-        for field in (
-                "workload", "l1i_size", "l1d_size", "l2_size", "num_cores",
-                "instruction_window_scope", "warmup_insts_cpu0",
-                "measure_insts_cpu0"):
-            expected = metadata.get(
-                field, "cpu0" if field == "instruction_window_scope" else None
-            )
-            if architecture.get(field) != expected:
-                reasons.append(
-                    f"target modules architecture {field} differs from canonical R1"
-                )
-    if not _path_matches(modules.get("source_r1"), r1_dir):
-        reasons.append("target modules source_r1 differs from canonical R1")
-    totals = modules.get("totals")
-    if not isinstance(totals, dict):
-        reasons.append("target modules totals are missing")
-    else:
-        dynamic = totals.get("dynamic_power_w")
-        leakage = totals.get("leakage_power_w")
-        total = totals.get("total_power_w")
-        if (not all(_finite_number(value) for value in (dynamic, leakage, total))
-                or float(dynamic) < 0 or float(leakage) < 0 or float(total) <= 0
-                or not math.isclose(
-                    float(dynamic) + float(leakage), float(total),
-                    rel_tol=1e-12, abs_tol=1e-12,
-                )):
-            reasons.append("target modules power totals are inconsistent")
-        gamma = modules.get("gamma")
-        if (not _finite_number(gamma) or not _finite_number(leakage)
-                or not _finite_number(total) or float(total) <= 0
-                or not math.isclose(
-                    float(gamma), float(leakage) / float(total),
-                    rel_tol=1e-12, abs_tol=1e-12,
-                )):
-            reasons.append("target modules gamma differs from leakage/total power")
-    if not _finite_number(modules.get("ipc1")) or float(modules["ipc1"]) <= 0:
-        reasons.append("target modules IPC1 must be finite and positive")
-
-    frequency = config.get("frequency")
-    physical = config.get("physical")
-    if not isinstance(frequency, dict) or not isinstance(physical, dict):
-        reasons.append("experiment config lacks frequency/physical inputs")
-        return
-    tmax_c = thermal.get("tmax_c")
-    if not _finite_number(tmax_c):
-        reasons.append("target thermal tmax_c must be finite")
-    for field, expected in (
-            ("power_trace", clip_point / "hotspot/power.ptrace"),
-            ("steady_file", clip_point / "hotspot/steady.txt"),
-            ("grid_steady_file", clip_point / "hotspot/grid.steady.txt")):
-        if not _path_matches(thermal.get(field), expected):
-            reasons.append(
-                f"target thermal {field} does not identify the target HotSpot output"
-            )
-    if thermal.get("return_code") != 0:
-        reasons.append("target thermal return_code is not zero")
-    if (not _finite_number(thermal.get("ambient_c"))
-            or thermal.get("ambient_c") != frequency.get("ambient_c")):
-        reasons.append("target thermal ambient differs from experiment config")
-    if (not _finite_number(thermal.get("r_convec_k_per_w"))
-            or thermal.get("r_convec_k_per_w") != physical.get("r_convec_k_per_w")):
-        reasons.append("target thermal cooling differs from experiment config")
-    if not _finite_number(thermal.get("tmax_k")):
-        reasons.append("target thermal tmax_k must be finite")
-    elif _finite_number(tmax_c) and not math.isclose(
-            float(thermal["tmax_k"]) - 273.15, float(tmax_c),
-            rel_tol=0.0, abs_tol=1e-9):
-        reasons.append("target thermal Kelvin/Celsius values disagree")
-    try:
-        expected_performance = _derived_target_performance(
-            modules, thermal, config
-        )
-    except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
-        reasons.append(f"cannot derive target thermal performance: {error}")
-        return
-    for field, expected in expected_performance.items():
-        if not _matches_expected(performance.get(field), expected):
-            reasons.append(
-                f"target performance {field} differs from target module/thermal inputs"
-            )
-    for summary_field, performance_field, message in (
-            ("gamma", "gamma",
-             "target summary gamma differs from target performance"),
-            ("tmax_c", "tmax_f0_c",
-             "target summary thermal tmax_c differs from target performance"),
-            ("sustainable_frequency_ghz", "sustainable_frequency_ghz",
-             "target summary sustainable_frequency_ghz differs from target performance"),
-            ("ipc1", "ipc1",
-             "target summary ipc1 differs from target performance"),
-            ("bips1_thermal", "bips1_thermal",
-             "target summary bips1_thermal differs from target performance")):
-        if not _matches_expected(
-                summary.get(summary_field), expected_performance[performance_field]):
-            reasons.append(message)
 
 
 def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
@@ -363,12 +190,20 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
     )
     target_modules_path = clip_point / "modules.json"
     target_thermal_path = clip_point / "hotspot/thermal_result.json"
+    target_manifest_path = clip_point / "hotspot/hotspot_manifest.json"
+    target_steady_path = clip_point / "hotspot/steady.txt"
     target_performance_path = clip_point / "performance.json"
     target_modules = _read_object(
         target_modules_path, reasons, "target modules", snapshots
     )
     target_thermal = _read_object(
         target_thermal_path, reasons, "target thermal result", snapshots
+    )
+    target_manifest = _read_object(
+        target_manifest_path, reasons, "target HotSpot manifest", snapshots
+    )
+    target_steady = _capture_file(
+        target_steady_path, reasons, "target HotSpot steady output", snapshots
     )
     target_performance = _read_object(
         target_performance_path, reasons, "target performance", snapshots
@@ -394,21 +229,17 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
     source_status = captured_source_status
 
     if source_vector is not None and target_vector is not None:
-        source_overrides = source_vector.get("gem5_overrides")
-        target_overrides = target_vector.get("gem5_overrides")
-        if source_overrides != target_overrides:
-            reasons.append("source and target gem5_overrides differ")
         for label, vector in (("source", source_vector), ("target", target_vector)):
             try:
-                expected_args = canonical_gem5_args(vector.get("gem5_overrides"))
+                validate_latency_vector(vector)
             except ValueError as error:
                 reasons.append(f"{label} {error}")
-            else:
-                if vector.get("gem5_args") != expected_args:
-                    reasons.append(
-                        f"{label} gem5_args are not the complete canonical rendering "
-                        "of gem5_overrides"
-                    )
+        try:
+            vectors_equal = strict_latency_vectors_equal(source_vector, target_vector)
+        except ValueError:
+            vectors_equal = False
+        if not vectors_equal:
+            reasons.append("source and target gem5_overrides differ or are invalid")
 
     canonical_key = _architecture_key(metadata or {})
     if any(not isinstance(value, str) or not value for value in canonical_key.values()):
@@ -447,11 +278,14 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
             reasons.append(f"{label} run config layout method is not {method}")
 
     if all(value is not None for value in (
+            metadata, config, target_modules, target_thermal, target_manifest,
+            target_steady, target_performance, clip_summary)):
+        validate_physical_coherence(
             metadata, config, target_modules, target_thermal,
-            target_performance, clip_summary)):
-        _validate_target_inputs(
-            metadata, config, target_modules, target_thermal,
-            target_performance, clip_summary, r1_dir, clip_point, reasons
+            target_performance, clip_summary, r1_dir, clip_point, reasons,
+            r1_stats_bytes=snapshots[r1_stats_path]["bytes"],
+            thermal_steady_bytes=target_steady["bytes"],
+            thermal_manifest=target_manifest,
         )
 
     if source_status is not None and source_status.get("state") != "success":
@@ -542,6 +376,14 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
                 "path": str(target_thermal_path),
                 "sha256": _snapshot_sha256(snapshots, target_thermal_path),
             },
+            "hotspot_manifest": {
+                "path": str(target_manifest_path),
+                "sha256": _snapshot_sha256(snapshots, target_manifest_path),
+            },
+            "steady": {
+                "path": str(target_steady_path),
+                "sha256": _snapshot_sha256(snapshots, target_steady_path),
+            },
         },
     }
     return ({
@@ -565,7 +407,7 @@ def attach_reused_result(fixed_point: Path, clip_point: Path, r1_dir: Path,
                          config_path: Path) -> dict:
     """Attach one result while excluding concurrent transactions on the point."""
     clip_point = Path(clip_point).resolve()
-    with _exclusive_point_lock(clip_point):
+    with exclusive_point_lock(clip_point):
         return _attach_reused_result_locked(
             fixed_point, clip_point, r1_dir, config_path
         )

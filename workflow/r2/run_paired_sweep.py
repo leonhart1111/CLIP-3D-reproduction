@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager, ExitStack
+from copy import deepcopy
 from dataclasses import asdict
+import fcntl
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -19,9 +23,75 @@ from workflow.experiments.balanced50 import (
 )
 from workflow.r1_catalog import ArchitectureKey
 from workflow.r2 import attach_result, reuse_result, run_r2
+from workflow.r2.attachment_validation import exclusive_point_lock
 
 
 SCHEMA_VERSION = 1
+SWEEP_LOCK_NAME = ".paired-r2-sweep.lock"
+PAIR_LOCK_NAME = ".paired-r2-pair.lock"
+
+# Global acquisition order: physical-root sweep -> physical-point pair ->
+# physical point attachment. Locks within one level use resolved path order.
+# A lower-level operation must never attempt to reacquire an earlier lock.
+
+
+@contextmanager
+def _execution_lock(path: Path, *, blocking: bool, conflict_message: str,
+                    shared: bool = False):
+    """Hold one filesystem execution lock for the entire protected operation."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    acquired = False
+    try:
+        flags = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        if not blocking:
+            flags |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(descriptor, flags)
+        except BlockingIOError as error:
+            raise RuntimeError(conflict_message) from error
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _ordered_lock_paths(paths: list[Path]) -> list[Path]:
+    """Return deterministic unique physical lock identities."""
+    unique = {str(Path(path).resolve()): Path(path).resolve() for path in paths}
+    return [unique[name] for name in sorted(unique)]
+
+
+@contextmanager
+def _execution_locks(paths: list[Path], *, blocking: bool,
+                     conflict_message: str, shared: bool = False):
+    """Acquire one lock level in deterministic order and unwind atomically."""
+    with ExitStack() as stack:
+        for path in _ordered_lock_paths(paths):
+            stack.enter_context(_execution_lock(
+                path, blocking=blocking, conflict_message=conflict_message,
+                shared=shared,
+            ))
+        yield
+
+
+def _sweep_lock_paths(fixed_root: Path, clip_root: Path) -> list[Path]:
+    return [
+        Path(fixed_root).resolve() / SWEEP_LOCK_NAME,
+        Path(clip_root).resolve() / SWEEP_LOCK_NAME,
+    ]
+
+
+def _pair_lock_paths(key: ArchitectureKey, fixed_root: Path,
+                     clip_root: Path) -> list[Path]:
+    relative = key.relative_path()
+    return [
+        Path(fixed_root).resolve() / relative / PAIR_LOCK_NAME,
+        Path(clip_root).resolve() / relative / PAIR_LOCK_NAME,
+    ]
 
 
 def _positive_int(text: str) -> int:
@@ -74,16 +144,17 @@ def _validated_vectors(fixed_point: Path, clip_point: Path) -> tuple[dict, dict]
     if not isinstance(fixed, dict) or not isinstance(clip, dict):
         raise ValueError("R2 latency vectors must contain objects")
     for label, vector in (("fixed-bin", fixed), ("CLIP-3D", clip)):
-        arguments = run_r2.canonical_gem5_args(vector.get("gem5_overrides"))
-        if vector.get("gem5_args") != arguments:
-            raise ValueError(
-                f"{label} gem5_args are not the canonical override rendering"
-            )
+        try:
+            run_r2.validate_latency_vector(vector)
+        except ValueError as error:
+            raise ValueError(f"{label} {error}") from error
     return fixed, clip
 
 
-def _summary_metrics(point: Path, result: dict, label: str) -> dict[str, float]:
-    summary = read_json(point / "pipeline_summary.json")
+def _summary_metrics(point: Path, result: dict, label: str,
+                     summary: dict | None = None) -> dict[str, float]:
+    summary = (read_json(point / "pipeline_summary.json")
+               if summary is None else summary)
     if not isinstance(summary, dict):
         raise ValueError(f"{label} pipeline summary must contain an object")
     ipc2 = summary.get("ipc2")
@@ -114,50 +185,34 @@ def _identity(record: dict, key: ArchitectureKey, paths: dict[str, Path],
 
 
 def _validate_local_attachment(r1_dir: Path, point: Path,
-                               label: str) -> tuple[dict, dict[str, float]] | None:
+                               label: str,
+                               config_path: Path | None = None,
+                               ) -> tuple[dict, dict[str, float]] | None:
     """Bind an attached local summary/performance to its validated gem5 result."""
-    decision = run_r2.validate_local_result(
-        r1_dir, point / "r2_latency.json", point / "gem5_r2",
+    decision = attach_result.validate_local_attachment(
+        point, r1_dir, config_path
     )
     if decision.get("accepted") is not True:
         return None
     result = decision.get("result")
     if not isinstance(result, dict):
         return None
-    result_path = (point / "gem5_r2/r2_result.json").resolve()
-    summary = _read_object(point / "pipeline_summary.json")
-    performance = _read_object(point / "performance.json")
-    if summary is None or performance is None:
+    summary = decision.get("summary")
+    if not isinstance(summary, dict):
         return None
     try:
-        metrics = _summary_metrics(point, result, label)
+        metrics = _summary_metrics(point, result, label, summary)
     except (OSError, ValueError):
-        return None
-    artifacts = summary.get("artifacts")
-    if not isinstance(artifacts, dict):
-        return None
-    if (summary.get("r2_source") != str(result_path)
-            or artifacts.get("r2_result") != str(result_path)
-            or summary.get("r2_reused") is True
-            or summary.get("r2_reuse_artifact") is not None
-            or artifacts.get("r2_reuse") is not None
-            or (point / "r2_reuse.json").exists()
-            or not _same_number(performance.get("ipc2"), metrics["ipc2"])
-            or not _same_number(performance.get("bips2"), metrics["bips2"])
-            or not _finite_positive(performance.get("sustainable_frequency_ghz"))
-            or not math.isclose(
-                metrics["bips2"],
-                metrics["ipc2"] * float(
-                    performance["sustainable_frequency_ghz"]
-                ),
-                rel_tol=1e-12, abs_tol=1e-12,
-            )):
         return None
     return result, metrics
 
 
-def _validate_fixed(paths: dict[str, Path]) -> tuple[dict, dict[str, float]] | None:
-    return _validate_local_attachment(paths["r1"], paths["fixed"], "fixed-bin")
+def _validate_fixed(paths: dict[str, Path],
+                    config_path: Path | None = None,
+                    ) -> tuple[dict, dict[str, float]] | None:
+    return _validate_local_attachment(
+        paths["r1"], paths["fixed"], "fixed-bin", config_path
+    )
 
 
 def _reuse_attachment_matches(point: Path, decision: dict,
@@ -221,7 +276,7 @@ def _can_resume_fixed(record: dict | None, key: ArchitectureKey,
         isinstance(record, dict)
         and record.get("fixed_complete") is True
         and _identity(record, key, paths, config_path)
-        and _validate_fixed(paths) is not None
+        and _validate_fixed(paths, config_path) is not None
     )
 
 
@@ -230,7 +285,7 @@ def _validate_completed(record: dict | None, key: ArchitectureKey,
     if (not isinstance(record, dict) or record.get("state") != "success"
             or not _identity(record, key, paths, config_path)):
         return False
-    fixed = _validate_fixed(paths)
+    fixed = _validate_fixed(paths, config_path)
     if fixed is None:
         return False
     fixed_result, fixed_metrics = fixed
@@ -238,7 +293,7 @@ def _validate_completed(record: dict | None, key: ArchitectureKey,
         fixed_vector, clip_vector = _validated_vectors(paths["fixed"], paths["clip"])
     except (KeyError, OSError, TypeError, ValueError):
         return False
-    reused = fixed_vector["gem5_overrides"] == clip_vector["gem5_overrides"]
+    reused = run_r2.strict_latency_vectors_equal(fixed_vector, clip_vector)
     if record.get("clip3d_reused_fixed_r2") is not reused:
         return False
 
@@ -257,17 +312,19 @@ def _validate_completed(record: dict | None, key: ArchitectureKey,
                 )):
             return False
         clip_result = fixed_result
+        try:
+            clip_metrics = _summary_metrics(
+                paths["clip"], clip_result, "CLIP-3D", clip_summary
+            )
+        except (OSError, ValueError):
+            return False
     else:
         clip_validated = _validate_local_attachment(
-            paths["r1"], paths["clip"], "CLIP-3D"
+            paths["r1"], paths["clip"], "CLIP-3D", config_path
         )
         if clip_validated is None:
             return False
-        clip_result, _validated_clip_metrics = clip_validated
-    try:
-        clip_metrics = _summary_metrics(paths["clip"], clip_result, "CLIP-3D")
-    except (OSError, ValueError):
-        return False
+        clip_result, clip_metrics = clip_validated
     return (
         record.get("physical_r2_runs") == (1 if reused else 2)
         and _same_number(record.get("fixed_ipc2"), fixed_metrics["ipc2"])
@@ -302,23 +359,71 @@ def _base_record(key: ArchitectureKey, paths: dict[str, Path],
 
 def _clear_reuse_attachment(point: Path) -> None:
     """Remove stale reuse commit state before publishing a local attachment."""
-    (point / "r2_reuse.json").unlink(missing_ok=True)
-    summary_path = point / "pipeline_summary.json"
-    summary = read_json(summary_path)
-    if not isinstance(summary, dict):
-        raise ValueError("CLIP-3D pipeline summary must contain an object")
-    summary.pop("r2_reused", None)
-    summary.pop("r2_reuse_artifact", None)
-    artifacts = summary.get("artifacts")
-    if isinstance(artifacts, dict):
-        artifacts.pop("r2_reuse", None)
-    write_json(summary_path, summary)
+    point = Path(point).resolve()
+    with exclusive_point_lock(point):
+        (point / "r2_reuse.json").unlink(missing_ok=True)
+        summary_path = point / "pipeline_summary.json"
+        summary = read_json(summary_path)
+        if not isinstance(summary, dict):
+            raise ValueError("CLIP-3D pipeline summary must contain an object")
+        summary.pop("r2_reused", None)
+        summary.pop("r2_reuse_artifact", None)
+        artifacts = summary.get("artifacts")
+        if isinstance(artifacts, dict):
+            artifacts.pop("r2_reuse", None)
+        write_json(summary_path, summary)
 
 
 def run_pair(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
              clip_root: Path, config_path: Path, rerun: bool = False,
              *, status_root: Path | None = None) -> dict:
-    """Run one fixed-first pair, returning a persisted success or failure record."""
+    """Join the physical sweep domain, then serialize one physical pair."""
+    normalized_key = ArchitectureKey(key.workload, key.l1d_size, key.l2_size)
+    resolved_fixed_root = Path(fixed_root).resolve()
+    resolved_clip_root = Path(clip_root).resolve()
+    resolved_status_root = (
+        resolved_fixed_root.parent / "paired_r2_status"
+        if status_root is None else Path(status_root).resolve()
+    )
+    sweep_locks = _sweep_lock_paths(resolved_fixed_root, resolved_clip_root)
+    with _execution_locks(
+            sweep_locks, blocking=True, shared=True,
+            conflict_message="physical R2 sweep lock is unavailable"):
+        return _run_pair_under_sweep(
+            normalized_key, r1_root, resolved_fixed_root, resolved_clip_root,
+            config_path,
+            rerun, status_root=resolved_status_root,
+        )
+
+
+def _run_pair_under_sweep(key: ArchitectureKey, r1_root: Path,
+                          fixed_root: Path, clip_root: Path, config_path: Path,
+                          rerun: bool = False, *,
+                          status_root: Path | None = None) -> dict:
+    """Serialize a pair while the caller participates in the sweep lock level."""
+    normalized_key = ArchitectureKey(key.workload, key.l1d_size, key.l2_size)
+    resolved_fixed_root = Path(fixed_root).resolve()
+    resolved_clip_root = Path(clip_root).resolve()
+    resolved_status_root = (
+        resolved_fixed_root.parent / "paired_r2_status"
+        if status_root is None else Path(status_root).resolve()
+    )
+    pair_locks = _pair_lock_paths(
+        normalized_key, resolved_fixed_root, resolved_clip_root
+    )
+    with _execution_locks(
+            pair_locks, blocking=True,
+            conflict_message="physical R2 pair lock is unavailable"):
+        return _run_pair_locked(
+            normalized_key, r1_root, resolved_fixed_root, resolved_clip_root,
+            config_path, rerun, status_root=resolved_status_root,
+        )
+
+
+def _run_pair_locked(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
+                     clip_root: Path, config_path: Path, rerun: bool = False,
+                     *, status_root: Path | None = None) -> dict:
+    """Run one pair while its execution lock is already held."""
     key = ArchitectureKey(key.workload, key.l1d_size, key.l2_size)
     r1_root = Path(r1_root).resolve()
     fixed_root = Path(fixed_root).resolve()
@@ -354,7 +459,7 @@ def run_pair(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
     write_json(paths["status"], record)
     try:
         if resume_fixed:
-            fixed_validated = _validate_fixed(paths)
+            fixed_validated = _validate_fixed(paths, config_path)
             if fixed_validated is None:  # Defensive against replacement after check.
                 raise ValueError("fixed R2 changed after resume validation")
             fixed_result, fixed_metrics = fixed_validated
@@ -364,7 +469,7 @@ def run_pair(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
                 paths["fixed"] / "gem5_r2", rerun=rerun,
             )
             attach_result.attach(paths["fixed"])
-            fixed_validated = _validate_fixed(paths)
+            fixed_validated = _validate_fixed(paths, config_path)
             if fixed_validated is None:
                 raise ValueError("fixed R2 failed post-attachment validation")
             fixed_result, fixed_metrics = fixed_validated
@@ -387,7 +492,7 @@ def run_pair(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
         fixed_vector, clip_vector = _validated_vectors(
             paths["fixed"], paths["clip"]
         )
-        reused = fixed_vector["gem5_overrides"] == clip_vector["gem5_overrides"]
+        reused = run_r2.strict_latency_vectors_equal(fixed_vector, clip_vector)
         if reused:
             decision = reuse_result.validate_reuse(
                 paths["fixed"], paths["clip"], paths["r1"], config_path
@@ -419,6 +524,9 @@ def run_pair(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
                     "reuse attachment marker/output binding is invalid"
                 )
             clip_result = fixed_result
+            clip_metrics = _summary_metrics(
+                paths["clip"], clip_result, "CLIP-3D", clip_summary
+            )
             clip_artifact = paths["clip"] / "r2_reuse.json"
         else:
             _clear_reuse_attachment(paths["clip"])
@@ -428,17 +536,16 @@ def run_pair(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
             )
             attach_result.attach(paths["clip"])
             clip_validated = _validate_local_attachment(
-                paths["r1"], paths["clip"], "CLIP-3D"
+                paths["r1"], paths["clip"], "CLIP-3D", config_path
             )
             if clip_validated is None:
                 raise ValueError(
                     "CLIP-3D local attachment failed result/performance/summary "
                     "validation"
                 )
-            clip_result, _clip_metrics = clip_validated
+            clip_result, clip_metrics = clip_validated
             clip_artifact = paths["clip"] / "gem5_r2/r2_result.json"
 
-        clip_metrics = _summary_metrics(paths["clip"], clip_result, "CLIP-3D")
         record.update({
             "state": "success",
             "phase": "complete",
@@ -501,8 +608,8 @@ def _existing_r2_validator(r1_root: Path, fixed_root: Path, clip_root: Path,
                 "accepted": False,
                 "reasons": [f"cannot validate paired latency vectors: {error}"],
             }
-        equal_overrides = (
-            fixed_vector["gem5_overrides"] == clip_vector["gem5_overrides"]
+        equal_overrides = run_r2.strict_latency_vectors_equal(
+            fixed_vector, clip_vector
         )
         branch = "reuse" if equal_overrides else "local"
         if rerun_requested:
@@ -520,10 +627,14 @@ def _existing_r2_validator(r1_root: Path, fixed_root: Path, clip_root: Path,
             decision = run_r2.validate_local_result(
                 r1_dir, point_dir / "r2_latency.json", point_dir / "gem5_r2"
             )
+            attachment_valid = _validate_local_attachment(
+                r1_dir, point_dir, "fixed-bin", config_path
+            ) is not None
             return {**decision, "branch": "fixed",
-                    "repair_required": False,
+                    "repair_required": (decision.get("accepted") is True
+                                        and not attachment_valid),
                     "rerun_requested": False,
-                    "scientific_evidence_accepted": decision.get("accepted") is True}
+                    "scientific_evidence_accepted": attachment_valid}
         if not equal_overrides:
             decision = run_r2.validate_local_result(
                 r1_dir, point_dir / "r2_latency.json", point_dir / "gem5_r2"
@@ -534,7 +645,7 @@ def _existing_r2_validator(r1_root: Path, fixed_root: Path, clip_root: Path,
                         "rerun_requested": False,
                         "scientific_evidence_accepted": False}
             attachment_valid = _validate_local_attachment(
-                r1_dir, point_dir, "CLIP-3D"
+                r1_dir, point_dir, "CLIP-3D", config_path
             ) is not None
             if attachment_valid:
                 return {**decision, "branch": "local",
@@ -614,9 +725,61 @@ def _pending_pair(key: ArchitectureKey, status_root: Path) -> dict:
     }
 
 
+def _revalidate_persisted_pairs(
+        keys: list[ArchitectureKey], r1_root: Path, fixed_root: Path,
+        clip_root: Path, status_root: Path, config_path: Path,
+        ) -> tuple[dict[ArchitectureKey, dict], dict]:
+    """Re-read and live-validate every selected persisted pair claim."""
+    certified: dict[ArchitectureKey, dict] = {}
+    rejections = []
+    for key in keys:
+        paths = _paths(key, r1_root, fixed_root, clip_root, status_root)
+        pair_locks = _pair_lock_paths(key, fixed_root, clip_root)
+        with _execution_locks(
+                pair_locks, blocking=True,
+                conflict_message="physical R2 pair lock is unavailable"):
+            persisted = _read_object(paths["status"])
+            accepted = _validate_completed(persisted, key, paths, config_path)
+            if accepted:
+                record = deepcopy(persisted)
+                record["completion_revalidated"] = True
+                certified[key] = record
+                continue
+
+            if persisted is None:
+                reason = "persisted pair status is missing or malformed"
+                record = _pending_pair(key, status_root)
+            elif persisted.get("state") == "success":
+                reason = "persisted success record failed live evidence validation"
+                record = deepcopy(persisted)
+            else:
+                reason = f"persisted pair state is {persisted.get('state')!r}"
+                record = deepcopy(persisted)
+            record.update({
+                "state": "failed",
+                "completion_revalidated": False,
+                "revalidation_error": reason,
+            })
+            record.setdefault("key", _key_dict(key))
+            record.setdefault("pair_status", str(paths["status"]))
+            certified[key] = record
+            rejections.append({
+                "key": _key_dict(key),
+                "pair_status": str(paths["status"]),
+                "reason": reason,
+            })
+    return certified, {
+        "performed": True,
+        "accepted_pair_count": len(keys) - len(rejections),
+        "rejected_pair_count": len(rejections),
+        "rejections": rejections,
+    }
+
+
 def _experiment_status(keys: list[ArchitectureKey], results: dict[ArchitectureKey, dict],
                        status_root: Path, preflight: dict, limited_run: bool,
-                       started: float) -> dict:
+                       started: float, *, completion_certified: bool = False,
+                       completion_revalidation: dict | None = None) -> dict:
     pairs = [results.get(key, _pending_pair(key, status_root)) for key in keys]
     completed = sum(pair.get("state") == "success" for pair in pairs)
     failed = sum(pair.get("state") == "failed" for pair in pairs)
@@ -665,7 +828,8 @@ def _experiment_status(keys: list[ArchitectureKey], results: dict[ArchitectureKe
         and physical_r2_runs == len(keys) + separate
     )
     complete = (
-        not limited_run
+        completion_certified
+        and not limited_run
         and len(keys) == 50
         and len(set(keys)) == 50
         and selected_results_valid
@@ -689,6 +853,12 @@ def _experiment_status(keys: list[ArchitectureKey], results: dict[ArchitectureKe
         "per_pair_run_counts_valid": per_pair_run_counts_valid,
         "result_keys_match_manifest": keys_match_manifest,
         "selected_results_valid": selected_results_valid,
+        "completion_revalidation": completion_revalidation or {
+            "performed": False,
+            "accepted_pair_count": 0,
+            "rejected_pair_count": 0,
+            "rejections": [],
+        },
         "preflight": preflight,
         "pairs": pairs,
     }
@@ -698,7 +868,31 @@ def run_sweep(r1_root: Path, fixed_root: Path, clip_root: Path,
               selection_path: Path, config_path: Path, status_root: Path,
               jobs: int = 1, rerun: bool = False,
               limit: int | None = None) -> dict:
-    """Validate both full roots, then concurrently run selected ordered pairs."""
+    """Fail fast on another sweep, then hold the sweep lock through final status."""
+    if jobs <= 0:
+        raise ValueError("jobs must be positive")
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive")
+    fixed_root = Path(fixed_root).resolve()
+    clip_root = Path(clip_root).resolve()
+    status_root = Path(status_root).resolve()
+    sweep_locks = _sweep_lock_paths(fixed_root, clip_root)
+    with _execution_locks(
+            sweep_locks, blocking=False,
+            conflict_message=(
+                "paired R2 sweep is already active on a physical root"
+            )):
+        return _run_sweep_locked(
+            r1_root, fixed_root, clip_root, selection_path, config_path,
+            status_root, jobs=jobs, rerun=rerun, limit=limit,
+        )
+
+
+def _run_sweep_locked(r1_root: Path, fixed_root: Path, clip_root: Path,
+                      selection_path: Path, config_path: Path, status_root: Path,
+                      jobs: int = 1, rerun: bool = False,
+                      limit: int | None = None) -> dict:
+    """Validate and execute a sweep while its outer execution lock is held."""
     if jobs <= 0:
         raise ValueError("jobs must be positive")
     if limit is not None and limit <= 0:
@@ -732,7 +926,8 @@ def run_sweep(r1_root: Path, fixed_root: Path, clip_root: Path,
     with ProcessPoolExecutor(max_workers=jobs) as executor:
         futures = {
             executor.submit(
-                run_pair, key, r1_root, fixed_root, clip_root, config_path, rerun,
+                _run_pair_under_sweep, key, r1_root, fixed_root, clip_root,
+                config_path, rerun,
                 status_root=status_root,
             ): key
             for key in keys
@@ -765,8 +960,12 @@ def run_sweep(r1_root: Path, fixed_root: Path, clip_root: Path,
                 f"{result.get('state')}"
             )
 
+    persisted_results, revalidation = _revalidate_persisted_pairs(
+        keys, r1_root, fixed_root, clip_root, status_root, config_path
+    )
     final = _experiment_status(
-        keys, results, status_root, preflight, limited_run, started
+        keys, persisted_results, status_root, preflight, limited_run, started,
+        completion_certified=True, completion_revalidation=revalidation,
     )
     final["finished_unix"] = time.time()
     if limited_run and final["selected_results_valid"]:

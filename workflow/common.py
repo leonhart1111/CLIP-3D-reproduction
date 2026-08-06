@@ -6,9 +6,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 from numbers import Real
 from pathlib import Path
+import tempfile
 from typing import Any
 
 
@@ -36,14 +38,36 @@ def read_json(path: Path | str) -> Any:
         return json.load(stream)
 
 
-def write_json(path: Path | str, value: Any) -> None:
+def atomic_write_bytes(path: Path | str, data: bytes) -> None:
+    """Publish complete bytes by unique same-directory temp and atomic replace."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(value, stream, indent=2, ensure_ascii=False)
-        stream.write("\n")
-    temporary.replace(path)
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o644
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{path.name}-", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(name)
+    descriptor_open = True
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor_open = False
+            stream.write(data)
+        os.replace(temporary, path)
+    finally:
+        if descriptor_open:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def write_json(path: Path | str, value: Any) -> None:
+    payload = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode(
+        "utf-8"
+    )
+    atomic_write_bytes(path, payload)
 
 
 def sha256_file(path: Path | str) -> str:
@@ -77,15 +101,10 @@ def parse_frequency_ghz(text: str | int | float) -> float:
     return value if match.group(2).lower() == "ghz" else value / 1000.0
 
 
-def parse_gem5_stats(path: Path | str,
-                     include_nonfinite: bool = False) -> dict[str, float]:
-    """Read the last statistics section into a flat name -> number map.
-
-    Normal workflow consumers retain the historical finite-only behavior.
-    Validation code may request non-finite values so malformed counters are
-    distinguished from counters that are absent.
-    """
-    sections = Path(path).read_text(encoding="utf-8").split(
+def parse_gem5_stats_text(text: str,
+                          include_nonfinite: bool = False) -> dict[str, float]:
+    """Parse the last gem5 statistics section from one captured text snapshot."""
+    sections = text.split(
         "---------- Begin Simulation Statistics ----------"
     )
     text = sections[-1]
@@ -103,6 +122,19 @@ def parse_gem5_stats(path: Path | str,
         if math.isfinite(value) or include_nonfinite:
             result[fields[0]] = value
     return result
+
+
+def parse_gem5_stats(path: Path | str,
+                     include_nonfinite: bool = False) -> dict[str, float]:
+    """Read the last statistics section into a flat name -> number map.
+
+    Normal workflow consumers retain the historical finite-only behavior.
+    Validation code may request non-finite values so malformed counters are
+    distinguished from counters that are absent.
+    """
+    return parse_gem5_stats_text(
+        Path(path).read_text(encoding="utf-8"), include_nonfinite
+    )
 
 
 def stat(stats: dict[str, float], name: str, default: float = 0.0) -> float:

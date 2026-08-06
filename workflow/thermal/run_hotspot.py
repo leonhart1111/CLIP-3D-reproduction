@@ -14,9 +14,10 @@ from workflow.common import PROJECT_ROOT, format_temperature_c, read_json, write
 DEFAULT_HOTSPOT = PROJECT_ROOT / "tools/src/hotspot/hotspot"
 
 
-def temperatures(path: Path) -> list[tuple[str, float]]:
+def parse_temperatures(text: str) -> list[tuple[str, float]]:
+    """Parse named Kelvin samples from one captured HotSpot steady snapshot."""
     values = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         fields = line.split()
         if len(fields) < 2:
             continue
@@ -26,8 +27,12 @@ def temperatures(path: Path) -> list[tuple[str, float]]:
             continue
         values.append((fields[0], value))
     if not values:
-        raise ValueError(f"no temperatures in {path}")
+        raise ValueError("no temperatures in HotSpot steady output")
     return values
+
+
+def temperatures(path: Path) -> list[tuple[str, float]]:
+    return parse_temperatures(path.read_text(encoding="utf-8"))
 
 
 def run_hotspot(case_dir: Path, hotspot: Path = DEFAULT_HOTSPOT,

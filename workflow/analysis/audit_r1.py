@@ -7,8 +7,8 @@ import argparse
 from collections import Counter
 from pathlib import Path
 
-from workflow.common import read_json, write_json
-from workflow.r1_catalog import build_catalogue
+from workflow.common import write_json
+from workflow.r1_catalog import build_catalogue, validate_canonical_plan
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -31,15 +31,14 @@ def audit(root: Path, output: Path, experiment_path: Path | int | None = None,
     output = Path(output).resolve()
 
     catalogue = build_catalogue(root, experiment_path, profile=profile)
-    planned_path = root / "planned_jobs.json"
-    planned = read_json(planned_path) if planned_path.is_file() else None
-    planned_count = int(planned["job_count"]) if planned else expected_points
+    plan_validation = validate_canonical_plan(root, catalogue)
+    planned_count = plan_validation["job_count"]
     records = catalogue["canonical_records"]
     counts = Counter(record["state"] for record in records)
     scopes = sorted({record.get("instruction_window_scope") for record in records
                      if record.get("instruction_window_scope")})
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "root": str(root),
         "experiment": str(experiment_path),
         "profile": profile,
@@ -51,9 +50,13 @@ def audit(root: Path, output: Path, experiment_path: Path | int | None = None,
         "excluded_noncanonical_count": len(catalogue["excluded_noncanonical"]),
         "excluded_noncanonical": catalogue["excluded_noncanonical"],
         "planned_points": planned_count,
+        "canonical_plan_valid": plan_validation["valid"],
+        "canonical_plan_path": plan_validation["path"],
+        "canonical_plan_errors": plan_validation["errors"],
         "instruction_window_scopes": scopes,
-        "complete": (planned_count == expected_points and catalogue["complete"]
-                     and len(scopes) == 1),
+        "complete": (plan_validation["valid"]
+                     and planned_count == expected_points
+                     and catalogue["complete"] and len(scopes) == 1),
         "records": records,
     }
     write_json(output, result)

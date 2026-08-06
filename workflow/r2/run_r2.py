@@ -29,27 +29,63 @@ GEM5_OVERRIDE_KEYS = (
     "xbar_frontend_latency", "xbar_forward_latency",
     "xbar_response_latency", "xbar_snoop_response_latency",
 )
+MAX_GEM5_LATENCY = (1 << 64) - 1
 
 
-def canonical_gem5_args(overrides: dict) -> list[str]:
-    """Render the complete latency override mapping in one immutable order."""
+def validate_gem5_overrides(overrides: dict) -> dict[str, int]:
+    """Validate the exact positive uint64 domain consumed by gem5 Cycles."""
     if not isinstance(overrides, dict) or set(overrides) != set(GEM5_OVERRIDE_KEYS):
         raise ValueError(
             "gem5_overrides must contain the complete canonical override key set"
         )
+    for key in GEM5_OVERRIDE_KEYS:
+        value = overrides[key]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(
+                f"gem5_overrides {key} must be a non-boolean integer"
+            )
+        if value < 1 or value > MAX_GEM5_LATENCY:
+            raise ValueError(
+                f"gem5_overrides {key} must be in [1, {MAX_GEM5_LATENCY}]"
+            )
+    return overrides
+
+
+def canonical_gem5_args(overrides: dict) -> list[str]:
+    """Render the complete latency override mapping in one immutable order."""
+    overrides = validate_gem5_overrides(overrides)
     arguments: list[str] = []
     for key in GEM5_OVERRIDE_KEYS:
         arguments.extend((f"--{key.replace('_', '-')}", str(overrides[key])))
     return arguments
 
 
+def validate_latency_vector(vector: dict) -> dict[str, int]:
+    """Validate overrides and their exact ordered command-line rendering."""
+    if not isinstance(vector, dict):
+        raise ValueError("latency vector must contain an object")
+    overrides = validate_gem5_overrides(vector.get("gem5_overrides"))
+    expected_args = canonical_gem5_args(overrides)
+    if vector.get("gem5_args") != expected_args:
+        raise ValueError(
+            "latency vector gem5_args are not the canonical rendering of "
+            "gem5_overrides"
+        )
+    return overrides
+
+
+def strict_latency_vectors_equal(left: dict, right: dict) -> bool:
+    """Compare only vectors that both satisfy the exact override contract."""
+    left_overrides = validate_latency_vector(left)
+    right_overrides = validate_latency_vector(right)
+    return all(left_overrides[key] == right_overrides[key]
+               for key in GEM5_OVERRIDE_KEYS)
+
+
 def _command_tail(metadata: dict, vector: dict) -> list[str]:
     scope = metadata.get("instruction_window_scope", "cpu0")
-    gem5_args = canonical_gem5_args(vector.get("gem5_overrides"))
-    if vector.get("gem5_args") != gem5_args:
-        raise ValueError(
-            "latency vector gem5_args are not the canonical rendering of gem5_overrides"
-        )
+    overrides = validate_latency_vector(vector)
+    gem5_args = canonical_gem5_args(overrides)
     tail = [
         "--stage", "R2", "--workload", metadata["workload"],
         "--l1i-size", metadata["l1i_size"], "--l1d-size", metadata["l1d_size"],

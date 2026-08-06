@@ -26,7 +26,7 @@ from workflow.floorplan.optimize_layout import optimize
 from workflow.mcpat.gem5_to_mcpat import convert
 from workflow.mcpat.parse_mcpat import parse_mcpat_text
 from workflow.r2.build_latency_vector import build_vector
-from workflow.r2.run_r2 import run as run_r2
+from workflow.r2.run_r2 import run as run_r2, strict_latency_vectors_equal
 from workflow.thermal.run_hotspot import run_hotspot
 from workflow.thermal.sustainable_frequency import evaluate
 
@@ -644,7 +644,7 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     r2_source = None
     if reuse_r2_dir is not None:
         source_vector = read_json(reuse_r2_dir / "r2_latency.json")
-        if source_vector.get("gem5_overrides") != vector.get("gem5_overrides"):
+        if not strict_latency_vectors_equal(source_vector, vector):
             raise ValueError(
                 f"cannot reuse R2 with different latency vector: {reuse_r2_dir}"
             )
