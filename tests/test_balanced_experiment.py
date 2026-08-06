@@ -874,5 +874,582 @@ class BalancedSelectionTests(unittest.TestCase):
             )
 
 
+class StrictR2ReuseTests(unittest.TestCase):
+    """Reject stale or scientifically incompatible R2 cache attachments."""
+
+    overrides = {
+        "l1i_tag_latency": 2,
+        "l1i_data_latency": 2,
+        "l1i_response_latency": 1,
+        "l1d_tag_latency": 3,
+        "l1d_data_latency": 3,
+        "l1d_response_latency": 1,
+        "l2_tag_latency": 12,
+        "l2_data_latency": 12,
+        "l2_response_latency": 1,
+        "xbar_frontend_latency": 1,
+        "xbar_forward_latency": 8,
+        "xbar_response_latency": 1,
+        "xbar_snoop_response_latency": 1,
+    }
+    gem5_args = [
+        "--l1i-tag-latency", "2",
+        "--l1i-data-latency", "2",
+        "--l1i-response-latency", "1",
+        "--l1d-tag-latency", "3",
+        "--l1d-data-latency", "3",
+        "--l1d-response-latency", "1",
+        "--l2-tag-latency", "12",
+        "--l2-data-latency", "12",
+        "--l2-response-latency", "1",
+        "--xbar-frontend-latency", "1",
+        "--xbar-forward-latency", "8",
+        "--xbar-response-latency", "1",
+        "--xbar-snoop-response-latency", "1",
+    ]
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.r1 = self.root / "canonical-r1/fft/l1d_32kB/l2_512kB"
+        self.fixed = self.root / "fixed/fft/l1d_32kB/l2_512kB"
+        self.clip = self.root / "clip/fft/l1d_32kB/l2_512kB"
+        self.config_path = self.root / "selected_experiment.json"
+        source_config = Path(__file__).resolve().parents[1] / (
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_lambda0020119_"
+            "traffic_weighted_exploratory.json"
+        )
+        self.config = read_json(source_config)
+        write_json(self.config_path, self.config)
+        self.metadata = {
+            "schema_version": 2,
+            "workload": "fft",
+            "l1i_size": "32kB",
+            "l1d_size": "32kB",
+            "l2_size": "512kB",
+            "num_cores": 4,
+            "cpu_type": "X86O3CPU",
+            "clock": "2GHz",
+            "warmup_insts_cpu0": 100000000,
+            "measure_insts_cpu0": 500000000,
+            "instruction_window_scope": "cpu0",
+            "command": ["fft", "--threads", "4"],
+            "stdin": None,
+        }
+        write_json(self.r1 / "r1_metadata.json", self.metadata)
+        (self.r1 / "stats.txt").write_text(
+            "---------- Begin Simulation Statistics ----------\n"
+            "system.cpu0.commitStats0.numInsts 500000000\n"
+            "system.cpu0.numCycles 200000000\n"
+            "system.cpu1.commitStats0.numInsts 490000000\n"
+            "system.cpu1.numCycles 200000000\n"
+            "system.cpu2.commitStats0.numInsts 480000000\n"
+            "system.cpu2.numCycles 200000000\n"
+            "system.cpu3.commitStats0.numInsts 470000000\n"
+            "system.cpu3.numCycles 200000000\n",
+            encoding="utf-8",
+        )
+        write_json(self.r1 / "status.json", {
+            "schema_version": 2,
+            "state": "success",
+            "instruction_window_scope": "cpu0",
+        })
+        for point, method, frequency in (
+                (self.fixed, "fixed-bin", 1.4),
+                (self.clip, "clip3d", 1.1)):
+            self._write_point(point, method, frequency)
+        self._write_source_result()
+
+    def _write_point(self, point: Path, method: str, frequency: float) -> None:
+        vector = {
+            "schema_version": 1,
+            "equation": 6,
+            "components_cycles": {
+                "l1i_cacti": 2,
+                "l1d_cacti": 3,
+                "l2_cacti": 12,
+                "l2_arbitration": 3,
+                "tsv": 2,
+                "l1_pipeline": 1,
+                "layout_wire": 3,
+            },
+            "critical_l1d_to_l2_cycles": 24,
+            "gem5_overrides": deepcopy(self.overrides),
+            "gem5_args": list(self.gem5_args),
+            "layout": str((point / "hotspot/layout.json").resolve()),
+            "layout_delays": {
+                "tsv_hops": 1,
+                "wire_cycles": 3,
+                "wire_cycles_unrounded": 2.8,
+                "maximum_wire_cycles": 4,
+                "maximum_wire_cycles_unrounded": 3.6,
+            },
+            "wire_cycle_aggregation_for_r2": "traffic-weighted",
+            "paper_parameters": [
+                "Ncores-1 arbitration = 3",
+                "2 cycles/TSV x 1",
+                "L1 pipeline cycles = 1",
+            ],
+            "reproduction_assumptions": ["fixture preserves the complete vector shape"],
+        }
+        write_json(point / "r2_latency.json", vector)
+        write_json(point / "run_config.json", {
+            "schema_version": 1,
+            "source": str(self.config_path.resolve()),
+            "layout_method": method,
+            "config": self.config,
+        })
+        write_json(point / "modules.json", {
+            "schema_version": 2,
+            "architecture": deepcopy(self.metadata),
+            "ipc1": 2.75,
+            "gamma": 0.25,
+            "totals": {
+                "dynamic_power_w": 80.0,
+                "leakage_power_w": 20.0,
+                "total_power_w": 100.0,
+                "area_mm2": 45.0,
+            },
+            "modules": [],
+        })
+        write_json(point / "hotspot/thermal_result.json", {
+            "schema_version": 1,
+            "tmax_c": 130.66037735849056,
+            "temperatures_c": {"core0": 130.66037735849056},
+            "maximum_module": "core0",
+        })
+        write_json(point / "performance.json", {
+            "schema_version": 1,
+            "equation": 13,
+            "gamma": 0.25,
+            "sustainable_frequency_ghz": frequency,
+            "ipc1": 2.75,
+            "bips1_thermal": 2.75 * frequency,
+        })
+        write_json(point / "pipeline_summary.json", {
+            "schema_version": 2,
+            "r1": str(self.r1.resolve()),
+            "output": str(point.resolve()),
+            "experiment": self.config["name"],
+            "workload": "fft",
+            "l1d_size": "32kB",
+            "l2_size": "512kB",
+            "layout_method": method,
+            "layout_mode": method,
+            "sustainable_frequency_ghz": frequency,
+            "ipc1": 2.75,
+            "bips1_thermal": 2.75 * frequency,
+            "ipc2": None,
+            "bips2": None,
+            "r2_source": None,
+            "stage_seconds": {
+                "mcpat": 1.0,
+                "cacti": 1.0,
+                "module_model": 1.0,
+                "layout_and_hotspot": 1.0,
+                "frequency_and_latency": 1.0,
+            },
+            "total_pipeline_seconds": 5.0,
+            "artifacts": {
+                "config": str((point / "run_config.json").resolve()),
+                "modules": str((point / "modules.json").resolve()),
+                "thermal": str((point / "hotspot/thermal_result.json").resolve()),
+                "performance": str((point / "performance.json").resolve()),
+                "r2_latency": str((point / "r2_latency.json").resolve()),
+                "r2_result": None,
+            },
+        })
+
+    def _identity(self, latency_path: Path) -> dict:
+        metadata = read_json(self.r1 / "r1_metadata.json")
+        return {
+            "r1_directory": str(self.r1.resolve()),
+            "r1_metadata_sha256": sha256_file(self.r1 / "r1_metadata.json"),
+            "r1_stats_sha256": sha256_file(self.r1 / "stats.txt"),
+            "latency_vector": str(latency_path.resolve()),
+            "latency_sha256": sha256_file(latency_path),
+            "instruction_window_scope": metadata["instruction_window_scope"],
+            "warmup_insts_cpu0": metadata["warmup_insts_cpu0"],
+            "measure_insts_cpu0": metadata["measure_insts_cpu0"],
+        }
+
+    def _write_source_result(self) -> None:
+        output = self.fixed / "gem5_r2"
+        result_path = output / "r2_result.json"
+        identity = self._identity(self.fixed / "r2_latency.json")
+        (output / "stats.txt").parent.mkdir(parents=True, exist_ok=True)
+        (output / "stats.txt").write_text(
+            "---------- Begin Simulation Statistics ----------\n"
+            "system.cpu0.commitStats0.numInsts 162500000\n"
+            "system.cpu0.numCycles 200000000\n"
+            "system.cpu1.commitStats0.numInsts 162500000\n"
+            "system.cpu1.numCycles 200000000\n"
+            "system.cpu2.commitStats0.numInsts 162500000\n"
+            "system.cpu2.numCycles 200000000\n"
+            "system.cpu3.commitStats0.numInsts 162500000\n"
+            "system.cpu3.numCycles 200000000\n",
+            encoding="utf-8",
+        )
+        write_json(result_path, {
+            "schema_version": 3,
+            **identity,
+            "command": ["gem5.opt", "--stage", "R2", *self.gem5_args],
+            "ipc2": 3.25,
+            "per_core": [
+                {"core": core, "instructions": 162500000,
+                 "cycles": 200000000, "ipc": 0.8125}
+                for core in range(4)
+            ],
+            "stats": str((output / "stats.txt").resolve()),
+            "stats_sha256": sha256_file(output / "stats.txt"),
+            "elapsed_seconds": 17.5,
+        })
+        write_json(output / "status.json", {
+            "schema_version": 3,
+            "state": "success",
+            **identity,
+            "r2_result": str(result_path.resolve()),
+            "r2_result_sha256": sha256_file(result_path),
+            "ipc2": 3.25,
+            "stats": str((output / "stats.txt").resolve()),
+            "stats_sha256": sha256_file(output / "stats.txt"),
+            "return_code": 0,
+        })
+        summary = read_json(self.fixed / "pipeline_summary.json")
+        summary.update({
+            "ipc2": 3.25,
+            "bips2": 3.25 * 1.4,
+            "r2_source": str(result_path.resolve()),
+        })
+        summary["stage_seconds"]["gem5_r2"] = 17.5
+        summary["total_pipeline_seconds"] = 22.5
+        summary["artifacts"]["r2_result"] = str(result_path.resolve())
+        write_json(self.fixed / "pipeline_summary.json", summary)
+
+    def _rewrite_result(self, mutate) -> None:
+        result_path = self.fixed / "gem5_r2/r2_result.json"
+        result = read_json(result_path)
+        mutate(result)
+        write_json(result_path, result)
+        status_path = self.fixed / "gem5_r2/status.json"
+        status = read_json(status_path)
+        status["r2_result_sha256"] = sha256_file(result_path)
+        write_json(status_path, status)
+
+    def test_local_successful_cache_accepts_matching_latency_and_r1_identity(self):
+        """Changing any requested local cache identity must make acceptance fail."""
+        from workflow.r2.run_r2 import run, validate_local_result
+
+        output = self.fixed / "gem5_r2"
+        decision = validate_local_result(self.r1, self.fixed / "r2_latency.json", output)
+
+        self.assertTrue(decision["accepted"])
+        with patch("workflow.r2.run_r2.subprocess.run",
+                   side_effect=AssertionError("compatible cache must resume")):
+            result = run(self.r1, self.fixed / "r2_latency.json", output)
+        self.assertEqual(result["ipc2"], 3.25)
+
+    def test_local_successful_cache_rejects_another_latency_path_and_requires_rerun(self):
+        """Status=success alone must never resume a result produced for another vector."""
+        from workflow.r2.run_r2 import run, validate_local_result
+
+        other = self.root / "another/r2_latency.json"
+        write_json(other, read_json(self.fixed / "r2_latency.json"))
+        output = self.fixed / "gem5_r2"
+
+        decision = validate_local_result(self.r1, other, output)
+        self.assertFalse(decision["accepted"])
+        self.assertTrue(any("latency_vector" in reason for reason in decision["reasons"]))
+        with self.assertRaisesRegex(ValueError, "--rerun"):
+            run(self.r1, other, output)
+
+    def test_local_success_status_with_missing_result_requires_explicit_rerun(self):
+        """A missing result cannot turn a declared successful cache into an implicit rerun."""
+        from workflow.r2.run_r2 import run
+
+        output = self.fixed / "gem5_r2"
+        (output / "r2_result.json").unlink()
+
+        with patch("workflow.r2.run_r2.subprocess.run",
+                   side_effect=AssertionError("stale success must fail closed")):
+            with self.assertRaisesRegex(ValueError, "--rerun"):
+                run(self.r1, self.fixed / "r2_latency.json", output)
+
+    def test_local_result_with_missing_success_status_requires_explicit_rerun(self):
+        """A surviving successful result must not be overwritten when status is missing."""
+        from workflow.r2.run_r2 import run
+
+        output = self.fixed / "gem5_r2"
+        (output / "status.json").unlink()
+
+        with patch("workflow.r2.run_r2.subprocess.run",
+                   side_effect=AssertionError("unvalidated result must fail closed")):
+            with self.assertRaisesRegex(ValueError, "--rerun"):
+                run(self.r1, self.fixed / "r2_latency.json", output)
+
+    def test_explicit_rerun_bypasses_malformed_cached_status(self):
+        """The existing --rerun contract replaces cache artifacts without reading status."""
+        from workflow.r2.run_r2 import run
+
+        output = self.fixed / "gem5_r2"
+        (output / "status.json").write_text("{malformed", encoding="utf-8")
+
+        def complete_gem5(command, **_kwargs):
+            (output / "stats.txt").write_text(
+                "---------- Begin Simulation Statistics ----------\n"
+                "system.cpu0.commitStats0.numInsts 162500000\n"
+                "system.cpu0.numCycles 200000000\n"
+                "system.cpu1.commitStats0.numInsts 162500000\n"
+                "system.cpu1.numCycles 200000000\n"
+                "system.cpu2.commitStats0.numInsts 162500000\n"
+                "system.cpu2.numCycles 200000000\n"
+                "system.cpu3.commitStats0.numInsts 162500000\n"
+                "system.cpu3.numCycles 200000000\n",
+                encoding="utf-8",
+            )
+            return CompletedProcess(command, 0, stdout="gem5 rerun fixture completed\n")
+
+        with patch("workflow.r2.run_r2.subprocess.run", side_effect=complete_gem5):
+            result = run(
+                self.r1, self.fixed / "r2_latency.json", output, rerun=True
+            )
+
+        self.assertEqual(result["ipc2"], 3.25)
+        self.assertEqual(read_json(output / "status.json")["state"], "success")
+
+    def test_successful_rerun_rejects_stale_stats_when_gem5_writes_none(self):
+        """A zero gem5 exit cannot bind old stats to a newly requested vector."""
+        from workflow.r2.run_r2 import run
+
+        output = self.fixed / "gem5_r2"
+        vector = read_json(self.fixed / "r2_latency.json")
+        vector["gem5_overrides"]["xbar_forward_latency"] = 9
+        vector["gem5_args"][21] = "9"
+        write_json(self.fixed / "r2_latency.json", vector)
+
+        with patch("workflow.r2.run_r2.subprocess.run", return_value=CompletedProcess(
+                ["gem5.opt"], 0, stdout="gem5 returned without stats\n")):
+            with self.assertRaisesRegex(ValueError, "fresh stats"):
+                run(self.r1, self.fixed / "r2_latency.json", output, rerun=True)
+
+        self.assertEqual(read_json(output / "status.json")["state"], "failed")
+
+    def test_local_all_core_cache_enforces_recorded_measurement_minimum(self):
+        """A resumable cache must satisfy the same all-core window as a fresh run."""
+        from workflow.r2.run_r2 import validate_local_result
+
+        metadata = read_json(self.r1 / "r1_metadata.json")
+        metadata["instruction_window_scope"] = "all-cores"
+        write_json(self.r1 / "r1_metadata.json", metadata)
+        self._write_source_result()
+
+        decision = validate_local_result(
+            self.r1, self.fixed / "r2_latency.json", self.fixed / "gem5_r2"
+        )
+
+        self.assertFalse(decision["accepted"])
+        self.assertTrue(any("measurement minimum" in reason
+                            for reason in decision["reasons"]), decision["reasons"])
+
+    def test_reuse_rejects_missing_source_r2_stats(self):
+        """Result JSON alone cannot prove IPC2 when its measured gem5 stats disappeared."""
+        from workflow.r2.reuse_result import validate_reuse
+
+        (self.fixed / "gem5_r2/stats.txt").unlink()
+
+        decision = validate_reuse(self.fixed, self.clip, self.r1, self.config_path)
+
+        self.assertFalse(decision["accepted"])
+        self.assertTrue(any("R2 stats" in reason for reason in decision["reasons"]),
+                        decision["reasons"])
+
+    def test_reuse_rejects_result_ipc_that_disagrees_with_source_r2_stats(self):
+        """Rehashing edited result JSON cannot make an unmeasured IPC2 auditable."""
+        from workflow.r2.reuse_result import validate_reuse
+
+        self._rewrite_result(lambda result: result.update(ipc2=9.0))
+        status = read_json(self.fixed / "gem5_r2/status.json")
+        status["ipc2"] = 9.0
+        write_json(self.fixed / "gem5_r2/status.json", status)
+
+        decision = validate_reuse(self.fixed, self.clip, self.r1, self.config_path)
+
+        self.assertFalse(decision["accepted"])
+        self.assertTrue(any("IPC2 differs" in reason for reason in decision["reasons"]),
+                        decision["reasons"])
+
+    def test_new_r2_result_and_status_record_schema3_provenance(self):
+        """A newly measured cache must persist every identity used by resume validation."""
+        from workflow.r2.run_r2 import run, validate_local_result
+
+        output = self.clip / "fresh_gem5_r2"
+
+        def complete_gem5(_command, **_kwargs):
+            (output / "stats.txt").write_text(
+                "---------- Begin Simulation Statistics ----------\n"
+                "system.cpu0.commitStats0.numInsts 500000000\n"
+                "system.cpu0.numCycles 200000000\n"
+                "system.cpu1.commitStats0.numInsts 10\n"
+                "system.cpu1.numCycles 200000000\n"
+                "system.cpu2.commitStats0.numInsts 10\n"
+                "system.cpu2.numCycles 200000000\n"
+                "system.cpu3.commitStats0.numInsts 10\n"
+                "system.cpu3.numCycles 200000000\n",
+                encoding="utf-8",
+            )
+            return CompletedProcess(_command, 0, stdout="gem5 fixture completed\n")
+
+        with patch("workflow.r2.run_r2.subprocess.run", side_effect=complete_gem5):
+            result = run(self.r1, self.clip / "r2_latency.json", output)
+
+        status = read_json(output / "status.json")
+        self.assertEqual(result["schema_version"], 3)
+        self.assertEqual(status["schema_version"], 3)
+        for key, value in self._identity(self.clip / "r2_latency.json").items():
+            self.assertEqual(result[key], value)
+            self.assertEqual(status[key], value)
+        self.assertEqual(status["r2_result_sha256"], sha256_file(output / "r2_result.json"))
+        self.assertEqual(result["stats_sha256"], sha256_file(output / "stats.txt"))
+        self.assertEqual(status["stats_sha256"], sha256_file(output / "stats.txt"))
+        self.assertTrue(validate_local_result(
+            self.r1, self.clip / "r2_latency.json", output
+        )["accepted"])
+
+    def test_reuse_rejects_one_different_override(self):
+        """Matching aggregate latency cannot hide one changed gem5 override."""
+        from workflow.r2.reuse_result import validate_reuse
+
+        vector = read_json(self.clip / "r2_latency.json")
+        vector["gem5_overrides"]["xbar_forward_latency"] = 9
+        vector["gem5_args"][21] = "9"
+        write_json(self.clip / "r2_latency.json", vector)
+
+        decision = validate_reuse(self.fixed, self.clip, self.r1, self.config_path)
+
+        self.assertFalse(decision["accepted"])
+        self.assertTrue(any("gem5_overrides" in reason for reason in decision["reasons"]))
+
+    def test_reuse_rejects_noncanonical_gem5_args_even_when_overrides_match(self):
+        """Stored args must be the complete ordered rendering of their own overrides."""
+        from workflow.r2.reuse_result import validate_reuse
+
+        for point in (self.fixed, self.clip):
+            with self.subTest(point=point.name):
+                vector = read_json(point / "r2_latency.json")
+                malformed = deepcopy(vector)
+                malformed["gem5_args"][-1] = "99"
+                write_json(point / "r2_latency.json", malformed)
+
+                decision = validate_reuse(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+                self.assertFalse(decision["accepted"])
+                self.assertTrue(any("gem5_args" in reason for reason in decision["reasons"]))
+                write_json(point / "r2_latency.json", vector)
+
+    def test_reuse_rejects_each_identity_and_source_provenance_mismatch(self):
+        """No architecture, R1, window, config, status, or result mismatch may reuse IPC2."""
+        from workflow.r2.reuse_result import validate_reuse
+
+        def architecture_mismatch():
+            summary = read_json(self.clip / "pipeline_summary.json")
+            summary["l2_size"] = "1024kB"
+            write_json(self.clip / "pipeline_summary.json", summary)
+
+        def r1_directory_mismatch():
+            summary = read_json(self.clip / "pipeline_summary.json")
+            summary["r1"] = str((self.root / "other-r1").resolve())
+            write_json(self.clip / "pipeline_summary.json", summary)
+
+        def scope_mismatch():
+            self._rewrite_result(
+                lambda result: result.update(instruction_window_scope="all-cores")
+            )
+
+        def config_mismatch():
+            run_config = read_json(self.clip / "run_config.json")
+            run_config["config"]["physical"]["r_convec_k_per_w"] = 4.0
+            write_json(self.clip / "run_config.json", run_config)
+
+        def status_mismatch():
+            status = read_json(self.fixed / "gem5_r2/status.json")
+            status["state"] = "failed"
+            write_json(self.fixed / "gem5_r2/status.json", status)
+
+        def result_provenance_mismatch():
+            self._rewrite_result(
+                lambda result: result.update(latency_vector=str(
+                    (self.root / "stale/r2_latency.json").resolve()
+                ))
+            )
+
+        for label, mutate, expected in (
+                ("architecture", architecture_mismatch, "architecture"),
+                ("r1-directory", r1_directory_mismatch, "R1 directory"),
+                ("instruction-scope", scope_mismatch, "instruction_window_scope"),
+                ("config", config_mismatch, "embedded config"),
+                ("status", status_mismatch, "status"),
+                ("result-provenance", result_provenance_mismatch, "latency_vector")):
+            with self.subTest(label=label):
+                self._write_point(self.fixed, "fixed-bin", 1.4)
+                self._write_point(self.clip, "clip3d", 1.1)
+                self._write_source_result()
+                mutate()
+
+                decision = validate_reuse(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+                self.assertFalse(decision["accepted"])
+                self.assertTrue(any(expected in reason for reason in decision["reasons"]),
+                                decision["reasons"])
+
+    def test_exact_reuse_writes_provenance_and_recomputes_clip_performance(self):
+        """An accepted reuse attaches source IPC2 without fabricating a target gem5 run."""
+        from workflow.r2.reuse_result import attach_reused_result, validate_reuse
+
+        decision = validate_reuse(self.fixed, self.clip, self.r1, self.config_path)
+        self.assertTrue(decision["accepted"], decision["reasons"])
+
+        summary = attach_reused_result(
+            self.fixed, self.clip, self.r1, self.config_path
+        )
+
+        source_result = self.fixed / "gem5_r2/r2_result.json"
+        artifact_path = self.clip / "r2_reuse.json"
+        artifact = read_json(artifact_path)
+        performance = read_json(self.clip / "performance.json")
+        self.assertEqual(summary["ipc2"], 3.25)
+        self.assertAlmostEqual(summary["bips2"], 3.25 * 1.1)
+        self.assertEqual(summary["r2_source"], str(source_result.resolve()))
+        self.assertTrue(summary["r2_reused"])
+        self.assertEqual(summary["r2_reuse_artifact"], str(artifact_path.resolve()))
+        self.assertNotIn("gem5_r2", summary["stage_seconds"])
+        self.assertFalse((self.clip / "gem5_r2/r2_result.json").exists())
+        self.assertEqual(performance["ipc2"], 3.25)
+        self.assertAlmostEqual(performance["bips2"], 3.25 * 1.1)
+        self.assertEqual(artifact["decision"], "accepted")
+        self.assertEqual(artifact["source_result"]["path"], str(source_result.resolve()))
+        self.assertEqual(artifact["source_result"]["sha256"], sha256_file(source_result))
+        self.assertEqual(artifact["source_stats"]["path"],
+                         str((self.fixed / "gem5_r2/stats.txt").resolve()))
+        self.assertEqual(artifact["source_stats"]["sha256"],
+                         sha256_file(self.fixed / "gem5_r2/stats.txt"))
+        self.assertEqual(artifact["source_ipc2"], 3.25)
+        self.assertEqual(artifact["canonical_architecture_key"], {
+            "workload": "fft", "l1d_size": "32kB", "l2_size": "512kB",
+        })
+        self.assertEqual(artifact["config"]["sha256"], sha256_file(self.config_path))
+        self.assertEqual(artifact["r1"]["metadata_sha256"],
+                         sha256_file(self.r1 / "r1_metadata.json"))
+        self.assertEqual(artifact["source_latency"]["sha256"],
+                         sha256_file(self.fixed / "r2_latency.json"))
+        self.assertEqual(artifact["target_latency"]["sha256"],
+                         sha256_file(self.clip / "r2_latency.json"))
+
+
 if __name__ == "__main__":
     unittest.main()
