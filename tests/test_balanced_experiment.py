@@ -1003,9 +1003,10 @@ class StrictR2ReuseTests(unittest.TestCase):
         })
         write_json(point / "modules.json", {
             "schema_version": 2,
+            "source_r1": str(self.r1.resolve()),
             "architecture": deepcopy(self.metadata),
             "ipc1": 2.75,
-            "gamma": 0.25,
+            "gamma": 0.2,
             "totals": {
                 "dynamic_power_w": 80.0,
                 "leakage_power_w": 20.0,
@@ -1016,14 +1017,22 @@ class StrictR2ReuseTests(unittest.TestCase):
         })
         write_json(point / "hotspot/thermal_result.json", {
             "schema_version": 1,
-            "tmax_c": 130.66037735849056,
-            "temperatures_c": {"core0": 130.66037735849056},
-            "maximum_module": "core0",
+            "command": ["hotspot", "-c", "hotspot.config"],
+            "return_code": 0,
+            "power_trace": str((point / "hotspot/power.ptrace").resolve()),
+            "steady_file": str((point / "hotspot/steady.txt").resolve()),
+            "grid_steady_file": str((point / "hotspot/grid.steady.txt").resolve()),
+            "tmax_k": 407.525,
+            "tmax_c": 134.375,
+            "peak_unit": "core0",
+            "ambient_c": 25.0,
+            "r_convec_k_per_w": 5.0,
+            "sample_count": 1,
         })
         write_json(point / "performance.json", {
             "schema_version": 1,
             "equation": 13,
-            "gamma": 0.25,
+            "gamma": 0.2,
             "sustainable_frequency_ghz": frequency,
             "ipc1": 2.75,
             "bips1_thermal": 2.75 * frequency,
@@ -1038,6 +1047,7 @@ class StrictR2ReuseTests(unittest.TestCase):
             "l2_size": "512kB",
             "layout_method": method,
             "layout_mode": method,
+            "tmax_c": 134.375,
             "sustainable_frequency_ghz": frequency,
             "ipc1": 2.75,
             "bips1_thermal": 2.75 * frequency,
@@ -1079,6 +1089,15 @@ class StrictR2ReuseTests(unittest.TestCase):
         output = self.fixed / "gem5_r2"
         result_path = output / "r2_result.json"
         identity = self._identity(self.fixed / "r2_latency.json")
+        command = [
+            "/opt/gem5.opt", "--listener-mode=off", f"--outdir={output.resolve()}",
+            "/opt/clip_r1.py", "--stage", "R2", "--workload", "fft",
+            "--l1i-size", "32kB", "--l1d-size", "32kB",
+            "--l2-size", "512kB", "--warmup-insts", "100000000",
+            "--measure-insts", "500000000", "--instruction-window-scope",
+            identity["instruction_window_scope"], *self.gem5_args,
+            "--options", "--threads 4",
+        ]
         (output / "stats.txt").parent.mkdir(parents=True, exist_ok=True)
         (output / "stats.txt").write_text(
             "---------- Begin Simulation Statistics ----------\n"
@@ -1095,7 +1114,7 @@ class StrictR2ReuseTests(unittest.TestCase):
         write_json(result_path, {
             "schema_version": 3,
             **identity,
-            "command": ["gem5.opt", "--stage", "R2", *self.gem5_args],
+            "command": command,
             "ipc2": 3.25,
             "per_core": [
                 {"core": core, "instructions": 162500000,
@@ -1116,6 +1135,7 @@ class StrictR2ReuseTests(unittest.TestCase):
             "stats": str((output / "stats.txt").resolve()),
             "stats_sha256": sha256_file(output / "stats.txt"),
             "return_code": 0,
+            "command": command,
         })
         summary = read_json(self.fixed / "pipeline_summary.json")
         summary.update({
@@ -1317,6 +1337,175 @@ class StrictR2ReuseTests(unittest.TestCase):
             self.r1, self.clip / "r2_latency.json", output
         )["accepted"])
 
+    def test_fresh_r2_rejects_fractional_instruction_and_cycle_counters(self):
+        """Fresh measurement must not truncate non-integral gem5 counters."""
+        from workflow.r2.run_r2 import run
+
+        for label, counter, value in (
+                ("instructions", "system.cpu1.commitStats0.numInsts", "10.5"),
+                ("cycles", "system.cpu1.numCycles", "200000000.5")):
+            with self.subTest(label=label):
+                output = self.clip / f"fractional-{label}"
+
+                def complete_gem5(command, **_kwargs):
+                    records = {
+                        f"system.cpu{core}.commitStats0.numInsts": "10"
+                        for core in range(4)
+                    }
+                    records.update({
+                        f"system.cpu{core}.numCycles": "200000000"
+                        for core in range(4)
+                    })
+                    records["system.cpu0.commitStats0.numInsts"] = "500000000"
+                    records[counter] = value
+                    text = "---------- Begin Simulation Statistics ----------\n" + "".join(
+                        f"{name} {number}\n" for name, number in records.items()
+                    )
+                    (output / "stats.txt").write_text(text, encoding="utf-8")
+                    return CompletedProcess(command, 0, stdout="fractional fixture\n")
+
+                with patch("workflow.r2.run_r2.subprocess.run",
+                           side_effect=complete_gem5):
+                    with self.assertRaisesRegex(ValueError, "positive integer"):
+                        run(self.r1, self.clip / "r2_latency.json", output)
+
+    def test_fresh_r2_rejects_stats_replaced_between_parse_and_hash(self):
+        """A fresh result must parse and hash one stable gem5 stats snapshot."""
+        import workflow.r2.run_r2 as run_r2
+
+        output = self.clip / "replaced-stats"
+        stats_path = output / "stats.txt"
+
+        def complete_gem5(command, **_kwargs):
+            stats_path.write_text(
+                "---------- Begin Simulation Statistics ----------\n"
+                "system.cpu0.commitStats0.numInsts 500000000\n"
+                "system.cpu0.numCycles 200000000\n"
+                "system.cpu1.commitStats0.numInsts 10\n"
+                "system.cpu1.numCycles 200000000\n"
+                "system.cpu2.commitStats0.numInsts 10\n"
+                "system.cpu2.numCycles 200000000\n"
+                "system.cpu3.commitStats0.numInsts 10\n"
+                "system.cpu3.numCycles 200000000\n",
+                encoding="utf-8",
+            )
+            return CompletedProcess(command, 0, stdout="replace fixture\n")
+
+        original_parse = run_r2.parse_gem5_stats
+        original_read_bytes = Path.read_bytes
+        replaced = False
+
+        def replace_stats() -> None:
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                stats_path.write_text(
+                    stats_path.read_text(encoding="utf-8").replace(
+                        "system.cpu1.commitStats0.numInsts 10",
+                        "system.cpu1.commitStats0.numInsts 999",
+                    ),
+                    encoding="utf-8",
+                )
+
+        def replace_after_parse(path, *args, **kwargs):
+            value = original_parse(path, *args, **kwargs)
+            if Path(path).resolve() == stats_path.resolve():
+                replace_stats()
+            return value
+
+        def replace_after_read_bytes(path):
+            value = original_read_bytes(path)
+            if Path(path).resolve() == stats_path.resolve():
+                replace_stats()
+            return value
+
+        with patch("workflow.r2.run_r2.subprocess.run", side_effect=complete_gem5), \
+                patch("workflow.r2.run_r2.parse_gem5_stats",
+                      side_effect=replace_after_parse), \
+                patch.object(Path, "read_bytes", replace_after_read_bytes):
+            with self.assertRaisesRegex(ValueError, "changed during validation"):
+                run_r2.run(self.r1, self.clip / "r2_latency.json", output)
+
+    def test_fresh_r2_rechecks_stats_after_result_publication(self):
+        """Successful status must not commit stats changed while writing the result."""
+        import workflow.r2.run_r2 as run_r2
+
+        output = self.clip / "stats-changed-during-result"
+        stats_path = output / "stats.txt"
+        result_path = output / "r2_result.json"
+
+        def complete_gem5(command, **_kwargs):
+            stats_path.write_text(
+                "---------- Begin Simulation Statistics ----------\n"
+                "system.cpu0.commitStats0.numInsts 500000000\n"
+                "system.cpu0.numCycles 200000000\n"
+                "system.cpu1.commitStats0.numInsts 10\n"
+                "system.cpu1.numCycles 200000000\n"
+                "system.cpu2.commitStats0.numInsts 10\n"
+                "system.cpu2.numCycles 200000000\n"
+                "system.cpu3.commitStats0.numInsts 10\n"
+                "system.cpu3.numCycles 200000000\n",
+                encoding="utf-8",
+            )
+            return CompletedProcess(command, 0, stdout="result race fixture\n")
+
+        real_publish = run_r2.write_json
+        replaced = False
+
+        def replace_stats_after_result(path, value):
+            nonlocal replaced
+            result = real_publish(path, value)
+            if Path(path).resolve() == result_path.resolve() and not replaced:
+                replaced = True
+                stats_path.write_text(
+                    stats_path.read_text(encoding="utf-8").replace(
+                        "system.cpu1.commitStats0.numInsts 10",
+                        "system.cpu1.commitStats0.numInsts 999",
+                    ),
+                    encoding="utf-8",
+                )
+            return result
+
+        with patch("workflow.r2.run_r2.subprocess.run", side_effect=complete_gem5), \
+                patch("workflow.r2.run_r2.write_json",
+                      side_effect=replace_stats_after_result):
+            with self.assertRaisesRegex(ValueError, "changed during validation"):
+                run_r2.run(self.r1, self.clip / "r2_latency.json", output)
+
+        self.assertEqual(read_json(output / "status.json")["state"], "failed")
+
+    def test_local_cache_rejects_tampered_latency_command_segment(self):
+        """Result/status hashes cannot legitimize a command with changed override values."""
+        from workflow.r2.run_r2 import validate_local_result
+
+        self._rewrite_result(
+            lambda result: result["command"].__setitem__(-1, "99")
+        )
+
+        decision = validate_local_result(
+            self.r1, self.fixed / "r2_latency.json", self.fixed / "gem5_r2"
+        )
+
+        self.assertFalse(decision["accepted"])
+        self.assertTrue(any("command" in reason for reason in decision["reasons"]),
+                        decision["reasons"])
+
+    def test_local_cache_rejects_success_status_with_nonzero_return_code(self):
+        """A state label cannot override a recorded nonzero gem5 return code."""
+        from workflow.r2.run_r2 import validate_local_result
+
+        status = read_json(self.fixed / "gem5_r2/status.json")
+        status["return_code"] = 7
+        write_json(self.fixed / "gem5_r2/status.json", status)
+
+        decision = validate_local_result(
+            self.r1, self.fixed / "r2_latency.json", self.fixed / "gem5_r2"
+        )
+
+        self.assertFalse(decision["accepted"])
+        self.assertTrue(any("return_code" in reason for reason in decision["reasons"]),
+                        decision["reasons"])
+
     def test_reuse_rejects_one_different_override(self):
         """Matching aggregate latency cannot hide one changed gem5 override."""
         from workflow.r2.reuse_result import validate_reuse
@@ -1407,6 +1596,334 @@ class StrictR2ReuseTests(unittest.TestCase):
                 self.assertTrue(any(expected in reason for reason in decision["reasons"]),
                                 decision["reasons"])
 
+    def test_reuse_rejects_mutated_target_modules_and_thermal_inputs(self):
+        """Target architecture, gamma, and thermal identity must be validated inputs."""
+        from workflow.r2.reuse_result import validate_reuse
+
+        def architecture_mismatch():
+            modules = read_json(self.clip / "modules.json")
+            modules["architecture"]["l2_size"] = "1024kB"
+            write_json(self.clip / "modules.json", modules)
+
+        def gamma_mismatch():
+            modules = read_json(self.clip / "modules.json")
+            modules["gamma"] = 0.35
+            write_json(self.clip / "modules.json", modules)
+
+        def thermal_mismatch():
+            thermal = read_json(self.clip / "hotspot/thermal_result.json")
+            thermal["ambient_c"] = 30.0
+            write_json(self.clip / "hotspot/thermal_result.json", thermal)
+
+        def thermal_path_mismatch():
+            thermal = read_json(self.clip / "hotspot/thermal_result.json")
+            thermal["power_trace"] = str(
+                (self.fixed / "hotspot/power.ptrace").resolve()
+            )
+            write_json(self.clip / "hotspot/thermal_result.json", thermal)
+
+        def thermal_temperature_mismatch():
+            thermal = read_json(self.clip / "hotspot/thermal_result.json")
+            thermal["tmax_c"] = 80.0
+            thermal["tmax_k"] = 353.15
+            write_json(self.clip / "hotspot/thermal_result.json", thermal)
+
+        for label, mutate, expected in (
+                ("architecture", architecture_mismatch, "modules architecture"),
+                ("gamma", gamma_mismatch, "gamma"),
+                ("thermal", thermal_mismatch, "thermal ambient"),
+                ("thermal-path", thermal_path_mismatch, "power_trace"),
+                ("thermal-temperature", thermal_temperature_mismatch,
+                 "thermal tmax_c")):
+            with self.subTest(label=label):
+                self._write_point(self.clip, "clip3d", 1.1)
+                mutate()
+
+                decision = validate_reuse(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+                self.assertFalse(decision["accepted"])
+                self.assertTrue(any(expected in reason for reason in decision["reasons"]),
+                                decision["reasons"])
+
+    def test_reuse_rejects_input_replaced_during_validation_snapshot(self):
+        """Parsed vector bytes and recorded hashes must come from one stable snapshot."""
+        import workflow.r2.reuse_result as reuse_result
+
+        original_read = reuse_result._read_object
+        replaced = False
+
+        def replace_after_read(path, reasons, label, *args, **kwargs):
+            nonlocal replaced
+            value = original_read(path, reasons, label, *args, **kwargs)
+            if label == "target latency vector" and not replaced:
+                replaced = True
+                changed = read_json(path)
+                changed["critical_l1d_to_l2_cycles"] = 999
+                write_json(path, changed)
+            return value
+
+        with patch("workflow.r2.reuse_result._read_object",
+                   side_effect=replace_after_read):
+            decision = reuse_result.validate_reuse(
+                self.fixed, self.clip, self.r1, self.config_path
+            )
+
+        self.assertFalse(decision["accepted"])
+        self.assertTrue(any("changed during validation" in reason
+                            for reason in decision["reasons"]), decision["reasons"])
+
+    def test_attach_evaluation_failure_leaves_no_accepted_or_partial_outputs(self):
+        """Evaluator failure must preserve authoritative target files and no marker."""
+        from workflow.r2.reuse_result import attach_reused_result
+
+        performance_before = (self.clip / "performance.json").read_bytes()
+        summary_before = (self.clip / "pipeline_summary.json").read_bytes()
+
+        with patch("workflow.r2.reuse_result.evaluate",
+                   side_effect=RuntimeError("injected evaluator failure")):
+            with self.assertRaisesRegex(RuntimeError, "injected evaluator failure"):
+                attach_reused_result(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+        self.assertFalse((self.clip / "r2_reuse.json").exists())
+        self.assertEqual((self.clip / "performance.json").read_bytes(), performance_before)
+        self.assertEqual((self.clip / "pipeline_summary.json").read_bytes(), summary_before)
+
+    def test_attach_summary_publish_failure_rolls_back_performance_and_marker(self):
+        """A failed second publication cannot expose half-attached target state."""
+        import workflow.r2.reuse_result as reuse_result
+
+        performance_before = (self.clip / "performance.json").read_bytes()
+        summary_before = (self.clip / "pipeline_summary.json").read_bytes()
+        real_publish = reuse_result.write_json
+        failed = False
+
+        def fail_summary_once(path, value):
+            nonlocal failed
+            if Path(path).resolve() == (self.clip / "pipeline_summary.json").resolve() \
+                    and not failed:
+                failed = True
+                raise OSError("injected summary publication failure")
+            return real_publish(path, value)
+
+        with patch("workflow.r2.reuse_result.write_json", side_effect=fail_summary_once):
+            with self.assertRaisesRegex(OSError, "summary publication"):
+                reuse_result.attach_reused_result(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+        self.assertFalse((self.clip / "r2_reuse.json").exists())
+        self.assertEqual((self.clip / "performance.json").read_bytes(), performance_before)
+        self.assertEqual((self.clip / "pipeline_summary.json").read_bytes(), summary_before)
+
+    def test_attach_rechecks_inputs_immediately_before_acceptance_marker(self):
+        """An input changed during output publication must abort the final commit marker."""
+        import workflow.r2.reuse_result as reuse_result
+
+        performance_before = (self.clip / "performance.json").read_bytes()
+        summary_before = (self.clip / "pipeline_summary.json").read_bytes()
+        real_publish = reuse_result.write_json
+        changed = False
+
+        def change_input_after_summary(path, value):
+            nonlocal changed
+            result = real_publish(path, value)
+            if Path(path).resolve() == (self.clip / "pipeline_summary.json").resolve() \
+                    and not changed:
+                changed = True
+                vector = read_json(self.clip / "r2_latency.json")
+                vector["critical_l1d_to_l2_cycles"] = 999
+                real_publish(self.clip / "r2_latency.json", vector)
+            return result
+
+        with patch("workflow.r2.reuse_result.write_json",
+                   side_effect=change_input_after_summary):
+            with self.assertRaisesRegex(ValueError, "changed during validation"):
+                reuse_result.attach_reused_result(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+        self.assertFalse((self.clip / "r2_reuse.json").exists())
+        self.assertEqual((self.clip / "performance.json").read_bytes(), performance_before)
+        self.assertEqual((self.clip / "pipeline_summary.json").read_bytes(), summary_before)
+
+    def test_attach_rejects_outputs_replaced_before_acceptance_marker(self):
+        """The marker must bind the exact performance and summary just published."""
+        import workflow.r2.reuse_result as reuse_result
+
+        performance_before = (self.clip / "performance.json").read_bytes()
+        summary_before = (self.clip / "pipeline_summary.json").read_bytes()
+        real_publish = reuse_result.write_json
+        replaced = False
+
+        def replace_outputs_after_summary(path, value):
+            nonlocal replaced
+            result = real_publish(path, value)
+            if Path(path).resolve() == (self.clip / "pipeline_summary.json").resolve() \
+                    and not replaced:
+                replaced = True
+                real_publish(self.clip / "performance.json", {"tampered": True})
+                real_publish(self.clip / "pipeline_summary.json", {"tampered": True})
+            return result
+
+        with patch("workflow.r2.reuse_result.write_json",
+                   side_effect=replace_outputs_after_summary):
+            with self.assertRaisesRegex(OSError, "published outputs changed"):
+                reuse_result.attach_reused_result(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+        self.assertFalse((self.clip / "r2_reuse.json").exists())
+        self.assertEqual((self.clip / "performance.json").read_bytes(), performance_before)
+        self.assertEqual((self.clip / "pipeline_summary.json").read_bytes(), summary_before)
+
+    def test_attach_checks_outputs_after_final_immutable_scan(self):
+        """Output replacement during the final scan must precede the last hash check."""
+        import workflow.r2.reuse_result as reuse_result
+
+        performance_before = (self.clip / "performance.json").read_bytes()
+        summary_before = (self.clip / "pipeline_summary.json").read_bytes()
+        original_scan = reuse_result._record_changed_snapshots
+        replaced = False
+
+        def replace_outputs_after_scan(snapshots, reasons, ignored=None):
+            nonlocal replaced
+            original_scan(snapshots, reasons, ignored)
+            if ignored and not replaced:
+                replaced = True
+                write_json(self.clip / "performance.json", {"tampered": True})
+                write_json(self.clip / "pipeline_summary.json", {"tampered": True})
+
+        with patch("workflow.r2.reuse_result._record_changed_snapshots",
+                   side_effect=replace_outputs_after_scan):
+            with self.assertRaisesRegex(OSError, "published outputs changed"):
+                reuse_result.attach_reused_result(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+        self.assertFalse((self.clip / "r2_reuse.json").exists())
+        self.assertEqual((self.clip / "performance.json").read_bytes(), performance_before)
+        self.assertEqual((self.clip / "pipeline_summary.json").read_bytes(), summary_before)
+
+    def test_evaluator_failure_does_not_clobber_concurrent_authoritative_update(self):
+        """Rollback must not restore outputs this attempt never published."""
+        import workflow.r2.reuse_result as reuse_result
+
+        concurrent_performance = {"concurrent": "performance"}
+        concurrent_summary = {"concurrent": "summary"}
+
+        def update_then_fail(*_args, **_kwargs):
+            write_json(self.clip / "performance.json", concurrent_performance)
+            write_json(self.clip / "pipeline_summary.json", concurrent_summary)
+            raise RuntimeError("injected concurrent evaluator failure")
+
+        with patch("workflow.r2.reuse_result.evaluate", side_effect=update_then_fail):
+            with self.assertRaisesRegex(RuntimeError, "concurrent evaluator failure"):
+                reuse_result.attach_reused_result(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+        self.assertFalse((self.clip / "r2_reuse.json").exists())
+        self.assertEqual(read_json(self.clip / "performance.json"), concurrent_performance)
+        self.assertEqual(read_json(self.clip / "pipeline_summary.json"), concurrent_summary)
+
+    def test_failed_reattach_preserves_previous_complete_attachment(self):
+        """A failed retry must not orphan an already valid committed attachment."""
+        import workflow.r2.reuse_result as reuse_result
+
+        reuse_result.attach_reused_result(
+            self.fixed, self.clip, self.r1, self.config_path
+        )
+        artifact_before = (self.clip / "r2_reuse.json").read_bytes()
+        performance_before = (self.clip / "performance.json").read_bytes()
+        summary_before = (self.clip / "pipeline_summary.json").read_bytes()
+
+        with patch("workflow.r2.reuse_result.evaluate",
+                   side_effect=RuntimeError("injected retry failure")):
+            with self.assertRaisesRegex(RuntimeError, "injected retry failure"):
+                reuse_result.attach_reused_result(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+        self.assertEqual((self.clip / "r2_reuse.json").read_bytes(), artifact_before)
+        self.assertEqual((self.clip / "performance.json").read_bytes(), performance_before)
+        self.assertEqual((self.clip / "pipeline_summary.json").read_bytes(), summary_before)
+
+    def test_failed_reattach_does_not_restore_marker_for_tampered_summary(self):
+        """A prior marker is reusable only when it binds both current outputs."""
+        import workflow.r2.reuse_result as reuse_result
+
+        reuse_result.attach_reused_result(
+            self.fixed, self.clip, self.r1, self.config_path
+        )
+        summary = read_json(self.clip / "pipeline_summary.json")
+        summary["bips2"] += 1.0
+        write_json(self.clip / "pipeline_summary.json", summary)
+        summary_before = (self.clip / "pipeline_summary.json").read_bytes()
+
+        with patch("workflow.r2.reuse_result.evaluate",
+                   side_effect=RuntimeError("injected retry failure")):
+            with self.assertRaisesRegex(RuntimeError, "injected retry failure"):
+                reuse_result.attach_reused_result(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+        self.assertFalse((self.clip / "r2_reuse.json").exists())
+        self.assertEqual((self.clip / "pipeline_summary.json").read_bytes(), summary_before)
+
+    def test_failed_reattach_does_not_restore_marker_for_new_source_provenance(self):
+        """A prior marker cannot certify a different newly validated source R2."""
+        import workflow.r2.reuse_result as reuse_result
+
+        reuse_result.attach_reused_result(
+            self.fixed, self.clip, self.r1, self.config_path
+        )
+        output = self.fixed / "gem5_r2"
+        stats_path = output / "stats.txt"
+        stats_path.write_text(
+            "---------- Begin Simulation Statistics ----------\n" + "".join(
+                f"system.cpu{core}.commitStats0.numInsts 150000000\n"
+                f"system.cpu{core}.numCycles 200000000\n"
+                for core in range(4)
+            ),
+            encoding="utf-8",
+        )
+        result_path = output / "r2_result.json"
+        result = read_json(result_path)
+        result["ipc2"] = 3.0
+        result["per_core"] = [
+            {"core": core, "instructions": 150000000,
+             "cycles": 200000000, "ipc": 0.75}
+            for core in range(4)
+        ]
+        result["stats_sha256"] = sha256_file(stats_path)
+        write_json(result_path, result)
+        status_path = output / "status.json"
+        status = read_json(status_path)
+        status["ipc2"] = 3.0
+        status["stats_sha256"] = sha256_file(stats_path)
+        status["r2_result_sha256"] = sha256_file(result_path)
+        write_json(status_path, status)
+        fixed_summary = read_json(self.fixed / "pipeline_summary.json")
+        fixed_summary["ipc2"] = 3.0
+        fixed_summary["bips2"] = 4.2
+        write_json(self.fixed / "pipeline_summary.json", fixed_summary)
+        self.assertTrue(reuse_result.validate_reuse(
+            self.fixed, self.clip, self.r1, self.config_path
+        )["accepted"])
+
+        with patch("workflow.r2.reuse_result.evaluate",
+                   side_effect=RuntimeError("injected new-source retry failure")):
+            with self.assertRaisesRegex(RuntimeError, "new-source retry failure"):
+                reuse_result.attach_reused_result(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+        self.assertFalse((self.clip / "r2_reuse.json").exists())
+
     def test_exact_reuse_writes_provenance_and_recomputes_clip_performance(self):
         """An accepted reuse attaches source IPC2 without fabricating a target gem5 run."""
         from workflow.r2.reuse_result import attach_reused_result, validate_reuse
@@ -1449,6 +1966,14 @@ class StrictR2ReuseTests(unittest.TestCase):
                          sha256_file(self.fixed / "r2_latency.json"))
         self.assertEqual(artifact["target_latency"]["sha256"],
                          sha256_file(self.clip / "r2_latency.json"))
+        self.assertEqual(artifact["target_inputs"]["modules"]["sha256"],
+                         sha256_file(self.clip / "modules.json"))
+        self.assertEqual(artifact["target_inputs"]["thermal"]["sha256"],
+                         sha256_file(self.clip / "hotspot/thermal_result.json"))
+        self.assertEqual(artifact["target_outputs"]["performance"]["sha256"],
+                         sha256_file(self.clip / "performance.json"))
+        self.assertEqual(artifact["target_outputs"]["sustainable_frequency_ghz"], 1.1)
+        self.assertAlmostEqual(artifact["target_outputs"]["bips2"], 3.25 * 1.1)
 
 
 if __name__ == "__main__":
