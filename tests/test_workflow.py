@@ -4,31 +4,39 @@ import math
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from copy import deepcopy
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from workflow.cacti.characterize_cache import PAPER_TABLE_II, parse_cacti_output
+from workflow.cacti.characterize_cache import parse_cacti_output
 from workflow.analysis.summarize_sweep import summarize
 from workflow.analysis.prepare_raw_power_validation import prepare
 from workflow.analysis.evaluate_operational_proxy import evaluate as evaluate_operational_proxy
 from workflow.analysis.promote_validated_config import promote
-from workflow.common import read_json, write_json
+from workflow.common import parse_gem5_stats, read_json, write_json
 from workflow.floorplan.comparison_layouts import generate as generate_comparison_layouts
-from workflow.floorplan.build_module_model import apply_physical_areas
-from workflow.floorplan.generate_hotspot_inputs import baseline_layout, grid_power, materialize
-from workflow.floorplan.layout_metrics import derive_layout_delays
-from workflow.floorplan.optimize_layout import optimize, proxy_temperature
-from workflow.mcpat.parse_mcpat import (
-    apply_power_calibration,
-    parse_mcpat_text,
-    resolve_power_calibration,
+from workflow.floorplan.build_module_model import (
+    apply_physical_areas,
+    build_model,
+    extract_communication_profile,
 )
+from workflow.floorplan.generate_hotspot_inputs import baseline_layout, grid_power, materialize
+from workflow.floorplan.layout_metrics import (
+    aggregate_wire_cycles,
+    communication_weights_from_model,
+    derive_layout_delays,
+    select_rounded_wire_cycles,
+)
+from workflow.floorplan.optimize_layout import optimize, proxy_temperature
+from workflow.mcpat.parse_mcpat import parse_mcpat_text, subtract
 from workflow.r2.calibrate_lambda_wire import (
     calibrate as calibrate_lambda_wire,
     calibrate_series as calibrate_lambda_wire_series,
     main as calibrate_lambda_wire_main,
 )
+from workflow.r2.build_latency_vector import build_vector
 from workflow.r2.run_wire_sensitivity import (
     build_sensitivity_vectors,
     run_series,
@@ -58,6 +66,15 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_temperature_text_and_csv_fields_use_six_decimals(self):
+        from workflow.common import format_temperature_c, format_temperature_csv_row
+
+        self.assertEqual(format_temperature_c(116.25), "116.250000")
+        self.assertEqual(
+            format_temperature_csv_row({"tmax_c": 116.25, "ipc1": 3.4}),
+            {"tmax_c": "116.250000", "ipc1": 3.4},
+        )
+
     def test_power_trace_round_trips_values_that_12g_breaks_total_invariant(self):
         """Raw total/dynamic/leakage files must retain their cell-level sum."""
         from workflow.floorplan.generate_hotspot_inputs import write_ptrace
@@ -94,6 +111,34 @@ class WorkflowTests(unittest.TestCase):
             text=True, capture_output=True, check=False,
         )
         self.assertNotEqual(completed.returncode, 0)
+
+    def test_proxy_calibration_cli_prints_temperature_rmse_with_six_decimals(self):
+        """A shortened RMSE presentation would lose calibrated temperature precision."""
+        from workflow.thermal.calibrate_proxy import main as calibrate_proxy_main
+
+        report = {
+            "fit": {"parameters": {
+                "alpha": 0.3, "beta": 0.0, "cross_tier_weight": 0.7,
+            }},
+            "evaluations": {"cross_validated_training_fit": {"validation": {
+                "rmse_c": 12.3456789, "spatial_spearman": 0.8,
+            }}},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "modules.json"
+            model.write_text("{}", encoding="utf-8")
+            output = StringIO()
+            argv = [
+                "calibrate_proxy", "--model", f"fixture={model}",
+                "--output-dir", str(root / "output"),
+            ]
+            with patch("sys.argv", argv), \
+                 patch("workflow.thermal.calibrate_proxy.calibrate", return_value=report), \
+                 redirect_stdout(output):
+                calibrate_proxy_main()
+
+        self.assertIn("validation RMSE=12.345679 C", output.getvalue())
 
 class FrequencyTests(unittest.TestCase):
     def test_separated_frequency_trace_scales_only_dynamic_power(self):
@@ -153,12 +198,12 @@ class FrequencyTests(unittest.TestCase):
             self.assertEqual(run["trace_sums_w"]["dynamic"], 12.0)
             self.assertEqual(run["trace_sums_w"]["leakage"], 8.0)
             self.assertEqual(run["trace_sums_w"]["composed"], 14.0)
-            self.assertIn("max_abs_uniform_gamma_comparison_error_c", result)
-            self.assertNotIn("max_abs_linear_error_c", result)
             self.assertEqual(run["trace_sums_w"]["total_at_f0"], 20.0)
             self.assertEqual(
                 run["uniform_gamma_comparison"]["scaling_mode"], "paper-uniform-gamma"
             )
+            self.assertIn("max_abs_uniform_gamma_comparison_error_c", result)
+            self.assertNotIn("max_abs_linear_error_c", result)
             self.assertFalse(result["recommendation"]["accepted"])
 
     def test_below_f0_hotspot_failure_writes_a_rejected_validation_result(self):
@@ -457,20 +502,190 @@ class FrequencyTests(unittest.TestCase):
 
 
 class ParserTests(unittest.TestCase):
-    def test_workload_power_calibration_is_explicitly_resolved(self):
-        config = {"power_calibration": {
-            "dynamic_scale": 1.1,
-            "leakage_scale": 1.2,
-            "by_workload": {
-                "fft": {"dynamic_scale": 0.9, "leakage_scale": 1.05}
-            },
-        }}
-        fft = resolve_power_calibration(config, "fft")
-        matmul = resolve_power_calibration(config, "matmul")
-        self.assertEqual(fft["dynamic_scale"], 0.9)
-        self.assertTrue(fft["selection"]["used_workload_override"])
-        self.assertEqual(matmul["dynamic_scale"], 1.1)
-        self.assertFalse(matmul["selection"]["used_workload_override"])
+    def test_stats_parser_can_preserve_nonfinite_values_for_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            stats_path = Path(temporary) / "stats.txt"
+            stats_path.write_text(
+                "finite.counter 12\nnonfinite.counter inf\n", encoding="utf-8"
+            )
+            self.assertEqual(parse_gem5_stats(stats_path), {"finite.counter": 12.0})
+            self.assertEqual(
+                parse_gem5_stats(stats_path, include_nonfinite=True),
+                {"finite.counter": 12.0, "nonfinite.counter": math.inf},
+            )
+
+    def test_communication_profile_sums_data_and_instruction_counters(self):
+        stats = {
+            "system.l2.demandAccesses::cpu0.data": 30.0,
+            "system.l2.demandAccesses::cpu0.inst": 10.0,
+            "system.l2.demandAccesses::cpu1.data": 60.0,
+        }
+        profile = extract_communication_profile(
+            stats, 2, Path("/tmp/r1/stats.txt"), "roi", required=True
+        )
+        self.assertEqual(profile["status"], "available")
+        self.assertEqual(profile["total_demand_accesses"], 100.0)
+        self.assertEqual(profile["per_core"]["0"]["raw_demand_accesses"], 40.0)
+        self.assertEqual(profile["per_core"]["0"]["normalized_weight"], 0.4)
+        self.assertEqual(profile["per_core"]["1"]["normalized_weight"], 0.6)
+        self.assertEqual(profile["per_core"]["0"]["matched_counters"], [
+            "system.l2.demandAccesses::cpu0.data",
+            "system.l2.demandAccesses::cpu0.inst",
+        ])
+        self.assertEqual(profile["source_stats"], "/tmp/r1/stats.txt")
+        self.assertEqual(profile["instruction_window_scope"], "roi")
+        self.assertEqual(
+            profile["counter_family"],
+            "system.l2.demandAccesses per CPU requestor",
+        )
+
+    def test_optional_communication_profile_records_invalid_inputs(self):
+        cases = {
+            "missing core": (
+                {"system.l2.demandAccesses::cpu0.data": 1.0},
+                "missing shared-L2 demand counter for core 1",
+            ),
+            "negative": ({
+                "system.l2.demandAccesses::cpu0.data": -1.0,
+                "system.l2.demandAccesses::cpu1.data": 2.0,
+            }, "negative"),
+            "non-finite": ({
+                "system.l2.demandAccesses::cpu0.data": math.inf,
+                "system.l2.demandAccesses::cpu1.data": 2.0,
+            }, "non-finite"),
+            "all zero": ({
+                "system.l2.demandAccesses::cpu0.data": 0.0,
+                "system.l2.demandAccesses::cpu1.data": 0.0,
+            }, "total demand accesses must be positive"),
+        }
+        for label, (stats, message) in cases.items():
+            with self.subTest(label=label):
+                profile = extract_communication_profile(
+                    stats, 2, Path("/tmp/stats.txt"), "roi", required=False
+                )
+                self.assertEqual(profile["status"], "unavailable")
+                self.assertTrue(
+                    any(message in item for item in profile["diagnostics"]),
+                    profile["diagnostics"],
+                )
+
+    def test_required_communication_profile_rejects_invalid_inputs(self):
+        cases = ({
+            "system.l2.demandAccesses::cpu0.data": 1.0,
+        }, {
+            "system.l2.demandAccesses::cpu0.data": -1.0,
+            "system.l2.demandAccesses::cpu1.data": 2.0,
+        }, {
+            "system.l2.demandAccesses::cpu0.data": math.nan,
+            "system.l2.demandAccesses::cpu1.data": 2.0,
+        }, {
+            "system.l2.demandAccesses::cpu0.data": 0.0,
+            "system.l2.demandAccesses::cpu1.data": 0.0,
+        })
+        for stats in cases:
+            with self.subTest(stats=stats):
+                with self.assertRaisesRegex(
+                        ValueError, "communication profile unavailable"):
+                    extract_communication_profile(
+                        stats, 2, Path("/tmp/stats.txt"), "roi", required=True
+                    )
+
+    def test_build_model_writes_available_communication_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            r1_dir = root / "r1"
+            r1_dir.mkdir()
+            write_json(r1_dir / "r1_metadata.json", {
+                "num_cores": 2,
+                "l1i_size": "32kB",
+                "l1d_size": "32kB",
+                "l2_size": "512kB",
+                "instruction_window_scope": "roi",
+            })
+            (r1_dir / "stats.txt").write_text(
+                "system.cpu0.commitStats0.numInsts 100\n"
+                "system.cpu1.commitStats0.numInsts 100\n"
+                "system.cpu0.numCycles 100\n"
+                "system.cpu1.numCycles 100\n"
+                "system.l2.demandAccesses::cpu0.data 25\n"
+                "system.l2.demandAccesses::cpu1.data 75\n",
+                encoding="utf-8",
+            )
+            mcpat_path = root / "mcpat.json"
+            write_json(mcpat_path, {
+                "modules": [
+                    {"name": "core0_logic", "kind": "core_logic", "core": 0,
+                     "area_mm2": 1.0, "dynamic_power_w": 1.0,
+                     "leakage_power_w": 0.1, "total_power_w": 1.1},
+                    {"name": "core1_logic", "kind": "core_logic", "core": 1,
+                     "area_mm2": 1.0, "dynamic_power_w": 1.0,
+                     "leakage_power_w": 0.1, "total_power_w": 1.1},
+                    {"name": "shared_l2", "kind": "l2", "area_mm2": 1.0,
+                     "dynamic_power_w": 0.1, "leakage_power_w": 0.1,
+                     "total_power_w": 0.2},
+                ],
+                "power_provenance": {"postprocessing": "none"},
+            })
+            cacti_path = root / "cacti.json"
+            write_json(cacti_path, {"records": [
+                {"level": "l1d", "size": "32kB", "size_bytes": 32 * 1024,
+                 "area_mm2": 0.2, "width_mm": 0.5, "height_mm": 0.4},
+                {"level": "l2", "size": "512kB", "size_bytes": 512 * 1024,
+                 "area_mm2": 1.0, "width_mm": 1.0, "height_mm": 1.0},
+            ]})
+            output = root / "modules.json"
+            model = build_model(
+                r1_dir, mcpat_path, cacti_path, output, area_scale=1.0,
+                require_communication_profile=True,
+            )
+            self.assertEqual(model, read_json(output))
+            self.assertEqual(model["communication_profile"]["status"], "available")
+            self.assertEqual(
+                model["communication_profile"]["per_core"]["1"]
+                     ["normalized_weight"],
+                0.75,
+            )
+
+    def test_subtraction_rebuilds_derived_power_after_rounding_clamp(self):
+        """Primitive rounding residuals must not break derived power sums."""
+        base = {
+            "area_mm2": 1.0,
+            "dynamic_power_w": 1.0,
+            "subthreshold_leakage_w": 0.2,
+            "gate_leakage_w": 0.1,
+            "leakage_power_w": 0.3,
+            "total_power_w": 1.3,
+        }
+        child = {
+            "area_mm2": 0.5,
+            "dynamic_power_w": 1.0000023,
+            "subthreshold_leakage_w": 0.15,
+            "gate_leakage_w": 0.04,
+            "leakage_power_w": 0.19,
+            "total_power_w": 1.1900023,
+        }
+
+        remainder = subtract(base, [child])
+
+        self.assertEqual(remainder["dynamic_power_w"], 0.0)
+        self.assertEqual(
+            remainder["leakage_power_w"],
+            remainder["subthreshold_leakage_w"] + remainder["gate_leakage_w"],
+        )
+        self.assertEqual(
+            remainder["total_power_w"],
+            remainder["dynamic_power_w"] + remainder["leakage_power_w"],
+        )
+        self.assertAlmostEqual(
+            remainder["subtraction_diagnostics"]["raw_residuals"]["total_power_w"],
+            0.1099977,
+        )
+        self.assertAlmostEqual(
+            remainder["subtraction_diagnostics"]["clipped_negative_magnitudes"][
+                "dynamic_power_w"
+            ],
+            0.0000023,
+        )
 
     def test_cacti_parser(self):
         text = """Access time (ns): 1.5
@@ -496,12 +711,9 @@ Cache height x width (mm): 2 x 4
         logic = result["modules"][0]
         self.assertAlmostEqual(logic["area_mm2"], 5.0)
         self.assertAlmostEqual(logic["dynamic_power_w"], 2.5)
-
-        apply_power_calibration(result, dynamic_scale=2.0, leakage_scale=3.0,
-                                provenance={"kind": "unit test"})
-        self.assertAlmostEqual(result["modules"][0]["dynamic_power_w"], 5.0)
-        self.assertAlmostEqual(result["modules"][0]["leakage_power_w"], 1.5)
-        self.assertAlmostEqual(result["modules"][0]["raw_power"]["total_power_w"], 3.0)
+        self.assertAlmostEqual(logic["leakage_power_w"], 0.5)
+        self.assertAlmostEqual(logic["total_power_w"], 3.0)
+        self.assertEqual(result["power_provenance"]["postprocessing"], "none")
 
     def test_detailed_mcpat_preserves_functional_core_blocks(self):
         sep = "*" * 40
@@ -530,10 +742,6 @@ Cache height x width (mm): 2 x 4
             "McPAT top-level functional blocks",
         )
 
-    def test_paper_table_ii_anchor(self):
-        self.assertEqual(PAPER_TABLE_II[("l1d", 64 * 1024)]["area_mm2"], 1.16)
-        self.assertEqual(PAPER_TABLE_II[("l2", 1024 * 1024)]["access_time_ns"], 1.984)
-
     def test_module_model_consumes_cacti_cache_geometry(self):
         modules = [
             {"name": "core0_logic", "kind": "core_logic", "area_mm2": 10.0,
@@ -548,23 +756,35 @@ Cache height x width (mm): 2 x 4
         metadata = {"l1i_size": "32kB", "l1d_size": "64kB", "l2_size": "512kB"}
         cacti = {"records": [
             {"level": "l1d", "size": "32kB", "size_bytes": 32 * 1024,
-             "area_mm2": 0.74, "width_mm": 1.0, "height_mm": 0.74,
-             "value_source": "paper Table II"},
+             "area_mm2": 0.20, "width_mm": 0.50, "height_mm": 0.40,
+             "value_source": "local CACTI run"},
             {"level": "l1d", "size": "64kB", "size_bytes": 64 * 1024,
-             "area_mm2": 1.16, "width_mm": 1.45, "height_mm": 0.8,
-             "value_source": "paper Table II"},
+             "area_mm2": 0.30, "width_mm": 0.60, "height_mm": 0.50,
+             "value_source": "local CACTI run"},
             {"level": "l2", "size": "512kB", "size_bytes": 512 * 1024,
-             "area_mm2": 10.01, "width_mm": 5.0, "height_mm": 2.002,
-             "value_source": "paper Table II"},
+             "area_mm2": 2.50, "width_mm": 2.50, "height_mm": 1.00,
+             "value_source": "local CACTI run"},
         ]}
         physical = apply_physical_areas(modules, metadata, cacti, 2.0)
         by_kind = {module["kind"]: module for module in physical}
         self.assertAlmostEqual(by_kind["core_logic"]["area_mm2"], 20.0)
         self.assertEqual(by_kind["core_logic"]["area_source"], "McPAT")
-        self.assertAlmostEqual(by_kind["l1d"]["area_mm2"], 2.32)
+        self.assertAlmostEqual(by_kind["l1d"]["area_mm2"], 0.60)
         self.assertAlmostEqual(by_kind["l1d"]["raw_area_mm2"], 30.0)
-        self.assertEqual(by_kind["l1d"]["area_source"], "paper Table II")
-        self.assertAlmostEqual(by_kind["l2"]["preferred_width_mm"], 5.0 * math.sqrt(2.0))
+        self.assertEqual(by_kind["l1d"]["area_source"], "local CACTI run")
+        self.assertAlmostEqual(by_kind["l2"]["preferred_width_mm"], 2.5 * math.sqrt(2.0))
+
+    def test_pipeline_rejects_removed_paper_table_ii_switch(self):
+        config = {
+            "schema_version": 1,
+            "cacti": {"use_paper_table_ii": True},
+            "physical": {"r_convec_k_per_w": 5.0},
+            "layout_optimizer": {"r_convec_k_per_w": 5.0},
+            "mcpat": {},
+            "delay": {},
+        }
+        with self.assertRaisesRegex(ValueError, "use_paper_table_ii has been removed"):
+            validate_config(config, "fixed-bin")
 
 
 class GridTests(unittest.TestCase):
@@ -821,6 +1041,244 @@ class GridTests(unittest.TestCase):
         same_tier = {**layout, "modules": [dict(module) for module in layout["modules"]]}
         next(module for module in same_tier["modules"] if module["kind"] == "l2")["tier"] = 0
         self.assertEqual(derive_layout_delays(same_tier)["tsv_hops"], 0)
+
+    def test_equal_traffic_weights_exactly_reproduce_arithmetic_mean(self):
+        per_core = [
+            {"core": core, "delay_cycles": value}
+            for core, value in enumerate((1.0, 2.0, 3.0, 4.0))
+        ]
+        self.assertEqual(
+            aggregate_wire_cycles(
+                per_core, "traffic-weighted",
+                {0: 0.25, 1: 0.25, 2: 0.25, 3: 0.25},
+            ),
+            2.5,
+        )
+
+    def test_dominant_core_shifts_traffic_weighted_delay(self):
+        per_core = [
+            {"core": core, "delay_cycles": value}
+            for core, value in enumerate((1.0, 2.0, 3.0, 4.0))
+        ]
+        self.assertAlmostEqual(
+            aggregate_wire_cycles(
+                per_core, "traffic-weighted",
+                {0: 0.7, 1: 0.1, 2: 0.1, 3: 0.1},
+            ),
+            1.6,
+        )
+
+    def test_traffic_weight_validation_rejects_malformed_mappings(self):
+        per_core = [
+            {"core": core, "delay_cycles": value}
+            for core, value in enumerate((1.0, 2.0))
+        ]
+        cases = {
+            "missing": ({0: 1.0}, "keys must exactly match"),
+            "extra": ({0: 0.5, 1: 0.5, 2: 0.0}, "keys must exactly match"),
+            "negative": ({0: 1.1, 1: -0.1}, "finite and non-negative"),
+            "nonfinite": ({0: math.inf, 1: 0.0}, "finite and non-negative"),
+            "not normalized": ({0: 0.4, 1: 0.4}, "sum to one"),
+        }
+        for label, (weights, message) in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, message):
+                    aggregate_wire_cycles(per_core, "traffic-weighted", weights)
+
+    def test_zero_traffic_weight_is_valid_when_mapping_is_normalized(self):
+        per_core = [
+            {"core": 0, "delay_cycles": 1.0},
+            {"core": 1, "delay_cycles": 8.0},
+        ]
+        self.assertEqual(
+            aggregate_wire_cycles(
+                per_core, "traffic-weighted", {"0": 1.0, "1": 0.0}
+            ),
+            1.0,
+        )
+
+    def test_derive_layout_delays_records_weighted_contributions(self):
+        layout = baseline_layout(self.model())
+        weights = {0: 0.7, 1: 0.1, 2: 0.1, 3: 0.1}
+        delays = derive_layout_delays(
+            layout, communication_weights=weights
+        )
+        expected = sum(
+            weights[item["core"]] * item["delay_cycles"]
+            for item in delays["per_core"]
+        )
+        self.assertAlmostEqual(
+            delays["traffic_weighted_wire_cycles_unrounded"], expected
+        )
+        self.assertEqual(
+            delays["traffic_weighted_wire_cycles"],
+            int(math.floor(expected + 0.5)),
+        )
+        for item in delays["per_core"]:
+            self.assertEqual(item["communication_weight"], weights[item["core"]])
+            self.assertAlmostEqual(
+                item["weighted_delay_cycles_contribution"],
+                weights[item["core"]] * item["delay_cycles"],
+            )
+
+    def test_selected_rounded_wire_cycle_uses_requested_aggregation(self):
+        delays = {
+            "wire_cycles": 2,
+            "maximum_wire_cycles": 5,
+            "traffic_weighted_wire_cycles": 3,
+        }
+        self.assertEqual(select_rounded_wire_cycles(delays, "mean"), 2)
+        self.assertEqual(select_rounded_wire_cycles(delays, "maximum"), 5)
+        self.assertEqual(
+            select_rounded_wire_cycles(delays, "traffic-weighted"), 3
+        )
+
+    def test_communication_weights_are_read_only_from_available_profile(self):
+        model = self.model()
+        model["communication_profile"] = {
+            "status": "available",
+            "per_core": {
+                "0": {"normalized_weight": 0.7},
+                "1": {"normalized_weight": 0.1},
+                "2": {"normalized_weight": 0.1},
+                "3": {"normalized_weight": 0.1},
+            },
+        }
+        self.assertEqual(
+            communication_weights_from_model(model, required=True),
+            {0: 0.7, 1: 0.1, 2: 0.1, 3: 0.1},
+        )
+        model["communication_profile"]["status"] = "unavailable"
+        self.assertIsNone(communication_weights_from_model(model, required=False))
+        with self.assertRaisesRegex(ValueError, "communication profile unavailable"):
+            communication_weights_from_model(model, required=True)
+
+    def test_optimizer_and_r2_use_the_same_traffic_weighted_aggregate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            model["architecture"] = {
+                "num_cores": 4,
+                "l1i_size": "32kB",
+                "l1d_size": "32kB",
+                "l2_size": "512kB",
+            }
+            weights = {0: 0.7, 1: 0.1, 2: 0.1, 3: 0.1}
+            model["communication_profile"] = {
+                "status": "available",
+                "source_stats": "/tmp/r1/stats.txt",
+                "instruction_window_scope": "roi",
+                "counter_family": "system.l2.demandAccesses per CPU requestor",
+                "per_core": {
+                    str(core): {
+                        "matched_counters": [
+                            f"system.l2.demandAccesses::cpu{core}.data"
+                        ],
+                        "raw_demand_accesses": weight * 100.0,
+                        "normalized_weight": weight,
+                    }
+                    for core, weight in weights.items()
+                },
+                "total_demand_accesses": 100.0,
+                "missing_cores": [],
+                "diagnostics": [],
+            }
+            modules_path = root / "modules.json"
+            write_json(modules_path, model)
+            layout_path = root / "layout.json"
+            report = optimize(
+                modules_path, layout_path, root / "optimizer.json",
+                allowed_l2_tiers=[1], require_scipy=False,
+                wire_aggregation="traffic-weighted",
+            )
+            cacti_path = root / "cacti.json"
+            write_json(cacti_path, {
+                "frequency_ghz": 2.0,
+                "records": [
+                    {"level": "l1d", "size": "32kB",
+                     "size_bytes": 32 * 1024, "access_cycles": 2},
+                    {"level": "l2", "size": "512kB",
+                     "size_bytes": 512 * 1024, "access_cycles": 4},
+                ],
+            })
+            vector = build_vector(
+                modules_path, cacti_path, root / "latency.json",
+                layout_path=layout_path, wire_aggregation="traffic-weighted",
+            )
+            optimized_delays = report["observability_diagnostics"][
+                "optimized_layout_delays"
+            ]
+            self.assertEqual(
+                vector["components_cycles"]["layout_wire"],
+                vector["layout_delays"]["traffic_weighted_wire_cycles"],
+            )
+            self.assertEqual(
+                optimized_delays["traffic_weighted_wire_cycles"],
+                vector["layout_delays"]["traffic_weighted_wire_cycles"],
+            )
+            self.assertAlmostEqual(
+                report["selected"]["wire_objective_cycles"],
+                report["selected"]["traffic_weighted_wire_cycles"],
+            )
+            self.assertEqual(
+                vector["wire_cycle_aggregation_for_r2"], "traffic-weighted"
+            )
+            expected_xbar = (
+                vector["components_cycles"]["l2_arbitration"]
+                + vector["components_cycles"]["tsv"]
+                + vector["components_cycles"]["layout_wire"]
+            )
+            self.assertEqual(
+                vector["gem5_overrides"]["xbar_forward_latency"], expected_xbar
+            )
+            self.assertTrue(any(
+                "one scalar shared-L2XBar latency" in assumption
+                for assumption in vector["reproduction_assumptions"]
+            ))
+
+    def test_traffic_weighted_r2_rejects_missing_layout_and_manual_override(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            model["architecture"] = {
+                "num_cores": 4,
+                "l1i_size": "32kB",
+                "l1d_size": "32kB",
+                "l2_size": "512kB",
+            }
+            model["communication_profile"] = {
+                "status": "available",
+                "per_core": {
+                    str(core): {"normalized_weight": 0.25}
+                    for core in range(4)
+                },
+            }
+            modules_path = root / "modules.json"
+            write_json(modules_path, model)
+            cacti_path = root / "cacti.json"
+            write_json(cacti_path, {
+                "frequency_ghz": 2.0,
+                "records": [
+                    {"level": "l1d", "size": "32kB",
+                     "size_bytes": 32 * 1024, "access_cycles": 2},
+                    {"level": "l2", "size": "512kB",
+                     "size_bytes": 512 * 1024, "access_cycles": 4},
+                ],
+            })
+            with self.assertRaisesRegex(ValueError, "requires a final layout"):
+                build_vector(
+                    modules_path, cacti_path, root / "missing_layout.json",
+                    wire_aggregation="traffic-weighted",
+                )
+
+            layout_path = root / "layout.json"
+            write_json(layout_path, baseline_layout(model))
+            with self.assertRaisesRegex(ValueError, "cannot override"):
+                build_vector(
+                    modules_path, cacti_path, root / "manual_override.json",
+                    wire_cycles=99, layout_path=layout_path,
+                    wire_aggregation="traffic-weighted",
+                )
 
     def test_area_quadrature_proxy_is_finite_and_geometry_sensitive(self):
         layout = baseline_layout(self.model())
@@ -1136,6 +1594,67 @@ class FormalGuardTests(unittest.TestCase):
         self.assertEqual(config["layout_optimizer"]["validation_policy"], "paper-single")
         self.assertEqual(config["layout_optimizer"]["beta"], 0.0)
         self.assertFalse(config["formal_validation"]["accepted"])
+        validate_config(config, "clip3d")
+
+    def test_nonformal_config_accepts_traffic_weighted_extension(self):
+        config = read_json(Path(
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_lambda0020119_exploratory.json"
+        ))
+        config["delay"]["wire_aggregation"] = "traffic-weighted"
+        validate_config(config, "clip3d")
+
+    def test_accepted_formal_config_rejects_traffic_weighted_extension_first(self):
+        config = read_json(Path(
+            "configs/experiments/clip3d_constrained_5p0_raw_power_p1_candidate.json"
+        ))
+        config["formal_validation"]["accepted"] = True
+        config["delay"]["wire_aggregation"] = "traffic-weighted"
+        with self.assertRaisesRegex(ValueError, "non-formal research extension"):
+            validate_config(config, "clip3d")
+
+    def test_default_mean_aggregation_remains_valid(self):
+        config = read_json(Path(
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_lambda0020119_exploratory.json"
+        ))
+        config["delay"].pop("wire_aggregation", None)
+        validate_config(config, "clip3d")
+
+    def test_clip3d_optimizer_rejects_conservative_maximum_mode(self):
+        config = read_json(Path(
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_lambda0020119_exploratory.json"
+        ))
+        config["delay"]["wire_aggregation"] = "maximum"
+        with self.assertRaisesRegex(ValueError, "maximum.*R2 sensitivity"):
+            validate_config(config, "clip3d")
+
+    def test_comparison_layouts_reject_traffic_weighted_selection(self):
+        config = read_json(Path(
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_lambda0020119_exploratory.json"
+        ))
+        config["delay"]["wire_aggregation"] = "traffic-weighted"
+        for method in ("cool3d-standard", "sa-lambda"):
+            with self.subTest(method=method), self.assertRaisesRegex(
+                    ValueError, "comparison layout methods"):
+                validate_config(config, method)
+
+    def test_traffic_weighted_exploratory_config_is_non_formal(self):
+        config = read_json(Path(
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_"
+            "lambda0020119_traffic_weighted_exploratory.json"
+        ))
+        self.assertEqual(
+            config["delay"]["wire_aggregation"], "traffic-weighted"
+        )
+        self.assertTrue(config["experiment_classification"]["non_formal"])
+        self.assertFalse(config["experiment_classification"]["paper_equivalent"])
+        self.assertFalse(config["formal_validation"]["accepted"])
+        self.assertGreater(config["layout_optimizer"]["lambda_wire"], 0.0)
+        self.assertEqual(config["layout_optimizer"]["allowed_l2_tiers"], [1])
         validate_config(config, "clip3d")
 
     def test_promotion_rejects_failed_proxy(self):

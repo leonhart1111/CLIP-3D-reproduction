@@ -12,19 +12,19 @@ import time
 from pathlib import Path
 
 from workflow.cacti.characterize_cache import characterize
-from workflow.common import PROJECT_ROOT, read_json, write_json
+from workflow.common import PROJECT_ROOT, format_temperature_c, read_json, write_json
 from workflow.floorplan.build_module_model import build_model
 from workflow.floorplan.comparison_layouts import METHODS as COMPARISON_METHODS
 from workflow.floorplan.comparison_layouts import generate as generate_comparison_layouts
 from workflow.floorplan.generate_hotspot_inputs import materialize
-from workflow.floorplan.layout_metrics import derive_layout_delays
+from workflow.floorplan.layout_metrics import (
+    communication_weights_from_model,
+    derive_layout_delays,
+    select_rounded_wire_cycles,
+)
 from workflow.floorplan.optimize_layout import optimize
 from workflow.mcpat.gem5_to_mcpat import convert
-from workflow.mcpat.parse_mcpat import (
-    apply_power_calibration,
-    parse_mcpat_text,
-    resolve_power_calibration,
-)
+from workflow.mcpat.parse_mcpat import parse_mcpat_text
 from workflow.r2.build_latency_vector import build_vector
 from workflow.r2.run_r2 import run as run_r2
 from workflow.thermal.run_hotspot import run_hotspot
@@ -157,6 +157,12 @@ def validate_config(config: dict, layout_method: str) -> None:
         raise ValueError("unsupported CLIP-3D pipeline config schema")
     if layout_method not in LAYOUT_METHODS:
         raise ValueError(f"unknown layout method: {layout_method}")
+    cacti_config = config.get("cacti", {})
+    if "use_paper_table_ii" in cacti_config:
+        raise ValueError(
+            "cacti.use_paper_table_ii has been removed; cache area and latency "
+            "must come from the local CACTI run"
+        )
     physical_r = float(config["physical"]["r_convec_k_per_w"])
     optimizer_r = float(config["layout_optimizer"]["r_convec_k_per_w"])
     if layout_method != "fixed-bin" and not abs(physical_r - optimizer_r) < 1e-12:
@@ -164,16 +170,13 @@ def validate_config(config: dict, layout_method: str) -> None:
             "layout search and final HotSpot must use the same R_conv: "
             f"optimizer={optimizer_r}, physical={physical_r}"
         )
-    calibration = config.get("mcpat", {}).get("power_calibration", {})
-    calibrations = [("default", calibration)] + list(
-        calibration.get("by_workload", {}).items()
-    )
-    for label, values in calibrations:
-        for name in ("dynamic_scale", "leakage_scale"):
-            if float(values.get(name, 1.0)) <= 0:
-                raise ValueError(
-                    f"mcpat.power_calibration[{label}].{name} must be positive"
-                )
+    allowed_mcpat = {
+        "temperature_k", "device_type", "longer_channel_device",
+        "interconnect_projection_type", "opt_for_clk",
+    }
+    unknown_mcpat = set(config.get("mcpat", {})) - allowed_mcpat
+    if unknown_mcpat:
+        raise ValueError(f"unsupported mcpat settings: {sorted(unknown_mcpat)}")
     tolerance = float(config.get("layout_optimizer", {}).get(
         "baseline_guard_bips_tolerance", 1e-9
     ))
@@ -187,6 +190,26 @@ def validate_config(config: dict, layout_method: str) -> None:
     allowed_tiers = config.get("layout_optimizer", {}).get("allowed_l2_tiers", [0, 1])
     if not allowed_tiers or any(int(tier) not in (0, 1) for tier in allowed_tiers):
         raise ValueError("layout_optimizer.allowed_l2_tiers must contain tier 0 and/or tier 1")
+    aggregation = config.get("delay", {}).get("wire_aggregation", "mean")
+    if aggregation not in ("mean", "maximum", "traffic-weighted"):
+        raise ValueError(
+            "delay.wire_aggregation must be mean, maximum, or traffic-weighted"
+        )
+    if (aggregation == "traffic-weighted"
+            and config.get("formal_validation", {}).get("accepted") is True):
+        raise ValueError(
+            "traffic-weighted wire aggregation is a non-formal research extension"
+        )
+    if layout_method == "clip3d" and aggregation == "maximum":
+        raise ValueError(
+            "maximum wire aggregation is only a conservative R2 sensitivity mode, "
+            "not a CLIP-3D optimizer objective"
+        )
+    if aggregation == "traffic-weighted" and layout_method in COMPARISON_METHODS:
+        raise ValueError(
+            "traffic-weighted aggregation is not supported by comparison layout "
+            "methods because their candidate selection uses a different objective"
+        )
     if config.get("formal_validation", {}).get("strict_p1") is True:
         if list(allowed_tiers) != [1]:
             raise ValueError("strict P1 requires layout_optimizer.allowed_l2_tiers == [1]")
@@ -211,9 +234,6 @@ def validate_config(config: dict, layout_method: str) -> None:
     )
     if wire_objective not in ("continuous", "r2-quantized"):
         raise ValueError("layout_optimizer.wire_objective is invalid")
-    aggregation = config.get("delay", {}).get("wire_aggregation", "mean")
-    if aggregation not in ("mean", "maximum"):
-        raise ValueError("delay.wire_aggregation must be mean or maximum")
 
 
 def refresh_copied_hotspot_paths(hotspot_dir: Path) -> None:
@@ -323,6 +343,14 @@ def select_clip3d_candidate(evaluations: list[dict],
         raise ValueError("CLIP-3D validation requires fixed-bin and optimized evaluations")
     fixed = by_policy["fixed-bin"]
     optimized = by_policy["optimized"]
+    aggregation = fixed.get("r2_wire_aggregation", "mean")
+    if optimized.get("r2_wire_aggregation", aggregation) != aggregation:
+        raise ValueError("CLIP-3D candidates use different R2 wire aggregations")
+    aggregation_label = {
+        "mean": "mean",
+        "maximum": "maximum",
+        "traffic-weighted": "traffic-weighted",
+    }.get(aggregation, str(aggregation))
     delta = optimized["bips1_thermal"] - fixed["bips1_thermal"]
     if delta > bips_tolerance:
         return optimized, "higher real-HotSpot thermal BIPS1"
@@ -332,9 +360,12 @@ def select_clip3d_candidate(evaluations: list[dict],
     fixed_wire = int(fixed.get("r2_wire_cycles", fixed["wire_cycles"]))
     optimized_wire = int(optimized.get("r2_wire_cycles", optimized["wire_cycles"]))
     if optimized_wire < fixed_wire:
-        return optimized, "thermal BIPS1 tie; lower discrete mean wire latency"
+        return optimized, f"thermal BIPS1 tie; lower discrete {aggregation_label} wire latency"
     if optimized_wire > fixed_wire:
-        return fixed, "thermal BIPS1 tie; fixed-bin has lower discrete mean wire latency"
+        return fixed, (
+            f"thermal BIPS1 tie; fixed-bin has lower discrete "
+            f"{aggregation_label} wire latency"
+        )
     if optimized["tmax_c"] < fixed["tmax_c"]:
         return optimized, "thermal BIPS1 and wire-latency tie; lower real HotSpot Tmax"
     return fixed, "thermal BIPS1 and wire-latency tie; fixed-bin has no higher real Tmax"
@@ -348,6 +379,11 @@ def evaluate_clip3d_candidate(modules_path: Path, proposed_layout: Path,
     physical = config["physical"]
     optimizer = config["layout_optimizer"]
     delay = config["delay"]
+    model = read_json(modules_path)
+    aggregation = delay.get("wire_aggregation", "mean")
+    communication_weights = communication_weights_from_model(
+        model, required=aggregation == "traffic-weighted"
+    )
     evaluations = []
     validation_root = output_dir / "layout_validation"
     for policy, layout in (("fixed-bin", None), ("optimized", proposed_layout)):
@@ -367,13 +403,12 @@ def evaluate_clip3d_candidate(modules_path: Path, proposed_layout: Path,
         layout_delays = derive_layout_delays(
             read_json(hotspot_dir / "layout.json"), frequency["f0_ghz"],
             delay.get("wire_rounding", "nearest"),
+            communication_weights,
         )
-        aggregation = delay.get("wire_aggregation", "mean")
-        r2_wire_cycles = (
-            layout_delays["wire_cycles"] if aggregation == "mean"
-            else layout_delays["maximum_wire_cycles"]
+        r2_wire_cycles = select_rounded_wire_cycles(
+            layout_delays, aggregation
         )
-        evaluations.append({
+        evaluation = {
             "policy": policy,
             "layout": str((hotspot_dir / "layout.json").resolve()),
             "hotspot_dir": str(hotspot_dir.resolve()),
@@ -386,7 +421,17 @@ def evaluate_clip3d_candidate(modules_path: Path, proposed_layout: Path,
             "maximum_wire_cycles": layout_delays["maximum_wire_cycles"],
             "r2_wire_aggregation": aggregation,
             "r2_wire_cycles": r2_wire_cycles,
-        })
+        }
+        if aggregation == "traffic-weighted":
+            evaluation.update({
+                "traffic_weighted_wire_cycles_unrounded": layout_delays[
+                    "traffic_weighted_wire_cycles_unrounded"
+                ],
+                "traffic_weighted_wire_cycles": layout_delays[
+                    "traffic_weighted_wire_cycles"
+                ],
+            })
+        evaluations.append(evaluation)
 
     tolerance = float(optimizer.get("baseline_guard_bips_tolerance", 1e-9))
     selected, reason = select_clip3d_candidate(evaluations, tolerance)
@@ -400,8 +445,8 @@ def evaluate_clip3d_candidate(modules_path: Path, proposed_layout: Path,
         "schema_version": 1,
         "method": "clip3d",
         "selection_rule": (
-            "maximum real-HotSpot thermal BIPS1; discrete mean wire cycles and real "
-            "Tmax break ties"
+            "maximum real-HotSpot thermal BIPS1; discrete "
+            f"{aggregation} wire cycles and real Tmax break ties"
         ),
         "selected_policy": selected["policy"],
         "fallback_used": selected["policy"] == "fixed-bin",
@@ -474,7 +519,6 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     frequency = config["frequency"]
     physical = config["physical"]
     mcpat_config = config.get("mcpat", {})
-    cacti_config = config.get("cacti", {})
     metadata = read_json(r1_dir / "r1_metadata.json")
     tools = {
         "mcpat": PROJECT_ROOT / "tools/src/mcpat/mcpat",
@@ -511,12 +555,6 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     if process.returncode != 0 or "McPAT (version 1.3" not in mcpat_text or "results" not in mcpat_text:
         raise RuntimeError(f"McPAT failed; see {mcpat_dir / 'mcpat.out'}")
     parsed_mcpat = parse_mcpat_text(mcpat_text)
-    calibration = resolve_power_calibration(mcpat_config, metadata["workload"])
-    apply_power_calibration(
-        parsed_mcpat, float(calibration.get("dynamic_scale", 1.0)),
-        float(calibration.get("leakage_scale", 1.0)),
-        calibration.get("provenance"),
-    )
     parsed_mcpat["command"] = command
     write_json(mcpat_dir / "mcpat.json", parsed_mcpat)
     stage_seconds["mcpat"] = time.perf_counter() - started
@@ -526,17 +564,19 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     characterize(
         tools["cacti"], tools["cacti_config"], output_dir / "cacti",
         l1_sizes, [metadata["l2_size"]], frequency["f0_ghz"],
-        bool(cacti_config.get("use_paper_table_ii", False)),
     )
     stage_seconds["cacti"] = time.perf_counter() - started
 
     started = time.perf_counter()
     modules_path = output_dir / "modules.json"
-    reference_raw = float(physical.get("area_reference_raw_mm2", 57.713078))
+    reference_raw = float(physical.get("area_reference_raw_mm2", 45.7538495872))
     area_scale = float(physical["area_reference_mm2"]) / reference_raw
     cacti_json = output_dir / "cacti/cacti_characterization.json"
     model = build_model(
-        r1_dir, mcpat_dir / "mcpat.json", cacti_json, modules_path, area_scale
+        r1_dir, mcpat_dir / "mcpat.json", cacti_json, modules_path, area_scale,
+        require_communication_profile=(
+            config["delay"].get("wire_aggregation", "mean") == "traffic-weighted"
+        ),
     )
     stage_seconds["module_model"] = time.perf_counter() - started
 
@@ -557,6 +597,7 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
             int(optimizer.get("proxy_quadrature_order", 2)),
             optimizer.get("wire_objective", "continuous"),
             config["delay"].get("wire_rounding", "nearest"),
+            config["delay"].get("wire_aggregation", "mean"),
         )
         if optimizer.get("validation_policy", "guarded") == "paper-single":
             layout_path, thermal, selection = evaluate_clip3d_paper_single(
@@ -652,6 +693,15 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
         "mean_wire_cycles_rounded": vector["layout_delays"]["wire_cycles"],
         "maximum_wire_cycles_rounded": vector["layout_delays"]["maximum_wire_cycles"],
     }
+    if "traffic_weighted_wire_cycles" in vector["layout_delays"]:
+        layout_diagnostics.update({
+            "traffic_weighted_wire_cycles_unrounded": vector["layout_delays"][
+                "traffic_weighted_wire_cycles_unrounded"
+            ],
+            "traffic_weighted_wire_cycles_rounded": vector["layout_delays"][
+                "traffic_weighted_wire_cycles"
+            ],
+        })
     if layout_method == "clip3d":
         optimizer_report = read_json(output_dir / "optimizer_report.json")
         selected_proxy = optimizer_report["selected"]["proxy_tmax_c"]
@@ -683,12 +733,10 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
         "cooling": {"r_convec_k_per_w": physical["r_convec_k_per_w"],
                     "ambient_c": frequency["ambient_c"]},
         "module_count": len(model["modules"]), "total_power_w": model["totals"]["total_power_w"],
-        "raw_total_power_w": (
-            model.get("raw_mcpat_module_totals") or {}
-        ).get("total_power_w"),
-        "power_calibration": model.get("power_calibration"),
+        "power_provenance": model["power_provenance"],
         "area_calibration": model.get("area_calibration"),
         "power_distribution": model.get("power_distribution"),
+        "communication_profile": model.get("communication_profile"),
         "gamma": model["gamma"], "tmax_c": thermal["tmax_c"],
         "sustainable_frequency_ghz": performance["sustainable_frequency_ghz"],
         "ipc1": performance["ipc1"], "bips1_thermal": performance["bips1_thermal"],
@@ -790,12 +838,12 @@ def main() -> None:
         }
         write_json(args.output_dir / "pipeline_summary.json", summary)
     print(f"Pipeline complete: method={summary['layout_method']}, "
-          f"Tmax={summary['tmax_c']:.3f} C, "
+          f"Tmax={format_temperature_c(summary['tmax_c'])} C, "
           f"f_sus={summary['sustainable_frequency_ghz']:.6f} GHz")
     if args.transient:
         print(
             f"Transient thermal complete: windows={transient['window_count']}, "
-            f"Tmax={transient['transient_tmax_c']:.3f} C"
+            f"Tmax={format_temperature_c(transient['transient_tmax_c'])} C"
         )
 
 

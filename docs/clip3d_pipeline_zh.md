@@ -70,13 +70,16 @@ workflow/mcpat/parse_mcpat.py
 
 转换器读取 `r1_metadata.json` 和 `stats.txt`，为四个核心分别填写周期数、指令类型、分支、L1 访问和 L1 未命中，并为共享 L2 填写访问和未命中。生成的是 45 nm、2 GHz、四发射、192 项 ROB 的四核心 XML。x86 活动量使用 gem5 的 `commitStats0.numOps`（微操作），不再使用不存在的 `opsCommitted`；ROB、rename、dispatch、wakeup 和物理寄存器访问优先使用 gem5 O3CPU 直接计数器。
 
-论文没有公开 McPAT XML。正式配置使用与表 III 泄漏比例最接近的 320 K、ITRS-HP、long-channel、conservative interconnect、`opt_for_clk=0`。此外使用一组全局、显式的表 III 锚点校准系数；`mcpat/mcpat.json` 同时保存 `raw_power` 和校准后功耗，不能把该系数当成未记录的调参旋钮。当前系数由 FFT 64 kB/1 MB 锚点得到，并已用 FFT 32 kB/256 kB 锚点交叉检查。
+论文没有公开 McPAT XML。正式配置把 320 K、ITRS-HP、long-channel、conservative interconnect、`opt_for_clk=0` 明确记录为本地建模假设。`mcpat/mcpat.json` 直接保存 McPAT 报告的逐模块动态功耗和泄漏功耗，后续流程不使用论文结果拟合的功耗乘数。
 
-McPAT 的详细结果被拆成 14 个物理模块：
+当前实际 McPAT 详细结果通常被拆成 34 个物理模块：
 
-- 每个核心一个核心逻辑块、一个 L1I、一个 L1D，共 12 个；
+- 每个核心拆为 IFU、rename、LSU、MMU、execution、other，并保留独立的
+  L1I、L1D，共 32 个；
 - 一个共享 L2；
 - 一个互连块。
+
+若简化 McPAT 输出缺少这些详细标题，解析器才回退为每核心一个聚合逻辑块。
 
 每个模块都有：
 
@@ -95,19 +98,19 @@ total_power_w
 
 程序：`workflow/floorplan/build_module_model.py`
 
-论文将参考设计（4 核、32 kB L1D、512 kB L2、45 nm）校准为 150 mm²。缓存面积采用论文表 II/CACTI，非缓存逻辑面积采用 McPAT；参考原始面积为 `41.783078+15.93=57.713078 mm²`，因此面积统一乘以：
+论文将参考设计（4 核、32 kB L1D、512 kB L2、45 nm）校准为 150 mm²。本项目现在只使用本地 CACTI 运行得到的缓存面积和延迟，非缓存逻辑面积采用 McPAT。参考原始面积为 `41.783078+3.9707715872=45.7538495872 mm²`，因此面积统一乘以：
 
 ```text
-scale = 150 / 57.713078 = 2.599064288340
+scale = 150 / 45.7538495872 = 3.278412665892
 ```
 
-只缩放面积，不缩放 McPAT 功耗。L1/L2 保留本机 CACTI 输出的长宽比，再缩放到论文表 II 面积；因此 L2 不再被错误地强制为正方形。70% 是后续布局利用率，不能先把 150 mm² 乘以 70%；否则会重复应用利用率。面积来源、缩放前面积和宏块长宽均写入 `modules.json`，后续若更换 McPAT 模板，必须重新计算，而不能继续沿用。
+只缩放面积，不缩放 McPAT 功耗。L1/L2 保留本机 CACTI 输出的面积和长宽比；因此 L2 不再被错误地强制为正方形，也不再套用论文表 II 面积。70% 是后续布局利用率，不能先把 150 mm² 乘以 70%；否则会重复应用利用率。面积来源、缩放前面积和宏块长宽均写入 `modules.json`，后续若更换 McPAT 模板或 CACTI 配置，必须重新计算，而不能继续沿用。
 
 ### 3.3 CACTI 延迟
 
 程序：`workflow/cacti/characterize_cache.py`
 
-脚本为每个容量单独生成配置，固定 45 nm、64 B cache line、L1 两路、L2 八路，然后在 CACTI 源码目录中执行。必须从源码目录执行，因为这个版本按相对路径读取 `tech_params/45nm.dat`；从输出目录运行会段错误。论文没有公开 CACTI 版本和完整组织参数，因此正式配置把论文表 II 的访问时间和面积作为有效值，同时把本机 CACTI 输出保存在同一记录的 `measured_*` 字段中。这样 R2 严格使用论文公布值，又不会伪装成本机工具恰好生成了相同结果。
+脚本为每个容量单独生成配置，固定 45 nm、64 B cache line、L1 两路、L2 八路，然后在 CACTI 源码目录中执行。必须从源码目录执行，因为这个版本按相对路径读取 `tech_params/45nm.dat`；从输出目录运行会段错误。缓存访问时间、面积、长宽、读写能量和漏电功耗均来自本地 CACTI 标准输出；项目中已经删除论文表 II 覆盖分支。
 
 CACTI 输出的 ns 延迟按 2 GHz（每周期 0.5 ns）转换为周期：
 
@@ -116,7 +119,7 @@ cycles_float = access_time_ns / 0.5
 cycles_int   = floor(cycles_float + 0.5)
 ```
 
-即四舍五入到最近整数，且至少为 1 周期，与论文表 II 的口径一致。
+即四舍五入到最近整数，且至少为 1 周期。
 
 ### 3.4 自动芯片边长和 P1 固定分箱
 
@@ -172,7 +175,7 @@ hotspot/materials.txt
 
 `stack.lcf` 是五层：被动中介层、底层有源硅、TIM、顶层有源硅、顶部 TIM。有源硅厚度为论文给出的 50 μm。`.ptrace` 的列顺序与两个有源 `.flp` 的模块顺序完全相同，避免 HotSpot 常见的模块数量或列错位问题。
 
-论文只说明“Cool-3D 默认封装”，没有给出全部层材料数值。`physical.thermal_stack.local_resistance_scale` 因此作为显式的有效局部热阻校准量写入配置和 `hotspot_manifest.json`；它只缩放硅/TIM 层热阻，不改变论文给出的 `R_conv`。缓存几何修正后该值重新校准为 `8.72`：FFT 64 kB/1 MB fixed-bin 在 `R_conv=5.0/3.5 K/W` 下分别得到 `124.39/100.00°C`，对应论文的 `124.4/100.0°C`。它仍须通过其他表 III 点交叉验证，并与 McPAT 功耗校准分开，避免用虚高功耗掩盖热堆叠误差。
+论文只说明“Cool-3D 默认封装”，没有给出全部层材料数值。`physical.thermal_stack.local_resistance_scale` 因此作为显式的有效局部热阻参数写入配置和 `hotspot_manifest.json`；它只影响硅/TIM 层热阻，不修改 McPAT 报告的动态功耗或泄漏功耗。该参数属于热堆叠假设，必须和功耗来源分开报告。
 
 `workflow/thermal/run_hotspot.py` 用 `grid + detailed_3D` 模式求稳态，并从所有报告单元中取最大温度。
 
@@ -224,6 +227,42 @@ BIPS2 = IPC2 × f_sus_GHz
 
 因为 IPC 的单位是“指令/周期”，GHz 是“十亿周期/秒”，两者相乘正好是“十亿指令/秒”。
 
+#### 可选的通信频率加权模式
+
+默认和论文对齐的模式仍是四条核心到 L2 路径的算术平均。非正式探索配置还可设置：
+
+```json
+"delay": {
+  "wire_aggregation": "traffic-weighted"
+}
+```
+
+程序从已完成 R1 的最终 `stats.txt` 中读取：
+
+```text
+system.l2.demandAccesses::cpu<i>.data
+system.l2.demandAccesses::cpu<i>.inst
+```
+
+同一核心同时存在两项时先求和，令该核心的访问量为 `A_i`，然后计算：
+
+```text
+q_i = A_i / sum_j(A_j)
+tau_traffic = sum_i(q_i * tau_i)
+```
+
+其中 `tau_i` 仍由该核心到 L2 的实际布局距离和 `0.69×R×C×L_i²` 得到。
+同一个 `tau_traffic` 同时进入公式(15)的优化器线延迟项和最终 `r2_latency.json`。
+因此不需要重跑 R1；每次 lifting 新生成的 `modules.json` 会保存原始访问次数、
+精确 counter 名、归一化权重、总访问次数、源 `stats.txt` 以及
+`instruction_window_scope`，便于审计。
+
+该模式有三项边界。第一，它是 profile-guided 研究扩展，不是论文严格验收数据，
+任何 `formal_validation.accepted=true` 配置都会拒绝它。第二，缺失任一核心、负数、
+非有限数或全零画像都会显式失败，绝不回退到等权。第三，当前 gem5 拓扑只有一个
+共享 `L2XBar`，所以 R2 注入的是访问频率加权后的单一整数周期，不是每核心独立
+延迟。通信次数也不等同于“某条路径增加一周期会造成多少 IPC 损失”的因果敏感度。
+
 ### 3.9 解析式布局器
 
 程序：`workflow/floorplan/optimize_layout.py`
@@ -250,7 +289,7 @@ BIPS2 = IPC2 × f_sus_GHz
 | `mcpat/input.xml` | 从 gem5 统计生成的四核心 McPAT 输入 |
 | `mcpat/mcpat.json` | 可机读的逐模块面积和功耗 |
 | `cacti/cacti_characterization.json` | CACTI ns、周期、能耗和面积 |
-| `modules.json` | 统一模块模型、IPC1、面积校准和 gamma |
+| `modules.json` | 统一模块模型、IPC1、面积校准、gamma，以及可审计的逐核心共享L2通信画像 |
 | `hotspot/layout.json` | 每个模块的 `(x,y,w,h,tier)` |
 | `hotspot/power_grid.json` | 每个单元的动态/泄漏/总功耗 |
 | `hotspot/hotspot_manifest.json` | HotSpot 文件路径、论文参数、假设和守恒残差 |
@@ -266,15 +305,15 @@ source scripts/env.sh
 python -m unittest discover -s tests -v
 ```
 
-当前14项测试包括公式(13)论文锚点、McPAT/CACTI解析、显式功耗校准、表 II 锚点、固定布局、面积重叠功耗守恒、布局延迟、冷却一致性、配置变更续跑守卫、严格R2汇总守卫、三候选对照布局，以及真实HotSpot频率缩放案例。
+当前测试包括公式(13)频率公式、McPAT/CACTI解析、本地CACTI几何传递、固定布局、面积重叠功耗守恒、布局延迟、冷却一致性、配置变更续跑守卫、严格R2汇总守卫、三候选对照布局，以及真实HotSpot频率缩放案例。
 
 ## 7. 必须明确的复现边界
 
 论文没有公开原始源码，因此以下内容是显式复现假设，而不是声称来自论文：
 
 - gem5 计数器到少数没有一对一计数器的 McPAT 活动字段的估算关系；
-- McPAT 320 K 器件工作点，以及表 III 锚定的全局动态/泄漏校准系数；
-- 论文表 II 值与本机 CACTI 输出之间的版本/组织差异；
+- McPAT 320 K 器件工作点和未公开 XML 字段的活动映射；
+- 本机 CACTI 版本和组织参数与论文未公开设置之间可能存在差异；
 - 当前 McPAT 版本为避免 CACTI-P 无有效阵列组织而保留的 32-bit 地址宽度；
 - 被动中介层厚度 100 μm；
 - 由表 III 内部温升锚定的有效局部热阻系数；

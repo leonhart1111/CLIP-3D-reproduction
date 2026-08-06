@@ -69,6 +69,101 @@ def mean_wire_cycles(modules: list[dict], f0_ghz: float,
     return sum(item["delay_cycles"] for item in per_core) / len(per_core), per_core
 
 
+def communication_weights_from_model(model: dict,
+                                     required: bool = False) -> dict[int, float] | None:
+    """Return recorded per-core traffic weights without inventing a fallback."""
+    profile = model.get("communication_profile")
+    if not isinstance(profile, dict) or profile.get("status") != "available":
+        if required:
+            diagnostics = profile.get("diagnostics", []) if isinstance(profile, dict) else []
+            detail = "; ".join(str(item) for item in diagnostics)
+            suffix = f": {detail}" if detail else ""
+            raise ValueError(f"communication profile unavailable{suffix}")
+        return None
+    per_core = profile.get("per_core")
+    if not isinstance(per_core, dict):
+        raise ValueError("available communication profile has no per-core records")
+    weights: dict[int, float] = {}
+    for core, record in per_core.items():
+        if not isinstance(record, dict) or "normalized_weight" not in record:
+            raise ValueError(f"communication profile core {core} has no normalized weight")
+        try:
+            core_id = int(core)
+            weight = float(record["normalized_weight"])
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"communication profile core {core} has an invalid weight") from error
+        if core_id in weights:
+            raise ValueError(f"communication profile repeats core {core_id}")
+        weights[core_id] = weight
+    return weights
+
+
+def aggregate_wire_cycles(per_core: list[dict], aggregation: str = "mean",
+                          communication_weights: dict[int | str, float] | None = None
+                          ) -> float:
+    """Aggregate represented core-to-L2 delays with one validated policy."""
+    if not per_core:
+        raise ValueError("wire aggregation requires at least one represented core")
+    delays: dict[int, float] = {}
+    for item in per_core:
+        core = int(item["core"])
+        delay = float(item["delay_cycles"])
+        if core in delays:
+            raise ValueError(f"wire delays repeat represented core {core}")
+        if not math.isfinite(delay) or delay < 0:
+            raise ValueError(f"core {core} wire delay must be finite and non-negative")
+        delays[core] = delay
+    if aggregation == "mean":
+        return sum(delays.values()) / len(delays)
+    if aggregation == "maximum":
+        return max(delays.values())
+    if aggregation != "traffic-weighted":
+        raise ValueError(f"unknown wire-cycle aggregation: {aggregation}")
+    if communication_weights is None:
+        raise ValueError("traffic-weighted wire aggregation requires communication weights")
+
+    weights: dict[int, float] = {}
+    for key, value in communication_weights.items():
+        try:
+            core = int(key)
+            weight = float(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("communication weights must use integer core IDs and numbers") from error
+        if core in weights:
+            raise ValueError(f"communication weights repeat core {core}")
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError("communication weights must be finite and non-negative")
+        weights[core] = weight
+    if set(weights) != set(delays):
+        raise ValueError(
+            "communication weight keys must exactly match represented core IDs: "
+            f"weights={sorted(weights)}, represented={sorted(delays)}"
+        )
+    if not math.isclose(sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("communication weights must sum to one")
+    return sum(weights[core] * delays[core] for core in sorted(delays))
+
+
+def select_rounded_wire_cycles(layout_delays: dict, aggregation: str) -> int:
+    """Select the one rounded layout-wire cycle consumed by shared-xbar R2."""
+    fields = {
+        "mean": "wire_cycles",
+        "maximum": "maximum_wire_cycles",
+        "traffic-weighted": "traffic_weighted_wire_cycles",
+    }
+    if aggregation not in fields:
+        raise ValueError(f"unknown wire-cycle aggregation: {aggregation}")
+    field = fields[aggregation]
+    if field not in layout_delays:
+        raise ValueError(
+            f"layout delays lack {field} required by {aggregation} aggregation"
+        )
+    value = int(layout_delays[field])
+    if value < 0:
+        raise ValueError("selected rounded wire delay cannot be negative")
+    return value
+
+
 def round_wire_cycles(value: float, policy: str = "nearest") -> int:
     if value < 0:
         raise ValueError("wire delay cannot be negative")
@@ -82,7 +177,9 @@ def round_wire_cycles(value: float, policy: str = "nearest") -> int:
 
 
 def derive_layout_delays(layout: dict, f0_ghz: float = 2.0,
-                         wire_rounding: str = "nearest") -> dict:
+                         wire_rounding: str = "nearest",
+                         communication_weights: dict[int | str, float] | None = None
+                         ) -> dict:
     modules = layout["modules"]
     l2 = l2_module(modules)
     centers = core_centers(modules)
@@ -92,7 +189,7 @@ def derive_layout_delays(layout: dict, f0_ghz: float = 2.0,
     mean_cycles, per_core = mean_wire_cycles(modules, f0_ghz)
     minimum_cycles = min(item["delay_cycles"] for item in per_core)
     maximum_cycles = max(item["delay_cycles"] for item in per_core)
-    return {
+    result = {
         "tsv_hops": hops[0],
         "wire_cycles_unrounded": mean_cycles,
         "wire_cycles": round_wire_cycles(mean_cycles, wire_rounding),
@@ -109,3 +206,25 @@ def derive_layout_delays(layout: dict, f0_ghz: float = 2.0,
             "distance": "smoothed Manhattan core-cluster center to L2 center",
         },
     }
+    if communication_weights is not None:
+        weighted = aggregate_wire_cycles(
+            per_core, "traffic-weighted", communication_weights
+        )
+        normalized = {int(key): float(value)
+                      for key, value in communication_weights.items()}
+        for item in per_core:
+            weight = normalized[int(item["core"])]
+            item["communication_weight"] = weight
+            item["weighted_delay_cycles_contribution"] = (
+                weight * item["delay_cycles"]
+            )
+        result.update({
+            "traffic_weighted_wire_cycles_unrounded": weighted,
+            "traffic_weighted_wire_cycles": round_wire_cycles(
+                weighted, wire_rounding
+            ),
+            "traffic_weighted_wire_cycle_aggregation": (
+                "shared-L2 demand-access weighted represented core-to-L2 paths"
+            ),
+        })
+    return result

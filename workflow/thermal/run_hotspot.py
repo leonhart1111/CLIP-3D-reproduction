@@ -8,7 +8,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from workflow.common import PROJECT_ROOT, read_json, write_json
+from workflow.common import PROJECT_ROOT, format_temperature_c, read_json, write_json
 
 
 DEFAULT_HOTSPOT = PROJECT_ROOT / "tools/src/hotspot/hotspot"
@@ -77,7 +77,10 @@ def main() -> None:
     parser.add_argument("--result-name", default="thermal_result.json")
     args = parser.parse_args()
     result = run_hotspot(args.case_dir, args.hotspot, args.ptrace, args.result_name)
-    print(f"HotSpot Tmax = {result['tmax_c']:.3f} C at {result['peak_unit']}")
+    print(
+        f"HotSpot Tmax = {format_temperature_c(result['tmax_c'])} C "
+        f"at {result['peak_unit']}"
+    )
 
 
 if __name__ == "__main__":

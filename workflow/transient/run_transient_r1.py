@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import shlex
 import subprocess
@@ -15,20 +16,41 @@ from workflow.common import PROJECT_ROOT, read_json, write_json
 
 DEFAULT_GEM5 = PROJECT_ROOT / "tools/src/gem5/build/X86/gem5.opt"
 TRANSIENT_CONFIG = PROJECT_ROOT / "configs/gem5/clip_r1_transient.py"
-
-
-def completed(output_dir: Path, sample_ms: float) -> bool:
+def completed(output_dir: Path, sample_ms: float,
+              source_r1_dir: Path | None = None) -> bool:
     status = output_dir / "status.json"
     metadata = output_dir / "r1_metadata.json"
     stats = output_dir / "stats.txt"
     if not status.is_file() or not metadata.is_file() or not stats.is_file():
         return False
     recorded = read_json(metadata)
-    return (
+    compatible = (
         read_json(status).get("state") == "success"
         and recorded.get("transient_statistics") is True
+        and recorded.get("transient_stats_mode") == "cumulative"
         and abs(float(recorded.get("sample_interval_ms", -1)) - sample_ms) < 1e-12
+        and isinstance(recorded.get("sample_interval_ticks"), int)
+        and int(recorded["sample_interval_ticks"]) > 0
+        and isinstance(recorded.get("measurement_start_tick"), int)
+        and isinstance(recorded.get("measurement_end_tick"), int)
+        and int(recorded["measurement_end_tick"])
+        > int(recorded["measurement_start_tick"])
     )
+    if not compatible or source_r1_dir is None:
+        return compatible
+    source_r1_dir = source_r1_dir.resolve()
+    recorded_status = read_json(status)
+    status_source = recorded_status.get("source_r1")
+    metadata_source = recorded.get("canonical_source_r1")
+    if (
+        not isinstance(status_source, str)
+        or not isinstance(metadata_source, str)
+        or Path(status_source).resolve() != source_r1_dir
+        or Path(metadata_source).resolve() != source_r1_dir
+    ):
+        return False
+    source_metadata = read_json(source_r1_dir / "r1_metadata.json")
+    return all(recorded.get(key) == value for key, value in source_metadata.items())
 
 
 def command_from_metadata(source_r1_dir: Path, output_dir: Path, gem5: Path,
@@ -40,6 +62,7 @@ def command_from_metadata(source_r1_dir: Path, output_dir: Path, gem5: Path,
         f"--outdir={output_dir.resolve()}",
         str(TRANSIENT_CONFIG.resolve()),
         "--sample-ms", str(sample_ms),
+        "--canonical-source-r1", str(source_r1_dir.resolve()),
         "--workload", metadata["workload"],
         "--binary", metadata["binary"],
         "--l1i-size", metadata["l1i_size"],
@@ -75,6 +98,14 @@ def run(source_r1_dir: Path, output_dir: Path, sample_ms: float = 10.0,
         gem5: Path = DEFAULT_GEM5, rerun: bool = False) -> dict:
     source_r1_dir = source_r1_dir.resolve()
     output_dir = output_dir.resolve()
+    if (
+        output_dir == source_r1_dir
+        or output_dir in source_r1_dir.parents
+        or source_r1_dir in output_dir.parents
+    ):
+        raise ValueError(
+            f"transient R1 output {output_dir} overlaps read-only input {source_r1_dir}"
+        )
     if not math.isfinite(sample_ms) or sample_ms <= 0:
         raise ValueError("sample_ms must be positive")
     for required in (source_r1_dir / "r1_metadata.json", source_r1_dir / "stats.txt"):
@@ -87,10 +118,20 @@ def run(source_r1_dir: Path, output_dir: Path, sample_ms: float = 10.0,
         raise FileNotFoundError(gem5)
     if not TRANSIENT_CONFIG.is_file():
         raise FileNotFoundError(TRANSIENT_CONFIG)
-    if not rerun and completed(output_dir, sample_ms):
+    if not rerun and completed(output_dir, sample_ms, source_r1_dir):
         return read_json(output_dir / "status.json")
     if not rerun and (output_dir / "status.json").is_file():
-        state = read_json(output_dir / "status.json").get("state")
+        existing_status = read_json(output_dir / "status.json")
+        state = existing_status.get("state")
+        recorded_source = existing_status.get("source_r1")
+        if (
+            state == "success"
+            and isinstance(recorded_source, str)
+            and Path(recorded_source).resolve() != source_r1_dir
+        ):
+            raise RuntimeError(
+                "successful transient R1 cache belongs to a different source R1"
+            )
         raise RuntimeError(
             f"transient R1 is not reusable (state={state} or sampling mismatch); "
             "use a new directory or --rerun"
@@ -105,11 +146,15 @@ def run(source_r1_dir: Path, output_dir: Path, sample_ms: float = 10.0,
         "shell_command": shlex.join(command),
     })
     started = time.time()
+    source_metadata_sha256 = "sha256:" + hashlib.sha256(
+        (source_r1_dir / "r1_metadata.json").read_bytes()
+    ).hexdigest()
     write_json(output_dir / "status.json", {
         "state": "running",
         "started_unix": started,
         "source_r1": str(source_r1_dir),
         "sample_interval_ms": sample_ms,
+        "source_r1_metadata_sha256": source_metadata_sha256,
         "command": command,
     })
     try:
@@ -125,6 +170,16 @@ def run(source_r1_dir: Path, output_dir: Path, sample_ms: float = 10.0,
         metadata = read_json(output_dir / "r1_metadata.json")
         if metadata.get("transient_statistics") is not True:
             raise RuntimeError("transient R1 did not record periodic-statistics metadata")
+        source_metadata = read_json(source_r1_dir / "r1_metadata.json")
+        mismatches = [
+            key for key, value in source_metadata.items()
+            if metadata.get(key) != value
+        ]
+        if mismatches:
+            raise RuntimeError(
+                "transient R1 metadata differs from canonical source: "
+                + ", ".join(mismatches)
+            )
         result = {
             "state": "success",
             "started_unix": started,
@@ -132,6 +187,7 @@ def run(source_r1_dir: Path, output_dir: Path, sample_ms: float = 10.0,
             "elapsed_seconds": time.time() - started,
             "source_r1": str(source_r1_dir),
             "sample_interval_ms": sample_ms,
+            "source_r1_metadata_sha256": source_metadata_sha256,
             "command": command,
         }
     except BaseException as error:
@@ -142,6 +198,7 @@ def run(source_r1_dir: Path, output_dir: Path, sample_ms: float = 10.0,
             "elapsed_seconds": time.time() - started,
             "source_r1": str(source_r1_dir),
             "sample_interval_ms": sample_ms,
+            "source_r1_metadata_sha256": source_metadata_sha256,
             "command": command,
             "error": f"{type(error).__name__}: {error}",
         })

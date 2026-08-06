@@ -127,7 +127,7 @@ python -m workflow.run_lifting_sweep \
 
 `cool3d-standard` 和 `sa-lambda` 各自对三个候选执行真实 HotSpot。由于论文没有公开这两个对照方法的源码和数值参数，本项目的有限网格与定种子 SA 是显式的独立复现，所有候选和搜索参数均写入 `layout_search/search_report.json`。
 
-`clip3d` 对解析优化器提出的候选和 fixed-bin 各执行一次真实 HotSpot，再按真实热约束 BIPS、离散平均线延迟和 Tmax 依次选择。代理候选更差时会回退 fixed-bin；`layout_selection.json` 会保留两次实测和回退原因。该保护是防止未公开代理系数造成假收益的复现措施，不应描述成论文原算法。由于配置现在包含修正后的 CACTI/Table-II 几何与 `8.72` 热阻校准，旧配置生成的下游结果会被续跑检查判为过期。
+`clip3d` 对解析优化器提出的候选和 fixed-bin 各执行一次真实 HotSpot，再按真实热约束 BIPS、离散平均线延迟和 Tmax 依次选择。代理候选更差时会回退 fixed-bin；`layout_selection.json` 会保留两次实测和回退原因。该保护是防止未公开代理系数造成假收益的复现措施，不应描述成论文原算法。由于配置现在包含本地 CACTI 几何与热阻校准，旧配置生成的下游结果会被续跑检查判为过期。
 
 生成表 V、VI、VII 的机器可读结果：
 

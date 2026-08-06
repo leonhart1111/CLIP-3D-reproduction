@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 from workflow.common import (
@@ -15,13 +16,84 @@ from workflow.common import (
 )
 
 
-# The reference pre-scale area combines McPAT non-cache logic with the
-# published CACTI/Table-II cache areas for the paper reference architecture
-# (4 cores, 32-kB L1I/L1D, 512-kB shared L2).  The previous 78.9409-mm^2
-# denominator used McPAT cache areas and therefore silently discarded the
-# CACTI geometry produced by the preceding pipeline stage.
-DEFAULT_REFERENCE_RAW_AREA_MM2 = 57.713078
+# The reference pre-scale area combines McPAT non-cache logic with local CACTI
+# cache areas for the paper reference architecture (4 cores, 32-kB L1I/L1D,
+# 512-kB shared L2).  Cache area and delay must come from the local CACTI run,
+# not from paper tables.
+DEFAULT_REFERENCE_RAW_AREA_MM2 = 45.7538495872
 DEFAULT_AREA_SCALE = 150.0 / DEFAULT_REFERENCE_RAW_AREA_MM2
+
+
+def extract_communication_profile(stats: dict[str, float], num_cores: int,
+                                  stats_path: Path,
+                                  instruction_window_scope: str,
+                                  required: bool = False) -> dict:
+    """Build an auditable shared-L2 demand-access profile for represented CPUs."""
+    if num_cores <= 0:
+        raise ValueError("communication profile requires at least one core")
+    per_core: dict[str, dict] = {}
+    diagnostics: list[str] = []
+    raw_counts: list[float | None] = []
+    missing_cores: list[int] = []
+    for core in range(num_cores):
+        candidates = [
+            f"system.l2.demandAccesses::cpu{core}.data",
+            f"system.l2.demandAccesses::cpu{core}.inst",
+        ]
+        matched = [name for name in candidates if name in stats]
+        if not matched:
+            missing_cores.append(core)
+            diagnostics.append(f"missing shared-L2 demand counter for core {core}")
+            raw_count: float | None = 0.0
+        else:
+            values = [float(stats[name]) for name in matched]
+            nonfinite = [name for name, value in zip(matched, values)
+                         if not math.isfinite(value)]
+            negative = [name for name, value in zip(matched, values) if value < 0]
+            if nonfinite:
+                diagnostics.extend(
+                    f"non-finite shared-L2 demand counter: {name}"
+                    for name in nonfinite
+                )
+                raw_count = None
+            else:
+                raw_count = sum(values)
+            diagnostics.extend(
+                f"negative shared-L2 demand counter: {name}" for name in negative
+            )
+        raw_counts.append(raw_count)
+        per_core[str(core)] = {
+            "matched_counters": matched,
+            "raw_demand_accesses": raw_count,
+            "normalized_weight": None,
+        }
+
+    total = None if any(value is None for value in raw_counts) else sum(
+        float(value) for value in raw_counts if value is not None
+    )
+    if total is not None and total <= 0:
+        diagnostics.append("total demand accesses must be positive")
+    status = "unavailable" if diagnostics else "available"
+    if status == "available":
+        assert total is not None and total > 0
+        for record in per_core.values():
+            record["normalized_weight"] = record["raw_demand_accesses"] / total
+
+    profile = {
+        "status": status,
+        "source_stats": str(stats_path.resolve()),
+        "instruction_window_scope": instruction_window_scope,
+        "counter_family": "system.l2.demandAccesses per CPU requestor",
+        "per_core": per_core,
+        "total_demand_accesses": total,
+        "missing_cores": missing_cores,
+        "diagnostics": diagnostics,
+    }
+    if required and status != "available":
+        raise ValueError(
+            "communication profile unavailable: " + "; ".join(diagnostics)
+        )
+    return profile
 
 
 def cache_record(cacti: dict, level: str, size: str) -> dict:
@@ -75,9 +147,18 @@ def apply_physical_areas(modules: list[dict], metadata: dict, cacti: dict,
 
 
 def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
-                area_scale: float = DEFAULT_AREA_SCALE) -> dict:
+                area_scale: float = DEFAULT_AREA_SCALE,
+                require_communication_profile: bool = False) -> dict:
     metadata = read_json(r1_dir / "r1_metadata.json")
-    stats = parse_gem5_stats(r1_dir / "stats.txt")
+    stats_path = r1_dir / "stats.txt"
+    stats = parse_gem5_stats(stats_path)
+    communication_stats = parse_gem5_stats(stats_path, include_nonfinite=True)
+    num_cores = int(metadata.get("num_cores", 4))
+    communication_profile = extract_communication_profile(
+        communication_stats, num_cores, stats_path,
+        str(metadata.get("instruction_window_scope", "not recorded")),
+        require_communication_profile,
+    )
     mcpat = read_json(mcpat_json)
     cacti = read_json(cacti_json)
     modules = apply_physical_areas(mcpat["modules"], metadata, cacti, area_scale)
@@ -108,7 +189,9 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
         "source_mcpat": str(mcpat_json.resolve()),
         "source_cacti": str(cacti_json.resolve()),
         "architecture": metadata,
-        "ipc1": aggregate_ipc(stats, int(metadata.get("num_cores", 4))),
+        "ipc1": aggregate_ipc(stats, num_cores),
+        "communication_profile": communication_profile,
+        "power_provenance": mcpat["power_provenance"],
         "area_calibration": {
             "scale_factor": area_scale,
             "reference_target_mm2": 150.0,
@@ -116,12 +199,10 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
             "reference_architecture": "4 cores, L1D=32kB, L2=512kB, 45nm",
             "pre_scale_sources": {
                 "core_logic_and_interconnect": "McPAT",
-                "l1i_l1d_l2": "CACTI effective geometry (paper Table II in formal mode)",
+                "l1i_l1d_l2": "local CACTI run",
             },
             "scope": "global area scale only; power is not scaled",
         },
-        "power_calibration": mcpat.get("power_calibration"),
-        "raw_mcpat_module_totals": mcpat.get("raw_module_totals"),
         "power_distribution": {
             "by_kind": by_kind,
             "movable_kinds": ["l2"],
