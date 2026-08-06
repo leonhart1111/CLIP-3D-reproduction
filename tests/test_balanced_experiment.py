@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import sys
+import shutil
 from copy import deepcopy
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -3315,6 +3316,101 @@ class PairedAggregationTests(unittest.TestCase):
             })
         return self.root / "paired_results.csv", self.root / "paired_summary.json"
 
+    def _attach_real_reuse_for_selected_pair(self) -> tuple[dict, Path]:
+        """Install one Task-5 fixture under a selected key and commit real reuse."""
+        from workflow.r2 import attach_result, reuse_result, run_r2
+
+        source = StrictR2ReuseTests(
+            "test_exact_reuse_writes_provenance_and_recomputes_clip_performance"
+        )
+        source.setUp()
+        self.addCleanup(source.doCleanups)
+        key = {"workload": "fft", "l1d_size": "64kB", "l2_size": "512kB"}
+        relative = Path(key["workload"]) / f"l1d_{key['l1d_size']}" / (
+            f"l2_{key['l2_size']}"
+        )
+        r1 = self.r1_root / relative
+        fixed = self.fixed_root / relative
+        clip = self.clip_root / relative
+        for old, new in ((source.r1, r1), (source.fixed, fixed), (source.clip, clip)):
+            shutil.copytree(old, new, dirs_exist_ok=True)
+
+        metadata = read_json(r1 / "r1_metadata.json")
+        metadata.update(key)
+        write_json(r1 / "r1_metadata.json", metadata)
+        for point, method in ((fixed, "fixed-bin"), (clip, "clip3d")):
+            run_config = read_json(point / "run_config.json")
+            run_config.update({"source": str(self.config_path.resolve()),
+                               "config": self.config, "layout_method": method})
+            write_json(point / "run_config.json", run_config)
+            modules = read_json(point / "modules.json")
+            modules["source_r1"] = str(r1.resolve())
+            modules["architecture"] = metadata
+            write_json(point / "modules.json", modules)
+            thermal = read_json(point / "hotspot/thermal_result.json")
+            thermal.update({
+                "power_trace": str((point / "hotspot/power.ptrace").resolve()),
+                "steady_file": str((point / "hotspot/steady.txt").resolve()),
+                "grid_steady_file": str((point / "hotspot/grid.steady.txt").resolve()),
+            })
+            write_json(point / "hotspot/thermal_result.json", thermal)
+            summary = read_json(point / "pipeline_summary.json")
+            summary.update({**key, "r1": str(r1.resolve()),
+                            "output": str(point.resolve()), "layout_method": method,
+                            "layout_mode": method,
+                            "r2_critical_path_cycles": read_json(
+                                point / "r2_latency.json"
+                            )["critical_l1d_to_l2_cycles"]})
+            write_json(point / "pipeline_summary.json", summary)
+
+        result_path = fixed / "gem5_r2/r2_result.json"
+        result = read_json(result_path)
+        identity = run_r2._provenance(r1, fixed / "r2_latency.json")
+        command = list(result["command"])
+        command[command.index("--outdir=" + str(source.fixed / "gem5_r2"))] = (
+            "--outdir=" + str((fixed / "gem5_r2").resolve())
+        )
+        command[command.index("--l1d-size") + 1] = key["l1d_size"]
+        result.update({**identity, "command": command,
+                       "stats": str((fixed / "gem5_r2/stats.txt").resolve()),
+                       "stats_sha256": sha256_file(fixed / "gem5_r2/stats.txt")})
+        write_json(result_path, result)
+        status_path = fixed / "gem5_r2/status.json"
+        status = read_json(status_path)
+        status.update({**identity, "command": command,
+                       "r2_result": str(result_path.resolve()),
+                       "r2_result_sha256": sha256_file(result_path),
+                       "stats": str((fixed / "gem5_r2/stats.txt").resolve()),
+                       "stats_sha256": sha256_file(fixed / "gem5_r2/stats.txt")})
+        write_json(status_path, status)
+        fixed_summary = read_json(fixed / "pipeline_summary.json")
+        fixed_summary["r2_source"] = str(result_path.resolve())
+        fixed_summary["artifacts"]["r2_result"] = str(result_path.resolve())
+        write_json(fixed / "pipeline_summary.json", fixed_summary)
+
+        attach_result.attach(fixed)
+        fixed_summary = read_json(fixed / "pipeline_summary.json")
+        fixed_performance = read_json(fixed / "performance.json")
+        fixed_summary["sustainable_frequency_ghz"] = fixed_performance[
+            "sustainable_frequency_ghz"
+        ]
+        fixed_summary["bips2"] = fixed_performance["bips2"]
+        write_json(fixed / "pipeline_summary.json", fixed_summary)
+        summary = reuse_result.attach_reused_result(fixed, clip, r1, self.config_path)
+        pair_path = self.status_root / relative / "pair_status.json"
+        pair = read_json(pair_path)
+        pair.update({
+            "r1_directory": str(r1.resolve()),
+            "fixed_point": str(fixed.resolve()), "clip3d_point": str(clip.resolve()),
+            "fixed_vector_sha256": sha256_file(fixed / "r2_latency.json"),
+            "clip3d_vector_sha256": sha256_file(clip / "r2_latency.json"),
+            "fixed_ipc2": fixed_summary["ipc2"], "fixed_bips2": fixed_summary["bips2"],
+            "clip3d_ipc2": summary["ipc2"], "clip3d_bips2": summary["bips2"],
+            "clip3d_reused_fixed_r2": True, "physical_r2_runs": 1,
+        })
+        write_json(pair_path, pair)
+        return summary, clip / "r2_reuse.json"
+
     def test_report_uses_all_fifty_measured_pairs_and_preserves_temperature_precision(self):
         """Dropping a selected row or rounding report temperatures changes the result."""
         from workflow.analysis.summarize_paired_sweep import summarize
@@ -3569,6 +3665,41 @@ class PairedAggregationTests(unittest.TestCase):
                          (2, 1, 1))
         self.assertEqual(result["fixed_to_clip_reuse_count"], 2)
         self.assertEqual(result["separate_clip_r2_count"], 2)
+
+    def test_report_accepts_committed_task5_reuse_and_rejects_marker_tampering(self):
+        """A real reused row is accepted only while its Task-5 marker remains bound."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        csv_path, json_path = self._make_complete_fixture()
+        summary, marker_path = self._attach_real_reuse_for_selected_pair()
+
+        result = summarize(self.fixed_root, self.clip_root, self.selection_path,
+                           self.config_path, csv_path, json_path)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["aggregate"]["fixed_to_clip_reuse_count"], 1)
+        self.assertEqual(result["aggregate"]["separate_clip_r2_count"], 49)
+        self.assertAlmostEqual(summary["ipc2"], 3.25)
+
+        marker = read_json(marker_path)
+        marker["source_ipc2"] = 99.0
+        write_json(marker_path, marker)
+        with self.assertRaisesRegex(ValueError, "reuse"):
+            summarize(self.fixed_root, self.clip_root, self.selection_path,
+                      self.config_path, csv_path, json_path)
+
+    def test_report_rejects_tampered_committed_reuse_output_hash(self):
+        """A reuse marker's published-output hash must bind the live summary bytes."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        csv_path, json_path = self._make_complete_fixture()
+        _summary, marker_path = self._attach_real_reuse_for_selected_pair()
+        marker = read_json(marker_path)
+        marker["target_outputs"]["summary"]["sha256"] = "0" * 64
+        write_json(marker_path, marker)
+
+        with self.assertRaisesRegex(ValueError, "reuse"):
+            summarize(self.fixed_root, self.clip_root, self.selection_path,
+                      self.config_path, csv_path, json_path)
 
     def test_report_rejects_duplicate_or_unbound_status_keys_and_mixed_config_hashes(self):
         """A status set that cannot be one selected/configured experiment is invalid."""
