@@ -3,16 +3,19 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
+import fcntl
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import tempfile
 
 from workflow.common import write_json
 from workflow.r2.run_r2 import canonical_gem5_args, validate_local_result
-from workflow.thermal.sustainable_frequency import evaluate
+from workflow.thermal.sustainable_frequency import closed_form_frequency, evaluate
 
 
 def _capture_file(path: Path, reasons: list[str], label: str,
@@ -85,6 +88,32 @@ def _replace_bytes(path: Path, data: bytes) -> None:
     temporary.replace(path)
 
 
+def _current_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _restore_if_still_published(path: Path, published_sha256: str,
+                                previous_bytes: bytes) -> None:
+    """Restore bytes still owned by this attachment under the point lock."""
+    if _current_sha256(path) == published_sha256:
+        _replace_bytes(path, previous_bytes)
+
+
+@contextmanager
+def _exclusive_point_lock(point: Path):
+    """Serialize validation, publication, marker commit, and rollback per point."""
+    descriptor = os.open(Path(point), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _accepted_marker_bytes(path: Path, performance_path: Path,
                            performance_sha256: str, summary_path: Path,
                            summary_sha256: str,
@@ -132,8 +161,62 @@ def _finite_number(value: object) -> bool:
             and math.isfinite(float(value)))
 
 
+def _matches_expected(value: object, expected: object) -> bool:
+    if isinstance(expected, bool):
+        return value is expected
+    if isinstance(expected, int):
+        return (isinstance(value, int) and not isinstance(value, bool)
+                and value == expected)
+    if isinstance(expected, float):
+        return (_finite_number(value) and math.isclose(
+            float(value), expected, rel_tol=1e-12, abs_tol=1e-12
+        ))
+    return value == expected
+
+
+def _derived_target_performance(modules: dict, thermal: dict,
+                                config: dict) -> dict:
+    """Derive the evaluator's complete non-R2 performance contract."""
+    frequency_config = config["frequency"]
+    gamma = float(modules["gamma"])
+    f0_ghz = float(frequency_config["f0_ghz"])
+    fmin_ghz = float(frequency_config["fmin_ghz"])
+    tsafe_c = float(frequency_config["tsafe_c"])
+    ambient_c = float(frequency_config["ambient_c"])
+    tmax_c = float(thermal["tmax_c"])
+    frequency, state, raw = closed_form_frequency(
+        tmax_c, gamma, f0_ghz, fmin_ghz, tsafe_c, ambient_c
+    )
+    floor_power_scale = gamma + (1.0 - gamma) * (fmin_ghz / f0_ghz)
+    estimated_tmax_at_fmin = ambient_c + (
+        tmax_c - ambient_c
+    ) * floor_power_scale
+    ipc1 = float(modules["ipc1"])
+    return {
+        "schema_version": 1,
+        "equation": 13,
+        "gamma": gamma,
+        "leakage_power_w": float(modules["totals"]["leakage_power_w"]),
+        "dynamic_power_w": float(modules["totals"]["dynamic_power_w"]),
+        "tmax_f0_c": tmax_c,
+        "ambient_c": ambient_c,
+        "tsafe_c": tsafe_c,
+        "f0_ghz": f0_ghz,
+        "fmin_ghz": fmin_ghz,
+        "unclamped_solution_ghz": raw,
+        "sustainable_frequency_ghz": frequency,
+        "estimated_tmax_at_fmin_c": estimated_tmax_at_fmin,
+        "thermal_feasible_at_fmin": estimated_tmax_at_fmin <= tsafe_c,
+        "floor_power_scale": floor_power_scale,
+        "state": state,
+        "ipc1": ipc1,
+        "bips1_thermal": ipc1 * frequency,
+    }
+
+
 def _validate_target_inputs(metadata: dict, config: dict, modules: dict,
-                            thermal: dict, summary: dict, r1_dir: Path,
+                            thermal: dict, performance: dict, summary: dict,
+                            r1_dir: Path,
                             clip_point: Path,
                             reasons: list[str]) -> None:
     architecture = modules.get("architecture")
@@ -208,12 +291,32 @@ def _validate_target_inputs(metadata: dict, config: dict, modules: dict,
             float(thermal["tmax_k"]) - 273.15, float(tmax_c),
             rel_tol=0.0, abs_tol=1e-9):
         reasons.append("target thermal Kelvin/Celsius values disagree")
-    summary_tmax = summary.get("tmax_c")
-    if (not _finite_number(summary_tmax) or not _finite_number(tmax_c)
-            or not math.isclose(
-                float(summary_tmax), float(tmax_c), rel_tol=0.0, abs_tol=1e-9
-            )):
-        reasons.append("target summary thermal tmax_c differs from thermal result")
+    try:
+        expected_performance = _derived_target_performance(
+            modules, thermal, config
+        )
+    except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
+        reasons.append(f"cannot derive target thermal performance: {error}")
+        return
+    for field, expected in expected_performance.items():
+        if not _matches_expected(performance.get(field), expected):
+            reasons.append(
+                f"target performance {field} differs from target module/thermal inputs"
+            )
+    for summary_field, performance_field, message in (
+            ("gamma", "gamma",
+             "target summary gamma differs from target performance"),
+            ("tmax_c", "tmax_f0_c",
+             "target summary thermal tmax_c differs from target performance"),
+            ("sustainable_frequency_ghz", "sustainable_frequency_ghz",
+             "target summary sustainable_frequency_ghz differs from target performance"),
+            ("ipc1", "ipc1",
+             "target summary ipc1 differs from target performance"),
+            ("bips1_thermal", "bips1_thermal",
+             "target summary bips1_thermal differs from target performance")):
+        if not _matches_expected(
+                summary.get(summary_field), expected_performance[performance_field]):
+            reasons.append(message)
 
 
 def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
@@ -267,7 +370,7 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
     target_thermal = _read_object(
         target_thermal_path, reasons, "target thermal result", snapshots
     )
-    _read_object(
+    target_performance = _read_object(
         target_performance_path, reasons, "target performance", snapshots
     )
     captured_source_result = _read_object(
@@ -344,10 +447,11 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
             reasons.append(f"{label} run config layout method is not {method}")
 
     if all(value is not None for value in (
-            metadata, config, target_modules, target_thermal, clip_summary)):
+            metadata, config, target_modules, target_thermal,
+            target_performance, clip_summary)):
         _validate_target_inputs(
-            metadata, config, target_modules, target_thermal, clip_summary,
-            r1_dir, clip_point, reasons
+            metadata, config, target_modules, target_thermal,
+            target_performance, clip_summary, r1_dir, clip_point, reasons
         )
 
     if source_status is not None and source_status.get("state") != "success":
@@ -459,6 +563,16 @@ def validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
 
 def attach_reused_result(fixed_point: Path, clip_point: Path, r1_dir: Path,
                          config_path: Path) -> dict:
+    """Attach one result while excluding concurrent transactions on the point."""
+    clip_point = Path(clip_point).resolve()
+    with _exclusive_point_lock(clip_point):
+        return _attach_reused_result_locked(
+            fixed_point, clip_point, r1_dir, config_path
+        )
+
+
+def _attach_reused_result_locked(fixed_point: Path, clip_point: Path, r1_dir: Path,
+                                 config_path: Path) -> dict:
     """Attach accepted fixed-bin IPC2 and recompute target CLIP performance."""
     fixed_point = Path(fixed_point).resolve()
     clip_point = Path(clip_point).resolve()
@@ -490,7 +604,7 @@ def attach_reused_result(fixed_point: Path, clip_point: Path, r1_dir: Path,
         context["clip_summary"],
         artifact,
     )
-    publication_started = False
+    attempted_outputs: dict[Path, tuple[str, bytes]] = {}
 
     try:
         with tempfile.TemporaryDirectory(prefix=".r2-reuse-", dir=clip_point) as staging:
@@ -517,6 +631,13 @@ def attach_reused_result(fixed_point: Path, clip_point: Path, r1_dir: Path,
 
             summary = deepcopy(context["clip_summary"])
             summary.update({
+                "gamma": performance["gamma"],
+                "tmax_c": performance["tmax_f0_c"],
+                "sustainable_frequency_ghz": performance[
+                    "sustainable_frequency_ghz"
+                ],
+                "ipc1": performance["ipc1"],
+                "bips1_thermal": performance["bips1_thermal"],
                 "ipc2": ipc2,
                 "bips2": performance["bips2"],
                 "r2_source": str(source_result_path),
@@ -548,17 +669,22 @@ def attach_reused_result(fixed_point: Path, clip_point: Path, r1_dir: Path,
                     "path": str(summary_path),
                     "sha256": summary_sha256,
                 },
+                "gamma": performance["gamma"],
                 "sustainable_frequency_ghz": performance[
                     "sustainable_frequency_ghz"
                 ],
+                "ipc1": performance["ipc1"],
+                "bips1_thermal": performance["bips1_thermal"],
                 "bips2": performance["bips2"],
             }
-            publication_started = True
             artifact_path.unlink(missing_ok=True)
+            attempted_outputs[performance_path] = (
+                performance_sha256, performance_before
+            )
             write_json(performance_path, performance)
-            if hashlib.sha256(performance_path.read_bytes()).hexdigest() \
-                    != performance_sha256:
+            if _current_sha256(performance_path) != performance_sha256:
                 raise OSError("published performance differs from staged output")
+            attempted_outputs[summary_path] = (summary_sha256, summary_before)
             write_json(summary_path, summary)
             changed = []
             _record_changed_snapshots(
@@ -566,26 +692,21 @@ def attach_reused_result(fixed_point: Path, clip_point: Path, r1_dir: Path,
             )
             if changed:
                 raise ValueError("R2 reuse inputs " + "; ".join(changed))
-            if (hashlib.sha256(performance_path.read_bytes()).hexdigest()
-                    != performance_sha256
-                    or hashlib.sha256(summary_path.read_bytes()).hexdigest()
-                    != summary_sha256):
+            if (_current_sha256(performance_path) != performance_sha256
+                    or _current_sha256(summary_path) != summary_sha256):
                 raise OSError("published outputs changed before acceptance marker")
             write_json(artifact_path, artifact)
             return summary
     except Exception:
-        if publication_started:
-            _replace_bytes(performance_path, performance_before)
-            _replace_bytes(summary_path, summary_before)
+        for path, (published_sha256, previous_bytes) in attempted_outputs.items():
+            _restore_if_still_published(path, published_sha256, previous_bytes)
         changed = []
         _record_changed_snapshots(
             snapshots, changed, {performance_path, summary_path}
         )
         outputs_restored = (
-            hashlib.sha256(performance_path.read_bytes()).hexdigest()
-            == snapshots[performance_path]["sha256"]
-            and hashlib.sha256(summary_path.read_bytes()).hexdigest()
-            == snapshots[summary_path]["sha256"]
+            _current_sha256(performance_path) == snapshots[performance_path]["sha256"]
+            and _current_sha256(summary_path) == snapshots[summary_path]["sha256"]
         )
         if previous_marker is not None and not changed and outputs_restored:
             _replace_bytes(artifact_path, previous_marker)

@@ -1033,7 +1033,19 @@ class StrictR2ReuseTests(unittest.TestCase):
             "schema_version": 1,
             "equation": 13,
             "gamma": 0.2,
+            "leakage_power_w": 20.0,
+            "dynamic_power_w": 80.0,
+            "tmax_f0_c": 134.375,
+            "ambient_c": 25.0,
+            "tsafe_c": 95.0,
+            "f0_ghz": 2.0,
+            "fmin_ghz": 0.4,
+            "unclamped_solution_ghz": frequency,
             "sustainable_frequency_ghz": frequency,
+            "estimated_tmax_at_fmin_c": 64.375,
+            "thermal_feasible_at_fmin": True,
+            "floor_power_scale": 0.36,
+            "state": "thermally_limited",
             "ipc1": 2.75,
             "bips1_thermal": 2.75 * frequency,
         })
@@ -1047,6 +1059,7 @@ class StrictR2ReuseTests(unittest.TestCase):
             "l2_size": "512kB",
             "layout_method": method,
             "layout_mode": method,
+            "gamma": 0.2,
             "tmax_c": 134.375,
             "sustainable_frequency_ghz": frequency,
             "ipc1": 2.75,
@@ -1647,6 +1660,76 @@ class StrictR2ReuseTests(unittest.TestCase):
                 self.assertTrue(any(expected in reason for reason in decision["reasons"]),
                                 decision["reasons"])
 
+    def test_reuse_rejects_incoherent_target_performance_and_summary(self):
+        """Every non-R2 performance field must derive from one target input set."""
+        from workflow.r2.reuse_result import validate_reuse
+
+        def change_modules_ipc1():
+            modules = read_json(self.clip / "modules.json")
+            modules["ipc1"] = 3.0
+            write_json(self.clip / "modules.json", modules)
+
+        def change_performance(field, value):
+            def mutate():
+                performance = read_json(self.clip / "performance.json")
+                performance[field] = value
+                write_json(self.clip / "performance.json", performance)
+            return mutate
+
+        def change_summary(field, value):
+            def mutate():
+                summary = read_json(self.clip / "pipeline_summary.json")
+                summary[field] = value
+                write_json(self.clip / "pipeline_summary.json", summary)
+            return mutate
+
+        cases = [("modules-ipc1", change_modules_ipc1, "performance ipc1")]
+        cases.extend(
+            (f"performance-{field}", change_performance(field, value), field)
+            for field, value in (
+                ("schema_version", 2),
+                ("equation", 12),
+                ("gamma", 0.3),
+                ("leakage_power_w", 21.0),
+                ("dynamic_power_w", 81.0),
+                ("tmax_f0_c", 130.0),
+                ("ambient_c", 30.0),
+                ("tsafe_c", 90.0),
+                ("f0_ghz", 1.8),
+                ("fmin_ghz", 0.5),
+                ("unclamped_solution_ghz", 1.2),
+                ("sustainable_frequency_ghz", 1.2),
+                ("estimated_tmax_at_fmin_c", 70.0),
+                ("thermal_feasible_at_fmin", False),
+                ("floor_power_scale", 0.4),
+                ("state", "thermal_headroom"),
+                ("ipc1", 3.0),
+                ("bips1_thermal", 3.0),
+            )
+        )
+        cases.extend(
+            (f"summary-{field}", change_summary(field, value), field)
+            for field, value in (
+                ("gamma", 0.9),
+                ("sustainable_frequency_ghz", 1.2),
+                ("ipc1", 3.0),
+                ("bips1_thermal", 3.0),
+            )
+        )
+
+        for label, mutate, expected in cases:
+            with self.subTest(label=label):
+                self._write_point(self.clip, "clip3d", 1.1)
+                mutate()
+
+                decision = validate_reuse(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+                self.assertFalse(decision["accepted"])
+                self.assertTrue(any(expected in reason for reason in decision["reasons"]),
+                                decision["reasons"])
+
     def test_reuse_rejects_input_replaced_during_validation_snapshot(self):
         """Parsed vector bytes and recorded hashes must come from one stable snapshot."""
         import workflow.r2.reuse_result as reuse_result
@@ -1719,6 +1802,37 @@ class StrictR2ReuseTests(unittest.TestCase):
         self.assertEqual((self.clip / "performance.json").read_bytes(), performance_before)
         self.assertEqual((self.clip / "pipeline_summary.json").read_bytes(), summary_before)
 
+    def test_rollback_preserves_summary_replaced_before_this_attempt_publishes_it(self):
+        """A performance write does not grant rollback ownership of the summary."""
+        import workflow.r2.reuse_result as reuse_result
+
+        performance_before = (self.clip / "performance.json").read_bytes()
+        concurrent_summary = {"concurrent": "summary-before-publication"}
+        real_publish = reuse_result.write_json
+        interrupted = False
+
+        def replace_summary_then_fail(path, value):
+            nonlocal interrupted
+            if Path(path).resolve() == (self.clip / "pipeline_summary.json").resolve() \
+                    and not interrupted:
+                interrupted = True
+                real_publish(path, concurrent_summary)
+                raise OSError("injected pre-summary publication failure")
+            return real_publish(path, value)
+
+        with patch("workflow.r2.reuse_result.write_json",
+                   side_effect=replace_summary_then_fail):
+            with self.assertRaisesRegex(OSError, "pre-summary publication"):
+                reuse_result.attach_reused_result(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+        self.assertFalse((self.clip / "r2_reuse.json").exists())
+        self.assertEqual((self.clip / "performance.json").read_bytes(), performance_before)
+        self.assertEqual(
+            read_json(self.clip / "pipeline_summary.json"), concurrent_summary
+        )
+
     def test_attach_rechecks_inputs_immediately_before_acceptance_marker(self):
         """An input changed during output publication must abort the final commit marker."""
         import workflow.r2.reuse_result as reuse_result
@@ -1754,8 +1868,6 @@ class StrictR2ReuseTests(unittest.TestCase):
         """The marker must bind the exact performance and summary just published."""
         import workflow.r2.reuse_result as reuse_result
 
-        performance_before = (self.clip / "performance.json").read_bytes()
-        summary_before = (self.clip / "pipeline_summary.json").read_bytes()
         real_publish = reuse_result.write_json
         replaced = False
 
@@ -1777,15 +1889,15 @@ class StrictR2ReuseTests(unittest.TestCase):
                 )
 
         self.assertFalse((self.clip / "r2_reuse.json").exists())
-        self.assertEqual((self.clip / "performance.json").read_bytes(), performance_before)
-        self.assertEqual((self.clip / "pipeline_summary.json").read_bytes(), summary_before)
+        self.assertEqual(read_json(self.clip / "performance.json"), {"tampered": True})
+        self.assertEqual(
+            read_json(self.clip / "pipeline_summary.json"), {"tampered": True}
+        )
 
     def test_attach_checks_outputs_after_final_immutable_scan(self):
         """Output replacement during the final scan must precede the last hash check."""
         import workflow.r2.reuse_result as reuse_result
 
-        performance_before = (self.clip / "performance.json").read_bytes()
-        summary_before = (self.clip / "pipeline_summary.json").read_bytes()
         original_scan = reuse_result._record_changed_snapshots
         replaced = False
 
@@ -1805,8 +1917,95 @@ class StrictR2ReuseTests(unittest.TestCase):
                 )
 
         self.assertFalse((self.clip / "r2_reuse.json").exists())
-        self.assertEqual((self.clip / "performance.json").read_bytes(), performance_before)
+        self.assertEqual(read_json(self.clip / "performance.json"), {"tampered": True})
+        self.assertEqual(
+            read_json(self.clip / "pipeline_summary.json"), {"tampered": True}
+        )
+
+    def test_rollback_restores_owned_summary_but_preserves_replaced_performance(self):
+        """Per-output CAS restores only bytes still owned by this attempt."""
+        import workflow.r2.reuse_result as reuse_result
+
+        summary_before = (self.clip / "pipeline_summary.json").read_bytes()
+        concurrent_performance = {"concurrent": "performance-after-publication"}
+        original_scan = reuse_result._record_changed_snapshots
+        replaced = False
+
+        def replace_performance_after_scan(snapshots, reasons, ignored=None):
+            nonlocal replaced
+            original_scan(snapshots, reasons, ignored)
+            if ignored and not replaced:
+                replaced = True
+                write_json(self.clip / "performance.json", concurrent_performance)
+
+        with patch("workflow.r2.reuse_result._record_changed_snapshots",
+                   side_effect=replace_performance_after_scan):
+            with self.assertRaisesRegex(OSError, "published outputs changed"):
+                reuse_result.attach_reused_result(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+
+        self.assertFalse((self.clip / "r2_reuse.json").exists())
+        self.assertEqual(
+            read_json(self.clip / "performance.json"), concurrent_performance
+        )
         self.assertEqual((self.clip / "pipeline_summary.json").read_bytes(), summary_before)
+
+    def test_concurrent_attachments_serialize_validation_through_rollback(self):
+        """One point cannot admit another attachment inside its transaction."""
+        import threading
+        import workflow.r2.reuse_result as reuse_result
+
+        real_evaluate = reuse_result.evaluate
+        first_entered = threading.Event()
+        second_started = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        call_guard = threading.Lock()
+        errors = []
+        call_count = 0
+
+        def controlled_evaluate(*args, **kwargs):
+            nonlocal call_count
+            with call_guard:
+                call_count += 1
+                call_number = call_count
+            if call_number == 1:
+                first_entered.set()
+                if not release_first.wait(5):
+                    raise RuntimeError("timed out waiting to release first attachment")
+            else:
+                second_entered.set()
+            return real_evaluate(*args, **kwargs)
+
+        def attach(started=None):
+            if started is not None:
+                started.set()
+            try:
+                reuse_result.attach_reused_result(
+                    self.fixed, self.clip, self.r1, self.config_path
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with patch("workflow.r2.reuse_result.evaluate",
+                   side_effect=controlled_evaluate):
+            first = threading.Thread(target=attach)
+            second = threading.Thread(target=attach, args=(second_started,))
+            first.start()
+            self.assertTrue(first_entered.wait(2))
+            second.start()
+            self.assertTrue(second_started.wait(2))
+            overlapped = second_entered.wait(0.5)
+            release_first.set()
+            first.join(5)
+            second.join(5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertFalse(overlapped)
+        self.assertTrue(second_entered.is_set())
+        self.assertEqual(errors, [])
 
     def test_evaluator_failure_does_not_clobber_concurrent_authoritative_update(self):
         """Rollback must not restore outputs this attempt never published."""
