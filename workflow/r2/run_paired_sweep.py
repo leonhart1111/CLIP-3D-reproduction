@@ -175,6 +175,14 @@ def _reuse_attachment_matches(point: Path, decision: dict,
         return False
     performance_path = point / "performance.json"
     summary_path = point / "pipeline_summary.json"
+    performance = _read_object(performance_path)
+    source_ipc2 = expected.get("source_ipc2")
+    if performance is None or not _finite_positive(source_ipc2):
+        return False
+    frequency = performance.get("sustainable_frequency_ghz")
+    if not _finite_positive(frequency):
+        return False
+    expected_bips2 = float(source_ipc2) * float(frequency)
     try:
         if outputs.get("performance") != {
                 "path": str(performance_path.resolve()),
@@ -191,8 +199,19 @@ def _reuse_attachment_matches(point: Path, decision: dict,
     return (
         summary.get("r2_reused") is True
         and summary.get("r2_reuse_artifact") == str(marker_path.resolve())
-        and _same_number(summary.get("ipc2"), marker.get("source_ipc2"))
-        and _same_number(summary.get("bips2"), outputs.get("bips2"))
+        and summary.get("r2_source") == expected["source_result"]["path"]
+        and summary.get("artifacts", {}).get("r2_result")
+        == expected["source_result"]["path"]
+        and summary.get("artifacts", {}).get("r2_reuse")
+        == str(marker_path.resolve())
+        and _same_number(performance.get("ipc2"), source_ipc2)
+        and _same_number(summary.get("ipc2"), source_ipc2)
+        and _same_number(performance.get("bips2"), expected_bips2)
+        and _same_number(summary.get("bips2"), expected_bips2)
+        and _same_number(
+            summary.get("sustainable_frequency_ghz"), frequency
+        )
+        and _same_number(outputs.get("bips2"), expected_bips2)
     )
 
 
@@ -279,6 +298,21 @@ def _base_record(key: ArchitectureKey, paths: dict[str, Path],
         "pair_status": str(paths["status"]),
         "fixed_complete": False,
     }
+
+
+def _clear_reuse_attachment(point: Path) -> None:
+    """Remove stale reuse commit state before publishing a local attachment."""
+    (point / "r2_reuse.json").unlink(missing_ok=True)
+    summary_path = point / "pipeline_summary.json"
+    summary = read_json(summary_path)
+    if not isinstance(summary, dict):
+        raise ValueError("CLIP-3D pipeline summary must contain an object")
+    summary.pop("r2_reused", None)
+    summary.pop("r2_reuse_artifact", None)
+    artifacts = summary.get("artifacts")
+    if isinstance(artifacts, dict):
+        artifacts.pop("r2_reuse", None)
+    write_json(summary_path, summary)
 
 
 def run_pair(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
@@ -387,7 +421,7 @@ def run_pair(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
             clip_result = fixed_result
             clip_artifact = paths["clip"] / "r2_reuse.json"
         else:
-            (paths["clip"] / "r2_reuse.json").unlink(missing_ok=True)
+            _clear_reuse_attachment(paths["clip"])
             run_r2.run(
                 paths["r1"], paths["clip"] / "r2_latency.json",
                 paths["clip"] / "gem5_r2", rerun=rerun,
@@ -443,7 +477,8 @@ def run_pair(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
 
 
 def _existing_r2_validator(r1_root: Path, fixed_root: Path, clip_root: Path,
-                           config_path: Path):
+                           config_path: Path,
+                           rerun_requested: bool = False):
     """Build the Task 4 callback solely from the Task 5 provenance validators."""
     r1_root = Path(r1_root).resolve()
     fixed_root = Path(fixed_root).resolve()
@@ -453,19 +488,117 @@ def _existing_r2_validator(r1_root: Path, fixed_root: Path, clip_root: Path,
     def validate(method: str, key: ArchitectureKey, point_dir: Path) -> dict:
         r1_dir = r1_root / key.relative_path()
         point_dir = Path(point_dir).resolve()
+        fixed_point = fixed_root / key.relative_path()
+        clip_point = clip_root / key.relative_path()
+        if method not in ("fixed-bin", "clip3d"):
+            return {"accepted": False, "reasons": [f"unknown method {method}"]}
+        try:
+            fixed_vector, clip_vector = _validated_vectors(
+                fixed_point, clip_point
+            )
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            return {
+                "accepted": False,
+                "reasons": [f"cannot validate paired latency vectors: {error}"],
+            }
+        equal_overrides = (
+            fixed_vector["gem5_overrides"] == clip_vector["gem5_overrides"]
+        )
+        branch = "reuse" if equal_overrides else "local"
+        if rerun_requested:
+            # Accepted here means safe to schedule replacement; the existing
+            # scientific evidence remains explicitly uncertified.
+            return {
+                "accepted": True,
+                "reasons": [],
+                "branch": "fixed" if method == "fixed-bin" else branch,
+                "repair_required": True,
+                "rerun_requested": True,
+                "scientific_evidence_accepted": False,
+            }
         if method == "fixed-bin":
-            return run_r2.validate_local_result(
+            decision = run_r2.validate_local_result(
                 r1_dir, point_dir / "r2_latency.json", point_dir / "gem5_r2"
             )
-        if method != "clip3d":
-            return {"accepted": False, "reasons": [f"unknown method {method}"]}
-        if (point_dir / "r2_reuse.json").is_file():
-            return reuse_result.validate_reuse(
-                fixed_root / key.relative_path(), point_dir, r1_dir, config_path
+            return {**decision, "branch": "fixed",
+                    "repair_required": False,
+                    "rerun_requested": False,
+                    "scientific_evidence_accepted": decision.get("accepted") is True}
+        if not equal_overrides:
+            decision = run_r2.validate_local_result(
+                r1_dir, point_dir / "r2_latency.json", point_dir / "gem5_r2"
             )
-        return run_r2.validate_local_result(
-            r1_dir, point_dir / "r2_latency.json", point_dir / "gem5_r2"
+            if decision.get("accepted") is not True:
+                return {**decision, "branch": "local",
+                        "repair_required": False,
+                        "rerun_requested": False,
+                        "scientific_evidence_accepted": False}
+            attachment_valid = _validate_local_attachment(
+                r1_dir, point_dir, "CLIP-3D"
+            ) is not None
+            if attachment_valid:
+                return {**decision, "branch": "local",
+                        "repair_required": False,
+                        "rerun_requested": False,
+                        "scientific_evidence_accepted": True}
+            return {
+                "accepted": True,
+                "branch": "local",
+                "repair_required": True,
+                "rerun_requested": False,
+                "scientific_evidence_accepted": False,
+                "reasons": ["local CLIP attachment requires repair"],
+                "local_result_validation": {
+                    "accepted": True,
+                    "result_path": decision.get("result_path"),
+                    "status_path": decision.get("status_path"),
+                },
+            }
+
+        source = run_r2.validate_local_result(
+            r1_dir, fixed_point / "r2_latency.json", fixed_point / "gem5_r2"
         )
+        if source.get("accepted") is not True:
+            return {
+                "accepted": False,
+                "branch": "reuse",
+                "repair_required": False,
+                "rerun_requested": False,
+                "scientific_evidence_accepted": False,
+                "reasons": [f"source {reason}" for reason in source["reasons"]],
+            }
+        reuse = reuse_result.validate_reuse(
+            fixed_point, point_dir, r1_dir, config_path
+        )
+        if reuse.get("accepted") is not True:
+            return {**reuse, "branch": "reuse",
+                    "repair_required": False,
+                    "rerun_requested": False,
+                    "scientific_evidence_accepted": False}
+        summary = _read_object(point_dir / "pipeline_summary.json")
+        attachment_valid = (
+            summary is not None
+            and _reuse_attachment_matches(point_dir, reuse, summary)
+        )
+        if attachment_valid:
+            return {**reuse, "branch": "reuse",
+                    "repair_required": False,
+                    "rerun_requested": False,
+                    "scientific_evidence_accepted": True}
+        return {
+            "accepted": True,
+            "branch": "reuse",
+            "repair_required": True,
+            "rerun_requested": False,
+            "scientific_evidence_accepted": False,
+            "reasons": ["reuse attachment marker/output binding requires repair"],
+            "source_validation": {
+                "accepted": True,
+                "result_path": source.get("result_path"),
+                "status_path": source.get("status_path"),
+            },
+            "reuse_eligibility": reuse,
+        }
 
     return validate
 
@@ -497,7 +630,46 @@ def _experiment_status(keys: list[ArchitectureKey], results: dict[ArchitectureKe
         and pair.get("clip3d_reused_fixed_r2") is False
         for pair in pairs
     )
-    complete = not limited_run and len(keys) == 50 and completed == 50 and failed == 0
+    successful_pairs = [pair for pair in pairs if pair.get("state") == "success"]
+    physical_values = [pair.get("physical_r2_runs") for pair in successful_pairs]
+    physical_values_valid = all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in physical_values
+    )
+    physical_r2_runs = sum(physical_values) if physical_values_valid else 0
+    per_pair_run_counts_valid = physical_values_valid and all(
+        pair.get("physical_r2_runs")
+        == (1 if pair.get("clip3d_reused_fixed_r2") is True else 2)
+        for pair in successful_pairs
+        if pair.get("clip3d_reused_fixed_r2") in (True, False)
+    ) and reuse + separate == completed
+    reported_keys = [
+        pair.get("key") for pair in pairs if pair.get("state") == "success"
+    ]
+    keys_match_manifest = (
+        len(reported_keys) == len(keys)
+        and all(reported == _key_dict(key)
+                for key, reported in zip(keys, reported_keys))
+        and len({
+            (reported.get("workload"), reported.get("l1d_size"),
+             reported.get("l2_size"))
+            for reported in reported_keys if isinstance(reported, dict)
+        }) == len(keys)
+    )
+    selected_results_valid = (
+        completed == len(keys)
+        and failed == 0
+        and keys_match_manifest
+        and reuse + separate == len(keys)
+        and per_pair_run_counts_valid
+        and physical_r2_runs == len(keys) + separate
+    )
+    complete = (
+        not limited_run
+        and len(keys) == 50
+        and len(set(keys)) == 50
+        and selected_results_valid
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "state": "success" if complete else ("failed" if failed else "running"),
@@ -513,10 +685,10 @@ def _experiment_status(keys: list[ArchitectureKey], results: dict[ArchitectureKe
         "pending_pair_count": len(keys) - completed - failed,
         "reuse_pair_count": reuse,
         "separate_clip_r2_count": separate,
-        "physical_r2_runs": sum(
-            int(pair.get("physical_r2_runs", 0)) for pair in pairs
-            if pair.get("state") == "success"
-        ),
+        "physical_r2_runs": physical_r2_runs,
+        "per_pair_run_counts_valid": per_pair_run_counts_valid,
+        "result_keys_match_manifest": keys_match_manifest,
+        "selected_results_valid": selected_results_valid,
         "preflight": preflight,
         "pairs": pairs,
     }
@@ -543,7 +715,8 @@ def run_sweep(r1_root: Path, fixed_root: Path, clip_root: Path,
         fixed_root, clip_root, all_keys, config_path,
         selection=selection, require_layout_only=False,
         existing_r2_validator=_existing_r2_validator(
-            r1_root, fixed_root, clip_root, config_path
+            r1_root, fixed_root, clip_root, config_path,
+            rerun_requested=rerun,
         ),
     )
     keys = all_keys if limit is None else all_keys[:limit]
@@ -596,8 +769,7 @@ def run_sweep(r1_root: Path, fixed_root: Path, clip_root: Path,
         keys, results, status_root, preflight, limited_run, started
     )
     final["finished_unix"] = time.time()
-    if limited_run and final["failed_pair_count"] == 0 \
-            and final["completed_pair_count"] == len(keys):
+    if limited_run and final["selected_results_valid"]:
         final["state"] = "success"
     elif not final["complete"]:
         final["state"] = "failed"
@@ -623,11 +795,7 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
     )
     if result.get("limited_run"):
-        return 0 if (
-            result.get("failed_pair_count") == 0
-            and result.get("completed_pair_count")
-            == result.get("selected_pair_count")
-        ) else 1
+        return 0 if result.get("selected_results_valid") is True else 1
     return 0 if result.get("complete") is True else 1
 
 
