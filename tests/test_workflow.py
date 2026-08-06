@@ -4,7 +4,9 @@ import math
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from copy import deepcopy
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,7 +30,7 @@ from workflow.floorplan.layout_metrics import (
     select_rounded_wire_cycles,
 )
 from workflow.floorplan.optimize_layout import optimize, proxy_temperature
-from workflow.mcpat.parse_mcpat import parse_mcpat_text
+from workflow.mcpat.parse_mcpat import parse_mcpat_text, subtract
 from workflow.r2.calibrate_lambda_wire import (
     calibrate as calibrate_lambda_wire,
     calibrate_series as calibrate_lambda_wire_series,
@@ -64,6 +66,15 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_temperature_text_and_csv_fields_use_six_decimals(self):
+        from workflow.common import format_temperature_c, format_temperature_csv_row
+
+        self.assertEqual(format_temperature_c(116.25), "116.250000")
+        self.assertEqual(
+            format_temperature_csv_row({"tmax_c": 116.25, "ipc1": 3.4}),
+            {"tmax_c": "116.250000", "ipc1": 3.4},
+        )
+
     def test_power_trace_round_trips_values_that_12g_breaks_total_invariant(self):
         """Raw total/dynamic/leakage files must retain their cell-level sum."""
         from workflow.floorplan.generate_hotspot_inputs import write_ptrace
@@ -100,6 +111,34 @@ class WorkflowTests(unittest.TestCase):
             text=True, capture_output=True, check=False,
         )
         self.assertNotEqual(completed.returncode, 0)
+
+    def test_proxy_calibration_cli_prints_temperature_rmse_with_six_decimals(self):
+        """A shortened RMSE presentation would lose calibrated temperature precision."""
+        from workflow.thermal.calibrate_proxy import main as calibrate_proxy_main
+
+        report = {
+            "fit": {"parameters": {
+                "alpha": 0.3, "beta": 0.0, "cross_tier_weight": 0.7,
+            }},
+            "evaluations": {"cross_validated_training_fit": {"validation": {
+                "rmse_c": 12.3456789, "spatial_spearman": 0.8,
+            }}},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "modules.json"
+            model.write_text("{}", encoding="utf-8")
+            output = StringIO()
+            argv = [
+                "calibrate_proxy", "--model", f"fixture={model}",
+                "--output-dir", str(root / "output"),
+            ]
+            with patch("sys.argv", argv), \
+                 patch("workflow.thermal.calibrate_proxy.calibrate", return_value=report), \
+                 redirect_stdout(output):
+                calibrate_proxy_main()
+
+        self.assertIn("validation RMSE=12.345679 C", output.getvalue())
 
 class FrequencyTests(unittest.TestCase):
     def test_separated_frequency_trace_scales_only_dynamic_power(self):
@@ -606,6 +645,47 @@ class ParserTests(unittest.TestCase):
                      ["normalized_weight"],
                 0.75,
             )
+
+    def test_subtraction_rebuilds_derived_power_after_rounding_clamp(self):
+        """Primitive rounding residuals must not break derived power sums."""
+        base = {
+            "area_mm2": 1.0,
+            "dynamic_power_w": 1.0,
+            "subthreshold_leakage_w": 0.2,
+            "gate_leakage_w": 0.1,
+            "leakage_power_w": 0.3,
+            "total_power_w": 1.3,
+        }
+        child = {
+            "area_mm2": 0.5,
+            "dynamic_power_w": 1.0000023,
+            "subthreshold_leakage_w": 0.15,
+            "gate_leakage_w": 0.04,
+            "leakage_power_w": 0.19,
+            "total_power_w": 1.1900023,
+        }
+
+        remainder = subtract(base, [child])
+
+        self.assertEqual(remainder["dynamic_power_w"], 0.0)
+        self.assertEqual(
+            remainder["leakage_power_w"],
+            remainder["subthreshold_leakage_w"] + remainder["gate_leakage_w"],
+        )
+        self.assertEqual(
+            remainder["total_power_w"],
+            remainder["dynamic_power_w"] + remainder["leakage_power_w"],
+        )
+        self.assertAlmostEqual(
+            remainder["subtraction_diagnostics"]["raw_residuals"]["total_power_w"],
+            0.1099977,
+        )
+        self.assertAlmostEqual(
+            remainder["subtraction_diagnostics"]["clipped_negative_magnitudes"][
+                "dynamic_power_w"
+            ],
+            0.0000023,
+        )
 
     def test_cacti_parser(self):
         text = """Access time (ns): 1.5

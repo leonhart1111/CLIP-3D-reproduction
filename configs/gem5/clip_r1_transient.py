@@ -11,6 +11,7 @@ sampling interval plus the original final section.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import runpy
@@ -30,6 +31,7 @@ def positive_float(text: str) -> float:
 def main() -> None:
     wrapper = argparse.ArgumentParser(add_help=False)
     wrapper.add_argument("--sample-ms", type=positive_float, default=10.0)
+    wrapper.add_argument("--canonical-source-r1", type=Path, required=True)
     wrapper_args, original_args = wrapper.parse_known_args()
     sys.argv = [sys.argv[0], *original_args]
 
@@ -81,6 +83,11 @@ def main() -> None:
         "sample_interval_s": sample_interval_s,
         "sample_interval_ticks": scheduling["sample_interval_ticks"],
         "measurement_start_tick": scheduling["measurement_start_tick"],
+        "measurement_end_tick": int(m5.curTick()),
+        "canonical_source_r1": str(wrapper_args.canonical_source_r1.resolve()),
+        "canonical_source_metadata_sha256": "sha256:" + hashlib.sha256(
+            (wrapper_args.canonical_source_r1 / "r1_metadata.json").read_bytes()
+        ).hexdigest(),
         "transient_wrapper": str(Path(__file__).resolve()),
         "base_r1_config": str(original),
     })
