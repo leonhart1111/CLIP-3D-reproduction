@@ -45,7 +45,10 @@ from workflow.r2.run_wire_sensitivity import (
 from workflow.run_lifting_pipeline import (
     evaluate_comparison_candidates, select_clip3d_candidate, validate_config,
 )
-from workflow.run_lifting_sweep import completed as lifting_completed
+from workflow.run_lifting_sweep import (
+    completed as lifting_completed,
+    required_artifacts as lifting_required_artifacts,
+)
 from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT, run_hotspot
 from workflow.thermal.calibrate_proxy import (
     calibrate, candidate_layouts, parse_external_case, proxy_acceptance_checks,
@@ -1796,6 +1799,11 @@ class FormalGuardTests(unittest.TestCase):
             old = {"physical": {"r_convec_k_per_w": 5.0}, "mcpat": {"temperature_k": 370}}
             new = {"physical": {"r_convec_k_per_w": 5.0}, "mcpat": {"temperature_k": 320}}
             write_json(root / "run_config.json", {"config": old})
+            for artifact in lifting_required_artifacts:
+                path = root / artifact
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("{}", encoding="utf-8")
             self.assertFalse(lifting_completed(root, new, "fixed-bin", True))
             self.assertTrue(lifting_completed(root, old, "fixed-bin", True))
 

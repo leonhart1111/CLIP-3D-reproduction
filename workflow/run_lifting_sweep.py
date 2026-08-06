@@ -7,40 +7,57 @@ import argparse
 import concurrent.futures
 from pathlib import Path
 
-from workflow.common import PROJECT_ROOT, read_json, write_json
+from workflow.common import PROJECT_ROOT, read_json, sha256_file, write_json
+from workflow.r1_catalog import build_catalogue, canonical_directories
 from workflow.run_lifting_pipeline import DEFAULT_CONFIG, LAYOUT_METHODS, run_pipeline
 
 
 DEFAULT_R1_ROOT = PROJECT_ROOT / "runs/architecture_sweep/r1/paper"
 DEFAULT_OUTPUT = PROJECT_ROOT / "runs/architecture_sweep/lifting"
+DEFAULT_R1_EXPERIMENT = PROJECT_ROOT / "configs/experiments/r1_cache_sweep.json"
 
 
-def discover(root: Path, workloads: set[str] | None = None) -> list[Path]:
-    points = []
-    for metadata_path in root.rglob("r1_metadata.json"):
-        directory = metadata_path.parent
-        if not (directory / "stats.txt").is_file():
-            continue
-        metadata = read_json(metadata_path)
-        if workloads is not None and metadata.get("workload") not in workloads:
-            continue
-        status = directory / "status.json"
-        if status.is_file() and read_json(status).get("state") != "success":
-            continue
-        points.append(directory)
-    return sorted(points)
+required_artifacts = (
+    "run_config.json",
+    "mcpat/mcpat.json",
+    "cacti/cacti_characterization.json",
+    "modules.json",
+    "hotspot/layout.json",
+    "hotspot/thermal_result.json",
+    "performance.json",
+    "r2_latency.json",
+    "pipeline_summary.json",
+)
+CLIP3D_REQUIRED_ARTIFACTS = ("optimizer_report.json", "layout_selection.json")
+
+
+def discover(root: Path, experiment_path: Path, profile: str = "paper",
+             workloads: set[str] | None = None,
+             require_complete: bool = True) -> tuple[list[Path], dict]:
+    """Return valid configured canonical points after validating the full grid."""
+    catalogue = build_catalogue(root, experiment_path, profile=profile)
+    if require_complete and not catalogue["complete"]:
+        raise ValueError("canonical R1 catalogue is incomplete or invalid")
+    points = canonical_directories(catalogue)
+    if workloads is not None:
+        points = [point for point in points
+                  if point.relative_to(root.resolve()).parts[0] in workloads]
+    return points, catalogue
 
 
 def completed(output: Path, config: dict, layout_method: str,
               require_r2: bool) -> bool:
+    artifacts = required_artifacts
+    if layout_method == "clip3d":
+        artifacts += CLIP3D_REQUIRED_ARTIFACTS
+    if any(not (output / artifact).is_file() for artifact in artifacts):
+        return False
     path = output / "pipeline_summary.json"
     run_config_path = output / "run_config.json"
-    if not path.is_file() or not run_config_path.is_file():
-        return False
     try:
         summary = read_json(path)
         recorded_config = read_json(run_config_path).get("config")
-    except Exception:
+    except (AttributeError, OSError, TypeError, ValueError):
         return False
     # Cooling alone is not a sufficient cache key: McPAT activity mapping,
     # local CACTI geometry, area calibration, or layer materials may change
@@ -54,6 +71,9 @@ def completed(output: Path, config: dict, layout_method: str,
             config["physical"]["r_convec_k_per_w"]):
         return False
     if require_r2 and (summary.get("ipc2") is None or summary.get("bips2") is None):
+        return False
+    if not require_r2 and (summary.get("ipc2") is not None
+                           or summary.get("bips2") is not None):
         return False
     return True
 
@@ -74,6 +94,9 @@ def one_job(args_tuple):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--r1-root", type=Path, default=DEFAULT_R1_ROOT)
+    parser.add_argument("--r1-experiment", type=Path, default=DEFAULT_R1_EXPERIMENT)
+    parser.add_argument("--r1-profile", default="paper")
+    parser.add_argument("--allow-incomplete-canonical", action="store_true")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--jobs", type=int, default=1)
@@ -97,11 +120,16 @@ def main() -> None:
         parser.error("choose either --run-r2 or --reuse-r2-root")
 
     r1_root = args.r1_root.resolve()
+    r1_experiment = args.r1_experiment.resolve()
     output_root = args.output_root.resolve()
     config_path = args.config.resolve()
     config = read_json(config_path)
     reuse_root = args.reuse_r2_root.resolve() if args.reuse_r2_root else None
-    points = discover(r1_root, set(args.workloads) if args.workloads else None)
+    points, catalogue = discover(
+        r1_root, r1_experiment, args.r1_profile,
+        set(args.workloads) if args.workloads else None,
+        not args.allow_incomplete_canonical,
+    )
     jobs = []
     skipped = []
     for point in points:
@@ -119,19 +147,44 @@ def main() -> None:
     else:
         with concurrent.futures.ProcessPoolExecutor(max_workers=args.jobs) as executor:
             results = list(executor.map(one_job, jobs))
+    skipped_summaries = [read_json(
+        output_root / point.relative_to(r1_root) / "pipeline_summary.json"
+    ) for point in points if str(point) in skipped]
+    result_summaries = [result["summary"] for result in results
+                        if result["state"] == "success"]
+    all_summaries = skipped_summaries + result_summaries
+    contains_r2 = any(summary.get("ipc2") is not None or summary.get("bips2") is not None
+                      for summary in all_summaries)
+    layout_only = not args.run_r2 and reuse_root is None
+    if layout_only and contains_r2:
+        raise RuntimeError("layout-only lifting sweep contains R2 performance results")
+    failed = sum(result["state"] == "failed" for result in results)
     report = {
-        "schema_version": 2, "r1_root": str(r1_root),
+        "schema_version": 3, "r1_root": str(r1_root),
+        "r1_experiment": str(r1_experiment), "r1_profile": args.r1_profile,
         "output_root": str(output_root), "config": str(config_path),
+        "config_sha256": sha256_file(config_path),
         "experiment": config.get("name", config_path.stem),
+        "classification": config.get("experiment_classification"),
         "layout_method": args.layout_method, "run_r2": args.run_r2,
         "reuse_r2_root": str(reuse_root) if reuse_root else None,
-        "workloads": args.workloads, "discovered": len(points),
-        "executed": len(jobs), "skipped": skipped, "results": results,
+        "contains_r2": contains_r2,
+        "workloads": args.workloads,
+        "selected_workload_count": len({
+            point.relative_to(r1_root).parts[0] for point in points
+        }),
+        "canonical_expected": catalogue["expected_count"],
+        "canonical_valid": catalogue["valid_count"],
+        "canonical_complete": catalogue["complete"],
+        "canonical_selected": len(points),
+        "excluded_noncanonical": catalogue["excluded_noncanonical"],
+        "discovered": len(points), "executed": len(jobs),
+        "skipped_count": len(skipped), "failed": failed,
+        "skipped": skipped, "results": results,
     }
     output_root.mkdir(parents=True, exist_ok=True)
     write_json(output_root / "sweep_status.json", report)
     success = sum(result["state"] == "success" for result in results)
-    failed = len(results) - success
     print(f"lifting sweep: discovered={len(points)} success={success} "
           f"failed={failed} skipped={len(skipped)}")
     if failed:

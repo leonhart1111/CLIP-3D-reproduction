@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sys
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
-from workflow.common import read_json, write_json
+from workflow.common import read_json, sha256_file, write_json
 from workflow.r1_catalog import (
     build_catalogue,
     canonical_directories,
@@ -317,6 +320,121 @@ class CanonicalAuditTests(CanonicalFixtureTests):
         before = read_json(output / "canonical_r1_before.sha256.json")
         after = read_json(output / "canonical_r1_after.sha256.json")
         self.assertEqual(before, after)
+
+
+class CanonicalLiftingTests(CanonicalFixtureTests):
+    def _add_noncanonical_duplicate(self, root: Path) -> None:
+        source = root / "fft/l1d_16kB/l2_128kB"
+        duplicate = root / "fft/l1d_16kB/l2_128kB.corrupt_duplicate_fixture"
+        write_json(duplicate / "r1_metadata.json",
+                   read_json(source / "r1_metadata.json"))
+        (duplicate / "stats.txt").write_text(
+            (source / "stats.txt").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+    def test_discover_uses_only_valid_canonical_catalogue_points(self):
+        """A metadata-bearing sibling is excluded instead of becoming a fifth job."""
+        from workflow.run_lifting_sweep import discover
+
+        root, experiment = self.make_grid_fixture()
+        self._add_noncanonical_duplicate(root)
+
+        points, catalogue = discover(root, experiment, "paper", None, True)
+
+        self.assertEqual(len(points), 4)
+        self.assertEqual(len(catalogue["excluded_noncanonical"]), 1)
+        self.assertNotIn("corrupt_duplicate", "\n".join(map(str, points)))
+
+    def test_discover_filters_workloads_after_validating_full_catalogue(self):
+        """Selecting FFT still validates the configured MATMUL points first."""
+        from workflow.run_lifting_sweep import discover
+
+        root, experiment = self.make_grid_fixture()
+
+        points, _catalogue = discover(root, experiment, "paper", {"fft"}, True)
+
+        self.assertEqual(len(points), 2)
+        self.assertTrue(all("/fft/" in str(point) for point in points))
+
+    def test_discover_rejects_missing_canonical_point_before_workload_filter(self):
+        """A selected workload cannot hide a missing configured architecture."""
+        from workflow.run_lifting_sweep import discover
+
+        root, experiment = self.make_grid_fixture()
+        missing = root / "matmul/l1d_32kB/l2_128kB"
+        (missing / "stats.txt").unlink()
+
+        with self.assertRaisesRegex(ValueError, "canonical R1 catalogue"):
+            discover(root, experiment, "paper", {"fft"}, True)
+
+    def test_cli_writes_canonical_layout_only_provenance_report(self):
+        """The launcher records catalogue and config provenance without running tools."""
+        from workflow.run_lifting_sweep import main
+
+        root, experiment = self.make_grid_fixture()
+        self._add_noncanonical_duplicate(root)
+        output = root.parent / "lifting"
+        config = root.parent / "lifting_config.json"
+        classification = {
+            "mode": "operational-exploratory-traffic-weighted",
+            "non_formal": True,
+            "paper_equivalent": False,
+            "shared_parameter_accepted": False,
+        }
+        write_json(config, {
+            "name": "fixture_layout_only",
+            "experiment_classification": classification,
+            "physical": {"r_convec_k_per_w": 5.0},
+        })
+
+        def layout_only_job(job):
+            r1, destination, *_rest = job
+            return {
+                "r1": str(r1), "output": str(destination), "state": "success",
+                "summary": {"ipc2": None, "bips2": None},
+            }
+
+        argv = [
+            "run_lifting_sweep.py", "--r1-root", str(root),
+            "--r1-experiment", str(experiment), "--r1-profile", "paper",
+            "--output-root", str(output), "--config", str(config),
+        ]
+        with patch("workflow.run_lifting_sweep.one_job", side_effect=layout_only_job):
+            with patch.object(sys, "argv", argv), redirect_stdout(StringIO()):
+                main()
+
+        report = read_json(output / "sweep_status.json")
+        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["config"], str(config.resolve()))
+        self.assertEqual(report["config_sha256"], sha256_file(config))
+        self.assertEqual(report["classification"], classification)
+        self.assertEqual(report["canonical_expected"], 4)
+        self.assertEqual(report["canonical_selected"], 4)
+        self.assertEqual(len(report["excluded_noncanonical"]), 1)
+        self.assertFalse(report["run_r2"])
+        self.assertFalse(report["contains_r2"])
+        self.assertEqual(report["selected_workload_count"], 2)
+        self.assertEqual(report["executed"], 4)
+        self.assertEqual(report["skipped_count"], 0)
+        self.assertEqual(report["failed"], 0)
+
+    def test_completed_rejects_a_summary_missing_required_pipeline_artifacts(self):
+        """A matching config alone cannot resume an incomplete lifting output."""
+        from workflow.run_lifting_sweep import completed
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            config = {"physical": {"r_convec_k_per_w": 5.0}}
+            write_json(output / "run_config.json", {"config": config})
+            write_json(output / "pipeline_summary.json", {
+                "layout_method": "fixed-bin",
+                "cooling": {"r_convec_k_per_w": 5.0},
+                "ipc2": None,
+                "bips2": None,
+            })
+
+            self.assertFalse(completed(output, config, "fixed-bin", False))
 
 
 if __name__ == "__main__":
