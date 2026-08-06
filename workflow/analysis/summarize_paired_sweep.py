@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
+import os
 from pathlib import Path
 from statistics import median
+import tempfile
 
 from workflow.common import read_json, sha256_file, write_json
 from workflow.experiments.balanced50 import (
@@ -45,17 +48,34 @@ def _read_object(path: Path, label: str) -> dict:
 
 
 def _positive(value: object, label: str) -> float:
-    if (not isinstance(value, (int, float)) or isinstance(value, bool)
-            or not math.isfinite(float(value)) or float(value) <= 0):
+    try:
+        number = _finite(value, label)
+    except ValueError as error:
+        raise ValueError(f"{label} must be a finite positive measured value") from error
+    if number <= 0:
         raise ValueError(f"{label} must be a finite positive measured value")
-    return float(value)
+    return number
+
+
+def _finite(value: object, label: str) -> float:
+    """Convert a JSON number without leaking OverflowError or non-finite values."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{label} must be a finite number")
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as error:
+        raise ValueError(f"{label} must be a finite number") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{label} must be a finite number")
+    return number
 
 
 def _same(left: object, right: object) -> bool:
-    return (isinstance(left, (int, float)) and not isinstance(left, bool)
-            and isinstance(right, (int, float)) and not isinstance(right, bool)
-            and math.isfinite(float(left)) and math.isfinite(float(right))
-            and math.isclose(float(left), float(right), rel_tol=1e-12, abs_tol=1e-12))
+    try:
+        return math.isclose(_finite(left, "left value"), _finite(right, "right value"),
+                            rel_tol=1e-12, abs_tol=1e-12)
+    except ValueError:
+        return False
 
 
 def _path(value: object, expected: Path, label: str) -> None:
@@ -118,7 +138,7 @@ def _validate_point(point: Path, method: str, key: object, config: dict,
     ipc2 = _positive(summary.get("ipc2"), f"{method} IPC2")
     bips2 = _positive(summary.get("bips2"), f"{method} BIPS2")
     frequency = _positive(summary.get("sustainable_frequency_ghz"), f"{method} frequency")
-    tmax_c = _positive(summary.get("tmax_c"), f"{method} Tmax")
+    tmax_c = _finite(summary.get("tmax_c"), f"{method} Tmax")
     if not _same(bips2, ipc2 * frequency):
         raise ValueError(f"{method} measured BIPS2 is not IPC2*f_sus")
     if not _same(ipc2, status_metrics[0]) or not _same(bips2, status_metrics[1]):
@@ -130,7 +150,7 @@ def _validate_point(point: Path, method: str, key: object, config: dict,
             raise ValueError(f"{method} performance {field} differs from summary")
     wire_cycles = vector.get("critical_l1d_to_l2_cycles")
     if (not isinstance(wire_cycles, int) or isinstance(wire_cycles, bool)
-            or wire_cycles < 0 or summary.get("r2_critical_path_cycles") != wire_cycles):
+            or wire_cycles <= 0 or summary.get("r2_critical_path_cycles") != wire_cycles):
         raise ValueError(f"{method} wire-cycle identity is invalid")
 
     if reused:
@@ -273,9 +293,11 @@ def _load_statuses(status_root: Path, keys: list[object], config_path: Path,
 
 
 def _statistics(rows: list[dict]) -> dict:
-    ratios = [row["ratio"] for row in rows]
-    changes = [row["percent_change"] for row in rows]
-    return {
+    if not rows:
+        raise ValueError("statistics require at least one paired row")
+    ratios = [_positive(row["ratio"], "BIPS2 ratio") for row in rows]
+    changes = [_finite(row["percent_change"], "percentage change") for row in rows]
+    result = {
         "n": len(rows),
         "arithmetic_mean_ratio": sum(ratios) / len(ratios),
         "geometric_mean_ratio": math.exp(sum(math.log(value) for value in ratios) / len(ratios)),
@@ -286,6 +308,10 @@ def _statistics(rows: list[dict]) -> dict:
         "fixed_to_clip_reuse_count": sum(row["clip3d_reused_fixed_r2"] for row in rows),
         "separate_clip_r2_count": sum(not row["clip3d_reused_fixed_r2"] for row in rows),
     }
+    for field in ("arithmetic_mean_ratio", "geometric_mean_ratio",
+                  "median_percent_change"):
+        _finite(result[field], f"derived {field}")
+    return result
 
 
 def _csv_row(row: dict) -> dict:
@@ -293,6 +319,62 @@ def _csv_row(row: dict) -> dict:
     for field in ("fixed_tmax_c", "clip3d_tmax_c"):
         result[field] = f"{result[field]:.6f}"
     return {field: result[field] for field in CSV_FIELDS}
+
+
+def _replace(source: Path, destination: Path) -> None:
+    """Single publication seam so a failed second replace can be regression-tested."""
+    source.replace(destination)
+
+
+def _stage_bytes(directory: Path, stem: str, data: bytes) -> Path:
+    descriptor, name = tempfile.mkstemp(prefix=f".{stem}-", dir=directory)
+    path = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def _restore_bytes(destination: Path, previous: bytes | None) -> None:
+    if previous is None:
+        destination.unlink(missing_ok=True)
+        return
+    staged = _stage_bytes(destination.parent, destination.name + ".rollback", previous)
+    os.replace(staged, destination)
+
+
+def _publish_reports(csv_path: Path, json_path: Path, csv_bytes: bytes,
+                     json_bytes: bytes) -> None:
+    """Publish both reports as one rollback-capable two-file transaction."""
+    csv_path = csv_path.resolve()
+    json_path = json_path.resolve()
+    if csv_path == json_path:
+        raise ValueError("CSV and JSON output paths must be distinct")
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    previous = {
+        csv_path: csv_path.read_bytes() if csv_path.exists() else None,
+        json_path: json_path.read_bytes() if json_path.exists() else None,
+    }
+    staged = {
+        csv_path: _stage_bytes(csv_path.parent, csv_path.name, csv_bytes),
+        json_path: _stage_bytes(json_path.parent, json_path.name, json_bytes),
+    }
+    published: list[Path] = []
+    try:
+        for destination in (csv_path, json_path):
+            _replace(staged[destination], destination)
+            published.append(destination)
+    except Exception:
+        for destination in reversed(published):
+            _restore_bytes(destination, previous[destination])
+        raise
+    finally:
+        for path in staged.values():
+            path.unlink(missing_ok=True)
 
 
 def summarize(fixed_root: Path, clip_root: Path, selection_path: Path,
@@ -342,6 +424,10 @@ def summarize(fixed_root: Path, clip_root: Path, selection_path: Path,
         if status.get("clip3d_vector_sha256") != clip["vector_sha256"]:
             raise ValueError("pair CLIP vector hash differs from CLIP point")
         ratio = clip["bips2"] / fixed["bips2"]
+        ratio = _positive(ratio, "BIPS2 ratio")
+        difference = _finite(abs(clip["bips2"] - fixed["bips2"]),
+                             "absolute BIPS2 difference")
+        percent_change = _finite(100.0 * (ratio - 1.0), "percentage change")
         rows.append({
             **_key_dict(key),
             "fixed_tmax_c": fixed["tmax_c"], "clip3d_tmax_c": clip["tmax_c"],
@@ -354,8 +440,8 @@ def summarize(fixed_root: Path, clip_root: Path, selection_path: Path,
             "fixed_ipc2": fixed["ipc2"], "clip3d_ipc2": clip["ipc2"],
             "fixed_bips2": fixed["bips2"], "clip3d_bips2": clip["bips2"],
             "clip3d_reused_fixed_r2": reused,
-            "absolute_bips2_difference": abs(clip["bips2"] - fixed["bips2"]),
-            "percent_change": 100.0 * (ratio - 1.0),
+            "absolute_bips2_difference": difference,
+            "percent_change": percent_change,
             "ratio": ratio,
         })
     workloads = {}
@@ -382,15 +468,18 @@ def summarize(fixed_root: Path, clip_root: Path, selection_path: Path,
         "aggregate": _statistics(rows),
         "rows": [{field: row[field] for field in CSV_FIELDS} for row in rows],
     }
-    csv_path = Path(csv_path)
-    json_path = Path(json_path)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS)
+    csv_buffer = io.StringIO(newline="")
+    with csv_buffer:
+        writer = csv.DictWriter(csv_buffer, fieldnames=CSV_FIELDS)
         writer.writeheader()
         writer.writerows(_csv_row(row) for row in rows)
-    write_json(json_path, result)
+        csv_bytes = csv_buffer.getvalue().encode("utf-8")
+    try:
+        json_bytes = (json.dumps(result, indent=2, ensure_ascii=False,
+                                 allow_nan=False) + "\n").encode("utf-8")
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"paired report is not valid finite JSON: {error}") from error
+    _publish_reports(Path(csv_path), Path(json_path), csv_bytes, json_bytes)
     return result
 
 

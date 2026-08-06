@@ -3458,6 +3458,118 @@ class PairedAggregationTests(unittest.TestCase):
             summarize(self.fixed_root, self.clip_root, self.selection_path,
                       self.config_path, csv_path, json_path)
 
+    def test_report_rejects_identical_csv_and_json_paths_before_publication(self):
+        """A single path cannot safely hold two different report formats."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        csv_path, _json_path = self._make_complete_fixture()
+        csv_path.write_bytes(b"old-csv")
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            summarize(self.fixed_root, self.clip_root, self.selection_path,
+                      self.config_path, csv_path, csv_path)
+        self.assertEqual(csv_path.read_bytes(), b"old-csv")
+
+    def test_report_rolls_back_both_outputs_when_second_publication_fails(self):
+        """A failed JSON replacement must not leave a new CSV beside old JSON."""
+        import workflow.analysis.summarize_paired_sweep as paired
+
+        csv_path, json_path = self._make_complete_fixture()
+        csv_path.write_bytes(b"old-csv")
+        json_path.write_bytes(b"old-json")
+        real_replace = paired._replace
+        calls = 0
+
+        def fail_second(source, destination):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected second publication failure")
+            return real_replace(source, destination)
+
+        with patch.object(paired, "_replace", side_effect=fail_second):
+            with self.assertRaisesRegex(OSError, "injected second"):
+                paired.summarize(self.fixed_root, self.clip_root,
+                                 self.selection_path, self.config_path,
+                                 csv_path, json_path)
+        self.assertEqual(csv_path.read_bytes(), b"old-csv")
+        self.assertEqual(json_path.read_bytes(), b"old-json")
+
+    def test_report_normalizes_huge_metrics_and_rejects_zero_wire_cycles(self):
+        """Overflowing metrics and zero-cycle vectors cannot become report rows."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        for label in ("huge", "zero-wire"):
+            with self.subTest(label=label):
+                csv_path, json_path = self._make_complete_fixture()
+                key = read_json(self.selection_path)["points"][0]
+                if label == "huge":
+                    status_path = self.status_root / key["workload"] / (
+                        f"l1d_{key['l1d_size']}/l2_{key['l2_size']}/pair_status.json"
+                    )
+                    status = read_json(status_path)
+                    old_limit = sys.get_int_max_str_digits()
+                    try:
+                        sys.set_int_max_str_digits(0)
+                        status["fixed_ipc2"] = 10 ** 10000
+                        write_json(status_path, status)
+                    finally:
+                        sys.set_int_max_str_digits(old_limit)
+                else:
+                    point = self.fixed_root / key["workload"] / (
+                        f"l1d_{key['l1d_size']}/l2_{key['l2_size']}"
+                    )
+                    vector = read_json(point / "r2_latency.json")
+                    vector["critical_l1d_to_l2_cycles"] = 0
+                    write_json(point / "r2_latency.json", vector)
+                    summary = read_json(point / "pipeline_summary.json")
+                    summary["r2_critical_path_cycles"] = 0
+                    write_json(point / "pipeline_summary.json", summary)
+                    for name in ("r2_result.json", "status.json"):
+                        r2_path = point / "gem5_r2" / name
+                        r2 = read_json(r2_path)
+                        r2["latency_sha256"] = sha256_file(point / "r2_latency.json")
+                        write_json(r2_path, r2)
+                    r2_status_path = point / "gem5_r2/status.json"
+                    r2_status = read_json(r2_status_path)
+                    r2_status["r2_result_sha256"] = sha256_file(
+                        point / "gem5_r2/r2_result.json"
+                    )
+                    write_json(r2_status_path, r2_status)
+                    pair_path = self.status_root / key["workload"] / (
+                        f"l1d_{key['l1d_size']}/l2_{key['l2_size']}/pair_status.json"
+                    )
+                    pair = read_json(pair_path)
+                    pair["fixed_vector_sha256"] = sha256_file(point / "r2_latency.json")
+                    write_json(pair_path, pair)
+                with self.assertRaisesRegex(ValueError, "finite|wire|cannot read"):
+                    summarize(self.fixed_root, self.clip_root, self.selection_path,
+                              self.config_path, csv_path, json_path)
+
+    def test_statistics_use_exact_win_tie_loss_and_even_median(self):
+        """Paired statistics must retain signed changes and exact tie semantics."""
+        from workflow.analysis.summarize_paired_sweep import _statistics
+
+        rows = [
+            {"ratio": 0.5, "percent_change": -50.0,
+             "clip3d_reused_fixed_r2": False},
+            {"ratio": 1.0, "percent_change": 0.0,
+             "clip3d_reused_fixed_r2": True},
+            {"ratio": 2.0, "percent_change": 100.0,
+             "clip3d_reused_fixed_r2": True},
+            {"ratio": 3.0, "percent_change": 200.0,
+             "clip3d_reused_fixed_r2": False},
+        ]
+
+        result = _statistics(rows)
+
+        self.assertAlmostEqual(result["arithmetic_mean_ratio"], 1.625)
+        self.assertAlmostEqual(result["geometric_mean_ratio"], 3.0 ** 0.25)
+        self.assertEqual(result["median_percent_change"], 50.0)
+        self.assertEqual((result["wins"], result["ties"], result["losses"]),
+                         (2, 1, 1))
+        self.assertEqual(result["fixed_to_clip_reuse_count"], 2)
+        self.assertEqual(result["separate_clip_r2_count"], 2)
+
     def test_report_rejects_duplicate_or_unbound_status_keys_and_mixed_config_hashes(self):
         """A status set that cannot be one selected/configured experiment is invalid."""
         from workflow.analysis.summarize_paired_sweep import summarize
