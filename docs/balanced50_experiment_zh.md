@@ -2,9 +2,14 @@
 
 本文是已完成 canonical R1 的 Balanced-50 后续实验手册。它只使用既有的
 100 个 R1 `paper` 点；**R1 永不再次执行**。所有命令都应从项目根目录
-运行（合并到主分支后为 `/home/zyjiang/Agenticflow/CLIP`），并先加载环境：
+运行（合并到主分支后为 `/home/zyjiang/Agenticflow/CLIP`）。必须在**同一个持续不
+退出的 Bash 终端会话**中，先执行以下初始化；不要把后续 Markdown 代码块复制到新
+shell。后续代码块依赖当前 shell 中的变量，`set -u` 会让未初始化的变量立即失败，
+而不会扩展为空路径；`set -euo pipefail` 也会一直提供 fail-fast 语义。若必须换用
+新的 shell，先完整重跑此初始化块：
 
 ```bash
+set -euo pipefail
 source scripts/env.sh
 
 R1=runs/architecture_sweep/r1/paper
@@ -42,7 +47,8 @@ R2 运行：每一对固定先运行一次，只有完整 overrides 和 provenan
 ## 先验证代码，再接触实验输出
 
 以下检查不启动 gem5、McPAT、CACTI 或 HotSpot。必须在任何审计、布局或 R2
-命令前成功完成：
+命令前成功完成。它们仍在上述同一个已启用 `set -euo pipefail` 的 shell 中执行；
+因此任一失败都会停止后续操作：
 
 ```bash
 source scripts/env.sh
@@ -73,11 +79,15 @@ python -m workflow.analysis.audit_r1 \
   --require-complete
 ```
 
-`refresh_r1_plan` 只重建 `planned_jobs.json`；其内部调用刻意没有 `--execute`，并在
-刷新前后哈希全部 canonical 的 `status.json`、`r1_metadata.json` 与 `stats.txt`。
-它是 plan-only、hash-protected 操作，不是重新运行 R1 的授权。预期为 100 个
-canonical valid success、一个排除的非 canonical 重复、100 个 planned job、一个
-instruction scope，且刷新前后 canonical 哈希完全一致。
+`refresh_r1_plan` 的内部调用刻意没有 `--execute`，所以不会启动 gem5，也不会改写
+任何 canonical 逐点的 `status.json`、`r1_metadata.json` 或 `stats.txt`。它会重建
+根目录 `$R1/` 的派生计划/汇总文件：`planned_jobs.json`、`summary.csv` 与
+`summary.json`。hash guard 的精确范围仅是全部 canonical 逐点的
+`status.json`、`r1_metadata.json` 与 `stats.txt`，并在刷新前后逐一比较；它不把这些
+允许重建的根级派生文件误称为不可变测量证据。该操作是 plan-only、hash-protected，
+不是重新运行 R1 的授权。预期为 100 个 canonical valid success、一个排除的非
+canonical 重复、100 个 planned job、一个 instruction scope，且刷新前后 canonical
+哈希完全一致。
 
 审计输出在 `$RESULTS/r1_audit/`：`canonical_r1_before.sha256.json`、
 `canonical_r1_after.sha256.json`、`refresh_report.json` 与 `audit.json`。
@@ -180,10 +190,18 @@ python -m workflow.analysis.summarize_paired_sweep \
 
 对同一根目录重复执行以上相同命令会验证并跳过已完成的 layout 点或完整配对，
 因此是正常的恢复方式。不要为了恢复而加 `--rerun`。`--rerun` 是显式 opt-in：它
-会请求替换已有结果，只应在确认需要重新取得该证据时使用；对于 layout sweep
-不要把 `--rerun-r2`、`--run-r2` 或 `--reuse-r2-root` 加入第 2/3 步，因为它们必须
-保持 layout-only。任何失败都先检查对应 `sweep_status.json`、pair status、
-`gem5_r2/gem5.log` 与逐点 JSON，再在不改变 `$R1` 的前提下恢复。
+会请求替换已有结果，只应在确认需要重新取得该证据时使用。对第 5 步 paired
+runner，`--rerun` 适用于本次调用的**每一个** selected key：默认完整调用就是全部
+50 对，会替换每对 fixed R2，以及 overrides 不同而必须本地运行的 CLIP R2；它不是
+“只重跑一个失败点”的开关。兼容的部分/失败工作通常不加它就能恢复。若已有成功
+cache 与当前请求不兼容，必须审慎决定对完整 50 对执行一次 `--rerun`，或者仅在确有
+明确范围和理由时使用带 `--limit` 的刻意有限调用；绝不可随意加上 `--rerun`。
+
+layout sweep 的 `--rerun` 同样影响该调用发现的全部 canonical layout job：第 2/3 步
+未限制 workload 时即各 100 个点，不是只替换一个 layout 点；这两个 layout-only
+命令仍不可加入 `--rerun-r2`、`--run-r2` 或 `--reuse-r2-root`。任何失败都先检查
+对应 `sweep_status.json`、pair status、`gem5_r2/gem5.log` 与逐点 JSON，再在不改变
+`$R1` 的前提下恢复。
 
 运行产生的 `$ROOT/` 和 `$RESULTS/` 是实验输出，不随本手册提交；除非仓库跟踪策略
 明确要求小型最终摘要，否则不要 `git add runs/` 或 `git add results/`。
