@@ -3158,5 +3158,358 @@ class PairedR2RunnerTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
 
+class PairedAggregationTests(unittest.TestCase):
+    """Exercise strict paired reporting with a complete tracked 50-point sample."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.r1_root = self.root / "canonical-r1"
+        self.fixed_root = self.root / "fixed_bin"
+        self.clip_root = self.root / "clip3d"
+        self.status_root = self.root / "paired_r2_status"
+        project = Path(__file__).resolve().parents[1]
+        self.selection_path = project / "configs/experiments/balanced50_traffic_weighted.json"
+        self.config_path = project / (
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_lambda0020119_"
+            "traffic_weighted_exploratory.json"
+        )
+        self.config = read_json(self.config_path)
+        self.classification = self.config["experiment_classification"]
+
+    def _write_point(self, root: Path, key: dict, method: str, ipc2: float,
+                     tmax_c: float) -> Path:
+        from workflow.r2 import run_r2
+
+        r1 = self.r1_root / key["workload"] / f"l1d_{key['l1d_size']}" / (
+            f"l2_{key['l2_size']}"
+        )
+        r1.mkdir(parents=True, exist_ok=True)
+        metadata = {
+            **key,
+            "l1i_size": "32kB",
+            "num_cores": 4,
+            "instruction_window_scope": "cpu0",
+            "warmup_insts_cpu0": 0,
+            "measure_insts_cpu0": 100,
+            "command": [],
+        }
+        write_json(r1 / "r1_metadata.json", metadata)
+        (r1 / "stats.txt").write_text(
+            "---------- Begin Simulation Statistics ----------\n"
+            + "".join(
+                f"system.cpu{core}.commitStats0.numInsts 100\n"
+                f"system.cpu{core}.numCycles 50\n"
+                for core in range(4)
+            ), encoding="utf-8",
+        )
+        point = root / key["workload"] / f"l1d_{key['l1d_size']}" / (
+            f"l2_{key['l2_size']}"
+        )
+        point.mkdir(parents=True, exist_ok=True)
+        vector = {
+            "gem5_overrides": {name: 7 for name in run_r2.GEM5_OVERRIDE_KEYS},
+            "critical_l1d_to_l2_cycles": 17 if method == "fixed-bin" else 19,
+        }
+        vector["gem5_args"] = run_r2.canonical_gem5_args(vector["gem5_overrides"])
+        write_json(point / "r2_latency.json", vector)
+        frequency = 1.5
+        bips2 = ipc2 * frequency
+        local_result = point / "gem5_r2/r2_result.json"
+        local_result.parent.mkdir(exist_ok=True)
+        r2_stats = local_result.parent / "stats.txt"
+        instructions = int(ipc2 * 25)
+        r2_stats.write_text(
+            "---------- Begin Simulation Statistics ----------\n"
+            + "".join(
+                f"system.cpu{core}.commitStats0.numInsts {instructions}\n"
+                f"system.cpu{core}.numCycles 100\n"
+                for core in range(4)
+            ), encoding="utf-8",
+        )
+        provenance = run_r2._provenance(r1, point / "r2_latency.json")
+        per_core = [
+            {"core": core, "instructions": instructions, "cycles": 100,
+             "ipc": instructions / 100}
+            for core in range(4)
+        ]
+        command = [
+            "/tmp/gem5", "--listener-mode=off",
+            f"--outdir={local_result.parent.resolve()}", "/tmp/clip_r1.py",
+            *run_r2._command_tail(metadata, vector),
+        ]
+        result = {
+            "schema_version": 3, "command": command, **provenance,
+            "ipc2": ipc2, "per_core": per_core,
+            "stats": str(r2_stats.resolve()), "stats_sha256": sha256_file(r2_stats),
+            "elapsed_seconds": 1.0,
+        }
+        write_json(local_result, result)
+        write_json(point / "gem5_r2/status.json", {
+            "schema_version": 3, "state": "success", "return_code": 0,
+            "command": command, **provenance, "ipc2": ipc2,
+            "stats": str(r2_stats.resolve()), "stats_sha256": sha256_file(r2_stats),
+            "r2_result": str(local_result.resolve()),
+            "r2_result_sha256": sha256_file(local_result),
+        })
+        write_json(point / "run_config.json", {
+            "layout_method": method,
+            "config": self.config,
+            "source": str(self.config_path.resolve()),
+        })
+        write_json(point / "performance.json", {
+            "ipc2": ipc2,
+            "bips2": bips2,
+            "sustainable_frequency_ghz": frequency,
+            "tmax_f0_c": tmax_c,
+        })
+        write_json(point / "pipeline_summary.json", {
+            "layout_method": method,
+            "experiment_classification": self.classification,
+            "workload": key["workload"], "l1d_size": key["l1d_size"],
+            "l2_size": key["l2_size"], "r1": str(r1.resolve()),
+            "tmax_c": tmax_c,
+            "sustainable_frequency_ghz": frequency,
+            "r2_critical_path_cycles": vector["critical_l1d_to_l2_cycles"],
+            "ipc2": ipc2,
+            "bips2": bips2,
+            "r2_source": str(local_result.resolve()),
+            "artifacts": {"r2_result": str(local_result.resolve())},
+        })
+        return point
+
+    def _make_complete_fixture(self) -> tuple[Path, Path]:
+        selection = read_json(self.selection_path)
+        for index, key in enumerate(selection["points"]):
+            fixed = self._write_point(
+                self.fixed_root, key, "fixed-bin", 2.0, 80.123456 + index
+            )
+            clip = self._write_point(
+                self.clip_root, key, "clip3d", 2.4, 81.654321 + index
+            )
+            status_path = self.status_root / key["workload"] / (
+                f"l1d_{key['l1d_size']}"
+            ) / f"l2_{key['l2_size']}" / "pair_status.json"
+            write_json(status_path, {
+                "schema_version": 1,
+                "state": "success",
+                "key": key,
+                "config": str(self.config_path.resolve()),
+                "config_sha256": sha256_file(self.config_path),
+                "r1_directory": str((self.r1_root / key["workload"] /
+                                     f"l1d_{key['l1d_size']}" /
+                                     f"l2_{key['l2_size']}").resolve()),
+                "fixed_point": str(fixed.resolve()),
+                "clip3d_point": str(clip.resolve()),
+                "fixed_vector_sha256": sha256_file(fixed / "r2_latency.json"),
+                "clip3d_vector_sha256": sha256_file(clip / "r2_latency.json"),
+                "fixed_ipc2": 2.0,
+                "fixed_bips2": 3.0,
+                "clip3d_ipc2": 2.4,
+                "clip3d_bips2": 3.6,
+                "clip3d_reused_fixed_r2": False,
+                "physical_r2_runs": 2,
+                "pair_status": str(status_path.resolve()),
+            })
+        return self.root / "paired_results.csv", self.root / "paired_summary.json"
+
+    def test_report_uses_all_fifty_measured_pairs_and_preserves_temperature_precision(self):
+        """Dropping a selected row or rounding report temperatures changes the result."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        csv_path, json_path = self._make_complete_fixture()
+        result = summarize(self.fixed_root, self.clip_root, self.selection_path,
+                           self.config_path, csv_path, json_path)
+
+        self.assertEqual(result["point_count"], 50)
+        self.assertEqual(set(result["workloads"]),
+                         {"fft", "cholesky", "stream", "matmul", "stencil"})
+        self.assertTrue(all(item["n"] == 10
+                            for item in result["workloads"].values()))
+        self.assertEqual(result["score_definition"],
+                         "paired measured BIPS2=IPC2*f_sus; exact validated reuse allowed")
+        self.assertTrue(result["complete"])
+        self.assertAlmostEqual(result["aggregate"]["arithmetic_mean_ratio"], 1.2)
+        self.assertAlmostEqual(result["aggregate"]["geometric_mean_ratio"], 1.2)
+        self.assertAlmostEqual(result["aggregate"]["median_percent_change"], 20.0)
+        self.assertEqual(result["aggregate"]["wins"], 50)
+
+        rows = csv_path.read_text(encoding="utf-8").splitlines()
+        self.assertIn("fixed_tmax_c", rows[0])
+        self.assertIn("clip3d_tmax_c", rows[0])
+        self.assertIn("fixed_wire_cycles", rows[0])
+        self.assertIn("clip3d_vector_sha256", rows[0])
+        self.assertIn("clip3d_reused_fixed_r2", rows[0])
+        self.assertIn("absolute_bips2_difference", rows[0])
+        self.assertIn("percent_change", rows[0])
+        self.assertIn("80.123456", rows[1])
+        self.assertIn("81.654321", rows[1])
+        self.assertEqual(read_json(json_path), result)
+
+    def test_report_rejects_rows_without_measured_bips2_or_with_proxy_marker(self):
+        """A proxy or a missing measured score must not enter paired statistics."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        for label in ("missing", "proxy"):
+            with self.subTest(label=label):
+                csv_path, json_path = self._make_complete_fixture()
+                key = read_json(self.selection_path)["points"][0]
+                summary_path = self.fixed_root / key["workload"] / (
+                    f"l1d_{key['l1d_size']}/l2_{key['l2_size']}/pipeline_summary.json"
+                )
+                summary = read_json(summary_path)
+                if label == "missing":
+                    summary.pop("bips2")
+                else:
+                    summary["bips2_proxy"] = True
+                write_json(summary_path, summary)
+                with self.assertRaisesRegex(ValueError, "measured|proxy"):
+                    summarize(self.fixed_root, self.clip_root, self.selection_path,
+                              self.config_path, csv_path, json_path)
+
+    def test_report_records_an_absolute_bips2_difference_for_a_clip_loss(self):
+        """A CLIP loss must not turn the absolute-difference column negative."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        csv_path, json_path = self._make_complete_fixture()
+        key = read_json(self.selection_path)["points"][0]
+        point = self.clip_root / key["workload"] / (
+            f"l1d_{key['l1d_size']}/l2_{key['l2_size']}"
+        )
+        for name in ("pipeline_summary.json", "performance.json"):
+            payload = read_json(point / name)
+            payload["ipc2"] = 1.6
+            payload["bips2"] = 2.4
+            write_json(point / name, payload)
+        r2_dir = point / "gem5_r2"
+        r2_stats = r2_dir / "stats.txt"
+        r2_stats.write_text(
+            "---------- Begin Simulation Statistics ----------\n"
+            + "".join(
+                f"system.cpu{core}.commitStats0.numInsts 40\n"
+                f"system.cpu{core}.numCycles 100\n"
+                for core in range(4)
+            ), encoding="utf-8",
+        )
+        result_path = r2_dir / "r2_result.json"
+        result = read_json(result_path)
+        result.update({
+            "ipc2": 1.6,
+            "per_core": [
+                {"core": core, "instructions": 40, "cycles": 100, "ipc": 0.4}
+                for core in range(4)
+            ],
+            "stats_sha256": sha256_file(r2_stats),
+        })
+        write_json(result_path, result)
+        r2_status = read_json(r2_dir / "status.json")
+        r2_status.update({
+            "ipc2": 1.6,
+            "stats_sha256": sha256_file(r2_stats),
+            "r2_result_sha256": sha256_file(result_path),
+        })
+        write_json(r2_dir / "status.json", r2_status)
+        status_path = self.status_root / key["workload"] / (
+            f"l1d_{key['l1d_size']}/l2_{key['l2_size']}/pair_status.json"
+        )
+        status = read_json(status_path)
+        status["clip3d_ipc2"] = 1.6
+        status["clip3d_bips2"] = 2.4
+        write_json(status_path, status)
+
+        result = summarize(self.fixed_root, self.clip_root, self.selection_path,
+                           self.config_path, csv_path, json_path)
+
+        self.assertAlmostEqual(result["rows"][0]["absolute_bips2_difference"], 0.6)
+
+    def test_report_rejects_a_local_r2_result_with_stale_vector_provenance(self):
+        """A locally attached score must retain the Task-5 R1/vector identity."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        csv_path, json_path = self._make_complete_fixture()
+        key = read_json(self.selection_path)["points"][0]
+        status_path = self.fixed_root / key["workload"] / (
+            f"l1d_{key['l1d_size']}/l2_{key['l2_size']}/gem5_r2/status.json"
+        )
+        status = read_json(status_path)
+        status["latency_sha256"] = "0" * 64
+        write_json(status_path, status)
+
+        with self.assertRaisesRegex(ValueError, "local R2 provenance"):
+            summarize(self.fixed_root, self.clip_root, self.selection_path,
+                      self.config_path, csv_path, json_path)
+
+    def test_report_rejects_summary_architecture_that_disagrees_with_selected_key(self):
+        """A valid R2 cache cannot relabel its selected workload or cache sizes."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        csv_path, json_path = self._make_complete_fixture()
+        key = read_json(self.selection_path)["points"][0]
+        summary_path = self.fixed_root / key["workload"] / (
+            f"l1d_{key['l1d_size']}/l2_{key['l2_size']}/pipeline_summary.json"
+        )
+        summary = read_json(summary_path)
+        summary["workload"] = "matmul"
+        write_json(summary_path, summary)
+
+        with self.assertRaisesRegex(ValueError, "architecture"):
+            summarize(self.fixed_root, self.clip_root, self.selection_path,
+                      self.config_path, csv_path, json_path)
+
+    def test_report_rejects_duplicate_or_unbound_status_keys_and_mixed_config_hashes(self):
+        """A status set that cannot be one selected/configured experiment is invalid."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        for label in ("duplicate", "config", "unbound"):
+            with self.subTest(label=label):
+                csv_path, json_path = self._make_complete_fixture()
+                keys = read_json(self.selection_path)["points"]
+                status_path = self.status_root / keys[-1]["workload"] / (
+                    f"l1d_{keys[-1]['l1d_size']}/l2_{keys[-1]['l2_size']}/pair_status.json"
+                )
+                status = read_json(status_path)
+                if label == "duplicate":
+                    status["key"] = keys[0]
+                elif label == "config":
+                    status["config_sha256"] = "0" * 64
+                else:
+                    status["pair_status"] = str(self.root / "other-status.json")
+                write_json(status_path, status)
+                with self.assertRaisesRegex(ValueError, "duplicate|config|self-binding"):
+                    summarize(self.fixed_root, self.clip_root, self.selection_path,
+                              self.config_path, csv_path, json_path)
+
+    def test_report_rejects_wrong_classification_and_unvalidated_reuse(self):
+        """A non-canonical classification or markerless reuse cannot be reported."""
+        from workflow.analysis.summarize_paired_sweep import summarize
+
+        for label in ("classification", "reuse"):
+            with self.subTest(label=label):
+                csv_path, json_path = self._make_complete_fixture()
+                key = read_json(self.selection_path)["points"][0]
+                if label == "classification":
+                    run_config_path = self.clip_root / key["workload"] / (
+                        f"l1d_{key['l1d_size']}/l2_{key['l2_size']}/run_config.json"
+                    )
+                    run_config = read_json(run_config_path)
+                    run_config["config"]["experiment_classification"] = {
+                        "non_formal": False
+                    }
+                    write_json(run_config_path, run_config)
+                else:
+                    status_path = self.status_root / key["workload"] / (
+                        f"l1d_{key['l1d_size']}/l2_{key['l2_size']}/pair_status.json"
+                    )
+                    status = read_json(status_path)
+                    status["clip3d_reused_fixed_r2"] = True
+                    status["physical_r2_runs"] = 1
+                    write_json(status_path, status)
+                with self.assertRaisesRegex(ValueError, "classification|reuse"):
+                    summarize(self.fixed_root, self.clip_root, self.selection_path,
+                              self.config_path, csv_path, json_path)
+
+
 if __name__ == "__main__":
     unittest.main()
