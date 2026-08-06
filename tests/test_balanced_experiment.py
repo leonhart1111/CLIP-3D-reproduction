@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import sys
+from copy import deepcopy
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -574,13 +575,16 @@ class BalancedSelectionTests(unittest.TestCase):
             "configs/experiments/r1_cache_sweep.json"
         )
         self.grid = read_json(self.grid_path)
-        self.config_path = self.root / "traffic_weighted.json"
+        self.config_path = Path(__file__).resolve().parents[1] / (
+            "configs/experiments/"
+            "clip3d_constrained_5p0_raw_power_p1_lambda0020119_"
+            "traffic_weighted_exploratory.json"
+        )
         self.config = read_json(Path(__file__).resolve().parents[1] / (
             "configs/experiments/"
             "clip3d_constrained_5p0_raw_power_p1_lambda0020119_"
             "traffic_weighted_exploratory.json"
         ))
-        write_json(self.config_path, self.config)
 
     @property
     def manifest_path(self) -> Path:
@@ -588,7 +592,8 @@ class BalancedSelectionTests(unittest.TestCase):
             "configs/experiments/balanced50_traffic_weighted.json"
         )
 
-    def _write_layout_roots(self) -> tuple[Path, Path]:
+    def _write_layout_roots(self, config_path: Path | None = None,
+                            config: dict | None = None) -> tuple[Path, Path]:
         """Create real, complete 100-point roots with layout-only artifacts."""
         from workflow.r1_catalog import expected_keys
         from workflow.run_lifting_sweep import (
@@ -596,6 +601,8 @@ class BalancedSelectionTests(unittest.TestCase):
             required_artifacts,
         )
 
+        config_path = (config_path or self.config_path).resolve()
+        config = config if config is not None else self.config
         fixed_root = self.root / "fixed"
         clip_root = self.root / "clip"
         for root, method in ((fixed_root, "fixed-bin"), (clip_root, "clip3d")):
@@ -608,9 +615,9 @@ class BalancedSelectionTests(unittest.TestCase):
                         write_json(point / artifact, {})
                 write_json(point / "run_config.json", {
                     "schema_version": 1,
-                    "source": str(self.config_path.resolve()),
+                    "source": str(config_path),
                     "layout_method": method,
-                    "config": self.config,
+                    "config": config,
                 })
                 write_json(point / "pipeline_summary.json", {
                     "layout_method": method,
@@ -652,15 +659,42 @@ class BalancedSelectionTests(unittest.TestCase):
             self.assertEqual({pair[0] for pair in pairs}, set(self.grid["l1d_sizes"]))
             self.assertEqual({pair[1] for pair in pairs}, set(self.grid["l2_sizes"]))
 
+    def test_selection_rejects_reordered_workload_blocks(self):
+        """Per-workload pair checks alone cannot preserve workload-major manifest order."""
+        from workflow.experiments.balanced50 import validate_selection
+
+        manifest, _keys = self._selection()
+        reordered = deepcopy(manifest)
+        reordered["points"] = reordered["points"][10:20] + reordered["points"][0:10] + (
+            reordered["points"][20:]
+        )
+
+        with self.assertRaisesRegex(ValueError, "entire predeclared order"):
+            validate_selection(reordered, self.grid)
+
+    def test_load_selection_rejects_absolute_and_parent_reference_paths(self):
+        """Manifest references must remain pinned beneath the repository root."""
+        from workflow.experiments.balanced50 import load_selection
+
+        manifest, _keys = self._selection()
+        for bad_path in (str(self.grid_path.resolve()), "../r1_cache_sweep.json"):
+            with self.subTest(path=bad_path):
+                malformed = deepcopy(manifest)
+                malformed["canonical_grid_config"]["path"] = bad_path
+                path = self.root / f"malformed-{len(bad_path)}.json"
+                write_json(path, malformed)
+                with self.assertRaisesRegex(ValueError, "project-relative"):
+                    load_selection(path)
+
     def test_preflight_reports_two_complete_layout_only_roots(self):
         """The selected 50 may proceed only after both whole 100-point roots validate."""
         from workflow.experiments.balanced50 import validate_layout_roots
 
-        _manifest, keys = self._selection()
+        manifest, keys = self._selection()
         fixed_root, clip_root = self._write_layout_roots()
 
         report = validate_layout_roots(
-            fixed_root, clip_root, keys, self.config_path,
+            fixed_root, clip_root, keys, self.config_path, selection=manifest,
         )
 
         self.assertEqual(report["mode"], "layout-only")
@@ -675,19 +709,20 @@ class BalancedSelectionTests(unittest.TestCase):
         """Checking only the selected 50 would hide an incomplete layout generation."""
         from workflow.experiments.balanced50 import validate_layout_roots
 
-        _manifest, keys = self._selection()
+        manifest, keys = self._selection()
         fixed_root, clip_root = self._write_layout_roots()
         missing = fixed_root / "fft/l1d_16kB/l2_256kB/run_config.json"
         missing.unlink()
 
         with self.assertRaisesRegex(ValueError, "fixed-bin root.*100"):
-            validate_layout_roots(fixed_root, clip_root, keys, self.config_path)
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path,
+                                  selection=manifest)
 
     def test_preflight_rejects_mismatched_layout_method(self):
         """A fixed output must never be mistaken for the CLIP-3D branch."""
         from workflow.experiments.balanced50 import validate_layout_roots
 
-        _manifest, keys = self._selection()
+        manifest, keys = self._selection()
         fixed_root, clip_root = self._write_layout_roots()
         point = clip_root / keys[0].relative_path()
         summary = read_json(point / "pipeline_summary.json")
@@ -695,13 +730,14 @@ class BalancedSelectionTests(unittest.TestCase):
         write_json(point / "pipeline_summary.json", summary)
 
         with self.assertRaisesRegex(ValueError, "clip3d.*layout method"):
-            validate_layout_roots(fixed_root, clip_root, keys, self.config_path)
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path,
+                                  selection=manifest)
 
     def test_preflight_rejects_changed_embedded_run_config(self):
         """A point regenerated with different lifting parameters cannot join the root."""
         from workflow.experiments.balanced50 import validate_layout_roots
 
-        _manifest, keys = self._selection()
+        manifest, keys = self._selection()
         fixed_root, clip_root = self._write_layout_roots()
         point = fixed_root / keys[0].relative_path()
         run_config = read_json(point / "run_config.json")
@@ -709,25 +745,29 @@ class BalancedSelectionTests(unittest.TestCase):
         write_json(point / "run_config.json", run_config)
 
         with self.assertRaisesRegex(ValueError, "embedded config"):
-            validate_layout_roots(fixed_root, clip_root, keys, self.config_path)
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path,
+                                  selection=manifest)
 
-    def test_preflight_rejects_wrong_experiment_classification(self):
-        """The non-formal traffic-weighted classification is part of the experiment identity."""
+    def test_preflight_rejects_config_not_pinned_by_selection(self):
+        """Consistent roots cannot substitute a different classified experiment config."""
         from workflow.experiments.balanced50 import validate_layout_roots
 
-        _manifest, keys = self._selection()
-        self.config["experiment_classification"]["non_formal"] = False
-        write_json(self.config_path, self.config)
-        fixed_root, clip_root = self._write_layout_roots()
+        manifest, keys = self._selection()
+        changed_config = deepcopy(self.config)
+        changed_config["experiment_classification"]["non_formal"] = False
+        changed_path = self.root / "changed_classified_config.json"
+        write_json(changed_path, changed_config)
+        fixed_root, clip_root = self._write_layout_roots(changed_path, changed_config)
 
-        with self.assertRaisesRegex(ValueError, "experiment classification"):
-            validate_layout_roots(fixed_root, clip_root, keys, self.config_path)
+        with self.assertRaisesRegex(ValueError, "does not match pinned"):
+            validate_layout_roots(fixed_root, clip_root, keys, changed_path,
+                                  selection=manifest)
 
     def test_preflight_rejects_missing_traffic_communication_profile(self):
         """Traffic-weighted layouts require recorded, usable per-core communication weights."""
         from workflow.experiments.balanced50 import validate_layout_roots
 
-        _manifest, keys = self._selection()
+        manifest, keys = self._selection()
         fixed_root, clip_root = self._write_layout_roots()
         point = fixed_root / keys[0].relative_path()
         summary = read_json(point / "pipeline_summary.json")
@@ -735,13 +775,39 @@ class BalancedSelectionTests(unittest.TestCase):
         write_json(point / "pipeline_summary.json", summary)
 
         with self.assertRaisesRegex(ValueError, "communication profile"):
-            validate_layout_roots(fixed_root, clip_root, keys, self.config_path)
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path,
+                                  selection=manifest)
+
+    def test_preflight_rejects_invalid_traffic_weight_values(self):
+        """Traffic weights must be finite, non-negative, and normalized to one."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        manifest, keys = self._selection()
+        for label, value, all_weights in (
+                ("nonfinite", float("nan"), False),
+                ("negative", -0.1, False),
+                ("unnormalized", 0.2, True)):
+            with self.subTest(label=label):
+                fixed_root, clip_root = self._write_layout_roots()
+                point = fixed_root / keys[0].relative_path()
+                summary = read_json(point / "pipeline_summary.json")
+                weights = summary["communication_profile"]["per_core"]
+                if all_weights:
+                    for record in weights.values():
+                        record["normalized_weight"] = value
+                else:
+                    weights["0"]["normalized_weight"] = value
+                write_json(point / "pipeline_summary.json", summary)
+
+                with self.assertRaisesRegex(ValueError, "communication profile"):
+                    validate_layout_roots(fixed_root, clip_root, keys, self.config_path,
+                                          selection=manifest)
 
     def test_layout_only_preflight_rejects_existing_r2_results(self):
         """The 200-output layout checkpoint must contain no measured R2 performance."""
         from workflow.experiments.balanced50 import validate_layout_roots
 
-        _manifest, keys = self._selection()
+        manifest, keys = self._selection()
         fixed_root, clip_root = self._write_layout_roots()
         point = fixed_root / keys[0].relative_path()
         summary = read_json(point / "pipeline_summary.json")
@@ -750,13 +816,14 @@ class BalancedSelectionTests(unittest.TestCase):
         write_json(point / "pipeline_summary.json", summary)
 
         with self.assertRaisesRegex(ValueError, "layout-only.*R2"):
-            validate_layout_roots(fixed_root, clip_root, keys, self.config_path)
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path,
+                                  selection=manifest)
 
     def test_resume_preflight_requires_and_uses_an_existing_r2_validator(self):
         """Resume mode delegates all existing R2 provenance decisions to its caller."""
         from workflow.experiments.balanced50 import validate_layout_roots
 
-        _manifest, keys = self._selection()
+        manifest, keys = self._selection()
         fixed_root, clip_root = self._write_layout_roots()
         point = fixed_root / keys[0].relative_path()
         summary = read_json(point / "pipeline_summary.json")
@@ -767,7 +834,7 @@ class BalancedSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "existing_r2_validator"):
             validate_layout_roots(
                 fixed_root, clip_root, keys, self.config_path,
-                require_layout_only=False,
+                require_layout_only=False, selection=manifest,
             )
 
         calls = []
@@ -778,13 +845,33 @@ class BalancedSelectionTests(unittest.TestCase):
 
         report = validate_layout_roots(
             fixed_root, clip_root, keys, self.config_path,
-            require_layout_only=False, existing_r2_validator=validator,
+            require_layout_only=False, selection=manifest,
+            existing_r2_validator=validator,
         )
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], "fixed-bin")
         self.assertEqual(calls[0][1], keys[0])
         self.assertEqual(report["fixed"]["existing_r2_count"], 1)
         self.assertEqual(report["clip3d"]["existing_r2_count"], 0)
+
+    def test_resume_preflight_rejects_a_validator_that_does_not_accept(self):
+        """Calling a provenance callback is insufficient unless it explicitly accepts R2."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        manifest, keys = self._selection()
+        fixed_root, clip_root = self._write_layout_roots()
+        point = fixed_root / keys[0].relative_path()
+        summary = read_json(point / "pipeline_summary.json")
+        summary["ipc2"] = 1.25
+        summary["bips2"] = 2.5
+        write_json(point / "pipeline_summary.json", summary)
+
+        with self.assertRaisesRegex(ValueError, "did not accept"):
+            validate_layout_roots(
+                fixed_root, clip_root, keys, self.config_path,
+                require_layout_only=False, selection=manifest,
+                existing_r2_validator=lambda *_args: {"accepted": False},
+            )
 
 
 if __name__ == "__main__":

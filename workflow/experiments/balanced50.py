@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict
+import math
 from pathlib import Path
 
 from workflow.common import PROJECT_ROOT, read_json, sha256_file
@@ -13,7 +13,6 @@ from workflow.r1_catalog import ArchitectureKey, expected_keys
 from workflow.run_lifting_sweep import CLIP3D_REQUIRED_ARTIFACTS, required_artifacts
 
 
-CANONICAL_GRID_PATH = PROJECT_ROOT / "configs/experiments/r1_cache_sweep.json"
 EXPECTED_CLASSIFICATION = {
     "mode": "operational-exploratory-traffic-weighted",
     "non_formal": True,
@@ -28,28 +27,41 @@ EXPECTED_PAIRS = [
 ]
 
 
+def _resolve_reference(manifest: dict, name: str) -> tuple[Path, str]:
+    """Resolve one manifest pin without allowing paths to escape the project."""
+    reference = manifest.get(name)
+    if not isinstance(reference, dict):
+        raise ValueError(f"selection manifest {name} must be an object")
+    relative = reference.get("path")
+    digest = reference.get("sha256")
+    if not isinstance(relative, str) or not relative:
+        raise ValueError(f"selection manifest {name} path is missing")
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ValueError(f"selection manifest {name} path must be project-relative")
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise ValueError(f"selection manifest {name} sha256 is invalid")
+    resolved = (PROJECT_ROOT / relative_path).resolve()
+    try:
+        resolved.relative_to(PROJECT_ROOT)
+    except ValueError as error:
+        raise ValueError(f"selection manifest {name} path must be project-relative") from error
+    if not resolved.is_file():
+        raise FileNotFoundError(f"selection manifest {name} is missing: {resolved}")
+    if sha256_file(resolved) != digest:
+        raise ValueError(f"selection manifest {name} sha256 does not match {resolved}")
+    return resolved, digest
+
+
 def load_selection(path: Path) -> dict:
-    """Load a selection manifest and resolve its immutable config references."""
+    """Load a selection manifest and verify its immutable project-local references."""
     manifest = read_json(path)
     if not isinstance(manifest, dict):
         raise ValueError("selection manifest must contain an object")
     if manifest.get("schema_version") != 1:
         raise ValueError("unsupported selection manifest schema")
     for name in ("canonical_grid_config", "experiment_config"):
-        reference = manifest.get(name)
-        if not isinstance(reference, dict):
-            raise ValueError(f"selection manifest {name} must be an object")
-        relative = reference.get("path")
-        digest = reference.get("sha256")
-        if not isinstance(relative, str) or not relative:
-            raise ValueError(f"selection manifest {name} path is missing")
-        if not isinstance(digest, str) or len(digest) != 64:
-            raise ValueError(f"selection manifest {name} sha256 is invalid")
-        resolved = PROJECT_ROOT / relative
-        if not resolved.is_file():
-            raise FileNotFoundError(f"selection manifest {name} is missing: {resolved}")
-        if sha256_file(resolved) != digest:
-            raise ValueError(f"selection manifest {name} sha256 does not match {resolved}")
+        _resolve_reference(manifest, name)
     return manifest
 
 
@@ -103,16 +115,16 @@ def validate_selection(manifest: dict, grid: dict) -> dict:
     unknown = [key for key in keys if key not in canonical_set]
     if unknown:
         raise ValueError(f"selection contains non-canonical key: {unknown[0]}")
+    expected = [ArchitectureKey(workload, l1d_size, l2_size)
+                for workload in workloads for l1d_size, l2_size in EXPECTED_PAIRS]
+    if keys != expected:
+        raise ValueError("selection keys do not match the entire predeclared order")
     for workload in workloads:
         pairs = [(key.l1d_size, key.l2_size) for key in keys if key.workload == workload]
-        if pairs != EXPECTED_PAIRS:
-            raise ValueError(f"selection order for {workload} is not the predeclared balanced order")
         if {l1d for l1d, _l2 in pairs} != set(l1d_sizes):
             raise ValueError(f"selection for {workload} does not cover every L1D level")
         if {l2 for _l1d, l2 in pairs} != set(l2_sizes):
             raise ValueError(f"selection for {workload} does not cover every L2 level")
-    if Counter(key.workload for key in keys) != Counter({workload: 10 for workload in workloads}):
-        raise ValueError("selection must contain ten points for every configured workload")
     return {
         "selection_name": manifest.get("selection_name"),
         "workload_count": len(workloads),
@@ -140,6 +152,10 @@ def _validate_communication_profile(summary: dict, point: Path) -> None:
         raise ValueError(f"communication profile invalid for {point}: {error}") from error
     if weights is None or set(weights) != {0, 1, 2, 3}:
         raise ValueError(f"communication profile invalid for {point}: expected cores 0..3")
+    if any(not math.isfinite(weight) or weight < 0 for weight in weights.values()):
+        raise ValueError(f"communication profile invalid for {point}: weights must be finite and non-negative")
+    if not math.isclose(sum(weights.values()), 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(f"communication profile invalid for {point}: weights must sum to one")
 
 
 def _validate_root(root: Path, method: str, canonical: list[ArchitectureKey],
@@ -190,8 +206,8 @@ def _validate_root(root: Path, method: str, canonical: list[ArchitectureKey],
                 "resume preflight found existing R2 results but existing_r2_validator is required"
             )
         decision = existing_r2_validator(method, key, point)
-        if not isinstance(decision, dict):
-            raise ValueError(f"existing_r2_validator returned a non-object for {method} at {point}")
+        if not isinstance(decision, dict) or decision.get("accepted") is not True:
+            raise ValueError(f"existing_r2_validator did not accept {method} R2 at {point}")
         existing_r2 += 1
     return {
         "root": str(root),
@@ -202,15 +218,27 @@ def _validate_root(root: Path, method: str, canonical: list[ArchitectureKey],
 
 def validate_layout_roots(
         fixed_root: Path, clip_root: Path, keys: list[ArchitectureKey], config_path: Path,
+        *, selection: dict,
         require_layout_only: bool = True,
         existing_r2_validator: Callable[[str, ArchitectureKey, Path], dict] | None = None,
 ) -> dict:
     """Validate complete paired layout roots before layout-only or resumable R2 work."""
     config_path = Path(config_path).resolve()
+    grid_path, _grid_sha256 = _resolve_reference(selection, "canonical_grid_config")
+    pinned_config_path, pinned_config_sha256 = _resolve_reference(
+        selection, "experiment_config"
+    )
+    if config_path != pinned_config_path or sha256_file(config_path) != pinned_config_sha256:
+        raise ValueError("supplied experiment config does not match pinned selection reference/hash")
     config = _read_object(config_path, "experiment config")
     if config.get("experiment_classification") != EXPECTED_CLASSIFICATION:
         raise ValueError("experiment classification must be the declared non-formal traffic-weighted classification")
-    canonical = expected_keys(read_json(CANONICAL_GRID_PATH))
+    grid = _read_object(grid_path, "canonical grid config")
+    validate_selection(selection, grid)
+    selected = selection_keys(selection)
+    if keys != selected:
+        raise ValueError("selected keys do not match the supplied selection manifest")
+    canonical = expected_keys(grid)
     if len(canonical) != 100 or len(set(canonical)) != 100:
         raise ValueError("canonical grid must contain exactly 100 unique architecture keys")
     if len(keys) != 50 or len(set(keys)) != 50 or any(key not in set(canonical) for key in keys):
@@ -233,6 +261,7 @@ def validate_layout_roots(
         "config": str(config_path),
         "config_sha256": sha256_file(config_path),
         "selected_count": len(keys),
+        "selected_pairs": [asdict(key) for key in keys],
         "selected_keys": [asdict(key) for key in keys],
         "fixed": fixed,
         "clip3d": clip3d,
