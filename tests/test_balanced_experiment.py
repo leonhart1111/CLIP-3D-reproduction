@@ -2175,5 +2175,545 @@ class StrictR2ReuseTests(unittest.TestCase):
         self.assertAlmostEqual(artifact["target_outputs"]["bips2"], 3.25 * 1.1)
 
 
+class PairedR2RunnerTests(unittest.TestCase):
+    """Run real paired state transitions around only the expensive boundaries."""
+
+    def setUp(self) -> None:
+        self.fixture = StrictR2ReuseTests(
+            "test_local_successful_cache_accepts_matching_latency_and_r1_identity"
+        )
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.root = self.fixture.root
+        self.r1_root = self.root / "canonical-r1"
+        self.fixed_root = self.root / "fixed"
+        self.clip_root = self.root / "clip"
+        self.config_path = self.fixture.config_path
+        self.status_root = self.root / "paired-status"
+        from workflow.r1_catalog import ArchitectureKey
+        self.key = ArchitectureKey("fft", "32kB", "512kB")
+
+    @staticmethod
+    def _complete_gem5(command, **_kwargs):
+        output = Path(next(arg.split("=", 1)[1] for arg in command
+                           if arg.startswith("--outdir=")))
+        (output / "stats.txt").parent.mkdir(parents=True, exist_ok=True)
+        (output / "stats.txt").write_text(
+            "---------- Begin Simulation Statistics ----------\n"
+            "system.cpu0.commitStats0.numInsts 162500000\n"
+            "system.cpu0.numCycles 200000000\n"
+            "system.cpu1.commitStats0.numInsts 162500000\n"
+            "system.cpu1.numCycles 200000000\n"
+            "system.cpu2.commitStats0.numInsts 162500000\n"
+            "system.cpu2.numCycles 200000000\n"
+            "system.cpu3.commitStats0.numInsts 162500000\n"
+            "system.cpu3.numCycles 200000000\n",
+            encoding="utf-8",
+        )
+        return CompletedProcess(command, 0, stdout="gem5 fixture completed\n")
+
+    def _make_vectors_unequal(self) -> None:
+        from workflow.r2.run_r2 import canonical_gem5_args
+        vector_path = self.fixture.clip / "r2_latency.json"
+        vector = read_json(vector_path)
+        vector["gem5_overrides"]["xbar_forward_latency"] = 9
+        vector["gem5_args"] = canonical_gem5_args(vector["gem5_overrides"])
+        write_json(vector_path, vector)
+
+    def _ordered_boundaries(self, events):
+        import workflow.r2.attach_result as attach_result
+        import workflow.r2.reuse_result as reuse_result
+        import workflow.r2.run_r2 as run_r2
+
+        real_run = run_r2.run
+        real_attach = attach_result.attach
+        real_reuse_attach = reuse_result.attach_reused_result
+
+        def ordered_run(r1_dir, latency_path, output_dir, *args, **kwargs):
+            branch = "fixed" if Path(latency_path).parent == self.fixture.fixed else "clip"
+            events.append(f"{branch}-run")
+            return real_run(r1_dir, latency_path, output_dir, *args, **kwargs)
+
+        def ordered_attach(point_dir):
+            branch = "fixed" if Path(point_dir) == self.fixture.fixed else "clip"
+            events.append(f"{branch}-attach")
+            return real_attach(point_dir)
+
+        def ordered_reuse(*args, **kwargs):
+            events.append("reuse-attach")
+            return real_reuse_attach(*args, **kwargs)
+
+        return (
+            patch("workflow.r2.run_paired_sweep.run_r2.run", side_effect=ordered_run),
+            patch("workflow.r2.run_paired_sweep.attach_result.attach",
+                  side_effect=ordered_attach),
+            patch("workflow.r2.run_paired_sweep.reuse_result.attach_reused_result",
+                  side_effect=ordered_reuse),
+        )
+
+    def test_equal_vectors_run_fixed_first_and_record_one_physical_run(self):
+        """Choosing reuse before fixed attachment would violate pair ordering."""
+        from workflow.r2.run_paired_sweep import run_pair
+
+        events = []
+        run_patch, attach_patch, reuse_patch = self._ordered_boundaries(events)
+        with run_patch, attach_patch, reuse_patch:
+            result = run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        self.assertEqual(result["state"], "success")
+        self.assertEqual(result["physical_r2_runs"], 1)
+        self.assertTrue(result["clip3d_reused_fixed_r2"])
+        self.assertEqual(events, ["fixed-run", "fixed-attach", "reuse-attach"])
+        self.assertEqual(
+            result["pair_status"],
+            str((self.status_root / self.key.relative_path() /
+                 "pair_status.json").resolve()),
+        )
+
+    def test_default_status_root_is_a_sibling_of_fixed_root(self):
+        """A direct call must not put scheduler state inside a layout root."""
+        from workflow.r2.run_paired_sweep import run_pair
+
+        result = run_pair(
+            self.key, self.r1_root, self.fixed_root, self.clip_root,
+            self.config_path,
+        )
+
+        expected = self.fixed_root.parent / "paired_r2_status" / (
+            self.key.relative_path()
+        ) / "pair_status.json"
+        self.assertEqual(result["pair_status"], str(expected.resolve()))
+        self.assertTrue(expected.is_file())
+
+    def test_unequal_vectors_run_and_attach_a_separate_clip_result(self):
+        """An override mismatch must never be relabeled as fixed-result reuse."""
+        from workflow.r2.run_paired_sweep import run_pair
+
+        self._make_vectors_unequal()
+        events = []
+        run_patch, attach_patch, reuse_patch = self._ordered_boundaries(events)
+        with patch("workflow.r2.run_r2.subprocess.run",
+                   side_effect=self._complete_gem5), \
+                run_patch, attach_patch, reuse_patch:
+            result = run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        self.assertEqual(result["state"], "success")
+        self.assertEqual(result["physical_r2_runs"], 2)
+        self.assertFalse(result["clip3d_reused_fixed_r2"])
+        self.assertEqual(
+            events, ["fixed-run", "fixed-attach", "clip-run", "clip-attach"]
+        )
+
+    def test_completed_compatible_pair_is_skipped_on_second_invocation(self):
+        """A validated successful pair must not repeat either attachment boundary."""
+        from workflow.r2.run_paired_sweep import run_pair
+
+        first = run_pair(
+            self.key, self.r1_root, self.fixed_root, self.clip_root,
+            self.config_path, status_root=self.status_root,
+        )
+        with patch("workflow.r2.run_paired_sweep.run_r2.run",
+                   side_effect=AssertionError("completed fixed must skip")), \
+                patch("workflow.r2.run_paired_sweep.attach_result.attach",
+                      side_effect=AssertionError("completed attach must skip")), \
+                patch("workflow.r2.run_paired_sweep.reuse_result.attach_reused_result",
+                      side_effect=AssertionError("completed reuse must skip")):
+            second = run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        self.assertEqual(second, first)
+
+    def test_completed_pair_with_tampered_reuse_marker_is_reattached(self):
+        """Marker existence alone must not make a damaged reused pair skippable."""
+        from workflow.r2.run_paired_sweep import run_pair
+
+        run_pair(
+            self.key, self.r1_root, self.fixed_root, self.clip_root,
+            self.config_path, status_root=self.status_root,
+        )
+        marker_path = self.fixture.clip / "r2_reuse.json"
+        marker = read_json(marker_path)
+        marker["source_ipc2"] = 99.0
+        write_json(marker_path, marker)
+        events = []
+        run_patch, attach_patch, reuse_patch = self._ordered_boundaries(events)
+        with run_patch, attach_patch, reuse_patch:
+            repaired = run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        self.assertEqual(repaired["state"], "success")
+        self.assertEqual(events, ["reuse-attach"])
+        self.assertEqual(read_json(marker_path)["source_ipc2"], 3.25)
+
+    def test_fresh_reuse_rejects_a_marker_corrupted_after_attachment(self):
+        """A fresh pair cannot succeed before its marker binds validated outputs."""
+        from workflow.r2.run_paired_sweep import run_pair
+        import workflow.r2.reuse_result as reuse_result
+
+        real_attach = reuse_result.attach_reused_result
+
+        def attach_then_corrupt(*args, **kwargs):
+            summary = real_attach(*args, **kwargs)
+            marker_path = self.fixture.clip / "r2_reuse.json"
+            marker = read_json(marker_path)
+            marker["source_ipc2"] = 99.0
+            write_json(marker_path, marker)
+            return summary
+
+        with patch("workflow.r2.run_paired_sweep.reuse_result.attach_reused_result",
+                   side_effect=attach_then_corrupt):
+            result = run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("reuse attachment", result["error"])
+
+    def test_failed_clip_stage_resumes_after_the_fixed_checkpoint(self):
+        """A CLIP interruption must preserve and validate completed fixed work."""
+        from workflow.r2.run_paired_sweep import run_pair
+
+        self._make_vectors_unequal()
+        events = []
+        run_patch, attach_patch, reuse_patch = self._ordered_boundaries(events)
+        failed_once = False
+
+        import workflow.r2.run_r2 as run_r2
+        real_run = run_r2.run
+
+        def fail_first_clip(r1_dir, latency_path, output_dir, *args, **kwargs):
+            nonlocal failed_once
+            branch = "fixed" if Path(latency_path).parent == self.fixture.fixed else "clip"
+            events.append(f"{branch}-run")
+            if branch == "clip" and not failed_once:
+                failed_once = True
+                raise RuntimeError("injected CLIP interruption")
+            return real_run(r1_dir, latency_path, output_dir, *args, **kwargs)
+
+        with patch("workflow.r2.run_paired_sweep.run_r2.run",
+                   side_effect=fail_first_clip), attach_patch, reuse_patch:
+            failed = run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+        self.assertEqual(failed["state"], "failed")
+        self.assertTrue(failed["fixed_complete"])
+        events.clear()
+
+        run_patch, attach_patch, reuse_patch = self._ordered_boundaries(events)
+        with patch("workflow.r2.run_r2.subprocess.run",
+                   side_effect=self._complete_gem5), \
+                run_patch, attach_patch, reuse_patch:
+            resumed = run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        self.assertEqual(resumed["state"], "success")
+        self.assertEqual(events, ["clip-run", "clip-attach"])
+
+    def test_separate_clip_rejects_incoherent_attached_performance(self):
+        """Local provenance cannot certify BIPS2 that disagrees with performance."""
+        from workflow.r2.run_paired_sweep import run_pair
+        import workflow.r2.attach_result as attach_result
+
+        self._make_vectors_unequal()
+        real_attach = attach_result.attach
+
+        def attach_then_corrupt(point_dir):
+            summary = real_attach(point_dir)
+            if Path(point_dir) == self.fixture.clip:
+                performance_path = Path(point_dir) / "performance.json"
+                performance = read_json(performance_path)
+                performance["bips2"] = 999.0
+                write_json(performance_path, performance)
+            return summary
+
+        with patch("workflow.r2.run_r2.subprocess.run",
+                   side_effect=self._complete_gem5), \
+                patch("workflow.r2.run_paired_sweep.attach_result.attach",
+                      side_effect=attach_then_corrupt):
+            result = run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("local attachment", result["error"])
+
+    def test_completed_separate_clip_with_corrupt_performance_is_reattached(self):
+        """Resume validation must bind local performance before skipping a pair."""
+        from workflow.r2.run_paired_sweep import run_pair
+
+        self._make_vectors_unequal()
+        with patch("workflow.r2.run_r2.subprocess.run",
+                   side_effect=self._complete_gem5):
+            first = run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+        self.assertEqual(first["state"], "success")
+        performance_path = self.fixture.clip / "performance.json"
+        performance = read_json(performance_path)
+        performance["bips2"] = 999.0
+        write_json(performance_path, performance)
+
+        events = []
+        run_patch, attach_patch, reuse_patch = self._ordered_boundaries(events)
+        with run_patch, attach_patch, reuse_patch:
+            repaired = run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        self.assertEqual(repaired["state"], "success")
+        self.assertEqual(events, ["clip-run", "clip-attach"])
+        self.assertAlmostEqual(read_json(performance_path)["bips2"], 3.575)
+
+    def test_sweep_retains_a_failed_pair_while_another_completes(self):
+        """One returned failure must not cancel or erase a completed pair."""
+        from concurrent.futures import Future
+        from workflow.experiments.balanced50 import load_selection, selection_keys
+        import workflow.r2.run_paired_sweep as paired
+
+        selection_path = Path(__file__).resolve().parents[1] / (
+            "configs/experiments/balanced50_traffic_weighted.json"
+        )
+        keys = selection_keys(load_selection(selection_path))[:2]
+        status_root = self.status_root
+
+        class ImmediateExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def submit(self, _function, key, *_args, **_kwargs):
+                future = Future()
+                state = "failed" if key == keys[0] else "success"
+                future.set_result({
+                    "schema_version": 1,
+                    "state": state,
+                    "key": {
+                        "workload": key.workload,
+                        "l1d_size": key.l1d_size,
+                        "l2_size": key.l2_size,
+                    },
+                    "clip3d_reused_fixed_r2": state == "success",
+                    "physical_r2_runs": 1 if state == "success" else 0,
+                    "pair_status": str(
+                        status_root / key.relative_path() / "pair_status.json"
+                    ),
+                })
+                return future
+
+        with patch.object(paired, "ProcessPoolExecutor", ImmediateExecutor), \
+                patch.object(paired, "validate_layout_roots",
+                             return_value={"mode": "resume"}):
+            result = paired.run_sweep(
+                self.r1_root, self.fixed_root, self.clip_root, selection_path,
+                self.config_path, self.status_root, jobs=2, limit=2,
+            )
+
+        self.assertEqual(result["selected_pair_count"], 2)
+        self.assertEqual(result["completed_pair_count"], 1)
+        self.assertEqual(result["failed_pair_count"], 1)
+        self.assertFalse(result["complete"])
+        self.assertEqual([pair["state"] for pair in result["pairs"]],
+                         ["failed", "success"])
+
+    def test_existing_r2_adapter_uses_task5_local_and_reuse_decisions(self):
+        """Resume preflight must not invent a weaker scheduler provenance path."""
+        import workflow.r2.run_paired_sweep as paired
+        from workflow.r2.attach_result import attach
+        from workflow.r2.reuse_result import attach_reused_result
+        from workflow.r2.run_r2 import run
+
+        adapter = paired._existing_r2_validator(
+            self.r1_root, self.fixed_root, self.clip_root, self.config_path
+        )
+        fixed = adapter("fixed-bin", self.key, self.fixture.fixed)
+        self.assertTrue(fixed["accepted"], fixed["reasons"])
+
+        attach_reused_result(
+            self.fixture.fixed, self.fixture.clip, self.fixture.r1,
+            self.config_path,
+        )
+        reused = adapter("clip3d", self.key, self.fixture.clip)
+        self.assertTrue(reused["accepted"], reused["reasons"])
+        self.assertIn("artifact", reused)
+
+        (self.fixture.clip / "r2_reuse.json").unlink()
+        self.fixture._write_point(self.fixture.clip, "clip3d", 1.1)
+        self._make_vectors_unequal()
+        with patch("workflow.r2.run_r2.subprocess.run",
+                   side_effect=self._complete_gem5):
+            run(
+                self.fixture.r1, self.fixture.clip / "r2_latency.json",
+                self.fixture.clip / "gem5_r2",
+            )
+        attach(self.fixture.clip)
+        local_clip = adapter("clip3d", self.key, self.fixture.clip)
+        self.assertTrue(local_clip["accepted"], local_clip["reasons"])
+        self.assertIn("result", local_clip)
+
+    def test_cli_rejects_nonpositive_jobs(self):
+        """Zero workers must fail argument parsing before scheduling anything."""
+        from workflow.r2.run_paired_sweep import main
+
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            main(["--r1-root", "r1", "--fixed-root", "fixed",
+                  "--clip-root", "clip", "--selection", "selection.json",
+                  "--config", "config.json", "--status-root", "status",
+                  "--jobs", "0"])
+
+    def test_limit_one_passes_only_the_first_manifest_entry(self):
+        """A smoke limit must preserve manifest order rather than completion order."""
+        from concurrent.futures import Future
+        from workflow.experiments.balanced50 import load_selection, selection_keys
+        import workflow.r2.run_paired_sweep as paired
+
+        selection_path = Path(__file__).resolve().parents[1] / (
+            "configs/experiments/balanced50_traffic_weighted.json"
+        )
+        first = selection_keys(load_selection(selection_path))[0]
+        observed = []
+        status_root = self.status_root
+
+        class ImmediateExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def submit(self, _function, key, *_args, **_kwargs):
+                observed.append(key)
+                future = Future()
+                future.set_result({
+                    "schema_version": 1,
+                    "state": "success",
+                    "key": {"workload": key.workload,
+                            "l1d_size": key.l1d_size, "l2_size": key.l2_size},
+                    "clip3d_reused_fixed_r2": True,
+                    "physical_r2_runs": 1,
+                    "pair_status": str(
+                        status_root / key.relative_path() / "pair_status.json"
+                    ),
+                })
+                return future
+
+        with patch.object(paired, "ProcessPoolExecutor", ImmediateExecutor), \
+                patch.object(paired, "validate_layout_roots",
+                             return_value={"mode": "resume"}):
+            result = paired.run_sweep(
+                self.r1_root, self.fixed_root, self.clip_root, selection_path,
+                self.config_path, self.status_root, limit=1,
+            )
+
+        self.assertEqual(observed, [first])
+        self.assertTrue(result["limited_run"])
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["state"], "success")
+        self.assertEqual(result["selected_pair_count"], 1)
+
+    def test_complete_fifty_pair_status_records_fifty_plus_k_runs(self):
+        """A complete summary must count one fixed run plus K separate CLIP runs."""
+        from concurrent.futures import Future
+        import workflow.r2.run_paired_sweep as paired
+
+        selection_path = Path(__file__).resolve().parents[1] / (
+            "configs/experiments/balanced50_traffic_weighted.json"
+        )
+        submitted = 0
+        status_root = self.status_root
+
+        class ImmediateExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def submit(self, _function, key, *_args, **_kwargs):
+                nonlocal submitted
+                separate = submitted < 7
+                submitted += 1
+                future = Future()
+                future.set_result({
+                    "schema_version": 1,
+                    "state": "success",
+                    "key": {"workload": key.workload,
+                            "l1d_size": key.l1d_size, "l2_size": key.l2_size},
+                    "clip3d_reused_fixed_r2": not separate,
+                    "physical_r2_runs": 2 if separate else 1,
+                    "pair_status": str(
+                        status_root / key.relative_path() / "pair_status.json"
+                    ),
+                })
+                return future
+
+        with patch.object(paired, "ProcessPoolExecutor", ImmediateExecutor), \
+                patch.object(paired, "validate_layout_roots",
+                             return_value={"mode": "resume"}), \
+                redirect_stdout(StringIO()):
+            result = paired.run_sweep(
+                self.r1_root, self.fixed_root, self.clip_root, selection_path,
+                self.config_path, self.status_root, jobs=4,
+            )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["selected_pair_count"], 50)
+        self.assertEqual(result["completed_pair_count"], 50)
+        self.assertEqual(result["separate_clip_r2_count"], 7)
+        self.assertEqual(result["reuse_pair_count"], 43)
+        self.assertEqual(result["physical_r2_runs"], 57)
+        self.assertEqual(len(result["pairs"]), 50)
+
+    def test_normal_cli_is_nonzero_while_any_of_fifty_is_incomplete(self):
+        """Subset success cannot make a full 50-pair invocation exit zero."""
+        import workflow.r2.run_paired_sweep as paired
+
+        selection_path = Path(__file__).resolve().parents[1] / (
+            "configs/experiments/balanced50_traffic_weighted.json"
+        )
+        incomplete = {
+            "complete": False, "limited_run": False,
+            "selected_pair_count": 50, "completed_pair_count": 49,
+            "failed_pair_count": 1, "pairs": [],
+        }
+        with patch.object(paired, "run_sweep", return_value=incomplete):
+            exit_code = paired.main([
+                "--r1-root", str(self.r1_root),
+                "--fixed-root", str(self.fixed_root),
+                "--clip-root", str(self.clip_root),
+                "--selection", str(selection_path),
+                "--config", str(self.config_path),
+                "--status-root", str(self.status_root),
+            ])
+
+        self.assertEqual(exit_code, 1)
+
 if __name__ == "__main__":
     unittest.main()
