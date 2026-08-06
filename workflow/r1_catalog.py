@@ -91,14 +91,14 @@ def _record_for(root: Path, key: ArchitectureKey, expected_scope: str,
             record["state"] = status.get("state")
             if record["state"] != "success":
                 errors.append(f"status state is not success: {record['state']!r}")
-        elif status is not None:
+        else:
             errors.append("status.json must contain an object")
     if not metadata_path.is_file():
         errors.append("missing r1_metadata.json")
         metadata = None
     else:
         metadata = _read(metadata_path, errors, "r1_metadata.json")
-        if metadata is not None and not isinstance(metadata, dict):
+        if not isinstance(metadata, dict):
             errors.append("r1_metadata.json must contain an object")
             metadata = None
     if not stats_path.is_file():

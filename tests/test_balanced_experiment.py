@@ -132,6 +132,30 @@ class CanonicalCatalogueTests(unittest.TestCase):
         self.assertFalse(record["valid"])
         self.assertIn("CPU2 cycles", " ".join(record["errors"]))
 
+    def test_catalogue_rejects_null_status_json(self):
+        """A JSON null cannot prove that a canonical R1 point succeeded."""
+        root, experiment = self.make_grid_fixture()
+        point = root / "fft/l1d_16kB/l2_128kB"
+        write_json(point / "status.json", None)
+
+        catalogue = build_catalogue(root, experiment, profile="paper")
+
+        record = catalogue["canonical_records"][0]
+        self.assertFalse(record["valid"])
+        self.assertIn("status.json must contain an object", record["errors"])
+
+    def test_catalogue_rejects_null_metadata_json(self):
+        """A JSON null cannot supply a canonical point's architecture metadata."""
+        root, experiment = self.make_grid_fixture()
+        point = root / "fft/l1d_16kB/l2_128kB"
+        write_json(point / "r1_metadata.json", None)
+
+        catalogue = build_catalogue(root, experiment, profile="paper")
+
+        record = catalogue["canonical_records"][0]
+        self.assertFalse(record["valid"])
+        self.assertIn("r1_metadata.json must contain an object", record["errors"])
+
     def test_snapshot_hashes_only_valid_canonical_artifacts(self):
         """Artifact provenance must omit invalid points and extra directories."""
         root, experiment = self.make_grid_fixture()
