@@ -1221,5 +1221,565 @@ class ROMOptimizerTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
 
 
+class ROMPipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.source_r1 = self.root / "source_r1"
+        self.steady = self.root / "steady_preflight"
+        self.output = self.root / "transient_rom"
+        self.transient_r1 = self.root / "periodic_r1"
+        self.config_path = self.root / "config.json"
+        self.hotspot = self.root / "hotspot"
+        self.modules = self.steady / "modules.json"
+        self.cacti = self.steady / "cacti/cacti_characterization.json"
+        self.power_windows = self.output / "windows/mcpat/power_windows.json"
+        self.proposed_layout = self.output / "optimization/proposed_layout.json"
+        for directory in (self.source_r1, self.steady, self.transient_r1):
+            directory.mkdir(parents=True)
+        self.cacti.parent.mkdir(parents=True)
+        self.hotspot.write_text("mock hotspot", encoding="utf-8")
+        write_json(self.modules, {"ipc1": 2.0, "modules": []})
+        write_json(self.cacti, {"frequency_ghz": 2.0, "records": []})
+        write_json(self.config_path, self.config())
+
+    @staticmethod
+    def config() -> dict:
+        return {
+            "schema_version": 1,
+            "name": "transient-rom-test",
+            "frequency": {
+                "ambient_c": 25.0,
+                "f0_ghz": 2.0,
+                "fmin_ghz": 1.0,
+                "tsafe_c": 50.0,
+            },
+            "physical": {
+                "grid_size": 1,
+                "utilization": 0.7,
+                "r_convec_k_per_w": 0.1,
+                "thermal_stack": {"layers": ["silicon", "tim"]},
+            },
+            "layout_optimizer": {
+                "allowed_l2_tiers": [1],
+                "wire_objective": "continuous",
+                "lambda_wire": 0.0,
+            },
+            "delay": {
+                "wire_rounding": "nearest",
+                "wire_aggregation": "mean",
+                "cycles_per_tsv": 2,
+                "l1_pipeline_cycles": 1,
+            },
+            "transient_rom": {
+                "enabled": True,
+                "calibration_runs": 8,
+                "validation_runs": 2,
+            },
+        }
+
+    def prepared(self) -> dict:
+        return {
+            "power_windows": str(self.power_windows.resolve()),
+            "transient_r1": str(self.transient_r1.resolve()),
+            "power_trace_identity": "sha256:power",
+            "stage_seconds": {"windowed_mcpat": 1.0},
+        }
+
+    def optimization(self) -> dict:
+        return {
+            "hotspot_calls_inside_optimizer": 0,
+            "proposed_layout": str(self.proposed_layout.resolve()),
+            "package_acceptance": {
+                "accepted": True,
+                "identity": {"power_trace": "sha256:power"},
+            },
+            "parameters": {"frequency_grid_ghz": [1.0, 2.0]},
+            "selected": {
+                "f_sus_trans_rom_ghz": 1.9,
+                "bips1_trans_rom_pred": 3.8,
+            },
+        }
+
+    @staticmethod
+    def bind_package(package: Path) -> None:
+        classification = {
+            "thermal_mode": "transient-rom",
+            "non_formal": True,
+            "paper_equivalent": False,
+        }
+        artifacts = []
+        for path in sorted(package.rglob("*")):
+            if not path.is_file() or path.name == "rom_artifact_manifest.json":
+                continue
+            artifacts.append({
+                "path": path.relative_to(package).as_posix(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "classification": classification,
+            })
+        write_json(package / "rom_artifact_manifest.json", {
+            "schema_version": 1,
+            **classification,
+            "scope": str(package.resolve()),
+            "artifacts": artifacts,
+        })
+
+    def test_pipeline_prepares_windows_once_reuses_package_and_validates_final_layout(self):
+        # Break caught: recomputing power windows per layout, deriving R2 from
+        # the fixed pilot, or reporting steady bips2 would invalidate comparisons.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        package = self.output / "rom_package"
+        package.mkdir(parents=True)
+        write_json(package / "rom_acceptance.json", {"accepted": True})
+        self.bind_package(package)
+        write_json(self.power_windows, {"mock": "power windows"})
+        write_json(self.proposed_layout, {"mock": "proposed layout"})
+        events = []
+
+        def build_vector_side_effect(*args, **kwargs):
+            events.append("r2-vector")
+            return {"critical_l1d_to_l2_cycles": 7}
+
+        def run_r2_side_effect(*args, **kwargs):
+            events.append("r2")
+            return {"ipc2": 1.5}
+
+        def final_side_effect(*args, **kwargs):
+            events.append("hotspot")
+            return {
+                "f_sus_trans_ghz": 1.8,
+                "search": {"evaluations": [{"frequency_ghz": 1.8}]},
+            }
+
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={
+                "summary": {
+                    "layout_method": "fixed-bin", "ipc2": None, "bips2": None,
+                }
+            },
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows",
+            return_value=self.prepared(),
+        ) as prepare, patch(
+            "workflow.transient.rom.run_pipeline.optimize_transient_layout",
+            return_value=self.optimization(),
+        ) as optimize, patch(
+            "workflow.transient.rom.run_pipeline.build_vector",
+            side_effect=build_vector_side_effect,
+        ) as build_vector_mock, patch(
+            "workflow.transient.rom.run_pipeline.run_r2",
+            side_effect=run_r2_side_effect,
+        ), patch(
+            "workflow.transient.rom.run_pipeline.search_layout_frequency",
+            side_effect=final_side_effect,
+        ) as final_search:
+            result = run_transient_rom_pipeline(
+                self.source_r1, self.steady, self.output, self.config_path,
+                self.transient_r1, calibrate=False, execute_r2=True,
+            )
+
+        prepare.assert_called_once()
+        optimize.assert_called_once()
+        self.assertEqual(events, ["r2-vector", "r2", "hotspot"])
+        self.assertEqual(
+            build_vector_mock.call_args.args[5], self.proposed_layout.resolve()
+        )
+        self.assertEqual(
+            final_search.call_args.args[1], self.proposed_layout.resolve()
+        )
+        self.assertEqual(result["f_sus_trans_rom_pred_ghz"], 1.9)
+        self.assertEqual(result["f_sus_trans_hotspot_ghz"], 1.8)
+        self.assertEqual(result["bips1_trans_rom_pred"], 3.8)
+        self.assertEqual(result["bips2_trans"], 2.7)
+        self.assertEqual(
+            result["rom_acceptance"]["identity"]["power_trace"],
+            "sha256:power",
+        )
+        keys = []
+
+        def collect_keys(value):
+            if isinstance(value, dict):
+                keys.extend(value)
+                for nested in value.values():
+                    collect_keys(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    collect_keys(nested)
+
+        collect_keys(result)
+        self.assertNotIn("bips2", keys)
+        self.assertTrue(result["non_formal"])
+        self.assertFalse(result["paper_equivalent"])
+        self.assertEqual(result["thermal_mode"], "transient-rom")
+        self.assertEqual(
+            read_json(self.output / "transient_rom_summary.json"), result
+        )
+        artifact_manifest = read_json(self.output / "rom_artifact_manifest.json")
+        self.assertTrue(artifact_manifest["non_formal"])
+        self.assertFalse(artifact_manifest["paper_equivalent"])
+        self.assertEqual(artifact_manifest["thermal_mode"], "transient-rom")
+        records = {record["path"]: record for record in artifact_manifest["artifacts"]}
+        for relative in (
+            "windows/mcpat/power_windows.json",
+            "optimization/proposed_layout.json",
+            "transient_rom_summary.json",
+        ):
+            self.assertEqual(records[relative]["classification"], {
+                "thermal_mode": "transient-rom",
+                "non_formal": True,
+                "paper_equivalent": False,
+            })
+
+    def test_pipeline_rejects_reused_steady_preflight_with_r2_measurement(self):
+        # Break caught: a reused pilot with R2 is not the fixed-bin/R2-disabled
+        # preflight required by ROM mode and can leak the wrong-layout IPC2.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={
+                "summary": {
+                    "layout_method": "fixed-bin", "ipc2": 1.25, "bips2": 2.5,
+                }
+            },
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows"
+        ) as prepare:
+            with self.assertRaisesRegex(ValueError, "R2-disabled"):
+                run_transient_rom_pipeline(
+                    self.source_r1, self.steady, self.output, self.config_path,
+                    self.transient_r1, calibrate=False, execute_r2=False,
+                )
+
+        prepare.assert_not_called()
+
+    def test_failed_final_hotspot_or_skipped_r2_omits_bips2_trans(self):
+        # Break caught: publishing a null/estimated BIPS2 as if it survived both
+        # the real final HotSpot gate and the optional R2 measurement.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        package = self.output / "rom_package"
+        package.mkdir(parents=True)
+        write_json(package / "rom_acceptance.json", {"accepted": True})
+        self.bind_package(package)
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": {"layout_method": "fixed-bin"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows",
+            return_value=self.prepared(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.optimize_transient_layout",
+            return_value=self.optimization(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.build_vector",
+            return_value={"critical_l1d_to_l2_cycles": 7},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.run_r2"
+        ) as run_r2_mock, patch(
+            "workflow.transient.rom.run_pipeline.search_layout_frequency",
+            return_value={"f_sus_trans_ghz": None, "search": {"evaluations": []}},
+        ):
+            result = run_transient_rom_pipeline(
+                self.source_r1, self.steady, self.output, self.config_path,
+                self.transient_r1, calibrate=False, execute_r2=False,
+            )
+
+        run_r2_mock.assert_not_called()
+        self.assertIsNone(result["f_sus_trans_hotspot_ghz"])
+        self.assertNotIn("bips2_trans", result)
+        self.assertNotIn("bips2", result)
+
+    def test_calibration_builds_and_accepts_package_before_optimization(self):
+        # Break caught: allowing optimization before the fixed 8+2 holdout gate
+        # bypasses the accepted-package contract.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        model = object()
+        cases = {
+            "training_hotspot_calls": 8,
+            "holdout_hotspot_calls": 2,
+            "training_cases": [{"id": str(i)} for i in range(8)],
+            "holdout_cases": [{"id": "h0"}, {"id": "h1"}],
+        }
+        events = []
+
+        def validation_side_effect(*args, **kwargs):
+            events.append("accepted")
+            package = self.output / "rom_package"
+            write_json(package / "rom_acceptance.json", {
+                "accepted": True, "identity": {"power_trace": "sha256:power"},
+            })
+            return {"accepted": True, "failure_reasons": []}
+
+        def optimize_side_effect(*args, **kwargs):
+            events.append("optimize")
+            return self.optimization()
+
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": {"layout_method": "fixed-bin"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows",
+            return_value=self.prepared(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.build_design",
+            return_value={"allowed_l2_tiers": [1], "base_layout": {}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.execute_calibration_cases",
+            return_value=cases,
+        ), patch(
+            "workflow.transient.rom.run_pipeline.fit_state_space",
+            return_value=(model, {"pod": {"rank": 2}}),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.save_model"
+        ), patch(
+            "workflow.transient.rom.run_pipeline.package_identity",
+            return_value={"power_trace": "sha256:power"},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_calibration_holdouts",
+            side_effect=validation_side_effect,
+        ), patch(
+            "workflow.transient.rom.run_pipeline.optimize_transient_layout",
+            side_effect=optimize_side_effect,
+        ), patch(
+            "workflow.transient.rom.run_pipeline.build_vector",
+            return_value={"critical_l1d_to_l2_cycles": 7},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.search_layout_frequency",
+            return_value={"f_sus_trans_ghz": 1.8, "search": {"evaluations": []}},
+        ):
+            result = run_transient_rom_pipeline(
+                self.source_r1, self.steady, self.output, self.config_path,
+                self.transient_r1, calibrate=True, execute_r2=False,
+            )
+
+        self.assertEqual(events, ["accepted", "optimize"])
+        self.assertEqual(result["calibration_hotspot_calls"], 10)
+        self.assertEqual(result["rom_package_status"], "calibrated")
+        self.assertEqual(
+            result["rom_acceptance"]["identity"]["power_trace"],
+            "sha256:power",
+        )
+        self.assertTrue(result["rom_holdout_validation"]["accepted"])
+        package_manifest = read_json(
+            self.output / "rom_package/rom_artifact_manifest.json"
+        )
+        self.assertEqual(package_manifest["thermal_mode"], "transient-rom")
+        self.assertTrue(package_manifest["non_formal"])
+        self.assertFalse(package_manifest["paper_equivalent"])
+
+    def test_calibrated_package_can_be_reused_from_a_fresh_output_root(self):
+        # Break caught: coupling the package to a populated optimization root
+        # makes the advertised calibration/reuse workflow impossible on rerun.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        first_output = self.output
+        second_output = self.root / "transient_rom_reuse"
+        package = first_output / "rom_package"
+        package.mkdir(parents=True)
+        write_json(package / "rom_acceptance.json", {
+            "accepted": True,
+            "identity": {"power_trace": "sha256:power"},
+        })
+        write_json(package / "validation_report.json", {
+            "accepted": True,
+            "failure_reasons": [],
+        })
+        self.bind_package(package)
+        optimization = self.optimization()
+        optimization["proposed_layout"] = str(
+            (second_output / "optimization/proposed_layout.json").resolve()
+        )
+        prepared = self.prepared()
+        prepared["power_windows"] = str(
+            (second_output / "windows/mcpat/power_windows.json").resolve()
+        )
+
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": {"layout_method": "fixed-bin"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows",
+            return_value=prepared,
+        ), patch(
+            "workflow.transient.rom.run_pipeline.optimize_transient_layout",
+            return_value=optimization,
+        ) as optimize, patch(
+            "workflow.transient.rom.run_pipeline.build_vector",
+            return_value={"critical_l1d_to_l2_cycles": 7},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.search_layout_frequency",
+            return_value={"f_sus_trans_ghz": 1.8, "search": {"evaluations": []}},
+        ):
+            result = run_transient_rom_pipeline(
+                self.source_r1, self.steady, second_output, self.config_path,
+                self.transient_r1, calibrate=False, execute_r2=False,
+                rom_package_dir=package,
+            )
+
+        self.assertEqual(optimize.call_args.args[1], package.resolve())
+        self.assertEqual(result["rom_package"], str(package.resolve()))
+        self.assertEqual(result["rom_package_status"], "reused")
+
+    def test_reuse_rejects_stale_or_incomplete_package_manifest_before_search(self):
+        # Break caught: a valid-looking acceptance marker cannot bind a model
+        # archive whose classified inventory or hashes have changed.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        package = self.output / "rom_package"
+        package.mkdir(parents=True)
+        acceptance = package / "rom_acceptance.json"
+        write_json(acceptance, {
+            "accepted": True,
+            "identity": {"power_trace": "sha256:power"},
+        })
+        (package / "pod_model.npz").write_bytes(b"model-v1")
+        self.bind_package(package)
+        (package / "pod_model.npz").write_bytes(b"model-tampered")
+
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": {"layout_method": "fixed-bin"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows",
+            return_value=self.prepared(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.optimize_transient_layout"
+        ) as optimize:
+            with self.assertRaisesRegex(ValueError, "manifest hash"):
+                run_transient_rom_pipeline(
+                    self.source_r1, self.steady, self.output, self.config_path,
+                    self.transient_r1, calibrate=False, execute_r2=False,
+                )
+
+        optimize.assert_not_called()
+
+    def test_rerun_r2_reuses_completed_windows_and_optimization(self):
+        # Break caught: retrying a failed R2 must not regenerate periodic power
+        # or collide with the already-populated deterministic optimizer output.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        package = self.output / "rom_package"
+        package.mkdir(parents=True)
+        write_json(package / "rom_acceptance.json", {
+            "accepted": True,
+            "identity": {"power_trace": "sha256:power"},
+        })
+        write_json(package / "validation_report.json", {
+            "accepted": True,
+            "failure_reasons": [],
+        })
+        self.bind_package(package)
+        write_json(self.power_windows, {"mock": "cached power windows"})
+        write_json(self.proposed_layout, {"mock": "proposed layout"})
+        write_json(
+            self.output / "optimization/optimization_report.json",
+            self.optimization(),
+        )
+
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": {"layout_method": "fixed-bin"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline._reuse_prepared_power_windows",
+            return_value=self.prepared(),
+        ) as reuse_windows, patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows"
+        ) as prepare, patch(
+            "workflow.transient.rom.run_pipeline._reuse_optimization",
+            return_value=self.optimization(),
+        ) as reuse_optimization, patch(
+            "workflow.transient.rom.run_pipeline.optimize_transient_layout"
+        ) as optimize, patch(
+            "workflow.transient.rom.run_pipeline.build_vector",
+            return_value={"critical_l1d_to_l2_cycles": 7},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.run_r2",
+            return_value={"ipc2": 1.5},
+        ) as run_r2_mock, patch(
+            "workflow.transient.rom.run_pipeline.search_layout_frequency",
+            return_value={"f_sus_trans_ghz": 1.8, "search": {"evaluations": []}},
+        ):
+            result = run_transient_rom_pipeline(
+                self.source_r1, self.steady, self.output, self.config_path,
+                self.transient_r1, calibrate=True, execute_r2=True,
+                rerun_r2=True,
+            )
+
+        reuse_windows.assert_called_once()
+        prepare.assert_not_called()
+        reuse_optimization.assert_called_once()
+        optimize.assert_not_called()
+        self.assertTrue(run_r2_mock.call_args.kwargs["rerun"])
+        self.assertEqual(result["bips2_trans"], 2.7)
+        self.assertEqual(result["rom_package_status"], "reused-calibration")
+
+    def test_exploratory_config_uses_exact_nonformal_rom_settings(self):
+        # Break caught: a hidden threshold or formal label would make a run
+        # incomparable to the reviewed Task 2 contract.
+        config = read_json(
+            Path(__file__).parents[1]
+            / "configs/experiments/clip3d_transient_rom_exploratory.json"
+        )
+        settings = parse_settings(config)
+
+        self.assertEqual(settings.sample_interval_ms, 2.0)
+        self.assertEqual(settings.calibration_windows, 64)
+        self.assertEqual(settings.prbs_seed, 20260807)
+        self.assertEqual(settings.prbs_fraction, 0.20)
+        self.assertEqual(settings.pod_energy_threshold, 0.999)
+        self.assertEqual(settings.max_pod_rank, 16)
+        self.assertEqual(settings.ridge, 1e-8)
+        self.assertEqual(settings.max_condition_number, 1e10)
+        self.assertEqual(settings.pss_period_repeats, 20)
+        self.assertEqual(settings.pss_tolerance_c, 0.01)
+        self.assertEqual(settings.frequency_tolerance_ghz, 0.01)
+        self.assertEqual(settings.max_holdout_peak_error_c, 1.0)
+        self.assertEqual(settings.max_holdout_grid_rmse_c, 0.75)
+        self.assertEqual(settings.search_grid_points_per_axis, 25)
+        self.assertEqual(settings.refinement_starts, 5)
+        self.assertTrue(config["transient_rom"]["enabled"])
+        self.assertTrue(config["transient_rom"]["non_formal"])
+        self.assertFalse(config["transient_rom"]["paper_equivalent"])
+
 if __name__ == "__main__":
     unittest.main()

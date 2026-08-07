@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "name": "clip3d_transient_rom_exploratory",
+  "technology_nm": 45,
+  "mcpat": {
+    "temperature_k": 320,
+    "device_type": 0,
+    "longer_channel_device": 1,
+    "interconnect_projection_type": 1,
+    "opt_for_clk": 0
+  },
+  "cacti": {
+    "value_source": "local CACTI run"
+  },
+  "frequency": {
+    "f0_ghz": 2.0,
+    "fmin_ghz": 0.4,
+    "tsafe_c": 95.0,
+    "ambient_c": 25.0
+  },
+  "physical": {
+    "tiers": 2,
+    "grid_size": 32,
+    "utilization": 0.7,
+    "area_reference_mm2": 150.0,
+    "area_reference_raw_mm2": 45.7538495872,
+    "area_reference_basis": "McPAT non-cache area plus local CACTI L1I/L1D/L2 area for 4-core 32kB/512kB reference",
+    "thermal_stack": {
+      "silicon_resistivity_mk_per_w": 0.01,
+      "tim_resistivity_mk_per_w": 0.25,
+      "interposer_thickness_m": 0.0001,
+      "active_silicon_thickness_m": 0.00005,
+      "tim_thickness_m": 0.00002,
+      "local_resistance_scale": 8.72,
+      "calibration": "Earlier Table III thermal anchor calibration retained; rerun calibration after switching cache geometry to local CACTI before formal claims."
+    },
+    "r_convec_k_per_w": 5.0
+  },
+  "layout_optimizer": {
+    "r_convec_k_per_w": 5.0,
+    "alpha": 0.3,
+    "beta": 0.0,
+    "cross_tier_weight": 0.965,
+    "lambda_wire": 0.0,
+    "allowed_l2_tiers": [1],
+    "validation_policy": "paper-single",
+    "wire_objective": "continuous",
+    "require_scipy": true,
+    "parameter_provenance": {
+      "alpha": "pre-validation candidate; do not cite as accepted",
+      "beta": "fixed_unidentifiable_under_p1",
+      "cross_tier_weight": "pre-validation candidate; do not cite as accepted",
+      "lambda_wire": "zero only to isolate thermal calibration; R2 required"
+    },
+    "baseline_guard_bips_tolerance": 1e-09
+  },
+  "comparison_layouts": {
+    "candidate_grid": 11,
+    "top_k_hotspot": 3,
+    "sa_iterations": 600,
+    "sa_seed": 20260725,
+    "sa_selection_lambda": 0.5
+  },
+  "delay": {
+    "tsv_hops": 1,
+    "cycles_per_tsv": 2,
+    "l1_pipeline_cycles": 1,
+    "wire_rounding": "nearest"
+  },
+  "transient_rom": {
+    "enabled": true,
+    "non_formal": true,
+    "paper_equivalent": false,
+    "note": "Exploratory raw-power method extension only; not a formal or paper-equivalent CLIP-3D result.",
+    "sample_interval_ms": 2.0,
+    "calibration_runs": 8,
+    "validation_runs": 2,
+    "calibration_windows": 64,
+    "prbs_seed": 20260807,
+    "prbs_fraction": 0.20,
+    "pod_energy_threshold": 0.999,
+    "max_pod_rank": 16,
+    "ridge": 1e-08,
+    "max_condition_number": 10000000000.0,
+    "pss_period_repeats": 20,
+    "pss_tolerance_c": 0.01,
+    "frequency_tolerance_ghz": 0.01,
+    "max_holdout_peak_error_c": 1.0,
+    "max_holdout_grid_rmse_c": 0.75,
+    "search_grid_points_per_axis": 25,
+    "refinement_starts": 5
+  },
+  "formal_validation": {
+    "strict_p1": true,
+    "accepted": false,
+    "promotion": "workflow.analysis.promote_validated_config only"
+  },
+  "provenance": {
+    "paper": [
+      "45 nm, 4 cores, 2 GHz",
+      "32x32 power grid on each active tier",
+      "70% utilization and 150 mm^2 reference calibration",
+      "T_safe=95 C, T_amb=25 C, f_min=0.4 GHz",
+      "Constrained cooling R_conv=5.0 K/W"
+    ],
+    "reproduction_assumptions": [
+      "This transient-ROM configuration is an explicit non-formal raw-power extension and must not be cited as the paper's steady Eq. (13) result.",
+      "McPAT dynamic and leakage powers are used without post-processing multipliers.",
+      "Cache delay, area, and aspect-ratio-preserving geometry come only from the local CACTI run.",
+      "The accepted ROM identity fixes the workload power trace, module geometry, thermal stack, cooling, grid, HotSpot binary, configuration, and allowed L2 tiers.",
+      "Final reported bips2_trans requires both real-HotSpot periodic validation and a current-layout R2 run."
+    ]
+  }
+}

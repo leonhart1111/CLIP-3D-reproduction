@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -43,7 +44,8 @@ from workflow.r2.run_wire_sensitivity import (
     summarize_workloads,
 )
 from workflow.run_lifting_pipeline import (
-    evaluate_comparison_candidates, select_clip3d_candidate, validate_config,
+    evaluate_comparison_candidates, main as run_lifting_pipeline_main,
+    select_clip3d_candidate, validate_config,
 )
 from workflow.run_lifting_sweep import (
     completed as lifting_completed,
@@ -1872,6 +1874,96 @@ class FormalGuardTests(unittest.TestCase):
                 allow_proxy=True, expected_points=1,
             )
             self.assertFalse(result["r2_complete"])
+
+
+class ThermalModeDispatchTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def invoke_cli(self, *arguments: str) -> None:
+        argv = [
+            "run_lifting_pipeline",
+            "--r1-dir", str(self.root / "r1"),
+            "--output-dir", str(self.root / "output"),
+            "--config", str(self.root / "config.json"),
+            *arguments,
+        ]
+        with patch("sys.argv", argv), redirect_stdout(StringIO()):
+            run_lifting_pipeline_main()
+
+    @staticmethod
+    def steady_summary() -> dict:
+        return {
+            "layout_method": "fixed-bin",
+            "tmax_c": 75.0,
+            "sustainable_frequency_ghz": 2.0,
+        }
+
+    def test_steady_mode_calls_legacy_pipeline_without_rom_dispatch(self):
+        # Break caught: making ROM the default would alter every historical
+        # steady invocation and import its optional NumPy/SciPy dependency.
+        module_name = "workflow.transient.rom.run_pipeline"
+        previous = sys.modules.pop(module_name, None)
+
+        def restore_module():
+            sys.modules.pop(module_name, None)
+            if previous is not None:
+                sys.modules[module_name] = previous
+
+        self.addCleanup(restore_module)
+        with patch(
+            "workflow.run_lifting_pipeline.run_pipeline",
+            return_value=self.steady_summary(),
+        ) as legacy:
+            self.invoke_cli("--thermal-mode", "steady")
+
+        legacy.assert_called_once()
+        self.assertNotIn(module_name, sys.modules)
+        self.assertEqual(legacy.call_args.kwargs["layout_method"], "fixed-bin")
+        self.assertFalse(legacy.call_args.kwargs["execute_r2"])
+
+    def test_rom_mode_runs_fixed_preflight_then_rom_with_r2_forwarded(self):
+        # Break caught: forwarding --run-r2 to the steady pilot either runs R2
+        # twice or derives it from the wrong (fixed-bin) layout.
+        rom_summary = {
+            "f_sus_trans_rom_pred_ghz": 1.9,
+            "f_sus_trans_hotspot_ghz": 1.8,
+            "bips1_trans_rom_pred": 3.8,
+            "bips2_trans": 2.7,
+        }
+        with patch(
+            "workflow.run_lifting_pipeline.run_pipeline",
+            return_value=self.steady_summary(),
+        ) as steady, patch(
+            "workflow.transient.rom.run_pipeline.run_transient_rom_pipeline",
+            return_value=rom_summary,
+        ) as rom:
+            self.invoke_cli(
+                "--thermal-mode", "transient-rom", "--run-r2", "--rerun-r2"
+            )
+
+        self.assertEqual(steady.call_args.kwargs["layout_method"], "fixed-bin")
+        self.assertFalse(steady.call_args.kwargs["execute_r2"])
+        self.assertTrue(rom.call_args.kwargs["execute_r2"])
+        self.assertTrue(rom.call_args.kwargs["rerun_r2"])
+        self.assertEqual(
+            rom.call_args.kwargs["steady_preflight_dir"],
+            (self.root / "output/steady_preflight").resolve(),
+        )
+        self.assertEqual(
+            rom.call_args.kwargs["output_dir"],
+            (self.root / "output/transient_rom").resolve(),
+        )
+
+    def test_rom_mode_rejects_legacy_transient_flag(self):
+        # Break caught: combining both meanings of transient thermal analysis
+        # produces overlapping output trees and ambiguous summaries.
+        with self.assertRaisesRegex(SystemExit, "cannot combine"):
+            self.invoke_cli(
+                "--thermal-mode", "transient-rom", "--transient", "true"
+            )
 
 
 if __name__ == "__main__":

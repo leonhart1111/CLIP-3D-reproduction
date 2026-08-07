@@ -774,6 +774,10 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--layout-method", choices=LAYOUT_METHODS, default="fixed-bin")
+    parser.add_argument(
+        "--thermal-mode", choices=("steady", "transient-rom"), default="steady",
+        help="select the unchanged steady flow or the opt-in transient ROM flow",
+    )
     parser.add_argument("--optimized-layout", action="store_true",
                         help="deprecated alias for --layout-method clip3d")
     parser.add_argument("--run-r2", action="store_true",
@@ -805,17 +809,97 @@ def main() -> None:
         default="steady",
     )
     parser.add_argument("--rerun-transient-r1", action="store_true")
+    parser.add_argument(
+        "--transient-rom-dir", type=Path,
+        help="transient-ROM output root (default: output-dir/transient_rom)",
+    )
+    parser.add_argument(
+        "--transient-rom-calibrate", action="store_true",
+        help="create and holdout-gate a new ROM package before optimization",
+    )
+    parser.add_argument(
+        "--transient-rom-r1-dir", type=Path,
+        help="reuse a compatible periodic-statistics R1 for ROM power windows",
+    )
+    parser.add_argument(
+        "--transient-rom-package-dir", type=Path,
+        help="reuse an accepted ROM package from a separate read-only path",
+    )
     args = parser.parse_args()
+    if args.thermal_mode == "transient-rom" and args.transient:
+        raise SystemExit(
+            "cannot combine --thermal-mode transient-rom with --transient true"
+        )
     if args.optimized_layout:
         if args.layout_method != "fixed-bin":
             parser.error("do not combine --optimized-layout and --layout-method")
         args.layout_method = "clip3d"
-    summary = run_pipeline(
-        args.r1_dir.resolve(), args.output_dir.resolve(), args.config.resolve(),
-        args.layout_method, args.run_r2, args.rerun_r2,
-        args.reuse_r2_dir.resolve() if args.reuse_r2_dir else None,
-        args.wire_objective, args.proxy_spatial_model,
-    )
+    if args.thermal_mode == "steady":
+        summary = run_pipeline(
+            r1_dir=args.r1_dir.resolve(),
+            output_dir=args.output_dir.resolve(),
+            config_path=args.config.resolve(),
+            layout_method=args.layout_method,
+            execute_r2=args.run_r2,
+            rerun_r2=args.rerun_r2,
+            reuse_r2_dir=(
+                args.reuse_r2_dir.resolve() if args.reuse_r2_dir else None
+            ),
+            wire_objective_override=args.wire_objective,
+            proxy_spatial_model_override=args.proxy_spatial_model,
+        )
+    else:
+        if args.reuse_r2_dir is not None:
+            parser.error(
+                "transient-rom derives R2 from its selected layout; "
+                "--reuse-r2-dir is not supported"
+            )
+        if args.wire_objective is not None or args.proxy_spatial_model is not None:
+            parser.error(
+                "transient-rom scientific identity must come from --config; "
+                "do not use steady optimizer overrides"
+            )
+        if args.transient_rom_calibrate and args.transient_rom_package_dir:
+            parser.error(
+                "choose either --transient-rom-calibrate or "
+                "--transient-rom-package-dir"
+            )
+        steady_preflight_dir = (args.output_dir / "steady_preflight").resolve()
+        if not (steady_preflight_dir / "pipeline_summary.json").is_file():
+            run_pipeline(
+                r1_dir=args.r1_dir.resolve(),
+                output_dir=steady_preflight_dir,
+                config_path=args.config.resolve(),
+                layout_method="fixed-bin",
+                execute_r2=False,
+                rerun_r2=False,
+                reuse_r2_dir=None,
+                wire_objective_override=None,
+                proxy_spatial_model_override=None,
+            )
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        summary = run_transient_rom_pipeline(
+            source_r1_dir=args.r1_dir.resolve(),
+            steady_preflight_dir=steady_preflight_dir,
+            output_dir=(
+                args.transient_rom_dir.resolve()
+                if args.transient_rom_dir
+                else (args.output_dir / "transient_rom").resolve()
+            ),
+            config_path=args.config.resolve(),
+            transient_r1_dir=(
+                args.transient_rom_r1_dir.resolve()
+                if args.transient_rom_r1_dir else None
+            ),
+            calibrate=args.transient_rom_calibrate,
+            execute_r2=args.run_r2,
+            rom_package_dir=(
+                args.transient_rom_package_dir.resolve()
+                if args.transient_rom_package_dir else None
+            ),
+            rerun_r2=args.rerun_r2,
+        )
     if args.transient:
         from workflow.transient.run_transient_pipeline import run_transient_pipeline
 
@@ -837,9 +921,14 @@ def main() -> None:
             "tmax_c": transient["transient_tmax_c"],
         }
         write_json(args.output_dir / "pipeline_summary.json", summary)
-    print(f"Pipeline complete: method={summary['layout_method']}, "
-          f"Tmax={format_temperature_c(summary['tmax_c'])} C, "
-          f"f_sus={summary['sustainable_frequency_ghz']:.6f} GHz")
+    if args.thermal_mode == "steady":
+        print(f"Pipeline complete: method={summary['layout_method']}, "
+              f"Tmax={format_temperature_c(summary['tmax_c'])} C, "
+              f"f_sus={summary['sustainable_frequency_ghz']:.6f} GHz")
+    else:
+        frequency = summary["f_sus_trans_hotspot_ghz"]
+        rendered = "none" if frequency is None else f"{frequency:.6f} GHz"
+        print(f"Transient ROM pipeline complete: f_sus_hotspot={rendered}")
     if args.transient:
         print(
             f"Transient thermal complete: windows={transient['window_count']}, "
