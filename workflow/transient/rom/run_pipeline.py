@@ -13,8 +13,19 @@ from workflow.transient.rom.calibrate_rom import (
     _package_identity,
     validate_calibration_holdouts,
 )
-from workflow.transient.rom.calibration_design import build_design
-from workflow.transient.rom.contracts import parse_settings, require_accepted_package
+from workflow.transient.rom.calibration_design import (
+    build_design,
+    calibration_design_hash,
+    load_calibration_design,
+)
+from workflow.transient.rom.contracts import (
+    ROMSettings,
+    parse_settings,
+    require_accepted_package,
+    require_package_calibration_evidence,
+    require_rom_artifact_manifest,
+    write_rom_artifact_manifest,
+)
 from workflow.transient.rom.materialize_calibration import execute_calibration_cases
 from workflow.transient.rom.optimize_layout import (
     _requested_identity,
@@ -85,64 +96,24 @@ _CLASSIFICATION = {
 
 def _write_artifact_manifest(output_dir: Path) -> dict:
     """Bind every ROM-owned output file to the non-formal classification."""
-    manifest_path = output_dir / "rom_artifact_manifest.json"
-    artifacts = []
-    for path in sorted(output_dir.rglob("*")):
-        if not path.is_file() or path == manifest_path:
-            continue
-        artifacts.append({
-            "path": path.relative_to(output_dir).as_posix(),
-            "sha256": sha256_file(path),
-            "classification": dict(_CLASSIFICATION),
-        })
-    manifest = {
-        "schema_version": 1,
-        **_CLASSIFICATION,
-        "scope": str(output_dir),
-        "artifacts": artifacts,
-    }
-    write_json(manifest_path, manifest)
-    return manifest
+    return write_rom_artifact_manifest(output_dir)
 
 
 def _validate_artifact_manifest(package_dir: Path) -> dict:
-    manifest_path = package_dir / "rom_artifact_manifest.json"
-    if not manifest_path.is_file():
-        raise ValueError("reusable ROM package lacks rom_artifact_manifest.json")
-    manifest = read_json(manifest_path)
-    if not isinstance(manifest, dict) or any(
-        manifest.get(field) != value for field, value in _CLASSIFICATION.items()
-    ):
-        raise ValueError("reusable ROM package manifest classification is invalid")
-    records = manifest.get("artifacts")
-    if not isinstance(records, list):
-        raise ValueError("reusable ROM package manifest artifacts must be a list")
-    recorded: dict[str, dict] = {}
-    for record in records:
-        if not isinstance(record, dict):
-            raise ValueError("reusable ROM package manifest record is invalid")
-        relative = record.get("path")
-        if (not isinstance(relative, str) or not relative
-                or relative in recorded or Path(relative).is_absolute()
-                or ".." in Path(relative).parts):
-            raise ValueError("reusable ROM package manifest path is invalid")
-        if record.get("classification") != _CLASSIFICATION:
-            raise ValueError("reusable ROM package artifact classification is invalid")
-        recorded[relative] = record
+    return require_rom_artifact_manifest(package_dir)
 
-    actual: dict[str, Path] = {}
-    for path in sorted(package_dir.rglob("*")):
-        if path == manifest_path or not path.is_file():
-            continue
-        if path.is_symlink():
-            raise ValueError("reusable ROM package manifest cannot bind symlinks")
-        actual[path.relative_to(package_dir).as_posix()] = path
-    if set(recorded) != set(actual):
-        raise ValueError("reusable ROM package manifest inventory is incomplete or stale")
-    for relative, path in actual.items():
-        if recorded[relative].get("sha256") != sha256_file(path):
-            raise ValueError(f"reusable ROM package manifest hash differs for {relative}")
-    return manifest
+
+def _load_calibration_evidence(package_dir: Path, settings: ROMSettings) -> dict:
+    """Load and cross-check the immutable 8+2 evidence behind a reused ROM."""
+    package_dir = Path(package_dir).resolve()
+    acceptance_path = package_dir / "rom_acceptance.json"
+    if not acceptance_path.is_file():
+        raise ValueError("reusable ROM package lacks rom_acceptance.json")
+    acceptance = read_json(acceptance_path)
+    identity = acceptance.get("identity") if isinstance(acceptance, dict) else None
+    if not isinstance(identity, dict):
+        raise ValueError("reusable ROM acceptance evidence is incomplete")
+    return require_package_calibration_evidence(package_dir, identity, settings)
 
 
 def _reuse_prepared_power_windows(source_r1_dir: Path,
@@ -191,7 +162,7 @@ def _reuse_optimization(modules_path: Path, package_dir: Path,
     optimizer = config.get("layout_optimizer")
     if not isinstance(optimizer, dict):
         raise ValueError("config lacks layout_optimizer settings")
-    design = build_design(modules, optimizer.get("allowed_l2_tiers"), settings)
+    design = load_calibration_design(package_dir)
     requested = _requested_identity(
         modules_path, config_path, hotspot, read_json(power_windows_path),
         config, design,
@@ -238,19 +209,26 @@ def _calibrate_package(modules_path: Path, power_windows_path: Path,
         read_json(modules_path), optimizer.get("allowed_l2_tiers"), settings
     )
     package_dir.mkdir(parents=True, exist_ok=True)
+    identity = package_identity(
+        modules_path, power_windows_path, config_path, hotspot, design, config
+    )
     cases = execute_calibration_cases(
         modules_path, power_windows_path, config_path, design, package_dir,
-        settings, hotspot=hotspot,
+        settings, hotspot=hotspot, identity=identity,
     )
-    model, fit_report = fit_state_space(cases["training_cases"], settings)
+    model, fit_report = fit_state_space(
+        cases["training_cases"], settings, package_dir=package_dir,
+    )
+    fit_report = {
+        **fit_report,
+        "calibration_design_hash": calibration_design_hash(design),
+    }
     save_model(package_dir / "pod_model.npz", model, fit_report)
     write_json(package_dir / "fit_report.json", fit_report)
     acceptance = validate_calibration_holdouts(
         model, design, cases["holdout_cases"], settings, config,
         output_dir=package_dir,
-        identity=package_identity(
-            modules_path, power_windows_path, config_path, hotspot, design, config
-        ),
+        identity=identity,
     )
     if acceptance.get("accepted") is not True:
         reasons = acceptance.get("failure_reasons", [])
@@ -275,12 +253,17 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
     hotspot = Path(DEFAULT_HOTSPOT).resolve()
     reject_overlapping_output(output_dir, [source_r1_dir, steady_preflight_dir])
     final_validation_dir = output_dir / "final_hotspot_validation"
-    if (rerun_r2 and final_validation_dir.exists()
+    if (final_validation_dir.exists()
             and (not final_validation_dir.is_dir()
                  or any(final_validation_dir.iterdir()))):
-        raise ValueError(
-            "refusing to reuse existing final HotSpot validation artifacts: "
-            "--rerun-r2 is only for retries that failed before final HotSpot"
+        if rerun_r2:
+            raise ValueError(
+                "refusing to reuse existing final HotSpot validation artifacts: "
+                "--rerun-r2 is only for retries that failed before final HotSpot"
+            )
+        raise FileExistsError(
+            "final HotSpot validation output directory is not empty: "
+            f"{final_validation_dir}"
         )
     if transient_r1_dir is not None:
         transient_r1_dir = Path(transient_r1_dir).resolve()
@@ -374,6 +357,7 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
         else (output_dir / "rom_package").resolve()
     )
     calibration_cases = None
+    calibration_evidence = None
     completed_calibration = (
         rerun_r2 and calibrate
         and (package_dir / "rom_artifact_manifest.json").is_file()
@@ -382,10 +366,9 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
     )
     if completed_calibration:
         _validate_artifact_manifest(package_dir)
-        calibration_acceptance = read_json(package_dir / "validation_report.json")
-        if (not isinstance(calibration_acceptance, dict)
-                or calibration_acceptance.get("accepted") is not True):
-            raise ValueError("completed ROM calibration validation is not accepted")
+        calibration_evidence = _load_calibration_evidence(package_dir, settings)
+        calibration_cases = calibration_evidence["cases"]
+        calibration_acceptance = calibration_evidence["validation"]
         package_status = "reused-calibration"
     elif calibrate:
         calibration_cases, calibration_acceptance = _calibrate_package(
@@ -400,7 +383,9 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
                 "rerun with calibration enabled"
             )
         _validate_artifact_manifest(package_dir)
-        calibration_acceptance = None
+        calibration_evidence = _load_calibration_evidence(package_dir, settings)
+        calibration_cases = calibration_evidence["cases"]
+        calibration_acceptance = calibration_evidence["validation"]
         package_status = "reused"
 
     optimization_dir = output_dir / "optimization"
@@ -427,47 +412,136 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
             or package_acceptance.get("accepted") is not True
             or not isinstance(package_acceptance.get("identity"), dict)):
         raise ValueError("ROM optimization lacks complete accepted-package identity")
+    if (calibration_evidence is not None
+            and package_acceptance != calibration_evidence["acceptance"]):
+        raise ValueError("ROM optimization acceptance differs from saved calibration evidence")
 
     delay = config.get("delay")
     if not isinstance(delay, dict):
         raise ValueError("config lacks delay settings")
-    latency_path = (output_dir / "r2_latency.json").resolve()
-    vector = build_vector(
-        modules_path, cacti_path, latency_path, None, None, proposed_layout,
-        delay.get("wire_rounding", "nearest"),
-        int(delay.get("cycles_per_tsv", 2)),
-        int(delay.get("l1_pipeline_cycles", 1)),
-        delay.get("wire_aggregation", "mean"),
-    )
-    r2_result = None
-    if execute_r2:
-        r2_result = run_r2(
-            source_r1_dir, latency_path, output_dir / "gem5_r2",
-            rerun=rerun_r2,
-        )
-
     frequency_grid = optimization.get("parameters", {}).get("frequency_grid_ghz")
     if frequency_grid is None:
         frequency_grid = _frequency_grid(config)
-    final_validation = search_layout_frequency(
-        modules_path, proposed_layout, power_windows_path,
-        final_validation_dir, config_path,
-        frequencies_ghz=frequency_grid,
-        period_repeats=settings.pss_period_repeats,
-        pss_tolerance_c=settings.pss_tolerance_c,
-        frequency_tolerance_ghz=settings.frequency_tolerance_ghz,
-        hotspot=hotspot,
+    for path in (
+        modules_path, proposed_layout, power_windows_path, config_path, hotspot,
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    final_validation_failure = None
+    try:
+        final_validation = search_layout_frequency(
+            modules_path, proposed_layout, power_windows_path,
+            final_validation_dir, config_path,
+            frequencies_ghz=frequency_grid,
+            period_repeats=settings.pss_period_repeats,
+            pss_tolerance_c=settings.pss_tolerance_c,
+            frequency_tolerance_ghz=settings.frequency_tolerance_ghz,
+            hotspot=hotspot,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        final_validation_dir.mkdir(parents=True, exist_ok=True)
+        final_validation_failure = {
+            "category": (
+                "validation_contract_error"
+                if isinstance(error, ValueError) else "tool_error"
+            ),
+            "error_type": type(error).__name__,
+            "message": str(error),
+            "artifact_dir": str(final_validation_dir),
+        }
+        write_json(
+            final_validation_dir / "final_validation_failure.json",
+            final_validation_failure,
+        )
+        final_validation = {
+            "schema_version": 1,
+            "state": "rom_final_validation_failed",
+            "f_sus_trans_ghz": None,
+            "search": {"evaluations": []},
+            "failure": final_validation_failure,
+        }
+
+    search = final_validation.get("search")
+    evaluations = search.get("evaluations") if isinstance(search, dict) else None
+    if not isinstance(evaluations, list):
+        evaluations = []
+    materialized_final_cases = (
+        sum(
+            1 for path in final_validation_dir.iterdir()
+            if path.is_dir() and path.name.startswith("frequency_")
+        )
+        if final_validation_dir.is_dir() else 0
     )
+    final_validation_hotspot_calls = max(len(evaluations), materialized_final_cases)
+    f_hotspot = final_validation.get("f_sus_trans_ghz")
+    if final_validation_failure is None:
+        nonconverged = [
+            evaluation for evaluation in evaluations
+            if not isinstance(evaluation, dict)
+            or evaluation.get("converged") is not True
+        ]
+        if not evaluations:
+            final_validation_failure = {
+                "category": "missing_pss_evidence",
+                "message": "final HotSpot validation recorded no PSS evaluations",
+                "artifact_dir": str(final_validation_dir),
+                "evaluations": [],
+            }
+        elif nonconverged:
+            final_validation_failure = {
+                "category": "pss_nonconvergence",
+                "message": "one or more final HotSpot evaluations did not reach PSS",
+                "artifact_dir": str(final_validation_dir),
+                "evaluations": nonconverged,
+            }
+        if final_validation_failure is not None:
+            f_hotspot = None
+            write_json(
+                final_validation_dir / "final_validation_failure.json",
+                final_validation_failure,
+            )
+
+    if final_validation_failure is not None:
+        pipeline_state = "rom_final_validation_failed"
+        final_validation_classification = final_validation_failure["category"]
+    elif f_hotspot is None:
+        pipeline_state = "thermally_infeasible"
+        final_validation_classification = "true_thermal_infeasible"
+    else:
+        pipeline_state = str(final_validation.get("state") or "validated")
+        final_validation_classification = "validated"
+
+    latency_path = (output_dir / "r2_latency.json").resolve()
+    vector = None
+    r2_result = None
+    if final_validation_classification == "validated":
+        vector = build_vector(
+            modules_path, cacti_path, latency_path, None, None, proposed_layout,
+            delay.get("wire_rounding", "nearest"),
+            int(delay.get("cycles_per_tsv", 2)),
+            int(delay.get("l1_pipeline_cycles", 1)),
+            delay.get("wire_aggregation", "mean"),
+        )
+        if execute_r2:
+            r2_result = run_r2(
+                source_r1_dir, latency_path, output_dir / "gem5_r2",
+                rerun=rerun_r2,
+            )
+
     f_rom = selected.get("f_sus_trans_rom_ghz")
     bips1_rom = selected.get("bips1_trans_rom_pred")
-    f_hotspot = final_validation.get("f_sus_trans_ghz")
     cases = calibration_cases or {}
+    historical_training_calls = int(cases.get("training_hotspot_calls", 0))
+    historical_holdout_calls = int(cases.get("holdout_hotspot_calls", 0))
+    invocation_training_calls = historical_training_calls if package_status == "calibrated" else 0
+    invocation_holdout_calls = historical_holdout_calls if package_status == "calibrated" else 0
     summary = {
         "schema_version": 1,
         "mode": "transient ROM layout optimization with real-HotSpot validation",
         "thermal_mode": "transient-rom",
         "non_formal": True,
         "paper_equivalent": False,
+        "state": pipeline_state,
         "source_r1": str(source_r1_dir),
         "steady_preflight": str(steady_preflight_dir),
         "output": str(output_dir),
@@ -484,19 +558,21 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
         "rom_package_status": package_status,
         "rom_acceptance": package_acceptance,
         "rom_holdout_validation": calibration_acceptance,
-        "training_hotspot_calls": int(cases.get("training_hotspot_calls", 0)),
-        "holdout_hotspot_calls": int(cases.get("holdout_hotspot_calls", 0)),
-        "calibration_hotspot_calls": (
-            int(cases.get("training_hotspot_calls", 0))
-            + int(cases.get("holdout_hotspot_calls", 0))
+        "training_hotspot_calls": historical_training_calls,
+        "holdout_hotspot_calls": historical_holdout_calls,
+        "calibration_hotspot_calls": historical_training_calls + historical_holdout_calls,
+        "training_hotspot_calls_this_invocation": invocation_training_calls,
+        "holdout_hotspot_calls_this_invocation": invocation_holdout_calls,
+        "calibration_hotspot_calls_this_invocation": (
+            invocation_training_calls + invocation_holdout_calls
         ),
         "optimizer_hotspot_calls": optimization.get(
             "hotspot_calls_inside_optimizer"
         ),
         "optimization_reused": optimization_reused,
-        "final_validation_hotspot_calls": len(
-            final_validation.get("search", {}).get("evaluations", [])
-        ),
+        "final_validation_hotspot_calls": final_validation_hotspot_calls,
+        "final_validation_classification": final_validation_classification,
+        "final_validation_failure": final_validation_failure,
         "f_sus_trans_rom_pred_ghz": f_rom,
         "f_sus_trans_hotspot_ghz": f_hotspot,
         "bips1_trans_rom_pred": bips1_rom,
@@ -505,8 +581,11 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
             float(r2_result["ipc2"]) * float(f_hotspot)
             if r2_result is not None and f_hotspot is not None else None
         ),
-        "r2_executed": execute_r2,
-        "r2_critical_path_cycles": vector.get("critical_l1d_to_l2_cycles"),
+        "r2_requested": execute_r2,
+        "r2_executed": r2_result is not None,
+        "r2_critical_path_cycles": (
+            vector.get("critical_l1d_to_l2_cycles") if vector else None
+        ),
         "artifacts": {
             "modules": str(modules_path),
             "cacti": str(cacti_path),
@@ -517,24 +596,45 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
                 if (package_dir / "rom_artifact_manifest.json").is_file()
                 else None
             ),
+            "calibration_manifest": str(
+                (package_dir / "calibration_manifest.json").resolve()
+            ),
+            "anchors": str((package_dir / "anchors.json").resolve()),
+            "calibration_cases": str(
+                (package_dir / "calibration_cases.json").resolve()
+            ),
+            "holdout_validation": str(
+                (package_dir / "validation_report.json").resolve()
+            ),
             "optimization_report": str(
                 (optimization_dir / "optimization_report.json").resolve()
             ),
             "proposed_layout": str(proposed_layout),
-            "r2_latency": str(latency_path),
+            "r2_latency": str(latency_path) if vector else None,
             "r2_result": (
                 str((output_dir / "gem5_r2/r2_result.json").resolve())
                 if r2_result else None
             ),
-            "final_hotspot_validation": str(
-                (final_validation_dir / "transient_sustainable_frequency.json").resolve()
+            "final_hotspot_validation": (
+                str((final_validation_dir / "transient_sustainable_frequency.json").resolve())
+                if (final_validation_dir / "transient_sustainable_frequency.json").is_file()
+                else None
+            ),
+            "final_validation_failure": (
+                str((final_validation_dir / "final_validation_failure.json").resolve())
+                if (final_validation_dir / "final_validation_failure.json").is_file()
+                else None
             ),
             "rom_artifact_manifest": str(
                 (output_dir / "rom_artifact_manifest.json").resolve()
             ),
         },
         "steady_preflight_layout_method": steady_summary.get("layout_method"),
-        "final_hotspot_state": final_validation.get("state"),
+        "final_hotspot_state": (
+            "rom_final_validation_failed"
+            if final_validation_failure is not None
+            else final_validation.get("state")
+        ),
     }
     if _contains_key(summary, "bips2"):
         raise AssertionError("transient ROM summary must not contain ambiguous bips2")

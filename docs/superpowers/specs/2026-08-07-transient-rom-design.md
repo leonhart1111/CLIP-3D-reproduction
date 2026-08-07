@@ -78,6 +78,9 @@ R1 -> McPAT + CACTI -> 稳态代理布局搜索 -> 最终 HotSpot -> Eq. (13) f_
   "validation_runs": 2,
   "pod_energy_threshold": 0.999,
   "max_pod_rank": 16,
+  "max_logm_condition_number": 1000000000000.0,
+  "max_logm_error_estimate": 1e-8,
+  "max_exp_log_reconstruction_error": 1e-8,
   "calibration_windows": 64,
   "pss_period_repeats": 20,
   "pss_tolerance_c": 0.01,
@@ -233,11 +236,14 @@ ROM 只有满足全部条件才能被优化入口消费：
 6. ROM 与 HotSpot 对每个留出点给出相同的安全/不安全结论；
 7. 几何、窗口功耗、频率模型、HotSpot 可执行文件和配置哈希一致。
 
+这些条件由流水线和直接 ROM 优化入口共用同一个包验证器执行。训练/留出 case 的模块、布局、功耗和温度 artifact 必须使用包根相对路径，且不得逃逸或指向 symlink；源模块 JSON 按原始字节复制到包内。因而完整接受包可整体移动，但不能脱离其 case、拟合、留出和 inventory 证据单独移动接受标记。命令行校准入口和流水线校准入口都必须在验收后写同样的 `rom_artifact_manifest.json`。
+
 任何失败都必须中止 `--thermal-mode transient-rom`，指出失败的作业、误差和可定位的 artifact
 路径。禁止自动改用稳态 Eq. (13)，禁止把未验证 ROM 的预测写为 `BIPS2_trans`。
 
 最终候选要经过真实 HotSpot PSS 验证；若真实验证失败，结果状态为 `rom_final_validation_failed`。
 该情况保留 ROM 预测以便诊断，但不得报告成功的瞬态优化效果。
+执行/I/O 失败记为 `tool_error`，畸形 trace 或搜索证据记为 `validation_contract_error`，PSS 未收敛记为 `pss_nonconvergence`；可在调用前确定的输入/输出前置条件错误不包装成工具失败。
 
 ## 8. 新的模块与产物
 
@@ -261,6 +267,7 @@ workflow/transient/rom/
 
 ```text
 transient_rom/
+  modules.json                              # 与身份哈希一致的包内源模块字节
   calibration_manifest.json
   anchors.json
   training/{anchor-id}/...              # 输入、轨迹、HotSpot 日志、哈希

@@ -48,6 +48,227 @@ from workflow.transient.rom.pod_state_space import (
 from workflow.transient.validation import power_trace_identity, validate_power_windows
 
 
+def canonical_json_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def write_test_artifact_manifest(package: Path) -> None:
+    classification = {
+        "thermal_mode": "transient-rom",
+        "non_formal": True,
+        "paper_equivalent": False,
+    }
+    artifacts = []
+    for path in sorted(package.rglob("*")):
+        if not path.is_file() or path.name == "rom_artifact_manifest.json":
+            continue
+        artifacts.append({
+            "path": path.relative_to(package).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "classification": classification,
+        })
+    write_json(package / "rom_artifact_manifest.json", {
+        "schema_version": 1,
+        **classification,
+        "scope": str(package.resolve()),
+        "artifacts": artifacts,
+    })
+
+
+def write_synthetic_accepted_package(
+    package: Path, design: dict, identity: dict, settings: object,
+    model: StateSpaceModel, modules_source: Path,
+    source_power_windows: dict,
+) -> None:
+    """Write one internally consistent, fully audited synthetic ROM package."""
+    classification = {
+        "thermal_mode": "transient-rom",
+        "non_formal": True,
+        "paper_equivalent": False,
+    }
+    package.mkdir(parents=True, exist_ok=True)
+    package_modules = package / "modules.json"
+    package_modules.write_bytes(Path(modules_source).read_bytes())
+    modules_sha256 = "sha256:" + hashlib.sha256(
+        package_modules.read_bytes()
+    ).hexdigest()
+    source_power_path = package / "source_power_windows.json"
+    write_json(source_power_path, source_power_windows)
+    source_power_sha256 = "sha256:" + hashlib.sha256(
+        source_power_path.read_bytes()
+    ).hexdigest()
+    prbs_power_windows = build_prbs_power_windows(
+        source_power_windows, design["prbs"]["multipliers"],
+        settings.calibration_windows,
+    )
+    write_json(package / "anchors.json", design)
+    write_json(package / "calibration_manifest.json", {
+        "schema_version": 1,
+        **classification,
+        "calibration_runs": 8,
+        "validation_runs": 2,
+        "calibration_design_hash": canonical_json_sha256(design),
+        "identity": identity,
+        "settings": {
+            **vars(settings),
+            "calibration_runs": 8,
+            "validation_runs": 2,
+        },
+        "sources": {
+            "modules": "modules.json",
+            "modules_sha256": modules_sha256,
+            "power_trace_identity": identity["power_trace"],
+            "power_windows": "source_power_windows.json",
+            "power_windows_sha256": source_power_sha256,
+            "config_sha256": identity["configuration_hash"],
+            "hotspot_sha256": identity["hotspot_hash"],
+        },
+        "training_ids": [point["id"] for point in design["training"]],
+        "holdout_ids": [point["id"] for point in design["holdout"]],
+    })
+
+    def evidence_case(point: dict, kind: str) -> dict:
+        case_dir = package / f"{kind}_{point['id']}"
+        case_dir.mkdir(exist_ok=True)
+        artifact_paths = {
+            "modules": package_modules,
+            "layout": case_dir / "layout.json",
+            "power_windows": case_dir / "power_windows.json",
+            "power_trace": case_dir / "power_transient.ptrace",
+            "temperature_trace": case_dir / "transient.ttrace",
+        }
+        write_json(
+            artifact_paths["layout"],
+            layout_for_point(design["base_layout"], point),
+        )
+        write_json(
+            artifact_paths["power_windows"],
+            prbs_power_windows if kind == "training" else source_power_windows,
+        )
+        artifact_paths["power_trace"].write_text(
+            "shared_l2\n1.0\n", encoding="utf-8"
+        )
+        artifact_paths["temperature_trace"].write_text(
+            "cell0\n300.0\n", encoding="utf-8"
+        )
+        case = {
+            "id": point["id"],
+            "kind": kind,
+            "point": point,
+            "initial_temperature": "ambient",
+            "hotspot": {"command": ["hotspot"], "elapsed_seconds": 0.1},
+            "artifacts": {
+                **{
+                    name: path.relative_to(package).as_posix()
+                    for name, path in artifact_paths.items()
+                },
+                "sha256": {
+                    name: "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+                    for name, path in artifact_paths.items()
+                },
+            },
+        }
+        if kind == "holdout":
+            case["periodic_steady_state"] = {
+                "full_grid_converged": True,
+                "evidence": {"period_count": 20, "last_delta_max_c": 0.0},
+            }
+        return case
+
+    training = [evidence_case(point, "training") for point in design["training"]]
+    holdouts = [evidence_case(point, "holdout") for point in design["holdout"]]
+    write_json(package / "calibration_cases.json", {
+        "schema_version": 1,
+        "training_hotspot_calls": 8,
+        "holdout_hotspot_calls": 2,
+        "training_cases": training,
+        "holdout_cases": holdouts,
+    })
+    ordered_training = sorted(training, key=lambda case: case["id"])
+    fit_report = {
+        "schema_version": 1,
+        "case_order": [case["id"] for case in ordered_training],
+        "calibration_design_hash": canonical_json_sha256(design),
+        "temperature_trace_sha256": {
+            case["id"]: case["artifacts"]["sha256"]["temperature_trace"]
+            for case in ordered_training
+        },
+        "power_windows_sha256": {
+            case["id"]: case["artifacts"]["sha256"]["power_windows"]
+            for case in ordered_training
+        },
+        "pod": {
+            "rank": 1,
+            "energy_threshold": settings.pod_energy_threshold,
+        },
+        "identification": {
+            "ridge": settings.ridge,
+            "gram_condition_number": 1.0,
+            "max_condition_number": settings.max_condition_number,
+        },
+        "continuous_conversion": {
+            "logm_input_condition_number": 1.0,
+            "max_logm_condition_number": settings.max_logm_condition_number,
+            "logm_error_estimate": 0.0,
+            "max_logm_error_estimate": settings.max_logm_error_estimate,
+            "exp_log_reconstruction_error": 0.0,
+            "max_exp_log_reconstruction_error": (
+                settings.max_exp_log_reconstruction_error
+            ),
+        },
+    }
+    write_json(package / "fit_report.json", fit_report)
+    save_model(package / "pod_model.npz", model, fit_report)
+    gates = {
+        "geometry_identity": True,
+        "input_identity": True,
+        "frequency_identity": True,
+        "hotspot_trace_identity": True,
+        "temperature_grid_identity": True,
+        "periodic_steady_state": True,
+        "grid_rmse": True,
+        "peak_temperature_error": True,
+        "safety_classification": True,
+    }
+    write_json(package / "validation_report.json", {
+        "schema_version": 1,
+        **classification,
+        "thresholds": {
+            "pss_tolerance_c": settings.pss_tolerance_c,
+            "max_holdout_grid_rmse_c": settings.max_holdout_grid_rmse_c,
+            "max_holdout_peak_error_c": settings.max_holdout_peak_error_c,
+        },
+        "accepted": True,
+        "failure_reasons": [],
+        "holdouts": [
+            {
+                "id": point["id"],
+                "accepted": True,
+                "grid_rmse_c": 0.2 + index * 0.1,
+                "peak_temperature_error_c": 0.4 + index * 0.1,
+                "rom_peak_c": 60.0 + index,
+                "hotspot_peak_c": 60.4 + 1.1 * index,
+                "rom_safe": True,
+                "hotspot_safe": True,
+                "gates": gates,
+            }
+            for index, point in enumerate(design["holdout"])
+        ],
+    })
+    write_json(package / "rom_acceptance.json", {
+        "schema_version": 1,
+        **classification,
+        "accepted": True,
+        "identity": identity,
+        "validation_report": "validation_report.json",
+    })
+    write_test_artifact_manifest(package)
+
+
 class ROMContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -68,6 +289,7 @@ class ROMContractTests(unittest.TestCase):
             stack={"layers": ["silicon", "tim"]},
             cooling={"ambient_c": 25.0},
             allowed_l2_tiers=[1],
+            calibration_design_hash="sha256:design",
         )
 
     def test_parse_settings_uses_strict_rom_defaults(self):
@@ -81,6 +303,9 @@ class ROMContractTests(unittest.TestCase):
         self.assertEqual(settings.max_pod_rank, 16)
         self.assertEqual(settings.ridge, 1e-8)
         self.assertEqual(settings.max_condition_number, 1e10)
+        self.assertEqual(settings.max_logm_condition_number, 1e12)
+        self.assertEqual(settings.max_logm_error_estimate, 1e-8)
+        self.assertEqual(settings.max_exp_log_reconstruction_error, 1e-8)
         self.assertEqual(settings.pss_period_repeats, 20)
         self.assertEqual(settings.pss_tolerance_c, 0.01)
         self.assertEqual(settings.frequency_tolerance_ghz, 0.01)
@@ -100,6 +325,12 @@ class ROMContractTests(unittest.TestCase):
             parse_settings({"transient_rom": {"pod_energy_threshold": 1.0}})
         with self.assertRaisesRegex(ValueError, "sample_interval_ms"):
             parse_settings({"transient_rom": {"sample_interval_ms": float("inf")}})
+        with self.assertRaisesRegex(ValueError, "max_logm_condition_number"):
+            parse_settings({"transient_rom": {"max_logm_condition_number": 0.5}})
+        with self.assertRaisesRegex(ValueError, "max_exp_log_reconstruction_error"):
+            parse_settings({
+                "transient_rom": {"max_exp_log_reconstruction_error": 0.0}
+            })
 
     def test_parse_settings_rejects_prbs_fraction_that_can_zero_power(self):
         with self.assertRaisesRegex(ValueError, "prbs_fraction must be less than 1"):
@@ -118,6 +349,21 @@ class ROMContractTests(unittest.TestCase):
         self.assertEqual(identity["stack"], {"layers": ["silicon", "tim"]})
         self.assertEqual(identity["cooling"], {"ambient_c": 25.0})
         self.assertEqual(identity["allowed_l2_tiers"], [1])
+        self.assertEqual(identity["calibration_design_hash"], "sha256:design")
+
+    def test_rejects_accepted_package_with_changed_calibration_design(self):
+        # Break caught: matching physics with changed anchors, holdouts, or
+        # simplices must not reinterpret stored B_L2 columns as a new design.
+        write_json(self.package / "rom_acceptance.json", {
+            "accepted": True,
+            "identity": self.identity(),
+        })
+
+        with self.assertRaisesRegex(ValueError, "calibration design hash identity"):
+            require_accepted_package(
+                self.package,
+                {**self.identity(), "calibration_design_hash": "sha256:changed"},
+            )
 
     def test_rejects_accepted_package_with_changed_power_identity(self):
         write_json(self.package / "rom_acceptance.json", {
@@ -369,6 +615,11 @@ class ROMCalibrationCaseTests(unittest.TestCase):
             report = execute_calibration_cases(
                 self.modules_path, self.power_path, self.config_path, self.design,
                 self.root / "calibration", self.settings, hotspot=self.hotspot,
+                identity={
+                    **ROMContractTests.identity(),
+                    "allowed_l2_tiers": [0, 1],
+                    "calibration_design_hash": canonical_json_sha256(self.design),
+                },
             )
 
         self.assertEqual(report["training_hotspot_calls"], 8)
@@ -408,6 +659,31 @@ class ROMCalibrationCaseTests(unittest.TestCase):
             self.assertEqual(pss["evidence"]["grid_cell_count"], 2)
             self.assertEqual(len(pss["evidence"]["period_end_deltas"]), 19)
             self.assertEqual(pss["evidence"]["last_delta_max_c"], 0.0)
+        package = self.root / "calibration"
+        self.assertEqual(read_json(package / "anchors.json"), self.design)
+        manifest = read_json(package / "calibration_manifest.json")
+        self.assertEqual(
+            manifest["calibration_design_hash"], canonical_json_sha256(self.design)
+        )
+        self.assertEqual(manifest["settings"]["calibration_windows"], 64)
+        self.assertEqual(manifest["settings"]["calibration_runs"], 8)
+        self.assertEqual(manifest["settings"]["validation_runs"], 2)
+        self.assertEqual(
+            manifest["identity"]["calibration_design_hash"],
+            canonical_json_sha256(self.design),
+        )
+        self.assertEqual(
+            (package / "modules.json").read_bytes(), self.modules_path.read_bytes()
+        )
+        for case in report["training_cases"] + report["holdout_cases"]:
+            for name in (
+                "modules", "layout", "power_windows", "power_trace",
+                "temperature_trace",
+            ):
+                relative = Path(case["artifacts"][name])
+                self.assertFalse(relative.is_absolute())
+                self.assertNotIn("..", relative.parts)
+                self.assertTrue((package / relative).is_file())
 
     def test_prbs_windows_preserve_power_triplets(self):
         # Break caught: scaling only one power component or retaining a stale
@@ -454,7 +730,77 @@ class ROMCalibrationCaseTests(unittest.TestCase):
             execute_calibration_cases(
                 self.modules_path, self.power_path, self.config_path, self.design,
                 output, self.settings, hotspot=self.hotspot,
+                identity={
+                    **ROMContractTests.identity(),
+                    "allowed_l2_tiers": [0, 1],
+                    "calibration_design_hash": canonical_json_sha256(self.design),
+                },
             )
+
+    def test_standalone_calibration_cli_publishes_reusable_package_manifest(self):
+        # Break caught: a CLI calibration that writes acceptance without the
+        # package inventory reports success but is rejected by normal reuse.
+        from workflow.transient.rom import calibrate_rom
+
+        output = self.root / "standalone-package"
+        design_path = self.root / "design.json"
+        write_json(design_path, self.design)
+        identity = {
+            **ROMContractTests.identity(),
+            "allowed_l2_tiers": [0, 1],
+            "calibration_design_hash": canonical_json_sha256(self.design),
+        }
+
+        def materialize(*_args, **_kwargs):
+            output.mkdir()
+            write_json(output / "anchors.json", self.design)
+            write_json(output / "calibration_cases.json", {"synthetic": True})
+            return {
+                "training_hotspot_calls": 8,
+                "holdout_hotspot_calls": 2,
+                "training_cases": [],
+                "holdout_cases": [],
+            }
+
+        def save(path, *_args, **_kwargs):
+            Path(path).write_bytes(b"synthetic model")
+
+        def accept(*_args, **_kwargs):
+            report = {"accepted": True, "failure_reasons": []}
+            write_json(output / "validation_report.json", report)
+            write_json(output / "rom_acceptance.json", {
+                "accepted": True,
+                "identity": identity,
+                "validation_report": "validation_report.json",
+            })
+            return report
+
+        argv = [
+            "calibrate_rom", "--modules", str(self.modules_path),
+            "--power-windows", str(self.power_path),
+            "--config", str(self.config_path), "--design", str(design_path),
+            "--output-dir", str(output), "--hotspot", str(self.hotspot),
+        ]
+        with patch("sys.argv", argv), patch.object(
+            calibrate_rom, "_package_identity", return_value=identity,
+        ), patch.object(
+            calibrate_rom, "execute_calibration_cases", side_effect=materialize,
+        ), patch.object(
+            calibrate_rom, "fit_state_space",
+            return_value=(object(), {"pod": {"rank": 1}}),
+        ), patch.object(
+            calibrate_rom, "save_model", side_effect=save,
+        ), patch.object(
+            calibrate_rom, "validate_calibration_holdouts", side_effect=accept,
+        ), patch("builtins.print"):
+            calibrate_rom.main()
+
+        manifest = read_json(output / "rom_artifact_manifest.json")
+        self.assertTrue(manifest["non_formal"])
+        self.assertFalse(manifest["paper_equivalent"])
+        paths = {record["path"] for record in manifest["artifacts"]}
+        self.assertIn("rom_acceptance.json", paths)
+        self.assertIn("pod_model.npz", paths)
 
 
 class StateSpaceTests(unittest.TestCase):
@@ -507,6 +853,14 @@ class StateSpaceTests(unittest.TestCase):
                 "artifacts": {
                     "temperature_trace": str(case_dir / "transient.ttrace"),
                     "power_windows": str(case_dir / "power_windows.json"),
+                    "sha256": {
+                        "temperature_trace": "sha256:" + hashlib.sha256(
+                            (case_dir / "transient.ttrace").read_bytes()
+                        ).hexdigest(),
+                        "power_windows": "sha256:" + hashlib.sha256(
+                            (case_dir / "power_windows.json").read_bytes()
+                        ).hexdigest(),
+                    },
                 },
             })
         return cases
@@ -545,6 +899,47 @@ class StateSpaceTests(unittest.TestCase):
         # otherwise masquerade as the configured fixed calibration period.
         with self.assertRaisesRegex(ValueError, "calibration_windows"):
             fit_state_space(self.unstable_training_cases(), parse_settings({}))
+
+    def test_fit_rejects_unreliable_logm_input_conditioning(self):
+        # Break caught: merely recording an ill-conditioned augmented discrete
+        # model allows a numerically unreliable continuous conversion to ship.
+        settings = replace(
+            self.settings(), max_logm_condition_number=1.0,
+        )
+
+        with self.assertRaisesRegex(ValueError, "logm input condition number"):
+            fit_state_space(self.unstable_training_cases(), settings)
+
+    def test_fit_rejects_exp_log_reconstruction_above_configured_limit(self):
+        # Break caught: accepting logm output without checking exp(log(A))
+        # permits conversion error to be amplified by every ROM recurrence.
+        settings = replace(
+            self.settings(),
+            max_logm_condition_number=1e300,
+            max_logm_error_estimate=1e300,
+            max_exp_log_reconstruction_error=1e-8,
+        )
+        from scipy.linalg import expm as scipy_expm
+
+        def inaccurate_expm(matrix):
+            reconstructed = scipy_expm(matrix)
+            reconstructed[0, 0] += 1e-4
+            return reconstructed
+
+        with patch(
+            "workflow.transient.rom.pod_state_space.expm",
+            side_effect=inaccurate_expm,
+        ), self.assertRaisesRegex(ValueError, "exp/log reconstruction error"):
+            fit_state_space(self.unstable_training_cases(), settings)
+
+    def test_fit_rejects_recorded_training_artifact_hash_mismatch(self):
+        # Break caught: fitting bytes that differ from the case record breaks the
+        # audit link between calibration execution and identified coefficients.
+        cases = self.unstable_training_cases()
+        cases[0]["artifacts"]["sha256"]["power_windows"] = "sha256:wrong"
+
+        with self.assertRaisesRegex(ValueError, "recorded power_windows hash"):
+            fit_state_space(cases, self.settings())
 
     def test_save_rejects_unstable_continuous_matrix(self):
         # Break caught: an unstable matrix persisted in a package bypasses the
@@ -1039,6 +1434,7 @@ class ROMOptimizerTests(unittest.TestCase):
         write_json(self.config_path, self.config())
         settings = parse_settings({})
         design = build_design(model, [1], settings)
+        self.design = design
         fixed_names = tuple(
             module["name"] for module in model["modules"]
             if module["kind"] != "l2"
@@ -1054,8 +1450,7 @@ class ROMOptimizerTests(unittest.TestCase):
             module_names=fixed_names,
             grid_unit_names=("cell0",),
         )
-        for package in (self.accepted_package, self.rejected_package):
-            save_model(package / "pod_model.npz", rom, {})
+        write_json(self.rejected_package / "anchors.json", design)
         power_windows = ROMCalibrationCaseTests.raw_windows()
         power_windows["canonical_source_r1"] = str(self.canonical_r1)
         write_json(self.power_windows, power_windows)
@@ -1086,11 +1481,12 @@ class ROMOptimizerTests(unittest.TestCase):
                 "r_convec_k_per_w": physical["r_convec_k_per_w"],
             },
             allowed_l2_tiers=config["layout_optimizer"]["allowed_l2_tiers"],
+            calibration_design_hash=canonical_json_sha256(design),
         )
-        write_json(self.accepted_package / "rom_acceptance.json", {
-            "accepted": True,
-            "identity": identity,
-        })
+        write_synthetic_accepted_package(
+            self.accepted_package, design, identity, settings, rom,
+            self.modules, power_windows,
+        )
         write_json(self.rejected_package / "rom_acceptance.json", {
             "accepted": False,
         })
@@ -1171,6 +1567,64 @@ class ROMOptimizerTests(unittest.TestCase):
         self.assertTrue(proposed.is_file())
         self.assertEqual(read_json(proposed), report["selected_layout"])
 
+    def test_optimizer_loads_saved_design_without_regenerating_it(self):
+        # Break caught: rerunning current design-generation code can change the
+        # anchor/simplex meaning of B_L2 columns in an already accepted model.
+        import workflow.transient.rom.optimize_layout as optimizer_module
+
+        with patch.object(
+            optimizer_module, "build_design", create=True,
+            side_effect=AssertionError("calibration design was regenerated"),
+        ) as regenerate, patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._frequency_evidence,
+        ):
+            report = optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        regenerate.assert_not_called()
+        self.assertEqual(
+            report["calibration_design_hash"], canonical_json_sha256(self.design)
+        )
+
+    def test_optimizer_reuses_a_relocated_self_contained_package(self):
+        # Break caught: absolute case-artifact paths either read the old package
+        # or fail after an accepted package is moved to a read-only reuse root.
+        relocated = self.root / "relocated-package"
+        self.accepted_package.rename(relocated)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._frequency_evidence,
+        ):
+            report = optimize_transient_layout(
+                self.modules, relocated, self.output, self.config_path,
+                self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertEqual(report["package_dir"], str(relocated.resolve()))
+        self.assertTrue((self.output / "proposed_layout.json").is_file())
+
+    def test_optimizer_rejects_saved_design_that_differs_from_acceptance(self):
+        # Break caught: loading anchors.json without checking its exact canonical
+        # hash still permits a stale acceptance marker to authorize new geometry.
+        changed = read_json(self.accepted_package / "anchors.json")
+        changed["holdout"][0]["x_mm"] += 0.001
+        write_json(self.accepted_package / "anchors.json", changed)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "calibration design hash identity"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
     def test_optimizer_rejects_unaccepted_package(self):
         # Break caught: consuming a model archive without the holdout acceptance
         # marker bypasses the scientific gate on every optimized result.
@@ -1179,6 +1633,178 @@ class ROMOptimizerTests(unittest.TestCase):
                 self.modules, self.rejected_package, self.output,
                 self.config_path, self.power_windows, hotspot=self.hotspot,
             )
+
+    def test_optimizer_rejects_package_without_saved_holdout_validation(self):
+        # Break caught: direct optimizer reuse must not trust rom_acceptance.json
+        # while the saved case/error evidence it was derived from is absent.
+        (self.accepted_package / "validation_report.json").unlink()
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "validation_report.json"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_training_case_that_differs_from_saved_design(self):
+        # Break caught: checking only the eight ids lets a direct optimizer
+        # consume case evidence produced for geometry other than its saved anchor.
+        cases_path = self.accepted_package / "calibration_cases.json"
+        cases = read_json(cases_path)
+        cases["training_cases"][0]["point"]["x_mm"] += 0.001
+        write_json(cases_path, cases)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "training case.*evidence differs"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_training_layout_that_differs_from_case_point(self):
+        # Break caught: self-consistent file hashes must not let the persisted
+        # training layout disagree with the anchor geometry it claims to fit.
+        cases_path = self.accepted_package / "calibration_cases.json"
+        cases = read_json(cases_path)
+        case = cases["training_cases"][0]
+        layout_path = self.accepted_package / case["artifacts"]["layout"]
+        layout = read_json(layout_path)
+        l2 = next(module for module in layout["modules"] if module["kind"] == "l2")
+        l2["x_mm"] += 0.001
+        write_json(layout_path, layout)
+        case["artifacts"]["sha256"]["layout"] = (
+            "sha256:" + hashlib.sha256(layout_path.read_bytes()).hexdigest()
+        )
+        write_json(cases_path, cases)
+        write_test_artifact_manifest(self.accepted_package)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "training case.*layout evidence differs"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_manifest_with_changed_conversion_threshold(self):
+        # Break caught: a package manifest that does not record the exact fitted
+        # conversion gate cannot be reused under the current configuration.
+        manifest_path = self.accepted_package / "calibration_manifest.json"
+        manifest = read_json(manifest_path)
+        manifest["settings"]["max_logm_error_estimate"] = 1e-4
+        write_json(manifest_path, manifest)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "resolved settings"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_manifest_with_changed_source_identity(self):
+        # Break caught: a rebuilt inventory must not let calibration evidence
+        # claim a different config or HotSpot than the accepted package identity.
+        manifest_path = self.accepted_package / "calibration_manifest.json"
+        manifest = read_json(manifest_path)
+        manifest["sources"]["config_sha256"] = "sha256:different-config"
+        write_json(manifest_path, manifest)
+        write_test_artifact_manifest(self.accepted_package)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "source identities"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_holdout_power_from_another_source_trace(self):
+        # Break caught: rehashing a holdout artifact cannot substitute power
+        # windows whose scientific identity differs from the accepted workload.
+        cases_path = self.accepted_package / "calibration_cases.json"
+        cases = read_json(cases_path)
+        case = cases["holdout_cases"][0]
+        power_path = self.accepted_package / case["artifacts"]["power_windows"]
+        power = read_json(power_path)
+        module = power["windows"][0]["modules"][0]
+        module["dynamic_power_w"] += 0.125
+        module["total_power_w"] += 0.125
+        power["windows"][0]["totals"]["dynamic_power_w"] += 0.125
+        power["windows"][0]["totals"]["total_power_w"] += 0.125
+        write_json(power_path, power)
+        case["artifacts"]["sha256"]["power_windows"] = (
+            "sha256:" + hashlib.sha256(power_path.read_bytes()).hexdigest()
+        )
+        write_json(cases_path, cases)
+        write_test_artifact_manifest(self.accepted_package)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "source power identity differs"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_training_power_not_derived_from_bound_source(self):
+        # Break caught: truthful PRBS metadata and self-consistent hashes cannot
+        # substitute excitation values that were not derived from source power.
+        cases_path = self.accepted_package / "calibration_cases.json"
+        cases = read_json(cases_path)
+        case = cases["training_cases"][0]
+        power_path = self.accepted_package / case["artifacts"]["power_windows"]
+        power = read_json(power_path)
+        module = power["windows"][0]["modules"][0]
+        module["dynamic_power_w"] += 0.125
+        module["total_power_w"] += 0.125
+        power["windows"][0]["totals"]["dynamic_power_w"] += 0.125
+        power["windows"][0]["totals"]["total_power_w"] += 0.125
+        power["timeline_audit"] = validate_power_windows(power)
+        power["power_trace_identity"] = power_trace_identity(power)
+        write_json(power_path, power)
+        power_hash = "sha256:" + hashlib.sha256(power_path.read_bytes()).hexdigest()
+        case["artifacts"]["sha256"]["power_windows"] = power_hash
+        write_json(cases_path, cases)
+
+        fit_path = self.accepted_package / "fit_report.json"
+        fit_report = read_json(fit_path)
+        fit_report["power_windows_sha256"][case["id"]] = power_hash
+        write_json(fit_path, fit_report)
+        model, _ = load_model(self.accepted_package / "pod_model.npz")
+        save_model(self.accepted_package / "pod_model.npz", model, fit_report)
+        write_test_artifact_manifest(self.accepted_package)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "PRBS power evidence differs"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
 
     def test_optimizer_rejects_changed_current_power_trace_before_search(self):
         # Break caught: copying power identity out of the acceptance marker lets
@@ -1280,6 +1906,9 @@ class ROMPipelineTests(unittest.TestCase):
         }
 
     def prepared(self) -> dict:
+        self.power_windows.parent.mkdir(parents=True, exist_ok=True)
+        if not self.power_windows.is_file():
+            write_json(self.power_windows, {"mock": "power windows"})
         return {
             "power_windows": str(self.power_windows.resolve()),
             "transient_r1": str(self.transient_r1.resolve()),
@@ -1288,13 +1917,38 @@ class ROMPipelineTests(unittest.TestCase):
         }
 
     def optimization(self) -> dict:
+        design = build_design(
+            CalibrationDesignTests.model(), [1], parse_settings({})
+        )
+        self.proposed_layout.parent.mkdir(parents=True, exist_ok=True)
+        if not self.proposed_layout.is_file():
+            write_json(self.proposed_layout, {"mock": "proposed layout"})
+        package_acceptance = {
+            "schema_version": 1,
+            "thermal_mode": "transient-rom",
+            "non_formal": True,
+            "paper_equivalent": False,
+            "accepted": True,
+            "identity": {
+                **ROMContractTests.identity(),
+                "calibration_design_hash": canonical_json_sha256(design),
+            },
+            "validation_report": "validation_report.json",
+        }
+        acceptance_path = self.output / "rom_package/rom_acceptance.json"
+        if acceptance_path.is_file():
+            candidate = read_json(acceptance_path)
+            candidate_identity = (
+                candidate.get("identity") if isinstance(candidate, dict) else None
+            )
+            if isinstance(candidate_identity, dict) and all(
+                field in candidate_identity for field in ROMContractTests.identity()
+            ):
+                package_acceptance = candidate
         return {
             "hotspot_calls_inside_optimizer": 0,
             "proposed_layout": str(self.proposed_layout.resolve()),
-            "package_acceptance": {
-                "accepted": True,
-                "identity": {"power_trace": "sha256:power"},
-            },
+            "package_acceptance": package_acceptance,
             "parameters": {"frequency_grid_ghz": [1.0, 2.0]},
             "selected": {
                 "f_sus_trans_rom_ghz": 1.9,
@@ -1334,7 +1988,13 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"ipc2": 1.5},
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value={"f_sus_trans_ghz": 1.8, "search": {"evaluations": []}},
+            return_value={
+                "state": "thermally_limited", "f_sus_trans_ghz": 1.8,
+                "search": {"evaluations": [{
+                    "frequency_ghz": 1.8, "converged": True,
+                    "last_period_peak_c": 49.0, "safe": True,
+                }]},
+            },
         ):
             return run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -1361,28 +2021,40 @@ class ROMPipelineTests(unittest.TestCase):
         summary.update(overrides)
         return summary
 
-    @staticmethod
-    def bind_package(package: Path) -> None:
-        classification = {
-            "thermal_mode": "transient-rom",
-            "non_formal": True,
-            "paper_equivalent": False,
+    def bind_package(self, package: Path) -> None:
+        source_model = CalibrationDesignTests.model()
+        settings = parse_settings({})
+        design = build_design(source_model, [1], settings)
+        design_identity = canonical_json_sha256(design)
+        identity = {
+            **ROMContractTests.identity(),
+            "modules_geometry_hash": "sha256:" + hashlib.sha256(
+                self.modules.read_bytes()
+            ).hexdigest(),
+            "power_trace": power_trace_identity(
+                ROMCalibrationCaseTests.raw_windows()
+            ),
+            "calibration_design_hash": design_identity,
         }
-        artifacts = []
-        for path in sorted(package.rglob("*")):
-            if not path.is_file() or path.name == "rom_artifact_manifest.json":
-                continue
-            artifacts.append({
-                "path": path.relative_to(package).as_posix(),
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                "classification": classification,
-            })
-        write_json(package / "rom_artifact_manifest.json", {
-            "schema_version": 1,
-            **classification,
-            "scope": str(package.resolve()),
-            "artifacts": artifacts,
-        })
+        fixed_names = tuple(
+            module["name"] for module in source_model["modules"]
+            if module["kind"] != "l2"
+        )
+        model = StateSpaceModel(
+            temperature_basis=numpy.ones((1, 1)),
+            a_continuous=numpy.array([[-1.0]]),
+            b_fixed=numpy.zeros((1, len(fixed_names))),
+            b_l2_anchors={
+                point["id"]: numpy.ones((1, 1))
+                for point in design["training"]
+            },
+            module_names=fixed_names,
+            grid_unit_names=("cell0",),
+        )
+        write_synthetic_accepted_package(
+            package, design, identity, settings, model, self.modules,
+            ROMCalibrationCaseTests.raw_windows(),
+        )
 
     def test_pipeline_prepares_windows_once_reuses_package_and_validates_final_layout(self):
         # Break caught: recomputing power windows per layout, deriving R2 from
@@ -1409,7 +2081,11 @@ class ROMPipelineTests(unittest.TestCase):
             events.append("hotspot")
             return {
                 "f_sus_trans_ghz": 1.8,
-                "search": {"evaluations": [{"frequency_ghz": 1.8}]},
+                "state": "thermally_limited",
+                "search": {"evaluations": [{
+                    "frequency_ghz": 1.8, "converged": True,
+                    "last_period_peak_c": 49.0, "safe": True,
+                }]},
             }
 
         with patch(
@@ -1443,7 +2119,7 @@ class ROMPipelineTests(unittest.TestCase):
 
         prepare.assert_called_once()
         optimize.assert_called_once()
-        self.assertEqual(events, ["r2-vector", "r2", "hotspot"])
+        self.assertEqual(events, ["hotspot", "r2-vector", "r2"])
         self.assertEqual(
             build_vector_mock.call_args.args[5], self.proposed_layout.resolve()
         )
@@ -1456,7 +2132,7 @@ class ROMPipelineTests(unittest.TestCase):
         self.assertEqual(result["bips2_trans"], 2.7)
         self.assertEqual(
             result["rom_acceptance"]["identity"]["power_trace"],
-            "sha256:power",
+            power_trace_identity(ROMCalibrationCaseTests.raw_windows()),
         )
         keys = []
 
@@ -1591,9 +2267,9 @@ class ROMPipelineTests(unittest.TestCase):
         prepare.assert_not_called()
         build_vector_mock.assert_not_called()
 
-    def test_failed_final_hotspot_or_skipped_r2_reports_null_bips2_trans(self):
-        # Break caught: omitting the field makes the summary schema unstable,
-        # while a number would claim success without both required measurements.
+    def test_final_pss_nonconvergence_is_audited_and_skips_r2(self):
+        # Break caught: treating a nonconverged PSS point as thermal infeasibility
+        # hides a validation failure and can still launch/report an R2 result.
         from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
 
         package = self.output / "rom_package"
@@ -1617,22 +2293,195 @@ class ROMPipelineTests(unittest.TestCase):
         ), patch(
             "workflow.transient.rom.run_pipeline.build_vector",
             return_value={"critical_l1d_to_l2_cycles": 7},
-        ), patch(
+        ) as build_vector_mock, patch(
             "workflow.transient.rom.run_pipeline.run_r2"
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value={"f_sus_trans_ghz": None, "search": {"evaluations": []}},
+            return_value={
+                "state": "thermally_infeasible",
+                "f_sus_trans_ghz": None,
+                "search": {"evaluations": [{
+                    "frequency_ghz": 1.0, "converged": False,
+                    "last_period_peak_c": 48.0, "safe": False,
+                }]},
+            },
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
-                self.transient_r1, calibrate=False, execute_r2=False,
+                self.transient_r1, calibrate=False, execute_r2=True,
             )
 
+        build_vector_mock.assert_not_called()
         run_r2_mock.assert_not_called()
+        self.assertEqual(result["state"], "rom_final_validation_failed")
+        self.assertEqual(
+            result["final_validation_failure"]["category"], "pss_nonconvergence"
+        )
+        self.assertEqual(result["f_sus_trans_rom_pred_ghz"], 1.9)
+        self.assertEqual(result["bips1_trans_rom_pred"], 3.8)
         self.assertIsNone(result["f_sus_trans_hotspot_ghz"])
         self.assertIn("bips2_trans", result)
         self.assertIsNone(result["bips2_trans"])
+        self.assertFalse(result["r2_executed"])
         self.assertNotIn("bips2", result)
+        self.assertEqual(
+            read_json(self.output / "transient_rom_summary.json"), result
+        )
+
+    def test_final_hotspot_tool_error_writes_failure_summary_and_skips_r2(self):
+        # Break caught: propagating HotSpot errors without a summary loses the ROM
+        # prediction and leaves no auditable reason that bips2_trans is absent.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        package = self.output / "rom_package"
+        package.mkdir(parents=True)
+        self.bind_package(package)
+
+        def fail_after_launch(*args, **kwargs):
+            case = Path(args[3]) / "frequency_0x1.0000000000000p+0_ghz"
+            case.mkdir(parents=True)
+            (case / "hotspot_transient.log").write_text(
+                "HotSpot failed\n", encoding="utf-8"
+            )
+            raise RuntimeError("transient HotSpot failed (rc=9)")
+
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": self.steady_summary()},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows",
+            return_value=self.prepared(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.optimize_transient_layout",
+            return_value=self.optimization(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.build_vector"
+        ) as build_vector_mock, patch(
+            "workflow.transient.rom.run_pipeline.run_r2"
+        ) as run_r2_mock, patch(
+            "workflow.transient.rom.run_pipeline.search_layout_frequency",
+            side_effect=fail_after_launch,
+        ):
+            result = run_transient_rom_pipeline(
+                self.source_r1, self.steady, self.output, self.config_path,
+                self.transient_r1, calibrate=False, execute_r2=True,
+            )
+
+        build_vector_mock.assert_not_called()
+        run_r2_mock.assert_not_called()
+        self.assertEqual(result["state"], "rom_final_validation_failed")
+        self.assertEqual(result["final_validation_failure"]["category"], "tool_error")
+        self.assertEqual(
+            result["final_validation_failure"]["error_type"], "RuntimeError"
+        )
+        self.assertIn("rc=9", result["final_validation_failure"]["message"])
+        self.assertEqual(result["f_sus_trans_rom_pred_ghz"], 1.9)
+        self.assertEqual(result["bips1_trans_rom_pred"], 3.8)
+        self.assertEqual(result["final_validation_hotspot_calls"], 1)
+        self.assertIsNone(result["bips2_trans"])
+        self.assertTrue((self.output / "transient_rom_summary.json").is_file())
+
+    def test_final_validation_contract_error_is_not_labeled_as_tool_failure(self):
+        # Break caught: malformed trace/search evidence is a validation-contract
+        # failure, not proof that the HotSpot executable itself failed.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        package = self.output / "rom_package"
+        package.mkdir(parents=True)
+        self.bind_package(package)
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": self.steady_summary()},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows",
+            return_value=self.prepared(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.optimize_transient_layout",
+            return_value=self.optimization(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.build_vector"
+        ) as build_vector_mock, patch(
+            "workflow.transient.rom.run_pipeline.run_r2"
+        ) as run_r2_mock, patch(
+            "workflow.transient.rom.run_pipeline.search_layout_frequency",
+            side_effect=ValueError("final temperature grid order differs"),
+        ):
+            result = run_transient_rom_pipeline(
+                self.source_r1, self.steady, self.output, self.config_path,
+                self.transient_r1, calibrate=False, execute_r2=True,
+            )
+
+        build_vector_mock.assert_not_called()
+        run_r2_mock.assert_not_called()
+        self.assertEqual(result["state"], "rom_final_validation_failed")
+        self.assertEqual(
+            result["final_validation_failure"]["category"],
+            "validation_contract_error",
+        )
+        self.assertEqual(
+            result["final_validation_failure"]["error_type"], "ValueError"
+        )
+
+    def test_all_converged_unsafe_grid_is_true_thermal_infeasible_not_tool_error(self):
+        # Break caught: folding a valid unsafe result into tool/nonconvergence
+        # failure makes physical infeasibility indistinguishable from bad evidence.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        package = self.output / "rom_package"
+        package.mkdir(parents=True)
+        self.bind_package(package)
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": self.steady_summary()},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows",
+            return_value=self.prepared(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.optimize_transient_layout",
+            return_value=self.optimization(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.build_vector"
+        ) as build_vector_mock, patch(
+            "workflow.transient.rom.run_pipeline.run_r2"
+        ) as run_r2_mock, patch(
+            "workflow.transient.rom.run_pipeline.search_layout_frequency",
+            return_value={
+                "state": "thermally_infeasible",
+                "f_sus_trans_ghz": None,
+                "search": {"evaluations": [{
+                    "frequency_ghz": 1.0, "converged": True,
+                    "last_period_peak_c": 51.0, "safe": False,
+                }]},
+            },
+        ):
+            result = run_transient_rom_pipeline(
+                self.source_r1, self.steady, self.output, self.config_path,
+                self.transient_r1, calibrate=False, execute_r2=True,
+            )
+
+        build_vector_mock.assert_not_called()
+        run_r2_mock.assert_not_called()
+        self.assertEqual(result["state"], "thermally_infeasible")
+        self.assertEqual(
+            result["final_validation_classification"], "true_thermal_infeasible"
+        )
+        self.assertIsNone(result["final_validation_failure"])
+        self.assertIsNone(result["bips2_trans"])
 
     def test_calibration_builds_and_accepts_package_before_optimization(self):
         # Break caught: allowing optimization before the fixed 8+2 holdout gate
@@ -1696,7 +2545,13 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"critical_l1d_to_l2_cycles": 7},
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value={"f_sus_trans_ghz": 1.8, "search": {"evaluations": []}},
+            return_value={
+                "state": "thermally_limited", "f_sus_trans_ghz": 1.8,
+                "search": {"evaluations": [{
+                    "frequency_ghz": 1.8, "converged": True,
+                    "last_period_peak_c": 49.0, "safe": True,
+                }]},
+            },
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -1737,13 +2592,15 @@ class ROMPipelineTests(unittest.TestCase):
         })
         self.bind_package(package)
         optimization = self.optimization()
-        optimization["proposed_layout"] = str(
-            (second_output / "optimization/proposed_layout.json").resolve()
-        )
+        second_proposed = second_output / "optimization/proposed_layout.json"
+        second_proposed.parent.mkdir(parents=True)
+        write_json(second_proposed, {"mock": "proposed layout"})
+        optimization["proposed_layout"] = str(second_proposed.resolve())
         prepared = self.prepared()
-        prepared["power_windows"] = str(
-            (second_output / "windows/mcpat/power_windows.json").resolve()
-        )
+        second_power = second_output / "windows/mcpat/power_windows.json"
+        second_power.parent.mkdir(parents=True)
+        write_json(second_power, {"mock": "power windows"})
+        prepared["power_windows"] = str(second_power.resolve())
 
         with patch(
             "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
@@ -1764,7 +2621,13 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"critical_l1d_to_l2_cycles": 7},
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value={"f_sus_trans_ghz": 1.8, "search": {"evaluations": []}},
+            return_value={
+                "state": "thermally_limited", "f_sus_trans_ghz": 1.8,
+                "search": {"evaluations": [{
+                    "frequency_ghz": 1.8, "converged": True,
+                    "last_period_peak_c": 49.0, "safe": True,
+                }]},
+            },
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, second_output, self.config_path,
@@ -1775,6 +2638,16 @@ class ROMPipelineTests(unittest.TestCase):
         self.assertEqual(optimize.call_args.args[1], package.resolve())
         self.assertEqual(result["rom_package"], str(package.resolve()))
         self.assertEqual(result["rom_package_status"], "reused")
+        self.assertEqual(result["training_hotspot_calls"], 8)
+        self.assertEqual(result["holdout_hotspot_calls"], 2)
+        self.assertEqual(result["calibration_hotspot_calls"], 10)
+        self.assertEqual(result["training_hotspot_calls_this_invocation"], 0)
+        self.assertEqual(result["holdout_hotspot_calls_this_invocation"], 0)
+        self.assertEqual(result["calibration_hotspot_calls_this_invocation"], 0)
+        self.assertEqual(
+            [case["grid_rmse_c"] for case in result["rom_holdout_validation"]["holdouts"]],
+            [0.2, 0.30000000000000004],
+        )
 
     def test_reuse_rejects_stale_or_incomplete_package_manifest_before_search(self):
         # Break caught: a valid-looking acceptance marker cannot bind a model
@@ -1863,7 +2736,13 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"ipc2": 1.5},
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value={"f_sus_trans_ghz": 1.8, "search": {"evaluations": []}},
+            return_value={
+                "state": "thermally_limited", "f_sus_trans_ghz": 1.8,
+                "search": {"evaluations": [{
+                    "frequency_ghz": 1.8, "converged": True,
+                    "last_period_peak_c": 49.0, "safe": True,
+                }]},
+            },
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -1935,6 +2814,9 @@ class ROMPipelineTests(unittest.TestCase):
         self.assertEqual(settings.max_pod_rank, 16)
         self.assertEqual(settings.ridge, 1e-8)
         self.assertEqual(settings.max_condition_number, 1e10)
+        self.assertEqual(settings.max_logm_condition_number, 1e12)
+        self.assertEqual(settings.max_logm_error_estimate, 1e-8)
+        self.assertEqual(settings.max_exp_log_reconstruction_error, 1e-8)
         self.assertEqual(settings.pss_period_repeats, 20)
         self.assertEqual(settings.pss_tolerance_c, 0.01)
         self.assertEqual(settings.frequency_tolerance_ghz, 0.01)
@@ -1945,6 +2827,15 @@ class ROMPipelineTests(unittest.TestCase):
         self.assertTrue(config["transient_rom"]["enabled"])
         self.assertTrue(config["transient_rom"]["non_formal"])
         self.assertFalse(config["transient_rom"]["paper_equivalent"])
+        self.assertEqual(
+            config["transient_rom"]["max_logm_condition_number"], 1e12
+        )
+        self.assertEqual(
+            config["transient_rom"]["max_logm_error_estimate"], 1e-8
+        )
+        self.assertEqual(
+            config["transient_rom"]["max_exp_log_reconstruction_error"], 1e-8
+        )
 
 if __name__ == "__main__":
     unittest.main()

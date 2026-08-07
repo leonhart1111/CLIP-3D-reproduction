@@ -89,14 +89,27 @@ def _case_id(case: dict) -> str:
     return identifier
 
 
-def _artifact(case: dict, name: str, identifier: str) -> Path:
+def _artifact(case: dict, name: str, identifier: str,
+              package_dir: Path | None) -> Path:
     artifacts = case.get("artifacts")
     value = artifacts.get(name) if isinstance(artifacts, dict) else None
     if not isinstance(value, str) or not value:
         raise ValueError(f"training case {identifier} lacks {name} artifact")
     path = Path(value)
+    if not path.is_absolute():
+        if package_dir is None:
+            raise ValueError(
+                f"training case {identifier} relative {name} artifact lacks package_dir"
+            )
+        path = Path(package_dir) / path
     if not path.is_file():
         raise FileNotFoundError(path)
+    hashes = artifacts.get("sha256") if isinstance(artifacts, dict) else None
+    recorded = hashes.get(name) if isinstance(hashes, dict) else None
+    if not isinstance(recorded, str) or not recorded:
+        raise ValueError(f"training case {identifier} lacks recorded {name} hash")
+    if recorded != _sha256(path):
+        raise ValueError(f"training case {identifier} recorded {name} hash differs")
     return path
 
 
@@ -118,14 +131,17 @@ def _canonicalize_basis_signs(basis: numpy.ndarray) -> numpy.ndarray:
 
 
 def _load_training_case(case: dict, expected_dt: float,
-                        expected_windows: int) -> dict:
+                        expected_windows: int,
+                        package_dir: Path | None) -> dict:
     identifier = _case_id(case)
     if case.get("initial_temperature") != "ambient":
         raise ValueError(
             f"training case {identifier} must record ambient initial temperature"
         )
-    temperature_path = _artifact(case, "temperature_trace", identifier)
-    power_path = _artifact(case, "power_windows", identifier)
+    temperature_path = _artifact(
+        case, "temperature_trace", identifier, package_dir,
+    )
+    power_path = _artifact(case, "power_windows", identifier, package_dir)
     names, temperatures_k = parse_ttrace_grid(temperature_path)
     power_windows = read_json(power_path)
     windows = power_windows.get("windows") if isinstance(power_windows, dict) else None
@@ -206,7 +222,10 @@ def _load_training_case(case: dict, expected_dt: float,
     }
 
 
-def fit_state_space(training_cases: list[dict], settings: ROMSettings) -> tuple[StateSpaceModel, dict]:
+def fit_state_space(
+    training_cases: list[dict], settings: ROMSettings, *,
+    package_dir: Path | None = None,
+) -> tuple[StateSpaceModel, dict]:
     """Fit a shared stable continuous model from eight full-grid anchor traces."""
     if not isinstance(settings, ROMSettings):
         raise ValueError("settings must be ROMSettings")
@@ -220,7 +239,9 @@ def fit_state_space(training_cases: list[dict], settings: ROMSettings) -> tuple[
     if len(set(identifiers)) != len(identifiers):
         raise ValueError("training case anchor ids must be unique")
     loaded = [
-        _load_training_case(case, dt, settings.calibration_windows)
+        _load_training_case(
+            case, dt, settings.calibration_windows, package_dir,
+        )
         for case in ordered_cases
     ]
 
@@ -291,9 +312,35 @@ def fit_state_space(training_cases: list[dict], settings: ROMSettings) -> tuple[
     discrete_augmented[:rank, :rank] = a_discrete
     discrete_augmented[:rank, rank:] = b_discrete
     discrete_augmented[rank:, rank:] = numpy.eye(input_count)
+    logm_input_condition = float(numpy.linalg.cond(discrete_augmented))
+    if (not math.isfinite(logm_input_condition)
+            or logm_input_condition > settings.max_logm_condition_number):
+        raise ValueError(
+            "logm input condition number exceeds max_logm_condition_number"
+        )
     continuous_complex, logm_error = logm(discrete_augmented, disp=False)
     if not numpy.all(numpy.isfinite(continuous_complex)):
         raise ValueError("discrete-to-continuous matrix logarithm is not finite")
+    logm_error = float(logm_error)
+    if (not math.isfinite(logm_error)
+            or logm_error > settings.max_logm_error_estimate):
+        raise ValueError("logm error estimate exceeds max_logm_error_estimate")
+    reconstructed_discrete = expm(continuous_complex)
+    denominator = max(
+        float(numpy.linalg.norm(discrete_augmented, ord=1)),
+        numpy.finfo(float).tiny,
+    )
+    exp_log_reconstruction_error = float(
+        numpy.linalg.norm(reconstructed_discrete - discrete_augmented, ord=1)
+        / denominator
+    )
+    if (not math.isfinite(exp_log_reconstruction_error)
+            or exp_log_reconstruction_error
+            > settings.max_exp_log_reconstruction_error):
+        raise ValueError(
+            "exp/log reconstruction error exceeds "
+            "max_exp_log_reconstruction_error"
+        )
     continuous_complex = continuous_complex / dt
     imaginary_max = float(numpy.max(numpy.abs(numpy.imag(continuous_complex))))
     real_scale = max(1.0, float(numpy.max(numpy.abs(numpy.real(continuous_complex)))))
@@ -352,7 +399,14 @@ def fit_state_space(training_cases: list[dict], settings: ROMSettings) -> tuple[
             "relative_residual_frobenius": fit_relative,
         },
         "continuous_conversion": {
-            "logm_error_estimate": float(logm_error) / dt,
+            "logm_input_condition_number": logm_input_condition,
+            "max_logm_condition_number": settings.max_logm_condition_number,
+            "logm_error_estimate": logm_error,
+            "max_logm_error_estimate": settings.max_logm_error_estimate,
+            "exp_log_reconstruction_error": exp_log_reconstruction_error,
+            "max_exp_log_reconstruction_error": (
+                settings.max_exp_log_reconstruction_error
+            ),
             "maximum_imaginary_component": imaginary_max,
             "imaginary_relative_tolerance": _IMAGINARY_RELATIVE_TOLERANCE,
             "stability_tolerance": _STABILITY_TOLERANCE,

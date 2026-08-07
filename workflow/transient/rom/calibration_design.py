@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import json
 import math
 import random
+from pathlib import Path
 from typing import Iterable
 
+from workflow.common import read_json
 from workflow.floorplan.generate_hotspot_inputs import baseline_layout, check_geometry
 from workflow.transient.rom.contracts import ROMSettings
 
@@ -15,6 +18,81 @@ from workflow.transient.rom.contracts import ROMSettings
 _TOLERANCE_MM = 1e-9
 _BISECTION_STEPS = 64
 _SEARCH_GRID = 64
+
+
+def calibration_design_hash(design: dict) -> str:
+    """Return the canonical identity of the exact persisted ROM design."""
+    if not isinstance(design, dict):
+        raise ValueError("calibration design must be a dictionary")
+    try:
+        encoded = json.dumps(
+            design, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ValueError("calibration design must contain finite JSON values") from error
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def load_calibration_design(package_dir: Path) -> dict:
+    """Load and structurally validate the exact design saved with a ROM."""
+    path = Path(package_dir) / "anchors.json"
+    if not path.is_file():
+        raise ValueError("reusable ROM package lacks anchors.json")
+    design = read_json(path)
+    if not isinstance(design, dict):
+        raise ValueError("saved calibration design must be a dictionary")
+    required = {
+        "base_layout", "l2_name", "allowed_l2_tiers", "training",
+        "holdout", "domains", "prbs",
+    }
+    if not required.issubset(design):
+        raise ValueError("saved calibration design is incomplete")
+    training, holdout = design["training"], design["holdout"]
+    if not isinstance(training, list) or len(training) != 8:
+        raise ValueError("saved calibration design must contain eight training anchors")
+    if not isinstance(holdout, list) or len(holdout) != 2:
+        raise ValueError("saved calibration design must contain two holdouts")
+    points = [*training, *holdout]
+    if any(not isinstance(point, dict) for point in points):
+        raise ValueError("saved calibration design points must be dictionaries")
+    identifiers = [point.get("id") for point in points]
+    if (any(not isinstance(identifier, str) or not identifier for identifier in identifiers)
+            or len(set(identifiers)) != len(identifiers)):
+        raise ValueError("saved calibration design point ids must be non-empty and unique")
+    tiers = design["allowed_l2_tiers"]
+    if not isinstance(tiers, list) or not tiers or len(set(tiers)) != len(tiers):
+        raise ValueError("saved calibration design allowed tiers are invalid")
+    if any(isinstance(tier, bool) or tier not in (0, 1) for tier in tiers):
+        raise ValueError("saved calibration design allowed tiers are invalid")
+    if not isinstance(design["domains"], dict) or set(design["domains"]) != {
+        str(tier) for tier in tiers
+    }:
+        raise ValueError("saved calibration design domains differ from allowed tiers")
+    training_ids = {point["id"] for point in training}
+    for tier in tiers:
+        domain = interpolation_domain(design, tier)
+        anchor_ids = domain.get("anchor_ids")
+        tier_ids = {point["id"] for point in training if point.get("tier") == tier}
+        if (not isinstance(anchor_ids, list) or len(anchor_ids) != len(tier_ids)
+                or set(anchor_ids) != tier_ids or not tier_ids.issubset(training_ids)):
+            raise ValueError("saved calibration design domain anchor ids are invalid")
+        if domain.get("kind") == "delaunay":
+            simplices = domain.get("simplices")
+            if not isinstance(simplices, list) or not simplices:
+                raise ValueError("saved calibration design lacks Delaunay simplices")
+            for simplex in simplices:
+                if (not isinstance(simplex, list) or len(simplex) != 3
+                        or any(isinstance(index, bool) or not isinstance(index, int)
+                               or index < 0 or index >= len(anchor_ids)
+                               for index in simplex)):
+                    raise ValueError("saved calibration design has invalid Delaunay simplices")
+        elif domain.get("kind") != "bilinear":
+            raise ValueError("saved calibration design domain kind is invalid")
+    for point in points:
+        layout_for_point(design["base_layout"], point)
+    calibration_design_hash(design)
+    return design
 
 
 def build_design(model: dict, allowed_l2_tiers: list[int], settings: ROMSettings) -> dict:

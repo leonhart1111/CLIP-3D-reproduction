@@ -45,7 +45,7 @@ python -m workflow.run_lifting_pipeline \
   --transient-rom-package-dir "$PACKAGE" --run-r2
 ```
 
-接受包会绑定 canonical R1 元数据、窗口功耗、模块与布局几何、配置、HotSpot 二进制、网格、热堆栈、冷却和允许的 L2 tier 的哈希/identity。任一不匹配、缺失清单或清单哈希陈旧都会拒绝复用，必须重新校准；不得手工复制或修改接受标记。
+接受包会绑定 canonical R1 元数据、窗口功耗、模块与布局几何、配置、HotSpot 二进制、网格、热堆栈、冷却、允许的 L2 tier，以及完整校准设计（8 个锚点、2 个留出点、插值域和 Delaunay simplices）的哈希/identity。复用只读取包内 `anchors.json`，不会用当前代码重新生成设计；`pod_model.npz` 中的 B_L2 anchor ID、拟合 case 顺序、训练输入/温度哈希、转换阈值和设计哈希必须与 `fit_report.json` 完全一致。复用还会重新读取 `calibration_cases.json` 与 `validation_report.json`，校验 8+2 case 的点/布局映射、包内 artifact 哈希、全部留出 gate 和误差阈值，并保留历史留出 RMSE/峰温误差。case artifact 路径只允许相对于包根目录，源 `modules.json` 的原始字节也会复制进包，因此完整包可整体移动后复用；路径逃逸、symlink、证据缺失、清单缺失或清单哈希陈旧都会拒绝复用。不得只复制或修改接受标记。
 
 ## 固定的 8+2 调用及产物
 
@@ -60,6 +60,7 @@ OUT/
     ├── r1/                            # 可选生成的周期统计 R1
     ├── windows/mcpat/power_windows.json
     ├── rom_package/
+    │   ├── modules.json
     │   ├── calibration_manifest.json
     │   ├── anchors.json
     │   ├── training/<anchor-id>/
@@ -79,9 +80,9 @@ OUT/
 
 ## 质量门与失败语义
 
-默认参数为 2 ms 采样、64 个 PRBS 窗口、20 个周期重复、PSS 末周期容差 `0.01 C`、频率细化容差 `0.01 GHz`。两个留出点都必须通过以下门：几何/功耗/频率/HotSpot trace/温度网格 identity 相同，ROM 和 HotSpot 均达到 PSS，整张最终周期网格 RMSE 不超过 `0.75 C`，峰温绝对误差不超过 `1.0 C`，且安全/不安全分类一致。PSS 峰值包含最终周期的初始状态，并比较整个网格而非单一热点。
+默认参数为 2 ms 采样、64 个 PRBS 窗口、20 个周期重复、PSS 末周期容差 `0.01 C`、频率细化容差 `0.01 GHz`。离散到连续转换还有三个显式数值门：增广离散矩阵条件数不超过 `1e12`、SciPy `logm` error estimate 不超过 `1e-8`、独立计算的 `||expm(logm(M))-M||_1/||M||_1` 不超过 `1e-8`；任何一个超限都会中止校准，而不是只写入诊断。两个留出点都必须通过以下门：几何/功耗/频率/HotSpot trace/温度网格 identity 相同，ROM 和 HotSpot 均达到 PSS，整张最终周期网格 RMSE 不超过 `0.75 C`，峰温绝对误差不超过 `1.0 C`，且安全/不安全分类一致。PSS 峰值包含最终周期的初始状态，并比较整个网格而非单一热点。
 
-任一训练或留出作业失败、哈希不符、PSS 不收敛、RMSE/峰温阈值越界、分类不一致，都会使 `rom_acceptance.json` 不被接受并阻止优化。最终真实 HotSpot PSS/频率验证失败时，仍可保留 ROM 预测供诊断，但 `f_sus_trans_hotspot_ghz` 与 `bips2_trans` 不能作为成功结果；未运行或失败的 R2 同样使 `bips2_trans` 为 `null`。不要以稳态回退或 ROM 预测替代这些失败。
+任一训练或留出作业失败、哈希不符、PSS 不收敛、RMSE/峰温阈值越界、分类不一致，都会使 `rom_acceptance.json` 不被接受并阻止优化。最终真实 HotSpot 在任何频率发生执行/I/O 错误、返回畸形 trace/搜索证据、或 PSS 不收敛时，汇总状态为 `rom_final_validation_failed`，`final_validation_failure.category` 分别记录 `tool_error`、`validation_contract_error` 或 `pss_nonconvergence`；调用前即可发现的缺失输入和非空输出目录则直接作为前置条件错误拒绝。失败时 ROM 预测仍保留，但不会启动 R2，`f_sus_trans_hotspot_ghz` 和 `bips2_trans` 均为 `null`。若所有真实 HotSpot 点均已收敛、但最低频率仍不安全，则状态为 `thermally_infeasible`、分类为 `true_thermal_infeasible`，明确区别于工具失败。不要以稳态回退或 ROM 预测替代这些结果。
 
 ## 汇总字段：预测与验证必须分开
 
@@ -90,6 +91,7 @@ OUT/
 - `f_sus_trans_rom_pred_ghz` 与 `bips1_trans_rom_pred`：ROM 在优化内给出的预测，仅用于选择候选和诊断，不是最终 HotSpot 验证值。
 - `f_sus_trans_hotspot_ghz`：最终候选经真实 HotSpot 周期稳态验证后的频率。
 - `ipc2_trans` 与 `bips2_trans`：当前候选布局的真实 R2 IPC，以及仅当真实 HotSpot 验证和 R2 都成功时计算的验证后瞬态 BIPS。
+- `training_hotspot_calls`、`holdout_hotspot_calls`、`calibration_hotspot_calls`：包内历史校准证据，复用时仍为 `8`、`2`、`10`；对应的 `*_this_invocation` 字段在纯复用调用中均为 `0`。
 - `bips2`：只属于独立稳态汇总；ROM 汇总中故意不存在这个含糊字段，不能把稳态 `bips2` 当作 `bips2_trans`。
 
 因此，报告应同时保留预测、留出误差、最终 HotSpot 结果、R2 结果、调用次数和所有 identity。即便所有门通过，结果仍是 non-formal、paper-inequivalent 的探索性扩展，不能提升为正式/论文等价结论。

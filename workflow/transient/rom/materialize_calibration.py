@@ -9,12 +9,17 @@ identity instead of treating the synthetic trace as a new measurement.
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import asdict
 import math
 from pathlib import Path
+import shutil
 
 from workflow.common import read_json, sha256_file, write_json
 from workflow.transient.generate_hotspot_trace import materialize_trace
-from workflow.transient.rom.calibration_design import layout_for_point
+from workflow.transient.rom.calibration_design import (
+    calibration_design_hash,
+    layout_for_point,
+)
 from workflow.transient.rom.contracts import ROMSettings
 from workflow.transient.run_hotspot_transient import (
     DEFAULT_HOTSPOT,
@@ -163,8 +168,9 @@ def _require_case_inputs(modules_path: Path, source_power_windows_path: Path,
     return modules, source, config
 
 
-def _case_artifacts(case_dir: Path, modules_path: Path, layout_path: Path,
-                    power_path: Path) -> dict:
+def _case_artifacts(case_dir: Path, package_dir: Path, modules_path: Path,
+                    layout_path: Path, power_path: Path) -> dict:
+    package_dir = package_dir.resolve()
     paths = {
         "modules": modules_path.resolve(),
         "layout": layout_path.resolve(),
@@ -175,14 +181,22 @@ def _case_artifacts(case_dir: Path, modules_path: Path, layout_path: Path,
     if any(not path.is_file() for path in paths.values()):
         missing = [str(path) for path in paths.values() if not path.is_file()]
         raise ValueError(f"calibration case lacks required artifacts: {missing}")
+    try:
+        relative_paths = {
+            name: path.relative_to(package_dir).as_posix()
+            for name, path in paths.items()
+        }
+    except ValueError as error:
+        raise ValueError("calibration case artifact is outside its package") from error
     return {
-        **{name: str(path) for name, path in paths.items()},
+        **relative_paths,
         "sha256": {name: _sha256(path) for name, path in paths.items()},
     }
 
 
 def _materialize_case(*, kind: str, point: dict, case_dir: Path,
-                      modules_path: Path, power_windows: dict, config: dict,
+                      package_dir: Path, modules_path: Path,
+                      power_windows: dict, config: dict,
                       design: dict, frequency_ghz: float, f0_ghz: float,
                       period_repeats: int, pss_tolerance_c: float,
                       hotspot: Path) -> dict:
@@ -212,7 +226,9 @@ def _materialize_case(*, kind: str, point: dict, case_dir: Path,
             "command": thermal.get("command"),
             "elapsed_seconds": thermal.get("elapsed_seconds"),
         },
-        "artifacts": _case_artifacts(case_dir, modules_path, layout_path, power_path),
+        "artifacts": _case_artifacts(
+            case_dir, package_dir, modules_path, layout_path, power_path,
+        ),
     }
     if kind == "holdout":
         names, rows = parse_ttrace_grid(case_dir / "transient.ttrace")
@@ -238,7 +254,8 @@ def _materialize_case(*, kind: str, point: dict, case_dir: Path,
 def execute_calibration_cases(modules_path: Path, source_power_windows_path: Path,
                               config_path: Path, design: dict, output_dir: Path,
                               settings: ROMSettings, *,
-                              hotspot: Path = DEFAULT_HOTSPOT) -> dict:
+                              hotspot: Path = DEFAULT_HOTSPOT,
+                              identity: dict) -> dict:
     """Materialize exactly eight PRBS anchors and two real-workload holdouts.
 
     This is intentionally a caller-controlled real-HotSpot boundary.  Unit
@@ -255,7 +272,46 @@ def execute_calibration_cases(modules_path: Path, source_power_windows_path: Pat
     modules, source_power_windows, config = _require_case_inputs(
         modules_path, source_power_windows_path, config_path, hotspot, design, settings
     )
+    design_identity = calibration_design_hash(design)
+    if not isinstance(identity, dict):
+        raise ValueError("calibration identity must be a dictionary")
+    if identity.get("calibration_design_hash") != design_identity:
+        raise ValueError("calibration design hash identity differs")
+    if identity.get("allowed_l2_tiers") != design.get("allowed_l2_tiers"):
+        raise ValueError("calibration allowed tiers identity differs")
     output_dir.mkdir(parents=True, exist_ok=True)
+    package_modules_path = output_dir / "modules.json"
+    shutil.copyfile(modules_path, package_modules_path)
+    write_json(output_dir / "anchors.json", design)
+    write_json(output_dir / "calibration_manifest.json", {
+        "schema_version": 1,
+        "mode": "transient ROM calibration",
+        "thermal_mode": "transient-rom",
+        "non_formal": True,
+        "paper_equivalent": False,
+        "calibration_runs": 8,
+        "validation_runs": 2,
+        "calibration_design_hash": design_identity,
+        "identity": deepcopy(identity),
+        "settings": {
+            **asdict(settings),
+            "calibration_runs": 8,
+            "validation_runs": 2,
+        },
+        "sources": {
+            "modules": str(modules_path),
+            "modules_sha256": _sha256(modules_path),
+            "power_windows": str(source_power_windows_path),
+            "power_windows_sha256": _sha256(source_power_windows_path),
+            "power_trace_identity": power_trace_identity(source_power_windows),
+            "config": str(config_path),
+            "config_sha256": _sha256(config_path),
+            "hotspot": str(hotspot),
+            "hotspot_sha256": _sha256(hotspot),
+        },
+        "training_ids": [point["id"] for point in design["training"]],
+        "holdout_ids": [point["id"] for point in design["holdout"]],
+    })
     prbs = design.get("prbs")
     if not isinstance(prbs, dict) or not isinstance(prbs.get("multipliers"), dict):
         raise ValueError("design lacks PRBS multipliers")
@@ -268,7 +324,8 @@ def execute_calibration_cases(modules_path: Path, source_power_windows_path: Pat
     for point in design["training"]:
         training.append(_materialize_case(
             kind="training", point=point, case_dir=output_dir / f"training_{point['id']}",
-            modules_path=modules_path, power_windows=prbs_power, config=config,
+            package_dir=output_dir, modules_path=package_modules_path,
+            power_windows=prbs_power, config=config,
             design=design, frequency_ghz=f0_ghz, f0_ghz=f0_ghz,
             period_repeats=1, pss_tolerance_c=settings.pss_tolerance_c, hotspot=hotspot,
         ))
@@ -277,7 +334,8 @@ def execute_calibration_cases(modules_path: Path, source_power_windows_path: Pat
     for point, frequency_ghz in zip(design["holdout"], holdout_frequencies):
         holdout.append(_materialize_case(
             kind="holdout", point=point, case_dir=output_dir / f"holdout_{point['id']}",
-            modules_path=modules_path, power_windows=source_power_windows, config=config,
+            package_dir=output_dir, modules_path=package_modules_path,
+            power_windows=source_power_windows, config=config,
             design=design, frequency_ghz=frequency_ghz, f0_ghz=f0_ghz,
             period_repeats=settings.pss_period_repeats,
             pss_tolerance_c=settings.pss_tolerance_c, hotspot=hotspot,

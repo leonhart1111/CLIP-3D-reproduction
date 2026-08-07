@@ -16,7 +16,9 @@ from workflow.transient.rom.contracts import (
     ROMSettings,
     parse_settings,
     rom_input_identity,
+    write_rom_artifact_manifest,
 )
+from workflow.transient.rom.calibration_design import calibration_design_hash
 from workflow.transient.rom.layout_rom import evaluate_layout_rom, validate_holdouts
 from workflow.transient.rom.materialize_calibration import execute_calibration_cases
 from workflow.transient.rom.pod_state_space import (
@@ -39,7 +41,7 @@ def _sha256(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _artifact(case: dict, name: str) -> tuple[Path, bool]:
+def _artifact(case: dict, name: str, package_dir: Path) -> tuple[Path, bool]:
     artifacts = case.get("artifacts")
     value = artifacts.get(name) if isinstance(artifacts, dict) else None
     hashes = artifacts.get("sha256") if isinstance(artifacts, dict) else None
@@ -47,6 +49,8 @@ def _artifact(case: dict, name: str) -> tuple[Path, bool]:
     if not isinstance(value, str) or not value:
         raise ValueError(f"holdout {case.get('id')!r} lacks {name} artifact")
     path = Path(value)
+    if not path.is_absolute():
+        path = Path(package_dir) / path
     if not path.is_file():
         raise FileNotFoundError(path)
     return path, isinstance(recorded, str) and recorded == _sha256(path)
@@ -90,15 +94,20 @@ def validate_calibration_holdouts(
             or not math.isfinite(float(tsafe))):
         raise ValueError("frequency.tsafe_c must be finite")
     comparisons = []
+    package_dir = Path(output_dir).resolve()
     for case in holdout_cases:
         if not isinstance(case, dict):
             raise ValueError("holdout case must be a dictionary")
         identifier = case.get("id")
         if not isinstance(identifier, str) or not identifier:
             raise ValueError("holdout case lacks an id")
-        layout_path, layout_hash_match = _artifact(case, "layout")
-        power_path, power_hash_match = _artifact(case, "power_windows")
-        trace_path, trace_hash_match = _artifact(case, "temperature_trace")
+        layout_path, layout_hash_match = _artifact(case, "layout", package_dir)
+        power_path, power_hash_match = _artifact(
+            case, "power_windows", package_dir,
+        )
+        trace_path, trace_hash_match = _artifact(
+            case, "temperature_trace", package_dir,
+        )
         layout = read_json(layout_path)
         power_windows = read_json(power_path)
         frequency = case.get("frequency_ghz")
@@ -211,6 +220,7 @@ def _package_identity(modules_path: Path, power_windows_path: Path,
             "r_convec_k_per_w": physical.get("r_convec_k_per_w"),
         },
         allowed_l2_tiers=design.get("allowed_l2_tiers"),
+        calibration_design_hash=calibration_design_hash(design),
     )
 
 
@@ -224,28 +234,36 @@ def main() -> None:
     parser.add_argument("--hotspot", type=Path, required=True)
     args = parser.parse_args()
     config = read_json(args.config)
+    design = read_json(args.design)
+    identity = _package_identity(
+        args.modules, args.power_windows, args.config, args.hotspot, design, config,
+    )
     report = execute_calibration_cases(
-        args.modules, args.power_windows, args.config, read_json(args.design),
+        args.modules, args.power_windows, args.config, design,
         args.output_dir, parse_settings(config), hotspot=args.hotspot,
+        identity=identity,
     )
     model, fit_report = fit_state_space(
-        report["training_cases"], parse_settings(config)
+        report["training_cases"], parse_settings(config),
+        package_dir=args.output_dir,
     )
+    fit_report = {
+        **fit_report,
+        "calibration_design_hash": calibration_design_hash(design),
+    }
     save_model(args.output_dir / "pod_model.npz", model, fit_report)
     write_json(args.output_dir / "fit_report.json", fit_report)
     validation = validate_calibration_holdouts(
-        model, read_json(args.design), report["holdout_cases"],
+        model, design, report["holdout_cases"],
         parse_settings(config), config, output_dir=args.output_dir,
-        identity=_package_identity(
-            args.modules, args.power_windows, args.config, args.hotspot,
-            read_json(args.design), config,
-        ),
+        identity=identity,
     )
     if not validation["accepted"]:
         raise ValueError(
             "transient ROM holdout validation failed: "
             + ", ".join(validation["failure_reasons"])
         )
+    write_rom_artifact_manifest(args.output_dir)
     print(
         "Transient ROM cases: "
         f"{report['training_hotspot_calls']} training, "

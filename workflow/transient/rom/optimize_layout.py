@@ -18,17 +18,19 @@ from workflow.floorplan.layout_metrics import (
     mean_wire_cycles,
     round_wire_cycles,
 )
-from workflow.transient.rom.calibration_design import build_design
+from workflow.transient.rom.calibration_design import (
+    calibration_design_hash,
+    load_calibration_design,
+)
 from workflow.transient.rom.contracts import (
     parse_settings,
-    require_accepted_package,
+    require_package_calibration_evidence,
     rom_input_identity,
 )
 from workflow.transient.rom.layout_rom import (
     find_rom_sustainable_frequency,
     interpolate_l2_input,
 )
-from workflow.transient.rom.pod_state_space import load_model
 from workflow.transient.validation import power_trace_identity
 
 
@@ -100,6 +102,7 @@ def _requested_identity(modules_path: Path, config_path: Path, hotspot: Path,
             "r_convec_k_per_w": physical.get("r_convec_k_per_w"),
         },
         allowed_l2_tiers=tiers,
+        calibration_design_hash=calibration_design_hash(design),
     )
 
 
@@ -186,12 +189,24 @@ def optimize_transient_layout(modules_path: Path, package_dir: Path,
         raise ValueError("transient ROM refinement_starts must equal 5")
     optimizer = config.get("layout_optimizer", {})
     tiers = optimizer.get("allowed_l2_tiers") if isinstance(optimizer, dict) else None
-    design = build_design(modules, tiers, settings)
+    design = load_calibration_design(package_dir)
     identity = _requested_identity(
         modules_path, config_path, hotspot, power_windows, config, design,
     )
-    acceptance = require_accepted_package(package_dir, identity)
-    model, model_metadata = load_model(package_dir / "pod_model.npz")
+    package_evidence = require_package_calibration_evidence(
+        package_dir, identity, settings,
+    )
+    acceptance = package_evidence["acceptance"]
+    model = package_evidence["model"]
+    model_metadata = package_evidence["model_metadata"]
+    design_identity = calibration_design_hash(design)
+    training_ids = sorted(point["id"] for point in design["training"])
+    if sorted(model.b_l2_anchors) != training_ids:
+        raise ValueError("saved calibration design anchors differ from POD B_L2 columns")
+    if model_metadata.get("calibration_design_hash") != design_identity:
+        raise ValueError("POD model calibration design hash differs")
+    if model_metadata.get("case_order") != training_ids:
+        raise ValueError("POD model case order differs from saved calibration design")
     base = design["base_layout"]
     l2_name = design["l2_name"]
     original = next(
@@ -380,7 +395,10 @@ def optimize_transient_layout(modules_path: Path, package_dir: Path,
         "config": str(config_path),
         "hotspot": str(hotspot),
         "package_acceptance": acceptance,
+        "package_calibration_cases": package_evidence["cases"],
+        "package_holdout_validation": package_evidence["validation"],
         "requested_identity": identity,
+        "calibration_design_hash": design_identity,
         "model_metadata": model_metadata,
         "parameters": {
             "ipc1": ipc1,

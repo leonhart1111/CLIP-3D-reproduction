@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import math
 from numbers import Real
 from pathlib import Path
 from typing import Any
 
-from workflow.common import read_json
+from workflow.common import read_json, sha256_file, write_json
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,9 @@ class ROMSettings:
     max_pod_rank: int
     ridge: float
     max_condition_number: float
+    max_logm_condition_number: float
+    max_logm_error_estimate: float
+    max_exp_log_reconstruction_error: float
     pss_period_repeats: int
     pss_tolerance_c: float
     frequency_tolerance_ghz: float
@@ -40,6 +43,9 @@ _DEFAULTS = {
     "max_pod_rank": 16,
     "ridge": 1e-8,
     "max_condition_number": 1e10,
+    "max_logm_condition_number": 1e12,
+    "max_logm_error_estimate": 1e-8,
+    "max_exp_log_reconstruction_error": 1e-8,
     "pss_period_repeats": 20,
     "pss_tolerance_c": 0.01,
     "frequency_tolerance_ghz": 0.01,
@@ -59,6 +65,7 @@ _REQUIRED_IDENTITY_FIELDS = (
     "stack",
     "cooling",
     "allowed_l2_tiers",
+    "calibration_design_hash",
 )
 _IDENTITY_LABELS = {
     "canonical_r1_metadata_hash": "canonical R1 metadata hash identity",
@@ -71,7 +78,95 @@ _IDENTITY_LABELS = {
     "stack": "stack identity",
     "cooling": "cooling identity",
     "allowed_l2_tiers": "allowed tiers identity",
+    "calibration_design_hash": "calibration design hash identity",
 }
+_CLASSIFICATION = {
+    "thermal_mode": "transient-rom",
+    "non_formal": True,
+    "paper_equivalent": False,
+}
+_HOLDOUT_GATES = {
+    "geometry_identity",
+    "input_identity",
+    "frequency_identity",
+    "hotspot_trace_identity",
+    "temperature_grid_identity",
+    "periodic_steady_state",
+    "grid_rmse",
+    "peak_temperature_error",
+    "safety_classification",
+}
+
+
+def write_rom_artifact_manifest(output_dir: Path) -> dict:
+    """Bind every ROM-owned file to its bytes and non-formal classification."""
+    output_dir = Path(output_dir).resolve()
+    manifest_path = output_dir / "rom_artifact_manifest.json"
+    artifacts = []
+    for path in sorted(output_dir.rglob("*")):
+        if not path.is_file() or path == manifest_path:
+            continue
+        artifacts.append({
+            "path": path.relative_to(output_dir).as_posix(),
+            "sha256": sha256_file(path),
+            "classification": dict(_CLASSIFICATION),
+        })
+    manifest = {
+        "schema_version": 1,
+        **_CLASSIFICATION,
+        "scope": str(output_dir),
+        "artifacts": artifacts,
+    }
+    write_json(manifest_path, manifest)
+    return manifest
+
+
+def require_rom_artifact_manifest(package_dir: Path) -> dict:
+    """Require a complete, current, symlink-free ROM artifact inventory."""
+    package_dir = Path(package_dir).resolve()
+    manifest_path = package_dir / "rom_artifact_manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("reusable ROM package lacks rom_artifact_manifest.json")
+    manifest = read_json(manifest_path)
+    if not isinstance(manifest, dict) or any(
+        manifest.get(field) != value for field, value in _CLASSIFICATION.items()
+    ):
+        raise ValueError("reusable ROM package manifest classification is invalid")
+    records = manifest.get("artifacts")
+    if not isinstance(records, list):
+        raise ValueError("reusable ROM package manifest artifacts must be a list")
+    recorded: dict[str, dict] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("reusable ROM package manifest record is invalid")
+        relative = record.get("path")
+        if (not isinstance(relative, str) or not relative
+                or relative in recorded or Path(relative).is_absolute()
+                or ".." in Path(relative).parts):
+            raise ValueError("reusable ROM package manifest path is invalid")
+        if record.get("classification") != _CLASSIFICATION:
+            raise ValueError(
+                "reusable ROM package artifact classification is invalid"
+            )
+        recorded[relative] = record
+
+    actual: dict[str, Path] = {}
+    for path in sorted(package_dir.rglob("*")):
+        if path == manifest_path or not path.is_file():
+            continue
+        if path.is_symlink():
+            raise ValueError("reusable ROM package manifest cannot bind symlinks")
+        actual[path.relative_to(package_dir).as_posix()] = path
+    if set(recorded) != set(actual):
+        raise ValueError(
+            "reusable ROM package manifest inventory is incomplete or stale"
+        )
+    for relative, path in actual.items():
+        if recorded[relative].get("sha256") != sha256_file(path):
+            raise ValueError(
+                f"reusable ROM package manifest hash differs for {relative}"
+            )
+    return manifest
 
 
 def _integer(value: Any, name: str, minimum: int = 1) -> int:
@@ -125,6 +220,18 @@ def parse_settings(config: dict) -> ROMSettings:
     )
     if max_condition_number < 1.0:
         raise ValueError("max_condition_number must be at least 1")
+    max_logm_condition_number = _positive(
+        setting["max_logm_condition_number"], "max_logm_condition_number"
+    )
+    if max_logm_condition_number < 1.0:
+        raise ValueError("max_logm_condition_number must be at least 1")
+    max_logm_error_estimate = _positive(
+        setting["max_logm_error_estimate"], "max_logm_error_estimate"
+    )
+    max_exp_log_reconstruction_error = _positive(
+        setting["max_exp_log_reconstruction_error"],
+        "max_exp_log_reconstruction_error",
+    )
     pss_period_repeats = _integer(setting["pss_period_repeats"], "pss_period_repeats")
     pss_tolerance_c = _positive(setting["pss_tolerance_c"], "pss_tolerance_c")
     frequency_tolerance_ghz = _positive(
@@ -143,6 +250,8 @@ def parse_settings(config: dict) -> ROMSettings:
     return ROMSettings(
         sample_interval_ms, calibration_windows, prbs_seed, prbs_fraction,
         pod_energy_threshold, max_pod_rank, ridge, max_condition_number,
+        max_logm_condition_number, max_logm_error_estimate,
+        max_exp_log_reconstruction_error,
         pss_period_repeats, pss_tolerance_c, frequency_tolerance_ghz,
         max_holdout_peak_error_c, max_holdout_grid_rmse_c,
         search_grid_points_per_axis, refinement_starts,
@@ -169,6 +278,7 @@ def rom_input_identity(
     stack: Any,
     cooling: Any,
     allowed_l2_tiers: list[int] | tuple[int, ...],
+    calibration_design_hash: str,
 ) -> dict:
     """Return the complete scientific provenance required to reuse a ROM."""
     hashes = {
@@ -178,6 +288,7 @@ def rom_input_identity(
         "layout_geometry_hash": layout_geometry_hash,
         "configuration_hash": configuration_hash,
         "hotspot_hash": hotspot_hash,
+        "calibration_design_hash": calibration_design_hash,
     }
     for name, value in hashes.items():
         if not isinstance(value, str) or not value:
@@ -216,6 +327,311 @@ def require_accepted_package(package_dir: Path, identity: dict) -> dict:
                 raise ValueError(_IDENTITY_LABELS[name])
         raise ValueError("ROM package identity differs")
     return acceptance
+
+
+def require_package_calibration_evidence(
+    package_dir: Path, identity: dict, settings: ROMSettings,
+) -> dict:
+    """Require the complete fitted model and 8+2 evidence used for acceptance."""
+    package_dir = Path(package_dir).resolve()
+    acceptance = require_accepted_package(package_dir, identity)
+    from workflow.transient.rom.calibration_design import (  # avoid import cycle
+        calibration_design_hash,
+        layout_for_point,
+        load_calibration_design,
+    )
+
+    design = load_calibration_design(package_dir)
+    design_identity = calibration_design_hash(design)
+    values = {}
+    for name in (
+        "calibration_manifest.json", "calibration_cases.json",
+        "fit_report.json", "validation_report.json",
+    ):
+        path = package_dir / name
+        if not path.is_file():
+            raise ValueError(f"reusable ROM package lacks {name}")
+        value = read_json(path)
+        if not isinstance(value, dict):
+            raise ValueError(f"reusable ROM package has invalid {name}")
+        values[name] = value
+
+    manifest = values["calibration_manifest.json"]
+    cases = values["calibration_cases.json"]
+    fit_report = values["fit_report.json"]
+    validation = values["validation_report.json"]
+    expected_settings = {
+        **asdict(settings),
+        "calibration_runs": 8,
+        "validation_runs": 2,
+    }
+    if manifest.get("settings") != expected_settings:
+        raise ValueError("reusable ROM calibration manifest resolved settings differ")
+    if any(manifest.get(field) != value for field, value in _CLASSIFICATION.items()):
+        raise ValueError("reusable ROM calibration manifest classification differs")
+    if (manifest.get("identity") != acceptance["identity"]
+            or manifest.get("calibration_design_hash") != design_identity
+            or manifest.get("calibration_runs") != 8
+            or manifest.get("validation_runs") != 2):
+        raise ValueError("reusable ROM calibration manifest evidence differs")
+    sources = manifest.get("sources")
+    expected_source_identities = {
+        "modules_sha256": acceptance["identity"]["modules_geometry_hash"],
+        "power_trace_identity": acceptance["identity"]["power_trace"],
+        "config_sha256": acceptance["identity"]["configuration_hash"],
+        "hotspot_sha256": acceptance["identity"]["hotspot_hash"],
+    }
+    if (not isinstance(sources, dict) or any(
+        sources.get(field) != value
+        for field, value in expected_source_identities.items()
+    )):
+        raise ValueError("reusable ROM calibration manifest source identities differ")
+    expected_modules_hash = expected_source_identities["modules_sha256"]
+    if acceptance.get("validation_report") != "validation_report.json":
+        raise ValueError("reusable ROM acceptance validation evidence path differs")
+
+    training, holdouts = cases.get("training_cases"), cases.get("holdout_cases")
+    expected_training = [point["id"] for point in design["training"]]
+    expected_holdouts = [point["id"] for point in design["holdout"]]
+    if (cases.get("training_hotspot_calls") != 8
+            or cases.get("holdout_hotspot_calls") != 2
+            or not isinstance(training, list) or len(training) != 8
+            or not isinstance(holdouts, list) or len(holdouts) != 2
+            or [case.get("id") for case in training] != expected_training
+            or [case.get("id") for case in holdouts] != expected_holdouts):
+        raise ValueError("reusable ROM calibration case evidence must contain exact 8+2")
+    if (manifest.get("training_ids") != expected_training
+            or manifest.get("holdout_ids") != expected_holdouts):
+        raise ValueError("reusable ROM calibration manifest case ids differ")
+
+    expected_points = {
+        point["id"]: point for point in [*design["training"], *design["holdout"]]
+    }
+    from workflow.transient.validation import power_trace_identity
+
+    artifact_hashes: dict[str, dict[str, str]] = {}
+    case_power_windows: dict[str, dict] = {}
+    for expected_kind, case_set in (("training", training), ("holdout", holdouts)):
+        for case in case_set:
+            identifier = case["id"]
+            if (case.get("kind") != expected_kind
+                    or case.get("point") != expected_points[identifier]
+                    or case.get("initial_temperature") != "ambient"
+                    or not isinstance(case.get("hotspot"), dict)):
+                raise ValueError(
+                    f"reusable ROM {expected_kind} case {identifier} evidence differs"
+                )
+            artifacts = case.get("artifacts")
+            hashes = artifacts.get("sha256") if isinstance(artifacts, dict) else None
+            artifact_hashes[identifier] = {}
+            resolved_artifacts: dict[str, Path] = {}
+            for artifact in (
+                "modules", "layout", "power_windows", "power_trace",
+                "temperature_trace",
+            ):
+                value = artifacts.get(artifact) if isinstance(artifacts, dict) else None
+                recorded = hashes.get(artifact) if isinstance(hashes, dict) else None
+                if not isinstance(value, str) or not isinstance(recorded, str):
+                    raise ValueError(
+                        f"reusable ROM {expected_kind} case {identifier} "
+                        f"lacks {artifact} hash"
+                    )
+                relative = Path(value)
+                if (relative.is_absolute() or ".." in relative.parts):
+                    raise ValueError(
+                        f"reusable ROM {expected_kind} case {identifier} "
+                        f"{artifact} path must be package-relative"
+                    )
+                path = (package_dir / relative).resolve()
+                if package_dir not in path.parents:
+                    raise ValueError(
+                        f"reusable ROM {expected_kind} case {identifier} "
+                        f"{artifact} path escapes package"
+                    )
+                if not path.is_file() or recorded != "sha256:" + sha256_file(path):
+                    raise ValueError(
+                        f"reusable ROM {expected_kind} case {identifier} "
+                        f"{artifact} hash differs"
+                    )
+                artifact_hashes[identifier][artifact] = recorded
+                resolved_artifacts[artifact] = path
+            if artifact_hashes[identifier]["modules"] != expected_modules_hash:
+                raise ValueError(
+                    f"reusable ROM {expected_kind} case {identifier} "
+                    "modules evidence differs"
+                )
+            expected_layout = layout_for_point(
+                design["base_layout"], expected_points[identifier]
+            )
+            if read_json(resolved_artifacts["layout"]) != expected_layout:
+                raise ValueError(
+                    f"reusable ROM {expected_kind} case {identifier} "
+                    "layout evidence differs"
+                )
+            power_windows = read_json(resolved_artifacts["power_windows"])
+            case_power_windows[identifier] = power_windows
+            if expected_kind == "training":
+                excitation = (
+                    power_windows.get("prbs_excitation")
+                    if isinstance(power_windows, dict) else None
+                )
+                if (not isinstance(excitation, dict)
+                        or excitation.get("source_power_trace_identity")
+                        != acceptance["identity"]["power_trace"]
+                        or excitation.get("window_count")
+                        != settings.calibration_windows
+                        or excitation.get("multipliers")
+                        != design["prbs"]["multipliers"]):
+                    raise ValueError(
+                        f"reusable ROM training case {identifier} "
+                        "source power identity differs"
+                    )
+            elif power_trace_identity(power_windows) != acceptance["identity"]["power_trace"]:
+                raise ValueError(
+                    f"reusable ROM holdout case {identifier} "
+                    "source power identity differs"
+                )
+            if expected_kind == "holdout":
+                pss = case.get("periodic_steady_state")
+                if (not isinstance(pss, dict)
+                        or pss.get("full_grid_converged") is not True):
+                    raise ValueError(
+                        f"reusable ROM holdout case {identifier} lacks PSS evidence"
+                    )
+
+    holdout_power_hashes = {
+        artifact_hashes[identifier]["power_windows"]
+        for identifier in expected_holdouts
+    }
+    if (len(holdout_power_hashes) != 1
+            or sources.get("power_windows_sha256") not in holdout_power_hashes):
+        raise ValueError("reusable ROM calibration source power bytes differ")
+    from workflow.transient.rom.materialize_calibration import (  # avoid import cycle
+        build_prbs_power_windows,
+    )
+
+    expected_prbs_power = build_prbs_power_windows(
+        case_power_windows[expected_holdouts[0]],
+        design["prbs"]["multipliers"],
+        settings.calibration_windows,
+    )
+    for identifier in expected_training:
+        if case_power_windows[identifier] != expected_prbs_power:
+            raise ValueError(
+                f"reusable ROM training case {identifier} "
+                "PRBS power evidence differs"
+            )
+
+    expected_case_order = sorted(expected_training)
+    expected_temperature_hashes = {
+        identifier: artifact_hashes[identifier]["temperature_trace"]
+        for identifier in expected_case_order
+    }
+    expected_power_hashes = {
+        identifier: artifact_hashes[identifier]["power_windows"]
+        for identifier in expected_case_order
+    }
+    if (fit_report.get("calibration_design_hash") != design_identity
+            or fit_report.get("case_order") != expected_case_order
+            or fit_report.get("temperature_trace_sha256")
+            != expected_temperature_hashes
+            or fit_report.get("power_windows_sha256") != expected_power_hashes):
+        raise ValueError("reusable ROM fit report training evidence differs")
+    identification = fit_report.get("identification")
+    if (not isinstance(identification, dict)
+            or identification.get("ridge") != settings.ridge
+            or identification.get("max_condition_number")
+            != settings.max_condition_number):
+        raise ValueError("reusable ROM fit report identification settings differ")
+    gram_condition = identification.get("gram_condition_number")
+    if (isinstance(gram_condition, bool) or not isinstance(gram_condition, Real)
+            or not math.isfinite(float(gram_condition))
+            or float(gram_condition) > settings.max_condition_number):
+        raise ValueError("reusable ROM fit report condition evidence differs")
+    pod = fit_report.get("pod")
+    if (not isinstance(pod, dict)
+            or pod.get("energy_threshold") != settings.pod_energy_threshold):
+        raise ValueError("reusable ROM fit report POD settings differ")
+    rank = pod.get("rank")
+    if (isinstance(rank, bool) or not isinstance(rank, int)
+            or rank < 1 or rank > settings.max_pod_rank):
+        raise ValueError("reusable ROM fit report POD rank differs")
+    conversion = fit_report.get("continuous_conversion")
+    conversion_gates = (
+        ("logm_input_condition_number", "max_logm_condition_number",
+         settings.max_logm_condition_number),
+        ("logm_error_estimate", "max_logm_error_estimate",
+         settings.max_logm_error_estimate),
+        ("exp_log_reconstruction_error", "max_exp_log_reconstruction_error",
+         settings.max_exp_log_reconstruction_error),
+    )
+    if not isinstance(conversion, dict):
+        raise ValueError("reusable ROM fit report lacks continuous conversion evidence")
+    for value_name, limit_name, expected_limit in conversion_gates:
+        value, limit = conversion.get(value_name), conversion.get(limit_name)
+        if (limit != expected_limit or isinstance(value, bool)
+                or not isinstance(value, Real) or not math.isfinite(float(value))
+                or float(value) > expected_limit):
+            raise ValueError(
+                f"reusable ROM fit report {value_name} evidence differs"
+            )
+
+    from workflow.transient.rom.pod_state_space import load_model  # avoid cycle
+
+    model, model_metadata = load_model(package_dir / "pod_model.npz")
+    if model_metadata != fit_report:
+        raise ValueError("reusable ROM POD model metadata differs from fit report")
+    if sorted(model.b_l2_anchors) != expected_case_order:
+        raise ValueError("saved calibration design anchors differ from POD B_L2 columns")
+
+    validation_holdouts = validation.get("holdouts")
+    expected_thresholds = {
+        "pss_tolerance_c": settings.pss_tolerance_c,
+        "max_holdout_grid_rmse_c": settings.max_holdout_grid_rmse_c,
+        "max_holdout_peak_error_c": settings.max_holdout_peak_error_c,
+    }
+    if any(validation.get(field) != value for field, value in _CLASSIFICATION.items()):
+        raise ValueError("reusable ROM holdout validation classification differs")
+    if (validation.get("accepted") is not True
+            or validation.get("failure_reasons") != []
+            or validation.get("thresholds") != expected_thresholds
+            or not isinstance(validation_holdouts, list)
+            or len(validation_holdouts) != 2
+            or [case.get("id") for case in validation_holdouts] != expected_holdouts):
+        raise ValueError("reusable ROM holdout validation evidence is incomplete")
+    for case in validation_holdouts:
+        if case.get("accepted") is not True:
+            raise ValueError(f"reusable ROM holdout {case.get('id')} is not accepted")
+        gates = case.get("gates")
+        if (not isinstance(gates, dict) or set(gates) != _HOLDOUT_GATES
+                or any(value is not True for value in gates.values())):
+            raise ValueError(
+                f"reusable ROM holdout {case.get('id')} gate evidence differs"
+            )
+        limits = {
+            "grid_rmse_c": settings.max_holdout_grid_rmse_c,
+            "peak_temperature_error_c": settings.max_holdout_peak_error_c,
+        }
+        for field, limit in limits.items():
+            value = case.get(field)
+            if (isinstance(value, bool) or not isinstance(value, Real)
+                    or not math.isfinite(float(value)) or float(value) < 0.0
+                    or float(value) > limit):
+                raise ValueError(
+                    f"reusable ROM holdout {case.get('id')} lacks finite {field}"
+                )
+    artifact_manifest = require_rom_artifact_manifest(package_dir)
+    return {
+        "acceptance": acceptance,
+        "design": design,
+        "manifest": manifest,
+        "cases": cases,
+        "fit_report": fit_report,
+        "model": model,
+        "model_metadata": model_metadata,
+        "validation": validation,
+        "artifact_manifest": artifact_manifest,
+    }
 
 
 def _normalized_identity(value: Any, context: str) -> dict:
