@@ -9,7 +9,11 @@ import math
 import os
 from pathlib import Path
 
-from workflow.common import aggregate_ipc, parse_gem5_stats_text
+from workflow.common import (
+    aggregate_ipc,
+    instruction_window_scope,
+    parse_gem5_stats_text,
+)
 from workflow.thermal.run_hotspot import parse_temperatures
 from workflow.thermal.sustainable_frequency import derive
 
@@ -68,15 +72,18 @@ def validate_physical_coherence(
     else:
         for field in (
                 "workload", "l1i_size", "l1d_size", "l2_size", "num_cores",
-                "instruction_window_scope", "warmup_insts_cpu0",
-                "measure_insts_cpu0"):
-            expected = metadata.get(
-                field, "cpu0" if field == "instruction_window_scope" else None
-            )
+                "warmup_insts_cpu0", "measure_insts_cpu0"):
+            expected = metadata.get(field)
             if architecture.get(field) != expected:
                 reasons.append(
                     f"target modules architecture {field} differs from canonical R1"
                 )
+        expected = instruction_window_scope(metadata)
+        actual = instruction_window_scope(architecture)
+        if actual != expected:
+            reasons.append(
+                "target modules architecture instruction_window_scope differs from canonical R1"
+            )
     if not _path_matches(modules.get("source_r1"), r1_dir):
         reasons.append("target modules source_r1 differs from canonical R1")
     totals = modules.get("totals")

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from workflow.common import (
     aggregate_ipc,
+    instruction_window_scope,
     parse_gem5_stats,
     parse_size_bytes,
     read_json,
@@ -26,7 +27,7 @@ DEFAULT_AREA_SCALE = 150.0 / DEFAULT_REFERENCE_RAW_AREA_MM2
 
 def extract_communication_profile(stats: dict[str, float], num_cores: int,
                                   stats_path: Path,
-                                  instruction_window_scope: str,
+                                  instruction_window_scope: object,
                                   required: bool = False) -> dict:
     """Build an auditable shared-L2 demand-access profile for represented CPUs."""
     if num_cores <= 0:
@@ -149,14 +150,15 @@ def apply_physical_areas(modules: list[dict], metadata: dict, cacti: dict,
 def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
                 area_scale: float = DEFAULT_AREA_SCALE,
                 require_communication_profile: bool = False) -> dict:
-    metadata = read_json(r1_dir / "r1_metadata.json")
+    metadata = dict(read_json(r1_dir / "r1_metadata.json"))
+    metadata["instruction_window_scope"] = instruction_window_scope(metadata)
     stats_path = r1_dir / "stats.txt"
     stats = parse_gem5_stats(stats_path)
     communication_stats = parse_gem5_stats(stats_path, include_nonfinite=True)
     num_cores = int(metadata.get("num_cores", 4))
     communication_profile = extract_communication_profile(
         communication_stats, num_cores, stats_path,
-        str(metadata.get("instruction_window_scope", "not recorded")),
+        metadata["instruction_window_scope"],
         require_communication_profile,
     )
     mcpat = read_json(mcpat_json)

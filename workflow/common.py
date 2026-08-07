@@ -38,6 +38,13 @@ def read_json(path: Path | str) -> Any:
         return json.load(stream)
 
 
+def instruction_window_scope(metadata: dict) -> object:
+    """Return an explicit scope, or the historical cpu0 default when absent."""
+    if "instruction_window_scope" in metadata:
+        return metadata["instruction_window_scope"]
+    return "cpu0"
+
+
 def atomic_write_bytes(path: Path | str, data: bytes) -> None:
     """Publish complete bytes by unique same-directory temp and atomic replace."""
     path = Path(path)

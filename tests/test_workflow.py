@@ -598,13 +598,14 @@ class ParserTests(unittest.TestCase):
             root = Path(temporary)
             r1_dir = root / "r1"
             r1_dir.mkdir()
-            write_json(r1_dir / "r1_metadata.json", {
+            metadata = {
                 "num_cores": 2,
                 "l1i_size": "32kB",
                 "l1d_size": "32kB",
                 "l2_size": "512kB",
                 "instruction_window_scope": "roi",
-            })
+            }
+            write_json(r1_dir / "r1_metadata.json", metadata)
             (r1_dir / "stats.txt").write_text(
                 "system.cpu0.commitStats0.numInsts 100\n"
                 "system.cpu1.commitStats0.numInsts 100\n"
@@ -637,11 +638,17 @@ class ParserTests(unittest.TestCase):
                  "area_mm2": 1.0, "width_mm": 1.0, "height_mm": 1.0},
             ]})
             output = root / "modules.json"
+            metadata.pop("instruction_window_scope")
+            write_json(r1_dir / "r1_metadata.json", metadata)
             model = build_model(
                 r1_dir, mcpat_path, cacti_path, output, area_scale=1.0,
                 require_communication_profile=True,
             )
             self.assertEqual(model, read_json(output))
+            self.assertEqual(model["architecture"]["instruction_window_scope"], "cpu0")
+            self.assertEqual(
+                model["communication_profile"]["instruction_window_scope"], "cpu0"
+            )
             self.assertEqual(model["communication_profile"]["status"], "available")
             self.assertEqual(
                 model["communication_profile"]["per_core"]["1"]

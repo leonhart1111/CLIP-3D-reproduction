@@ -1296,7 +1296,9 @@ class StrictR2ReuseTests(unittest.TestCase):
             "r1_stats_sha256": sha256_file(self.r1 / "stats.txt"),
             "latency_vector": str(latency_path.resolve()),
             "latency_sha256": sha256_file(latency_path),
-            "instruction_window_scope": metadata["instruction_window_scope"],
+            "instruction_window_scope": metadata.get(
+                "instruction_window_scope", "cpu0"
+            ),
             "warmup_insts_cpu0": metadata["warmup_insts_cpu0"],
             "measure_insts_cpu0": metadata["measure_insts_cpu0"],
         }
@@ -1373,6 +1375,34 @@ class StrictR2ReuseTests(unittest.TestCase):
         status = read_json(status_path)
         status["r2_result_sha256"] = sha256_file(result_path)
         write_json(status_path, status)
+
+    def test_local_attach_accepts_legacy_r1_and_module_scope_omission(self):
+        """A pre-schema cpu0 run can attach its already measured local R2."""
+        from workflow.r2.attach_result import attach
+
+        self.metadata.pop("instruction_window_scope")
+        write_json(self.r1 / "r1_metadata.json", self.metadata)
+        modules_path = self.fixed / "modules.json"
+        modules = read_json(modules_path)
+        modules["architecture"].pop("instruction_window_scope")
+        write_json(modules_path, modules)
+        self._write_source_result()
+
+        attached = attach(self.fixed)
+
+        self.assertEqual(attached["ipc2"], 3.25)
+
+    def test_local_attach_rejects_explicit_scope_mismatch(self):
+        """Compatibility for an absent key must not accept all-cores evidence."""
+        from workflow.r2.attach_result import attach
+
+        modules_path = self.fixed / "modules.json"
+        modules = read_json(modules_path)
+        modules["architecture"]["instruction_window_scope"] = "all-cores"
+        write_json(modules_path, modules)
+
+        with self.assertRaisesRegex(ValueError, "instruction_window_scope"):
+            attach(self.fixed)
 
     def test_local_successful_cache_accepts_matching_latency_and_r1_identity(self):
         """Changing any requested local cache identity must make acceptance fail."""
