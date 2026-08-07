@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 import tempfile
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+
+import numpy
 
 from workflow.common import write_json
 from workflow.transient.rom.contracts import (
@@ -24,6 +27,13 @@ from workflow.transient.rom.calibration_design import (
 from workflow.transient.rom.materialize_calibration import (
     build_prbs_power_windows,
     execute_calibration_cases,
+)
+from workflow.transient.rom.pod_state_space import (
+    StateSpaceModel,
+    discretize,
+    fit_state_space,
+    load_model,
+    save_model,
 )
 from workflow.transient.validation import power_trace_identity, validate_power_windows
 
@@ -435,6 +445,164 @@ class ROMCalibrationCaseTests(unittest.TestCase):
                 self.modules_path, self.power_path, self.config_path, self.design,
                 output, self.settings, hotspot=self.hotspot,
             )
+
+
+class StateSpaceTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    @staticmethod
+    def first_order_model(a: float, b: float) -> StateSpaceModel:
+        return StateSpaceModel(
+            temperature_basis=numpy.ones((1, 1)),
+            a_continuous=numpy.array([[a]], dtype=float),
+            b_fixed=numpy.empty((1, 0), dtype=float),
+            b_l2_anchors={"a0": numpy.array([[b]], dtype=float)},
+            module_names=(),
+        )
+
+    def settings(self):
+        return replace(parse_settings({}), calibration_windows=2)
+
+    def unstable_training_cases(self) -> list[dict]:
+        cases = []
+        for index in range(8):
+            case_dir = self.root / f"a{index}"
+            case_dir.mkdir()
+            write_json(case_dir / "hotspot_manifest.json", {"ambient_c": 25.0})
+            (case_dir / "transient.ttrace").write_text(
+                "t0_r00_c00\n299.15\n300.15\n", encoding="utf-8"
+            )
+            write_json(case_dir / "power_windows.json", {
+                "nominal_sample_interval_ms": 2.0,
+                "windows": [
+                    {
+                        "index": window,
+                        "duration_s": 0.002,
+                        "modules": [{
+                            "name": "shared_l2", "kind": "l2",
+                            "total_power_w": 0.0,
+                        }],
+                    }
+                    for window in range(2)
+                ],
+            })
+            cases.append({
+                "id": f"a{index}",
+                "point": {"id": f"a{index}"},
+                "initial_temperature": "ambient",
+                "artifacts": {
+                    "temperature_trace": str(case_dir / "transient.ttrace"),
+                    "power_windows": str(case_dir / "power_windows.json"),
+                },
+            })
+        return cases
+
+    def test_augmented_discretization_matches_first_order_rc(self):
+        # Break caught: integrating B through A via an inverse or Euler step
+        # gives the wrong exact zero-order-hold response.
+        model = self.first_order_model(a=-2.0, b=3.0)
+
+        a_d, b_d = discretize(model, 0.5, model.b_l2_anchors["a0"])
+
+        self.assertAlmostEqual(a_d[0, 0], math.exp(-1.0), places=12)
+        self.assertAlmostEqual(
+            b_d[0, 0], 1.5 * (1.0 - math.exp(-1.0)), places=12
+        )
+
+    def test_fit_rejects_unstable_continuous_pole(self):
+        # Break caught: accepting a positive continuous pole permits divergent
+        # temperatures in PSS evaluation.
+        with self.assertRaisesRegex(
+            ValueError, "unstable continuous-time state matrix"
+        ):
+            fit_state_space(self.unstable_training_cases(), self.settings())
+
+    def test_fit_requires_recorded_ambient_initial_state(self):
+        # Break caught: prepending a zero state to a steady-start trace biases
+        # every identified state and input coefficient.
+        cases = self.unstable_training_cases()
+        cases[0]["initial_temperature"] = "steady"
+
+        with self.assertRaisesRegex(ValueError, "ambient initial temperature"):
+            fit_state_space(cases, self.settings())
+
+    def test_fit_rejects_truncated_training_case(self):
+        # Break caught: mutually truncated temperature and power artifacts can
+        # otherwise masquerade as the configured fixed calibration period.
+        with self.assertRaisesRegex(ValueError, "calibration_windows"):
+            fit_state_space(self.unstable_training_cases(), parse_settings({}))
+
+    def test_save_rejects_unstable_continuous_matrix(self):
+        # Break caught: an unstable matrix persisted in a package bypasses the
+        # stability gate enforced during fitting.
+        model = self.first_order_model(a=0.25, b=1.0)
+
+        with self.assertRaisesRegex(
+            ValueError, "unstable continuous-time state matrix"
+        ):
+            save_model(self.root / "unstable.npz", model, {})
+
+    def test_load_rejects_duplicate_l2_anchor_ids(self):
+        # Break caught: dictionary construction otherwise overwrites one
+        # anchor's input matrix silently.
+        path = self.root / "duplicate.npz"
+        numpy.savez_compressed(
+            path,
+            temperature_basis=numpy.ones((1, 1)),
+            a_continuous=numpy.array([[-1.0]]),
+            b_fixed=numpy.empty((1, 0)),
+            b_l2_anchor_ids=numpy.array(["a0", "a0"]),
+            b_l2_anchor_values=numpy.array([[1.0], [2.0]]),
+            module_names=numpy.array([], dtype=str),
+            metadata_json=numpy.asarray("{}"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "anchor ids.*unique"):
+            load_model(path)
+
+    def test_load_rejects_complex_model_matrix(self):
+        # Break caught: dtype conversion must not silently discard imaginary
+        # continuous dynamics from a malformed archive.
+        path = self.root / "complex.npz"
+        numpy.savez_compressed(
+            path,
+            temperature_basis=numpy.ones((1, 1)),
+            a_continuous=numpy.array([[-1.0 + 0.25j]]),
+            b_fixed=numpy.empty((1, 0)),
+            b_l2_anchor_ids=numpy.array(["a0"]),
+            b_l2_anchor_values=numpy.array([[1.0]]),
+            module_names=numpy.array([], dtype=str),
+            metadata_json=numpy.asarray("{}"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "a_continuous must be real"):
+            load_model(path)
+
+    def test_model_persistence_uses_exact_path_and_round_trips(self):
+        # Break caught: numpy's filename overload appends .npz and makes the
+        # same advertised Path impossible to load.
+        path = self.root / "model"
+        model = self.first_order_model(a=-2.0, b=3.0)
+        metadata = {"rank": 1, "residual": 0.125}
+
+        save_model(path, model, metadata)
+        loaded, loaded_metadata = load_model(path)
+
+        self.assertTrue(path.is_file())
+        self.assertTrue(numpy.array_equal(
+            loaded.temperature_basis, model.temperature_basis
+        ))
+        self.assertTrue(numpy.array_equal(
+            loaded.a_continuous, model.a_continuous
+        ))
+        self.assertTrue(numpy.array_equal(
+            loaded.b_l2_anchors["a0"], model.b_l2_anchors["a0"]
+        ))
+        self.assertEqual(loaded.module_names, model.module_names)
+        self.assertEqual(loaded_metadata, metadata)
 
 
 if __name__ == "__main__":

@@ -6,9 +6,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from workflow.common import read_json
+from workflow.common import read_json, write_json
 from workflow.transient.rom.contracts import parse_settings
 from workflow.transient.rom.materialize_calibration import execute_calibration_cases
+from workflow.transient.rom.pod_state_space import fit_state_space, save_model
 
 
 def main() -> None:
@@ -25,10 +26,16 @@ def main() -> None:
         args.modules, args.power_windows, args.config, read_json(args.design),
         args.output_dir, parse_settings(config), hotspot=args.hotspot,
     )
+    model, fit_report = fit_state_space(
+        report["training_cases"], parse_settings(config)
+    )
+    save_model(args.output_dir / "pod_model.npz", model, fit_report)
+    write_json(args.output_dir / "fit_report.json", fit_report)
     print(
         "Transient ROM cases: "
         f"{report['training_hotspot_calls']} training, "
-        f"{report['holdout_hotspot_calls']} holdout"
+        f"{report['holdout_hotspot_calls']} holdout; "
+        f"POD rank {fit_report['pod']['rank']}"
     )
 
 
