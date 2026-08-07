@@ -21,6 +21,10 @@ from workflow.transient.rom.calibration_design import (
     layout_for_point,
     make_prbs_input,
 )
+from workflow.transient.rom.materialize_calibration import (
+    build_prbs_power_windows,
+    execute_calibration_cases,
+)
 
 
 class ROMContractTests(unittest.TestCase):
@@ -239,6 +243,164 @@ class CalibrationDesignTests(unittest.TestCase):
         self.assertTrue(_rectangle_is_legal(
             base_layout, 1, _rectangle_coordinates(9.0, 9.0, scale), []
         ))
+
+
+class ROMCalibrationCaseTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.modules_path = self.root / "modules.json"
+        self.power_path = self.root / "raw_power_windows.json"
+        self.config_path = self.root / "config.json"
+        self.hotspot = self.root / "hotspot"
+        self.hotspot.write_text("mock executable", encoding="utf-8")
+        write_json(self.modules_path, CalibrationDesignTests.model())
+        write_json(self.power_path, self.raw_windows())
+        write_json(self.config_path, {
+            "physical": {
+                "grid_size": 1,
+                "utilization": 0.70,
+                "r_convec_k_per_w": 0.1,
+            },
+            "frequency": {
+                "ambient_c": 25.0,
+                "f0_ghz": 2.0,
+                "fmin_ghz": 1.0,
+            },
+        })
+        self.settings = parse_settings({})
+        self.design = build_design(
+            CalibrationDesignTests.model(), [0, 1], self.settings
+        )
+
+    @staticmethod
+    def raw_windows() -> dict:
+        modules = CalibrationDesignTests.model()["modules"]
+        records = []
+        for index in range(2):
+            samples = [dict(module) for module in modules]
+            records.append({
+                "schema_version": 1,
+                "index": index,
+                "source_stats_sha256": f"sha256:stats-{index}",
+                "start_tick": 2 * index,
+                "end_tick": 2 * (index + 1),
+                "duration_ticks": 2,
+                "duration_s": 0.002,
+                "is_partial": False,
+                "modules": samples,
+                "totals": {
+                    field: sum(module[field] for module in samples)
+                    for field in ("dynamic_power_w", "leakage_power_w", "total_power_w")
+                },
+            })
+        return {
+            "schema_version": 1,
+            "canonical_source_r1": "/source/r1",
+            "transient_r1": "/source/transient-r1",
+            "window_count": 2,
+            "nominal_sample_interval_ms": 2.0,
+            "nominal_sample_interval_ticks": 2,
+            "measurement_start_tick": 0,
+            "measurement_end_tick": 4,
+            "module_names": [module["name"] for module in modules],
+            "run_settings": {"mcpat_settings": {}},
+            "power_provenance": {
+                "dynamic": "McPAT Runtime Dynamic",
+                "subthreshold_leakage": "McPAT Subthreshold Leakage",
+                "gate_leakage": "McPAT Gate Leakage",
+                "postprocessing": "none",
+            },
+            "windows": records,
+        }
+
+    def multipliers(self) -> dict[str, list[float]]:
+        return self.design["prbs"]["multipliers"]
+
+    @staticmethod
+    def _mock_hotspot(case_dir: Path, hotspot: Path, initial_temperature: str) -> dict:
+        manifest = __import__("json").loads(
+            (case_dir / "transient_trace_manifest.json").read_text(encoding="utf-8")
+        )
+        names = (case_dir / "power_transient.ptrace").read_text(
+            encoding="utf-8"
+        ).splitlines()[0].split()
+        rows = ["\t".join(names)]
+        rows.extend("\t".join("300.0" for _ in names)
+                    for _ in range(manifest["window_count"]))
+        (case_dir / "transient.ttrace").write_text(
+            "\n".join(rows) + "\n", encoding="utf-8"
+        )
+        return {
+            "command": [str(hotspot), "-c", "hotspot.config"],
+            "elapsed_seconds": 0.125,
+            "initial_temperature": initial_temperature,
+        }
+
+    def test_calibration_emits_exactly_eight_training_and_two_holdout_cases(self):
+        # Break caught: omitting an anchor/holdout or routing either through a
+        # non-ambient HotSpot invocation changes the case-artifact contract.
+        with patch(
+            "workflow.transient.rom.materialize_calibration.run_hotspot_transient",
+            side_effect=self._mock_hotspot,
+        ) as hotspot_run:
+            report = execute_calibration_cases(
+                self.modules_path, self.power_path, self.config_path, self.design,
+                self.root / "calibration", self.settings, hotspot=self.hotspot,
+            )
+
+        self.assertEqual(report["training_hotspot_calls"], 8)
+        self.assertEqual(report["holdout_hotspot_calls"], 2)
+        self.assertEqual(hotspot_run.call_count, 10)
+        self.assertEqual(len(report["training_cases"]), 8)
+        self.assertEqual(len(report["holdout_cases"]), 2)
+        self.assertTrue(all(
+            case["initial_temperature"] == "ambient"
+            for case in report["training_cases"] + report["holdout_cases"]
+        ))
+        self.assertTrue(all(
+            case["artifacts"]["sha256"]["power_windows"].startswith("sha256:")
+            and case["artifacts"]["sha256"]["power_trace"].startswith("sha256:")
+            and case["artifacts"]["sha256"]["temperature_trace"].startswith("sha256:")
+            for case in report["training_cases"] + report["holdout_cases"]
+        ))
+        self.assertEqual(
+            [case["frequency_ghz"] for case in report["holdout_cases"]],
+            [2.0, 1.6],
+        )
+        self.assertTrue(all(
+            case["periodic_steady_state"]["full_grid_converged"]
+            for case in report["holdout_cases"]
+        ))
+
+    def test_prbs_windows_preserve_power_triplets(self):
+        # Break caught: scaling only one power component or retaining a stale
+        # total makes a materialized PRBS power record physically inconsistent.
+        result = build_prbs_power_windows(
+            self.raw_windows(), self.multipliers(), 64
+        )
+
+        self.assertEqual(result["window_count"], 64)
+        self.assertEqual(result["power_provenance"], self.raw_windows()["power_provenance"])
+        self.assertTrue(all(
+            module["total_power_w"]
+            == module["dynamic_power_w"] + module["leakage_power_w"]
+            for window in result["windows"] for module in window["modules"]
+        ))
+
+    def test_calibration_rejects_a_nonempty_output_directory(self):
+        # Break caught: publishing cases into an existing directory can mix
+        # provenance from different calibration inputs.
+        output = self.root / "occupied"
+        output.mkdir()
+        (output / "prior.json").write_text("{}", encoding="utf-8")
+
+        with self.assertRaisesRegex(FileExistsError, "not empty"):
+            execute_calibration_cases(
+                self.modules_path, self.power_path, self.config_path, self.design,
+                output, self.settings, hotspot=self.hotspot,
+            )
 
 
 if __name__ == "__main__":
