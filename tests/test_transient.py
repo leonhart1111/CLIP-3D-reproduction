@@ -19,6 +19,10 @@ from workflow.transient.run_hotspot_transient import (
     summarize_period_end_convergence,
     summarize_temperature_samples,
 )
+from workflow.transient.verify_sustainable_frequency import (
+    last_period_peak,
+    search_layout_frequency,
+)
 from workflow.transient.run_dual_layout_validation import run_dual_layout_validation
 from workflow.transient.run_transient_r1 import command_from_metadata
 from workflow.transient.run_transient_pipeline import prepare_power_windows
@@ -843,6 +847,75 @@ class TransientTraceTests(unittest.TestCase):
         )
         self.assertAlmostEqual(result["last_delta_max_c"], 0.25)
         self.assertEqual(result["last_delta_unit_index"], 0)
+
+    def test_layout_neutral_frequency_search_uses_pss_peak_and_brackets(self):
+        """Catch a search that requires IPC2, ignores a grid cell, or skips refinement."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("modules.json", "layout.json", "windows.json", "config.json"):
+                write_json(root / name, {"modules": []})
+            write_json(root / "config.json", {
+                "frequency": {"f0_ghz": 2.0, "tsafe_c": 50.0},
+            })
+            hotspot = root / "hotspot"
+            hotspot.write_text("synthetic executable", encoding="utf-8")
+            rows_by_case = {}
+
+            def fake_materialize(_modules, _layout, _windows, output, _config,
+                                 frequency_scale, _repeats):
+                rows_by_case[str(output)] = frequency_scale * 2.0
+                return {"windows_per_period": 2}
+
+            def fake_grid(path):
+                frequency = rows_by_case[str(path.parent)]
+                if frequency == 1.0:
+                    return ["a", "b"], [[300.0, 300.0], [300.0, 300.0],
+                                            [300.0, 300.0], [300.0, 301.0]]
+                if frequency >= 2.0:
+                    return ["a", "b"], [[300.0, 330.0], [300.0, 330.0],
+                                            [300.0, 330.0], [300.0, 330.0]]
+                return ["a", "b"], [[300.0, 300.0], [300.0, 300.0],
+                                        [300.0, 300.0], [300.0, 300.0]]
+
+            with patch(
+                "workflow.transient.verify_sustainable_frequency.validate_power_windows"
+            ), patch(
+                "workflow.transient.verify_sustainable_frequency.materialize_trace",
+                side_effect=fake_materialize,
+            ), patch(
+                "workflow.transient.verify_sustainable_frequency.run_hotspot_transient",
+                return_value={"trace_peak": {"tmax_c": 0.0}},
+            ), patch(
+                "workflow.transient.verify_sustainable_frequency.parse_ttrace_grid",
+                side_effect=fake_grid,
+            ):
+                result = search_layout_frequency(
+                    root / "modules.json", root / "layout.json", root / "windows.json",
+                    root / "output", root / "config.json", frequencies_ghz=[1.0, 1.5, 2.0],
+                    period_repeats=2, pss_tolerance_c=0.1,
+                    frequency_tolerance_ghz=0.1, hotspot=hotspot,
+                )
+
+            evaluations = {item["frequency_ghz"]: item for item in result["search"]["evaluations"]}
+            self.assertFalse(evaluations[1.0]["converged"])
+            self.assertGreater(evaluations[2.0]["last_period_peak_c"], 50.0)
+            self.assertEqual(evaluations[2.0]["last_period_peak_unit"], "b")
+            self.assertEqual(len(result["search"]["safe_unsafe_brackets"]), 2)
+            self.assertGreater(result["f_sus_trans_ghz"], 1.5)
+            self.assertLess(result["f_sus_trans_ghz"], 2.0)
+
+    def test_last_period_peak_rejects_boolean_period_length(self):
+        """Catch bool values being accepted as integer period lengths."""
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            last_period_peak([[300.0], [300.0]], True)
+
+    def test_last_period_peak_includes_final_period_initial_state(self):
+        """Catch a safety peak that omits the final period's initial state."""
+        result = last_period_peak(
+            [[300.0], [330.0], [300.0], [300.0]], windows_per_period=2
+        )
+        self.assertAlmostEqual(result["tmax_c"], 56.85)
+        self.assertEqual(result["phase"], "period_initial_state")
 
     def test_thermal_result_has_standard_classification_and_acceptance_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:

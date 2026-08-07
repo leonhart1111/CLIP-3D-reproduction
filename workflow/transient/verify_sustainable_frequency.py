@@ -35,7 +35,9 @@ def _frequencies(values: list[float]) -> list[float]:
 
 def last_period_peak(rows_k: list[list[float]], windows_per_period: int) -> dict:
     """Return the final period peak, including its initial (previous-end) state."""
-    if not isinstance(windows_per_period, int) or windows_per_period < 1:
+    if (isinstance(windows_per_period, bool)
+            or not isinstance(windows_per_period, int)
+            or windows_per_period < 1):
         raise ValueError("windows_per_period must be a positive integer")
     if len(rows_k) <= windows_per_period or len(rows_k) % windows_per_period:
         raise ValueError("at least two complete temperature periods are required")
