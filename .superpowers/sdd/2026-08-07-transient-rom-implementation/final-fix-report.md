@@ -4,6 +4,9 @@ Date: 2026-08-08
 
 Base commit: `d95e3b440255e3e65e9cad36309281795fc72e07`
 
+Latest replay-hardening round base:
+`bff1704444f1ec4fec5394f2c3869b658ba6f2ca`
+
 Scope: final correctness, reuse-integrity, failure-semantics, and auditability
 fixes for the non-formal transient-ROM path. The steady Eq. 13 implementation
 was intentionally left unchanged.
@@ -45,6 +48,19 @@ was intentionally left unchanged.
    value. A non-dictionary return escaped through `.get()`, while missing or
    malformed evaluations, non-finite sustainable frequency, and inconsistent
    state/safety could be mislabeled or reach the R2 boundary.
+9. The first semantic holdout-reuse fix still replayed only the real-HotSpot
+   half of each comparison. Reuse derived the trace peak, safety, PSS, and grid
+   identity, but continued to trust persisted ROM peak/safety, RMSE, peak
+   error, per-gate booleans, and accepted flags. The root cause was a second,
+   partial implementation of the holdout contract in `contracts.py` rather
+   than reuse of the calibration-time comparison itself.
+10. The first returned-search validator checked selected invariants but did not
+    prove that the recorded midpoint evaluations and refined brackets were the
+    output of the canonical local-boundary search. It also trusted the recorded
+    `converged` bit without validating its complete PSS evidence, and direct
+    `float()` conversion of an arbitrarily large JSON integer could escape as
+    `OverflowError`. The root cause was validating a summary of the search
+    instead of replaying the search algorithm from safely normalized evidence.
 
 ## Implemented behavior
 
@@ -95,6 +111,24 @@ was intentionally left unchanged.
   consistent grid/search/PSS metadata. Contract failures write
   `final_validation_failure.json`, preserve ROM predictions, and never build an
   R2 vector or launch R2.
+- Calibration holdout validation now has a non-publishing mode. Reuse loads the
+  saved POD model, persisted design, packaged config, two case layouts/powers,
+  and immutable temperature traces, then calls the exact calibration-time
+  evaluator and gate implementation without rewriting any package artifact.
+  The complete recomputed report must equal `validation_report.json`, including
+  ROM and HotSpot peaks/safety, RMSE, peak error, every gate, failure reasons,
+  and accepted flags; the recomputed result must independently be accepted.
+- Final HotSpot validation now checks the complete
+  `period_end_convergence` structure for every grid and midpoint evaluation,
+  derives convergence from the repeated-period count and final full-grid delta,
+  and derives safety from that convergence plus the inclusive final-period
+  peak. It maps every recorded frequency and replays
+  `find_sustainable_frequency()` with the saved evaluator results. The entire
+  rebuilt search—including midpoint set, grid
+  evaluations, local brackets, monotonic flag, state, and sustainable
+  frequency—must equal the returned search before R2 can start. Numeric
+  normalization converts non-finite and non-convertible/overflowing JSON
+  numbers into a validation-contract `ValueError` inside the recovery boundary.
 - The standalone `calibrate_rom` CLI now finalizes
   `rom_artifact_manifest.json` through the same shared package-finalization
   helpers as pipeline calibration.
@@ -124,7 +158,7 @@ packages, direct-optimizer deep validation, CLI manifest finalization, final
 validation failure classes, R2 suppression, partial call accounting, source
 identity, and PRBS derivation.
 
-The last review condition was reproduced independently:
+The prior review condition was reproduced independently:
 
 ```text
 RED: test_optimizer_rejects_training_power_not_derived_from_bound_source
@@ -143,7 +177,7 @@ training power not derived from the bound source, missing holdout evidence, and
 an incomplete/stale artifact manifest. A relocated self-contained package is
 accepted and reused without regeneration or HotSpot inside the optimizer.
 
-The final re-review round added two independent RED groups before production
+The preceding re-review round added two independent RED groups before production
 changes:
 
 ```text
@@ -161,25 +195,63 @@ distinct validation failure, and an all-converged unsafe grid remains genuine
 `thermally_infeasible` rather than a contract/tool error.
 ```
 
+The latest round added seven more RED regressions before its production
+changes:
+
+```text
+Persisted-report RED (4 tests): forged ROM peak, forged ROM safety, forged
+peak error, and a self-consistent forged safety gate/accepted flag all reached
+ROM search (`ROM search ran before the current identity gate`).
+
+Canonical-search RED (3 tests): a forged refined-safe bracket and PSS evidence
+inconsistent with the recorded converged bit both reached the R2 boundary; a
+10**400 JSON integer escaped the recovery boundary as OverflowError.
+
+GREEN: the four persisted-report regressions are rejected before ROM search,
+and all three canonical-search regressions become validation_contract_error
+with no latency-vector construction or R2 launch. The validator does not modify
+the forged persisted report while checking it.
+```
+
 ## Fresh verification
 
-Relevant integration suite, after the final re-review fixes:
+Focused package-reuse, final-pipeline, and calibration-case suites:
+
+```bash
+/home/zyjiang/Agenticflow/CLIP/.venv/bin/python -m unittest \
+  tests.test_transient_rom.ROMOptimizerTests \
+  tests.test_transient_rom.ROMPipelineTests \
+  tests.test_transient_rom.ROMCalibrationCaseTests -v
+```
+
+Result: `52 tests` passed.
+
+Complete transient-ROM test module:
+
+```bash
+/home/zyjiang/Agenticflow/CLIP/.venv/bin/python -m unittest \
+  tests.test_transient_rom -v
+```
+
+Result: `89 tests` passed.
+
+Relevant integration suite, after the replay-hardening fixes:
 
 ```bash
 /home/zyjiang/Agenticflow/CLIP/.venv/bin/python -m unittest \
   tests.test_transient_rom tests.test_transient tests.test_workflow
 ```
 
-Result: `218 tests` passed; `2` expected skips for unavailable live HotSpot
+Result: `225 tests` passed; `2` expected skips for unavailable live HotSpot
 tests.
 
-Full discovery, after the final re-review fixes:
+Full discovery, after the replay-hardening fixes:
 
 ```bash
 /home/zyjiang/Agenticflow/CLIP/.venv/bin/python -m unittest discover -s tests
 ```
 
-Result: `366 tests` run; `1` error and `2` expected skips. The only error is the
+Result: `373 tests` run; `1` error and `2` expected skips. The only error is the
 pre-existing historical fixture gap in
 `test_lambda_wire_exploratory_config.py`:
 
@@ -207,9 +279,10 @@ steady layout-optimizer implementation relative to the requested base.
 ## Review status and remaining concerns
 
 No Critical review finding remains. All confirmed Important findings were
-implemented. The final two conditions—semantic holdout evidence replay and
-post-call final-search result validation—are covered by the 12-test RED/GREEN
-round above.
+implemented. The latest conditions—complete two-sided holdout recomputation,
+canonical final-search replay, and overflow-safe contract failure—are covered
+by the seven-test RED/GREEN round above, in addition to the preceding 12-test
+reuse/final-validation round.
 
 No live HotSpot, gem5, McPAT, CACTI, R1, R2, or EDA tool was invoked during
 these fixes or verification. Tests use synthetic artifacts and mocks at the

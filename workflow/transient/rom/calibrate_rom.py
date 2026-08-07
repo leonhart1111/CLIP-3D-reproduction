@@ -75,9 +75,9 @@ def _same_point(layout: dict, point: dict, l2_name: str) -> bool:
 def validate_calibration_holdouts(
     model: StateSpaceModel, design: dict, holdout_cases: list[dict],
     settings: ROMSettings, config: dict, *, output_dir: Path,
-    identity: dict,
+    identity: dict | None, publish: bool = True,
 ) -> dict:
-    """Evaluate and gate the two materialized HotSpot holdouts."""
+    """Evaluate and gate two holdouts, optionally publishing acceptance."""
     if not isinstance(holdout_cases, list) or len(holdout_cases) != 2:
         raise ValueError("holdout_cases must contain exactly two cases")
     if not isinstance(design, dict) or not isinstance(design.get("l2_name"), str):
@@ -86,16 +86,26 @@ def validate_calibration_holdouts(
     if not isinstance(frequency_config, dict):
         raise ValueError("config lacks frequency settings")
     f0 = frequency_config.get("f0_ghz")
+    fmin = frequency_config.get("fmin_ghz")
     tsafe = frequency_config.get("tsafe_c")
     if (isinstance(f0, bool) or not isinstance(f0, (int, float))
             or not math.isfinite(float(f0)) or float(f0) <= 0.0):
         raise ValueError("frequency.f0_ghz must be finite and positive")
+    if (isinstance(fmin, bool) or not isinstance(fmin, (int, float))
+            or not math.isfinite(float(fmin)) or float(fmin) <= 0.0
+            or float(fmin) > float(f0)):
+        raise ValueError(
+            "frequency.fmin_ghz must be finite, positive, and not exceed f0"
+        )
     if (isinstance(tsafe, bool) or not isinstance(tsafe, (int, float))
             or not math.isfinite(float(tsafe))):
         raise ValueError("frequency.tsafe_c must be finite")
     comparisons = []
     package_dir = Path(output_dir).resolve()
-    for case in holdout_cases:
+    expected_frequencies = (
+        float(f0), 0.6 * float(f0) + 0.4 * float(fmin),
+    )
+    for case_index, case in enumerate(holdout_cases):
         if not isinstance(case, dict):
             raise ValueError("holdout case must be a dictionary")
         identifier = case.get("id")
@@ -117,12 +127,27 @@ def validate_calibration_holdouts(
         rom = evaluate_layout_rom(
             model, design, power_windows, layout, float(frequency), settings, config
         )
-        names, rows_k = parse_ttrace_grid(trace_path)
         windows = power_windows.get("windows") if isinstance(power_windows, dict) else None
         if not isinstance(windows, list) or not windows:
             raise ValueError(f"holdout {identifier} has invalid power windows")
         windows_per_period = len(windows)
-        convergence = summarize_period_end_convergence(rows_k, windows_per_period)
+        try:
+            names, rows_k = parse_ttrace_grid(trace_path)
+            convergence = summarize_period_end_convergence(
+                rows_k, windows_per_period
+            )
+            peak = last_period_peak(rows_k, windows_per_period)
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                f"holdout {identifier} temperature trace period structure is invalid"
+            ) from error
+        expected_sample_count = windows_per_period * settings.pss_period_repeats
+        if (len(rows_k) != expected_sample_count
+                or case.get("window_count") != expected_sample_count
+                or convergence.get("period_count") != settings.pss_period_repeats):
+            raise ValueError(
+                f"holdout {identifier} temperature trace period structure differs"
+            )
         recorded_pss = case.get("periodic_steady_state")
         recorded_names = (
             recorded_pss.get("grid_unit_names") if isinstance(recorded_pss, dict) else None
@@ -130,15 +155,21 @@ def validate_calibration_holdouts(
         temperature_grid_identity_match = (
             recorded_names == names and tuple(names) == model.grid_unit_names
         )
-        hotspot_converged = (
+        recorded_pss_match = (
             isinstance(recorded_pss, dict)
+            and recorded_pss.get("period_repeats") == settings.pss_period_repeats
+            and recorded_pss.get("pss_tolerance_c") == settings.pss_tolerance_c
             and recorded_pss.get("full_grid_converged") is True
             and recorded_names == names
+            and recorded_pss.get("evidence") == convergence
+        )
+        hotspot_converged = (
+            recorded_pss_match
             and len(names) == model.temperature_basis.shape[0]
             and convergence["period_count"] >= 2
+            and isinstance(convergence["last_delta_max_c"], (int, float))
             and convergence["last_delta_max_c"] <= settings.pss_tolerance_c
         )
-        peak = last_period_peak(rows_k, windows_per_period)
         final_grid_c = (
             numpy.asarray(rows_k[-windows_per_period:], dtype=float) - 273.15
         )
@@ -155,6 +186,11 @@ def validate_calibration_holdouts(
         recorded_scale = case.get("frequency_scale")
         frequency_match = (
             rom["frequency_ghz"] == float(frequency)
+            and float(fmin) <= float(frequency) <= float(f0)
+            and math.isclose(
+                float(frequency), expected_frequencies[case_index],
+                rel_tol=1e-12, abs_tol=1e-12,
+            )
             and isinstance(recorded_scale, (int, float))
             and not isinstance(recorded_scale, bool)
             and math.isclose(
@@ -175,7 +211,9 @@ def validate_calibration_holdouts(
             "hotspot": hotspot,
         })
     return validate_holdouts(
-        comparisons, settings, output_dir=output_dir, identity=identity
+        comparisons, settings,
+        output_dir=output_dir if publish else None,
+        identity=identity if publish else None,
     )
 
 

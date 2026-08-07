@@ -85,19 +85,6 @@ _CLASSIFICATION = {
     "non_formal": True,
     "paper_equivalent": False,
 }
-_HOLDOUT_GATES = {
-    "geometry_identity",
-    "input_identity",
-    "frequency_identity",
-    "hotspot_trace_identity",
-    "temperature_grid_identity",
-    "periodic_steady_state",
-    "grid_rmse",
-    "peak_temperature_error",
-    "safety_classification",
-}
-
-
 def write_rom_artifact_manifest(output_dir: Path) -> dict:
     """Bind every ROM-owned file to its bytes and non-formal classification."""
     output_dir = Path(output_dir).resolve()
@@ -399,21 +386,8 @@ def require_package_calibration_evidence(
             != "sha256:" + sha256_file(packaged_config_path)):
         raise ValueError("reusable ROM calibration config evidence differs")
     packaged_config = read_json(packaged_config_path)
-    frequency_config = (
-        packaged_config.get("frequency")
-        if isinstance(packaged_config, dict) else None
-    )
-    if not isinstance(frequency_config, dict):
-        raise ValueError("reusable ROM packaged config lacks frequency settings")
-    f0_ghz = _positive(frequency_config.get("f0_ghz"), "frequency.f0_ghz")
-    fmin_ghz = _positive(frequency_config.get("fmin_ghz"), "frequency.fmin_ghz")
-    tsafe_c = frequency_config.get("tsafe_c")
-    if (isinstance(tsafe_c, bool) or not isinstance(tsafe_c, Real)
-            or not math.isfinite(float(tsafe_c))):
-        raise ValueError("frequency.tsafe_c must be finite")
-    tsafe_c = float(tsafe_c)
-    if fmin_ghz > f0_ghz:
-        raise ValueError("frequency.fmin_ghz must not exceed frequency.f0_ghz")
+    if not isinstance(packaged_config, dict):
+        raise ValueError("reusable ROM packaged config must be a dictionary")
     expected_modules_hash = expected_source_identities["modules_sha256"]
     if acceptance.get("validation_report") != "validation_report.json":
         raise ValueError("reusable ROM acceptance validation evidence path differs")
@@ -435,19 +409,10 @@ def require_package_calibration_evidence(
     expected_points = {
         point["id"]: point for point in [*design["training"], *design["holdout"]]
     }
-    expected_holdout_frequencies = dict(zip(expected_holdouts, (
-        f0_ghz, 0.6 * f0_ghz + 0.4 * fmin_ghz,
-    )))
     from workflow.transient.validation import power_trace_identity
-    from workflow.transient.run_hotspot_transient import (
-        parse_ttrace_grid,
-        summarize_period_end_convergence,
-    )
-    from workflow.transient.verify_sustainable_frequency import last_period_peak
 
     artifact_hashes: dict[str, dict[str, str]] = {}
     case_power_windows: dict[str, dict] = {}
-    holdout_trace_evidence: dict[str, dict] = {}
     for expected_kind, case_set in (("training", training), ("holdout", holdouts)):
         for case in case_set:
             identifier = case["id"]
@@ -528,94 +493,6 @@ def require_package_calibration_evidence(
                     f"reusable ROM holdout case {identifier} "
                     "source power identity differs"
                 )
-            if expected_kind == "holdout":
-                pss = case.get("periodic_steady_state")
-                frequency_ghz = case.get("frequency_ghz")
-                expected_frequency = expected_holdout_frequencies[identifier]
-                if (isinstance(frequency_ghz, bool)
-                        or not isinstance(frequency_ghz, Real)
-                        or not math.isfinite(float(frequency_ghz))
-                        or float(frequency_ghz) <= 0.0
-                        or not fmin_ghz <= float(frequency_ghz) <= f0_ghz
-                        or not math.isclose(
-                            float(frequency_ghz), expected_frequency,
-                            rel_tol=1e-12, abs_tol=1e-12,
-                        )):
-                    raise ValueError(
-                        f"reusable ROM holdout case {identifier} "
-                        "has invalid frequency_ghz"
-                    )
-                frequency_scale = case.get("frequency_scale")
-                if (isinstance(frequency_scale, bool)
-                        or not isinstance(frequency_scale, Real)
-                        or not math.isfinite(float(frequency_scale))
-                        or not math.isclose(
-                            float(frequency_scale), float(frequency_ghz) / f0_ghz,
-                            rel_tol=1e-12, abs_tol=1e-15,
-                        )):
-                    raise ValueError(
-                        f"reusable ROM holdout case {identifier} "
-                        "frequency scale differs"
-                    )
-                windows = (
-                    power_windows.get("windows")
-                    if isinstance(power_windows, dict) else None
-                )
-                if not isinstance(windows, list) or not windows:
-                    raise ValueError(
-                        f"reusable ROM holdout case {identifier} "
-                        "has invalid power windows"
-                    )
-                windows_per_period = len(windows)
-                try:
-                    names, rows_k = parse_ttrace_grid(
-                        resolved_artifacts["temperature_trace"]
-                    )
-                    convergence = summarize_period_end_convergence(
-                        rows_k, windows_per_period
-                    )
-                    peak = last_period_peak(rows_k, windows_per_period)
-                except (OSError, ValueError) as error:
-                    raise ValueError(
-                        f"reusable ROM holdout case {identifier} "
-                        "temperature trace period structure is invalid"
-                    ) from error
-                expected_sample_count = (
-                    windows_per_period * settings.pss_period_repeats
-                )
-                if (len(rows_k) != expected_sample_count
-                        or case.get("window_count") != expected_sample_count
-                        or convergence.get("period_count")
-                        != settings.pss_period_repeats):
-                    raise ValueError(
-                        f"reusable ROM holdout case {identifier} "
-                        "temperature trace period structure differs"
-                    )
-                last_delta = convergence.get("last_delta_max_c")
-                if (isinstance(last_delta, bool) or not isinstance(last_delta, Real)
-                        or not math.isfinite(float(last_delta))
-                        or float(last_delta) > settings.pss_tolerance_c):
-                    raise ValueError(
-                        f"reusable ROM holdout case {identifier} "
-                        "does not reach full-grid PSS"
-                    )
-                if (not isinstance(pss, dict)
-                        or pss.get("period_repeats") != settings.pss_period_repeats
-                        or pss.get("pss_tolerance_c") != settings.pss_tolerance_c
-                        or pss.get("full_grid_converged") is not True
-                        or pss.get("grid_unit_names") != names
-                        or pss.get("evidence") != convergence):
-                    raise ValueError(
-                        f"reusable ROM holdout case {identifier} "
-                        "recorded PSS evidence differs"
-                    )
-                peak_c = float(peak["tmax_c"])
-                holdout_trace_evidence[identifier] = {
-                    "frequency_ghz": float(frequency_ghz),
-                    "grid_unit_names": tuple(names),
-                    "last_period_peak_c": peak_c,
-                    "safe": peak_c <= tsafe_c,
-                }
 
     holdout_power_hashes = {
         artifact_hashes[identifier]["power_windows"]
@@ -701,75 +578,18 @@ def require_package_calibration_evidence(
         raise ValueError("reusable ROM POD model metadata differs from fit report")
     if sorted(model.b_l2_anchors) != expected_case_order:
         raise ValueError("saved calibration design anchors differ from POD B_L2 columns")
-    for identifier in expected_holdouts:
-        if holdout_trace_evidence[identifier]["grid_unit_names"] != model.grid_unit_names:
-            raise ValueError(
-                f"reusable ROM holdout {identifier} temperature grid differs"
-            )
+    from workflow.transient.rom.calibrate_rom import validate_calibration_holdouts
 
-    validation_holdouts = validation.get("holdouts")
-    expected_thresholds = {
-        "pss_tolerance_c": settings.pss_tolerance_c,
-        "max_holdout_grid_rmse_c": settings.max_holdout_grid_rmse_c,
-        "max_holdout_peak_error_c": settings.max_holdout_peak_error_c,
-    }
-    if any(validation.get(field) != value for field, value in _CLASSIFICATION.items()):
-        raise ValueError("reusable ROM holdout validation classification differs")
-    if (validation.get("accepted") is not True
-            or validation.get("failure_reasons") != []
-            or validation.get("thresholds") != expected_thresholds
-            or not isinstance(validation_holdouts, list)
-            or len(validation_holdouts) != 2
-            or [case.get("id") for case in validation_holdouts] != expected_holdouts):
-        raise ValueError("reusable ROM holdout validation evidence is incomplete")
-    for case in validation_holdouts:
-        identifier = case.get("id")
-        actual = holdout_trace_evidence[identifier]
-        if case.get("accepted") is not True:
-            raise ValueError(f"reusable ROM holdout {identifier} is not accepted")
-        frequency_ghz = case.get("frequency_ghz")
-        if (isinstance(frequency_ghz, bool)
-                or not isinstance(frequency_ghz, Real)
-                or not math.isclose(
-                    float(frequency_ghz), actual["frequency_ghz"],
-                    rel_tol=1e-12, abs_tol=1e-12,
-                )):
-            raise ValueError(
-                f"reusable ROM holdout {identifier} frequency evidence differs"
-            )
-        hotspot_peak_c = case.get("hotspot_peak_c")
-        if (isinstance(hotspot_peak_c, bool)
-                or not isinstance(hotspot_peak_c, Real)
-                or not math.isfinite(float(hotspot_peak_c))
-                or not math.isclose(
-                    float(hotspot_peak_c), actual["last_period_peak_c"],
-                    rel_tol=1e-12, abs_tol=1e-12,
-                )):
-            raise ValueError(
-                f"reusable ROM holdout {identifier} HotSpot peak evidence differs"
-            )
-        if case.get("hotspot_safe") is not actual["safe"]:
-            raise ValueError(
-                f"reusable ROM holdout {identifier} HotSpot safety evidence differs"
-            )
-        gates = case.get("gates")
-        if (not isinstance(gates, dict) or set(gates) != _HOLDOUT_GATES
-                or any(value is not True for value in gates.values())):
-            raise ValueError(
-                f"reusable ROM holdout {case.get('id')} gate evidence differs"
-            )
-        limits = {
-            "grid_rmse_c": settings.max_holdout_grid_rmse_c,
-            "peak_temperature_error_c": settings.max_holdout_peak_error_c,
-        }
-        for field, limit in limits.items():
-            value = case.get(field)
-            if (isinstance(value, bool) or not isinstance(value, Real)
-                    or not math.isfinite(float(value)) or float(value) < 0.0
-                    or float(value) > limit):
-                raise ValueError(
-                    f"reusable ROM holdout {case.get('id')} lacks finite {field}"
-                )
+    recomputed_validation = validate_calibration_holdouts(
+        model, design, holdouts, settings, packaged_config,
+        output_dir=package_dir, identity=None, publish=False,
+    )
+    if recomputed_validation != validation:
+        raise ValueError(
+            "reusable ROM recomputed holdout validation differs from persisted report"
+        )
+    if recomputed_validation.get("accepted") is not True:
+        raise ValueError("reusable ROM recomputed holdout validation is not accepted")
     artifact_manifest = require_rom_artifact_manifest(package_dir)
     return {
         "acceptance": acceptance,

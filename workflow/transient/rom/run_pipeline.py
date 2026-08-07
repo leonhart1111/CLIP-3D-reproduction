@@ -43,7 +43,10 @@ from workflow.transient.run_transient_pipeline import (
 )
 from workflow.transient.run_transient_r1 import run as run_transient_r1
 from workflow.transient.validation import power_trace_identity, validate_power_windows
-from workflow.transient.verify_sustainable_frequency import search_layout_frequency
+from workflow.transient.verify_sustainable_frequency import (
+    find_sustainable_frequency,
+    search_layout_frequency,
+)
 
 
 def package_identity(modules_path: Path, power_windows_path: Path,
@@ -82,7 +85,92 @@ def _validate_final_search_result(
     value: object, frequency_grid: list[float], settings: ROMSettings,
     config: dict,
 ) -> dict:
-    """Require one internally consistent real-HotSpot search result."""
+    """Replay and require one canonical real-HotSpot frequency search."""
+    def finite_number(item: object, label: str, *, positive: bool = False,
+                      nonnegative: bool = False) -> float:
+        if isinstance(item, bool) or not isinstance(item, Real):
+            raise ValueError(f"{label} must be a finite number")
+        try:
+            normalized = float(item)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"{label} must be a finite number") from error
+        if (not math.isfinite(normalized)
+                or positive and normalized <= 0.0
+                or nonnegative and normalized < 0.0):
+            raise ValueError(f"{label} must be a finite number")
+        return normalized
+
+    def integer(item: object, label: str, *, positive: bool = False) -> int:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError(f"{label} must be an integer")
+        if positive and item < 1:
+            raise ValueError(f"{label} must be a positive integer")
+        return item
+
+    def convergence_delta(evidence: object, index: int) -> float:
+        label = f"final HotSpot evaluation {index} PSS evidence"
+        if not isinstance(evidence, dict):
+            raise ValueError(f"{label} must be a dictionary")
+        expected_fields = {
+            "period_count", "grid_cell_count", "period_end_tmax_c",
+            "period_end_deltas", "last_delta_max_c",
+            "last_delta_unit_index",
+        }
+        if set(evidence) != expected_fields:
+            raise ValueError(f"{label} has incomplete convergence fields")
+        period_count = integer(
+            evidence["period_count"], f"{label} period_count", positive=True,
+        )
+        if period_count != settings.pss_period_repeats:
+            raise ValueError(f"{label} period_count differs from requested repeats")
+        grid_cell_count = integer(
+            evidence["grid_cell_count"], f"{label} grid_cell_count", positive=True,
+        )
+        period_end_tmax = evidence["period_end_tmax_c"]
+        if (not isinstance(period_end_tmax, list)
+                or len(period_end_tmax) != period_count):
+            raise ValueError(f"{label} period_end_tmax_c has invalid length")
+        for period_index, temperature in enumerate(period_end_tmax):
+            finite_number(
+                temperature, f"{label} period_end_tmax_c[{period_index}]",
+            )
+
+        deltas = evidence["period_end_deltas"]
+        if not isinstance(deltas, list) or len(deltas) != period_count - 1:
+            raise ValueError(f"{label} period_end_deltas has invalid length")
+        normalized_deltas: list[tuple[float, int]] = []
+        for period_index, delta in enumerate(deltas, start=1):
+            if (not isinstance(delta, dict) or set(delta) != {
+                    "from_period_index", "to_period_index", "delta_max_c",
+                    "unit_index",
+            }):
+                raise ValueError(f"{label} period delta {period_index} is incomplete")
+            if (integer(delta["from_period_index"], f"{label} from index")
+                    != period_index - 1
+                    or integer(delta["to_period_index"], f"{label} to index")
+                    != period_index):
+                raise ValueError(f"{label} period delta indices are inconsistent")
+            unit_index = integer(delta["unit_index"], f"{label} unit_index")
+            if not 0 <= unit_index < grid_cell_count:
+                raise ValueError(f"{label} unit_index is outside the temperature grid")
+            normalized_deltas.append((finite_number(
+                delta["delta_max_c"], f"{label} delta_max_c",
+                nonnegative=True,
+            ), unit_index))
+
+        last_delta = finite_number(
+            evidence["last_delta_max_c"], f"{label} last_delta_max_c",
+            nonnegative=True,
+        )
+        last_unit = integer(
+            evidence["last_delta_unit_index"],
+            f"{label} last_delta_unit_index",
+        )
+        if (not normalized_deltas
+                or (last_delta, last_unit) != normalized_deltas[-1]):
+            raise ValueError(f"{label} last-period delta is inconsistent")
+        return last_delta
+
     if not isinstance(value, dict):
         raise ValueError("final HotSpot validation result must be a dictionary")
     search = value.get("search")
@@ -94,17 +182,16 @@ def _validate_final_search_result(
     frequency = config.get("frequency") if isinstance(config, dict) else None
     if not isinstance(frequency, dict):
         raise ValueError("config lacks frequency settings")
-    tsafe_c = frequency.get("tsafe_c")
-    f0_ghz = frequency.get("f0_ghz")
-    if (isinstance(tsafe_c, bool) or not isinstance(tsafe_c, Real)
-            or not math.isfinite(float(tsafe_c))):
-        raise ValueError("frequency.tsafe_c must be finite")
-    if (isinstance(f0_ghz, bool) or not isinstance(f0_ghz, Real)
-            or not math.isfinite(float(f0_ghz)) or float(f0_ghz) <= 0.0):
-        raise ValueError("frequency.f0_ghz must be finite and positive")
-    grid = sorted({float(item) for item in frequency_grid})
-    if (not grid or any(not math.isfinite(item) or item <= 0.0 for item in grid)):
+    tsafe_c = finite_number(frequency.get("tsafe_c"), "frequency.tsafe_c")
+    f0_ghz = finite_number(
+        frequency.get("f0_ghz"), "frequency.f0_ghz", positive=True,
+    )
+    if not isinstance(frequency_grid, list) or not frequency_grid:
         raise ValueError("final HotSpot frequency grid is invalid")
+    grid = sorted({
+        finite_number(item, "final HotSpot frequency grid", positive=True)
+        for item in frequency_grid
+    })
 
     by_frequency: dict[float, dict] = {}
     ordered_frequencies = []
@@ -113,29 +200,47 @@ def _validate_final_search_result(
             raise ValueError(
                 f"final HotSpot evaluation {index} must be a dictionary"
             )
-        item_frequency = evaluation.get("frequency_ghz")
-        if (isinstance(item_frequency, bool) or not isinstance(item_frequency, Real)
-                or not math.isfinite(float(item_frequency))
-                or not grid[0] <= float(item_frequency) <= grid[-1]):
+        item_frequency = finite_number(
+            evaluation.get("frequency_ghz"),
+            f"final HotSpot evaluation {index} frequency", positive=True,
+        )
+        if not grid[0] <= item_frequency <= grid[-1]:
             raise ValueError(
                 f"final HotSpot evaluation {index} has invalid frequency"
             )
-        item_frequency = float(item_frequency)
         if item_frequency in by_frequency:
             raise ValueError("final HotSpot evaluations contain duplicate frequencies")
         converged = evaluation.get("converged")
-        peak_c = evaluation.get("last_period_peak_c")
+        peak_c = finite_number(
+            evaluation.get("last_period_peak_c"),
+            f"final HotSpot evaluation {index} period peak",
+        )
         safe = evaluation.get("safe")
         if not isinstance(converged, bool):
             raise ValueError(
                 f"final HotSpot evaluation {index} lacks boolean convergence"
             )
-        if (isinstance(peak_c, bool) or not isinstance(peak_c, Real)
-                or not math.isfinite(float(peak_c))):
+        last_delta = convergence_delta(
+            evaluation.get("period_end_convergence"), index,
+        )
+        expected_converged = (
+            settings.pss_period_repeats >= 2
+            and last_delta <= settings.pss_tolerance_c
+        )
+        if converged is not expected_converged:
             raise ValueError(
-                f"final HotSpot evaluation {index} lacks a finite period peak"
+                f"final HotSpot evaluation {index} convergence is inconsistent"
             )
-        expected_safe = converged and float(peak_c) <= float(tsafe_c)
+        peak_unit = evaluation.get("last_period_peak_unit")
+        if not isinstance(peak_unit, str) or not peak_unit:
+            raise ValueError(
+                f"final HotSpot evaluation {index} lacks a peak unit"
+            )
+        finite_number(
+            evaluation.get("trace_peak_c"),
+            f"final HotSpot evaluation {index} trace peak",
+        )
+        expected_safe = expected_converged and peak_c <= tsafe_c
         if not isinstance(safe, bool) or safe is not expected_safe:
             raise ValueError(
                 f"final HotSpot evaluation {index} safety is inconsistent"
@@ -144,58 +249,69 @@ def _validate_final_search_result(
         ordered_frequencies.append(item_frequency)
     if ordered_frequencies != sorted(ordered_frequencies):
         raise ValueError("final HotSpot evaluations are not frequency ordered")
-    if any(item not in by_frequency for item in grid):
-        raise ValueError("final HotSpot evaluations do not cover the frequency grid")
-    grid_evaluations = [by_frequency[item] for item in grid]
 
-    safe_frequencies = [
-        item for item, evaluation in by_frequency.items()
-        if evaluation["safe"]
-    ]
-    expected_sustainable = max(safe_frequencies) if safe_frequencies else None
-    reported_sustainable = value.get("f_sus_trans_ghz")
-    search_sustainable = search.get("sustainable_frequency_ghz")
-    if expected_sustainable is None:
-        if reported_sustainable is not None or search_sustainable is not None:
+    def recorded_evaluation(requested_frequency: float) -> dict:
+        try:
+            return by_frequency[requested_frequency]
+        except KeyError as error:
             raise ValueError(
-                "final HotSpot sustainable frequency is inconsistent with safety"
-            )
-    else:
-        for candidate in (reported_sustainable, search_sustainable):
-            if (isinstance(candidate, bool) or not isinstance(candidate, Real)
-                    or not math.isfinite(float(candidate))
-                    or float(candidate) != expected_sustainable):
-                raise ValueError(
-                    "final HotSpot sustainable frequency is missing or inconsistent"
-                )
+                "final HotSpot evaluations omit a canonical refinement frequency"
+            ) from error
 
-    floor_infeasible = not grid_evaluations[0]["safe"]
-    expected_state = (
-        "thermally_infeasible" if expected_sustainable is None
-        else "thermally_infeasible_at_fmin" if floor_infeasible
-        else "thermal_headroom_within_grid" if grid_evaluations[-1]["safe"]
-        else "thermally_limited"
+    try:
+        rebuilt_search = find_sustainable_frequency(
+            recorded_evaluation, grid, tsafe_c,
+            settings.frequency_tolerance_ghz,
+        )
+    except OverflowError as error:
+        raise ValueError("final HotSpot search contains an invalid number") from error
+    if rebuilt_search != search:
+        raise ValueError("final HotSpot search evidence is not canonical")
+
+    expected_sustainable = rebuilt_search["sustainable_frequency_ghz"]
+    reported_sustainable = value.get("f_sus_trans_ghz")
+    if expected_sustainable is None:
+        if reported_sustainable is not None:
+            raise ValueError(
+                "final HotSpot sustainable frequency is inconsistent with search"
+            )
+    elif (finite_number(
+            reported_sustainable, "final HotSpot sustainable frequency",
+            positive=True,
+    ) != expected_sustainable):
+        raise ValueError(
+            "final HotSpot sustainable frequency is inconsistent with search"
+        )
+    if value.get("state") != rebuilt_search["state"]:
+        raise ValueError("final HotSpot state is inconsistent with search")
+
+    frequency_evidence = value.get("frequency")
+    if not isinstance(frequency_evidence, dict):
+        raise ValueError("final HotSpot frequency evidence is inconsistent")
+    finite_number(
+        frequency_evidence.get("f0_ghz"),
+        "final HotSpot frequency evidence f0_ghz", positive=True,
     )
-    if value.get("state") != expected_state or search.get("state") != expected_state:
-        raise ValueError("final HotSpot state is inconsistent with evaluations")
-    monotonic = not any(
-        not left["safe"] and right["safe"]
-        for left, right in zip(grid_evaluations, grid_evaluations[1:])
+    finite_number(
+        frequency_evidence.get("tsafe_c"),
+        "final HotSpot frequency evidence tsafe_c",
     )
-    if (search.get("frequency_grid_ghz") != grid
-            or search.get("grid_evaluations") != grid_evaluations
-            or search.get("tsafe_c") != float(tsafe_c)
-            or search.get("frequency_tolerance_ghz")
-            != settings.frequency_tolerance_ghz
-            or search.get("thermally_infeasible_at_fmin") is not floor_infeasible
-            or search.get("monotonic_grid_safe_to_unsafe") is not monotonic
-            or not isinstance(search.get("safe_unsafe_brackets"), list)):
-        raise ValueError("final HotSpot search evidence is inconsistent")
     if value.get("frequency") != {
-        "f0_ghz": float(f0_ghz), "tsafe_c": float(tsafe_c), "grid_ghz": grid,
+        "f0_ghz": f0_ghz, "tsafe_c": tsafe_c, "grid_ghz": grid,
     }:
         raise ValueError("final HotSpot frequency evidence is inconsistent")
-    if value.get("periodic_steady_state") != {
+    pss_evidence = value.get("periodic_steady_state")
+    if not isinstance(pss_evidence, dict):
+        raise ValueError("final HotSpot PSS settings are inconsistent")
+    integer(
+        pss_evidence.get("period_repeats"),
+        "final HotSpot PSS period_repeats", positive=True,
+    )
+    finite_number(
+        pss_evidence.get("pss_tolerance_c"),
+        "final HotSpot PSS tolerance", positive=True,
+    )
+    if pss_evidence != {
         "period_repeats": settings.pss_period_repeats,
         "pss_tolerance_c": settings.pss_tolerance_c,
     }:

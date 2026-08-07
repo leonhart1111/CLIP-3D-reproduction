@@ -50,7 +50,7 @@ from workflow.transient.run_hotspot_transient import (
     summarize_period_end_convergence,
 )
 from workflow.transient.validation import power_trace_identity, validate_power_windows
-from workflow.transient.verify_sustainable_frequency import last_period_peak
+from workflow.transient.verify_sustainable_frequency import find_sustainable_frequency
 
 
 def canonical_json_sha256(value: object) -> str:
@@ -115,7 +115,6 @@ def write_synthetic_accepted_package(
     config = read_json(package_config)
     f0_ghz = float(config["frequency"]["f0_ghz"])
     fmin_ghz = float(config["frequency"]["fmin_ghz"])
-    tsafe_c = float(config["frequency"]["tsafe_c"])
     holdout_frequencies = (f0_ghz, 0.6 * f0_ghz + 0.4 * fmin_ghz)
     write_json(package / "anchors.json", design)
     write_json(package / "calibration_manifest.json", {
@@ -144,8 +143,6 @@ def write_synthetic_accepted_package(
         "holdout_ids": [point["id"] for point in design["holdout"]],
     })
 
-    holdout_semantics = {}
-
     def evidence_case(point: dict, kind: str, index: int) -> dict:
         case_dir = package / f"{kind}_{point['id']}"
         case_dir.mkdir(exist_ok=True)
@@ -156,14 +153,12 @@ def write_synthetic_accepted_package(
             "power_trace": case_dir / "power_transient.ptrace",
             "temperature_trace": case_dir / "transient.ttrace",
         }
-        write_json(
-            artifact_paths["layout"],
-            layout_for_point(design["base_layout"], point),
+        layout = layout_for_point(design["base_layout"], point)
+        case_power_windows = (
+            prbs_power_windows if kind == "training" else source_power_windows
         )
-        write_json(
-            artifact_paths["power_windows"],
-            prbs_power_windows if kind == "training" else source_power_windows,
-        )
+        write_json(artifact_paths["layout"], layout)
+        write_json(artifact_paths["power_windows"], case_power_windows)
         artifact_paths["power_trace"].write_text(
             "shared_l2\n1.0\n", encoding="utf-8"
         )
@@ -174,9 +169,26 @@ def write_synthetic_accepted_package(
             1 if kind == "training"
             else len(source_power_windows["windows"]) * settings.pss_period_repeats
         )
-        artifact_paths["temperature_trace"].write_text(
-            "cell0\n" + "300.0\n" * period_rows, encoding="utf-8"
-        )
+        if kind == "holdout":
+            rom = evaluate_layout_rom(
+                model, design, case_power_windows, layout, frequency_ghz,
+                settings, config,
+            )
+            period_grid_c = rom["final_period_grid_c"]
+            temperature_rows_k = period_grid_c * settings.pss_period_repeats
+            artifact_paths["temperature_trace"].write_text(
+                "\t".join(model.grid_unit_names) + "\n"
+                + "\n".join(
+                    "\t".join(f"{value + 273.15:.17g}" for value in row)
+                    for row in temperature_rows_k
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        else:
+            artifact_paths["temperature_trace"].write_text(
+                "cell0\n" + "300.0\n" * period_rows, encoding="utf-8"
+            )
         case = {
             "id": point["id"],
             "kind": kind,
@@ -203,18 +215,12 @@ def write_synthetic_accepted_package(
             convergence = summarize_period_end_convergence(
                 rows, windows_per_period
             )
-            peak = last_period_peak(rows, windows_per_period)
             case["periodic_steady_state"] = {
                 "period_repeats": settings.pss_period_repeats,
                 "pss_tolerance_c": settings.pss_tolerance_c,
                 "full_grid_converged": True,
                 "grid_unit_names": names,
                 "evidence": convergence,
-            }
-            holdout_semantics[point["id"]] = {
-                "frequency_ghz": frequency_ghz,
-                "peak_c": peak["tmax_c"],
-                "safe": peak["tmax_c"] <= tsafe_c,
             }
         return case
 
@@ -268,46 +274,13 @@ def write_synthetic_accepted_package(
     }
     write_json(package / "fit_report.json", fit_report)
     save_model(package / "pod_model.npz", model, fit_report)
-    gates = {
-        "geometry_identity": True,
-        "input_identity": True,
-        "frequency_identity": True,
-        "hotspot_trace_identity": True,
-        "temperature_grid_identity": True,
-        "periodic_steady_state": True,
-        "grid_rmse": True,
-        "peak_temperature_error": True,
-        "safety_classification": True,
-    }
-    write_json(package / "validation_report.json", {
-        "schema_version": 1,
-        **classification,
-        "thresholds": {
-            "pss_tolerance_c": settings.pss_tolerance_c,
-            "max_holdout_grid_rmse_c": settings.max_holdout_grid_rmse_c,
-            "max_holdout_peak_error_c": settings.max_holdout_peak_error_c,
-        },
-        "accepted": True,
-        "failure_reasons": [],
-        "holdouts": [
-            {
-                "id": point["id"],
-                "frequency_ghz": holdout_semantics[point["id"]]["frequency_ghz"],
-                "accepted": True,
-                "grid_rmse_c": 0.2 + index * 0.1,
-                "peak_temperature_error_c": 0.4 + index * 0.1,
-                "rom_peak_c": (
-                    holdout_semantics[point["id"]]["peak_c"]
-                    - (0.4 + index * 0.1)
-                ),
-                "hotspot_peak_c": holdout_semantics[point["id"]]["peak_c"],
-                "rom_safe": holdout_semantics[point["id"]]["safe"],
-                "hotspot_safe": holdout_semantics[point["id"]]["safe"],
-                "gates": gates,
-            }
-            for index, point in enumerate(design["holdout"])
-        ],
-    })
+    validation = validate_calibration_holdouts(
+        model, design, holdouts, settings, config,
+        output_dir=package, identity=None, publish=False,
+    )
+    if validation.get("accepted") is not True:
+        raise AssertionError("synthetic accepted package failed canonical holdout gates")
+    write_json(package / "validation_report.json", validation)
     write_json(package / "rom_acceptance.json", {
         "schema_version": 1,
         **classification,
@@ -1357,18 +1330,20 @@ class ROMEvaluationTests(unittest.TestCase):
 
     def _write_holdout_cases(self, root: Path, model: StateSpaceModel,
                              trace_names: tuple[str, ...]) -> tuple[dict, list[dict]]:
-        config = {"frequency": {"f0_ghz": 2.0, "ambient_c": 25.0,
-                                "tsafe_c": 100.0}}
-        expected = evaluate_layout_rom(
-            model, self.design(), self.power_windows(), self.layout(),
-            4.0, self.settings(), config,
-        )
+        config = {"frequency": {"f0_ghz": 2.0, "fmin_ghz": 1.0,
+                                "ambient_c": 25.0, "tsafe_c": 100.0}}
+        frequencies = (2.0, 1.6)
 
         def sha256(path: Path) -> str:
             return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
         cases = []
         for index in range(2):
+            frequency_ghz = frequencies[index]
+            expected = evaluate_layout_rom(
+                model, self.design(), self.power_windows(), self.layout(),
+                frequency_ghz, self.settings(), config,
+            )
             case_dir = root / f"h{index}"
             case_dir.mkdir()
             layout_path = case_dir / "layout.json"
@@ -1386,12 +1361,16 @@ class ROMEvaluationTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            convergence = summarize_period_end_convergence(
+                [[value + 273.15 for value in row] for row in rows], 1
+            )
             cases.append({
                 "id": f"h{index}",
                 "point": {"id": f"h{index}", "tier": 0,
                           "x_mm": 0.0, "y_mm": 0.0},
-                "frequency_ghz": 4.0,
-                "frequency_scale": 2.0,
+                "frequency_ghz": frequency_ghz,
+                "frequency_scale": frequency_ghz / 2.0,
+                "window_count": 2,
                 "artifacts": {
                     "layout": str(layout_path),
                     "power_windows": str(power_path),
@@ -1403,8 +1382,11 @@ class ROMEvaluationTests(unittest.TestCase):
                     },
                 },
                 "periodic_steady_state": {
+                    "period_repeats": self.settings().pss_period_repeats,
+                    "pss_tolerance_c": self.settings().pss_tolerance_c,
                     "full_grid_converged": True,
                     "grid_unit_names": list(trace_names),
+                    "evidence": convergence,
                 },
             })
         return config, cases
@@ -1914,7 +1896,7 @@ class ROMOptimizerTests(unittest.TestCase):
         with patch(
             "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
             side_effect=self._search_must_not_run,
-        ), self.assertRaisesRegex(ValueError, "PSS evidence differs"):
+        ), self.assertRaisesRegex(ValueError, "recomputed holdout validation differs"):
             optimize_transient_layout(
                 self.modules, self.accepted_package, self.output,
                 self.config_path, self.power_windows, hotspot=self.hotspot,
@@ -1934,7 +1916,7 @@ class ROMOptimizerTests(unittest.TestCase):
         with patch(
             "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
             side_effect=self._search_must_not_run,
-        ), self.assertRaisesRegex(ValueError, "HotSpot peak evidence differs"):
+        ), self.assertRaisesRegex(ValueError, "recomputed holdout validation differs"):
             optimize_transient_layout(
                 self.modules, self.accepted_package, self.output,
                 self.config_path, self.power_windows, hotspot=self.hotspot,
@@ -1954,13 +1936,60 @@ class ROMOptimizerTests(unittest.TestCase):
         with patch(
             "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
             side_effect=self._search_must_not_run,
-        ), self.assertRaisesRegex(ValueError, "HotSpot safety evidence differs"):
+        ), self.assertRaisesRegex(ValueError, "recomputed holdout validation differs"):
             optimize_transient_layout(
                 self.modules, self.accepted_package, self.output,
                 self.config_path, self.power_windows, hotspot=self.hotspot,
             )
 
         self.assertFalse(self.output.exists())
+
+    def assert_persisted_holdout_forgery_rejected(self, mutate) -> None:
+        validation_path = self.accepted_package / "validation_report.json"
+        validation = read_json(validation_path)
+        mutate(validation["holdouts"][0])
+        write_json(validation_path, validation)
+        write_test_artifact_manifest(self.accepted_package)
+        forged_bytes = validation_path.read_bytes()
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(
+            ValueError, "recomputed holdout validation differs"
+        ):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertEqual(validation_path.read_bytes(), forged_bytes)
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_recomputes_and_rejects_forged_rom_peak(self):
+        self.assert_persisted_holdout_forgery_rejected(
+            lambda holdout: holdout.__setitem__("rom_peak_c", 49.5)
+        )
+
+    def test_optimizer_recomputes_and_rejects_forged_rom_safety(self):
+        self.assert_persisted_holdout_forgery_rejected(
+            lambda holdout: holdout.__setitem__("rom_safe", False)
+        )
+
+    def test_optimizer_recomputes_and_rejects_forged_peak_error(self):
+        self.assert_persisted_holdout_forgery_rejected(
+            lambda holdout: holdout.__setitem__(
+                "peak_temperature_error_c", 0.0
+            )
+        )
+
+    def test_optimizer_recomputes_gates_and_accepted_flag(self):
+        def forge(holdout: dict) -> None:
+            holdout["rom_safe"] = False
+            holdout["gates"]["safety_classification"] = True
+            holdout["accepted"] = True
+
+        self.assert_persisted_holdout_forgery_rejected(forge)
 
     def test_optimizer_rejects_changed_current_power_trace_before_search(self):
         # Break caught: copying power identity out of the acceptance marker lets
@@ -2105,7 +2134,7 @@ class ROMPipelineTests(unittest.TestCase):
             "hotspot_calls_inside_optimizer": 0,
             "proposed_layout": str(self.proposed_layout.resolve()),
             "package_acceptance": package_acceptance,
-            "parameters": {"frequency_grid_ghz": [1.0, 2.0]},
+            "parameters": {"frequency_grid_ghz": [1.0, 1.8, 2.0]},
             "selected": {
                 "f_sus_trans_rom_ghz": 1.9,
                 "bips1_trans_rom_pred": 3.8,
@@ -2114,63 +2143,52 @@ class ROMPipelineTests(unittest.TestCase):
 
     @staticmethod
     def final_validation(evaluations: list[dict] | None = None) -> dict:
-        """Return one internally consistent synthetic final HotSpot search."""
-        if evaluations is None:
-            evaluations = [
-                {
-                    "frequency_ghz": 1.0, "converged": True,
-                    "last_period_peak_c": 45.0, "safe": True,
-                },
-                {
-                    "frequency_ghz": 1.8, "converged": True,
-                    "last_period_peak_c": 49.0, "safe": True,
-                },
-                {
-                    "frequency_ghz": 2.0, "converged": True,
-                    "last_period_peak_c": 51.0, "safe": False,
-                },
-            ]
-        evaluations = [dict(evaluation) for evaluation in evaluations]
-        by_frequency = {
-            float(evaluation["frequency_ghz"]): evaluation
+        """Return a result built by the real canonical frequency-search helper."""
+        grid = [1.0, 1.8, 2.0]
+        supplied = None if evaluations is None else {
+            float(evaluation["frequency_ghz"]): dict(evaluation)
             for evaluation in evaluations
         }
-        grid = [1.0, 2.0]
-        grid_evaluations = [by_frequency[frequency] for frequency in grid]
-        safe_frequencies = [
-            frequency for frequency, evaluation in by_frequency.items()
-            if evaluation["safe"]
-        ]
-        sustainable = max(safe_frequencies) if safe_frequencies else None
-        floor_infeasible = not grid_evaluations[0]["safe"]
-        state = (
-            "thermally_infeasible" if sustainable is None
-            else "thermally_infeasible_at_fmin" if floor_infeasible
-            else "thermal_headroom_within_grid" if grid_evaluations[-1]["safe"]
-            else "thermally_limited"
-        )
-        monotonic = not any(
-            not left["safe"] and right["safe"]
-            for left, right in zip(grid_evaluations, grid_evaluations[1:])
-        )
-        search = {
-            "frequency_grid_ghz": grid,
-            "tsafe_c": 50.0,
-            "frequency_tolerance_ghz": 0.01,
-            "monotonic_grid_safe_to_unsafe": monotonic,
-            "thermally_infeasible_at_fmin": floor_infeasible,
-            "sustainable_frequency_ghz": sustainable,
-            "state": state,
-            "safe_unsafe_brackets": [],
-            "grid_evaluations": grid_evaluations,
-            "evaluations": sorted(
-                evaluations, key=lambda evaluation: evaluation["frequency_ghz"]
-            ),
-        }
+
+        def evaluate(frequency_ghz: float) -> dict:
+            if supplied is None:
+                converged = True
+                peak_c = 49.0 if frequency_ghz <= 1.8 else 51.0
+            else:
+                recorded = supplied[frequency_ghz]
+                converged = recorded["converged"]
+                peak_c = recorded["last_period_peak_c"]
+            last_delta = 0.0 if converged else 0.02
+            deltas = [
+                {
+                    "from_period_index": index - 1,
+                    "to_period_index": index,
+                    "delta_max_c": last_delta,
+                    "unit_index": 0,
+                }
+                for index in range(1, 20)
+            ]
+            return {
+                "frequency_ghz": frequency_ghz,
+                "converged": converged,
+                "last_period_peak_c": peak_c,
+                "last_period_peak_unit": "cell0",
+                "period_end_convergence": {
+                    "period_count": 20,
+                    "grid_cell_count": 1,
+                    "period_end_tmax_c": [peak_c] * 20,
+                    "period_end_deltas": deltas,
+                    "last_delta_max_c": last_delta,
+                    "last_delta_unit_index": 0,
+                },
+                "trace_peak_c": peak_c,
+            }
+
+        search = find_sustainable_frequency(evaluate, grid, 50.0, 0.01)
         return {
             "schema_version": 1,
-            "state": state,
-            "f_sus_trans_ghz": sustainable,
+            "state": search["state"],
+            "f_sus_trans_ghz": search["sustainable_frequency_ghz"],
             "frequency": {"f0_ghz": 2.0, "tsafe_c": 50.0, "grid_ghz": grid},
             "periodic_steady_state": {
                 "period_repeats": 20, "pss_tolerance_c": 0.01,
@@ -2553,6 +2571,10 @@ class ROMPipelineTests(unittest.TestCase):
                     "last_period_peak_c": 48.0, "safe": False,
                 },
                 {
+                    "frequency_ghz": 1.8, "converged": False,
+                    "last_period_peak_c": 48.5, "safe": False,
+                },
+                {
                     "frequency_ghz": 2.0, "converged": False,
                     "last_period_peak_c": 49.0, "safe": False,
                 },
@@ -2747,6 +2769,30 @@ class ROMPipelineTests(unittest.TestCase):
 
         self.assert_final_validation_contract_failure(returned)
 
+    def test_final_noncanonical_refined_bracket_is_contract_failure(self):
+        returned = self.final_validation()
+        returned["search"]["safe_unsafe_brackets"][0][
+            "refined_safe_frequency_ghz"
+        ] = 1.7
+
+        self.assert_final_validation_contract_failure(returned)
+
+    def test_final_pss_evidence_inconsistent_with_convergence_is_contract_failure(self):
+        returned = self.final_validation()
+        evidence = returned["search"]["evaluations"][0][
+            "period_end_convergence"
+        ]
+        evidence["last_delta_max_c"] = 0.02
+        evidence["period_end_deltas"][-1]["delta_max_c"] = 0.02
+
+        self.assert_final_validation_contract_failure(returned)
+
+    def test_final_huge_json_number_is_validation_contract_failure(self):
+        returned = self.final_validation()
+        returned["search"]["evaluations"][0]["last_period_peak_c"] = 10**400
+
+        self.assert_final_validation_contract_failure(returned)
+
     def test_all_converged_unsafe_grid_is_true_thermal_infeasible_not_tool_error(self):
         # Break caught: folding a valid unsafe result into tool/nonconvergence
         # failure makes physical infeasibility indistinguishable from bad evidence.
@@ -2779,6 +2825,10 @@ class ROMPipelineTests(unittest.TestCase):
                 {
                     "frequency_ghz": 1.0, "converged": True,
                     "last_period_peak_c": 51.0, "safe": False,
+                },
+                {
+                    "frequency_ghz": 1.8, "converged": True,
+                    "last_period_peak_c": 51.5, "safe": False,
                 },
                 {
                     "frequency_ghz": 2.0, "converged": True,
@@ -2902,6 +2952,7 @@ class ROMPipelineTests(unittest.TestCase):
             "failure_reasons": [],
         })
         self.bind_package(package)
+        persisted_validation = read_json(package / "validation_report.json")
         optimization = self.optimization()
         second_proposed = second_output / "optimization/proposed_layout.json"
         second_proposed.parent.mkdir(parents=True)
@@ -2949,10 +3000,7 @@ class ROMPipelineTests(unittest.TestCase):
         self.assertEqual(result["training_hotspot_calls_this_invocation"], 0)
         self.assertEqual(result["holdout_hotspot_calls_this_invocation"], 0)
         self.assertEqual(result["calibration_hotspot_calls_this_invocation"], 0)
-        self.assertEqual(
-            [case["grid_rmse_c"] for case in result["rom_holdout_validation"]["holdouts"]],
-            [0.2, 0.30000000000000004],
-        )
+        self.assertEqual(result["rom_holdout_validation"], persisted_validation)
 
     def test_reuse_rejects_stale_or_incomplete_package_manifest_before_search(self):
         # Break caught: a valid-looking acceptance marker cannot bind a model
