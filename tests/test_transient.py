@@ -16,6 +16,7 @@ from workflow.transient.generate_hotspot_trace import write_trace
 from workflow.transient.run_hotspot_transient import (
     parse_ttrace,
     run_hotspot_transient,
+    summarize_period_end_convergence,
     summarize_temperature_samples,
 )
 from workflow.transient.run_dual_layout_validation import run_dual_layout_validation
@@ -306,6 +307,84 @@ class TransientTraceTests(unittest.TestCase):
             self.assertNotIn("dynamic_scale", result["raw_power_evidence"])
             self.assertNotIn("leakage_scale", result["raw_power_evidence"])
             self.assertIn("power_conservation", result["conservation_evidence"])
+
+    def test_frequency_scaled_trace_repeats_period_and_preserves_power_split(self):
+        """Catch an incorrect frequency transform of dynamic power, leakage, or time."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            write_json(root / "modules.json", model)
+            windows = []
+            for index, dynamic_scale in enumerate((1.0, 2.0)):
+                modules = []
+                for source in model["modules"]:
+                    module = dict(source)
+                    module["dynamic_power_w"] *= dynamic_scale
+                    module["total_power_w"] = (
+                        module["dynamic_power_w"] + module["leakage_power_w"]
+                    )
+                    modules.append(module)
+                windows.append({
+                    "index": index, "start_tick": index * 10,
+                    "end_tick": (index + 1) * 10, "duration_s": 0.01,
+                    "duration_ticks": 10,
+                    "source_stats_sha256": f"sha256:stats-{index}",
+                    "modules": modules,
+                    "totals": {
+                        field: sum(module[field] for module in modules)
+                        for field in ("dynamic_power_w", "leakage_power_w",
+                                      "total_power_w")
+                    },
+                })
+            write_json(root / "power_windows.json", {
+                "nominal_sample_interval_ms": 10.0,
+                "nominal_sample_interval_ticks": 10,
+                "measurement_start_tick": 0,
+                "measurement_end_tick": 20,
+                "power_provenance": {
+                    "dynamic": "McPAT Runtime Dynamic",
+                    "subthreshold_leakage": "McPAT Subthreshold Leakage",
+                    "gate_leakage": "McPAT Gate Leakage",
+                    "postprocessing": "none",
+                },
+                "run_settings": {"dynamic_scale": 1.0, "leakage_scale": 1.0},
+                "windows": windows,
+            })
+            config = {
+                "frequency": {"ambient_c": 25.0},
+                "physical": {"grid_size": 4, "utilization": 0.70,
+                             "r_convec_k_per_w": 5.0},
+            }
+            from workflow.floorplan.generate_hotspot_inputs import baseline_layout
+            write_json(root / "layout.json", baseline_layout(model))
+
+            result = materialize_trace(
+                root / "modules.json", root / "layout.json",
+                root / "power_windows.json", root / "hotspot", config,
+                frequency_scale=0.5, period_repeats=3,
+            )
+
+            dynamic_lines = (root / "hotspot/power_dynamic_transient.ptrace").read_text().splitlines()
+            leakage_lines = (root / "hotspot/power_leakage_transient.ptrace").read_text().splitlines()
+            total_lines = (root / "hotspot/power_transient.ptrace").read_text().splitlines()
+            self.assertEqual(len(total_lines), 7)
+            self.assertEqual(dynamic_lines[1:3], dynamic_lines[3:5])
+            self.assertEqual(dynamic_lines[1:3], dynamic_lines[5:7])
+            for dynamic, leakage, total in zip(
+                dynamic_lines[1:], leakage_lines[1:], total_lines[1:]
+            ):
+                for expected, observed in zip(
+                    [float(a) + float(b) for a, b in zip(
+                        dynamic.split(), leakage.split()
+                    )],
+                    [float(value) for value in total.split()],
+                ):
+                    self.assertAlmostEqual(observed, expected, places=14)
+            self.assertIn("-sampling_intvl 0.02",
+                          (root / "hotspot/hotspot.config").read_text())
+            self.assertEqual(result["frequency_scaling"]["dynamic_power_scale"], 0.5)
+            self.assertEqual(result["frequency_scaling"]["leakage_power_scale"], 1.0)
+            self.assertEqual(result["windows_per_period"], 2)
 
     @staticmethod
     def windowed_mcpat_fixture(root: Path) -> tuple[Path, Path, dict, Path, dict]:
@@ -755,6 +834,15 @@ class TransientTraceTests(unittest.TestCase):
         self.assertEqual(result["overall_peak"]["peak_unit"], "initial")
         self.assertEqual(result["trace_peak_minus_initial_c"], -5.0)
         self.assertEqual(result["final_minus_initial_c"], -8.0)
+
+    def test_period_end_convergence_uses_full_grid(self):
+        """Catch a PSS check that watches only Tmax and misses a moving hotspot."""
+        result = summarize_period_end_convergence(
+            [[300.0, 305.0], [301.0, 310.0],
+             [300.0, 305.0], [301.25, 310.0]], 2
+        )
+        self.assertAlmostEqual(result["last_delta_max_c"], 0.25)
+        self.assertEqual(result["last_delta_unit_index"], 0)
 
     def test_thermal_result_has_standard_classification_and_acceptance_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:

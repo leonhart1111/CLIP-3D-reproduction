@@ -45,7 +45,16 @@ def set_sampling_interval(config_path: Path, interval_s: float) -> None:
 
 
 def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path: Path,
-                      output_dir: Path, config: dict) -> dict:
+                      output_dir: Path, config: dict,
+                      frequency_scale: float = 1.0,
+                      period_repeats: int = 1) -> dict:
+    """Materialize a fixed-layout trace, optionally scaled to another frequency."""
+    if not math.isfinite(frequency_scale) or frequency_scale <= 0:
+        raise ValueError("frequency_scale must be positive and finite")
+    if isinstance(period_repeats, bool) or not isinstance(period_repeats, int):
+        raise ValueError("period_repeats must be a positive integer")
+    if period_repeats < 1:
+        raise ValueError("period_repeats must be a positive integer")
     physical = config["physical"]
     frequency = config["frequency"]
     grid_size = int(physical["grid_size"])
@@ -92,35 +101,65 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
     # Grid the steady layout before creating the output directory so geometry
     # and conservation failures cannot publish a partial trace case.
     grid_power(layout, grid_size)
-    power_summary = summarize_power_windows(windows)
-    sample_interval_s = float(power_windows["nominal_sample_interval_ms"]) / 1000.0
+    nominal_sample_interval_s = (
+        float(power_windows["nominal_sample_interval_ms"]) / 1000.0
+    )
+    sample_interval_s = nominal_sample_interval_s / frequency_scale
+    scaled_windows = []
+    for window in windows:
+        modules = []
+        for source in window["modules"]:
+            module = dict(source)
+            module["dynamic_power_w"] = (
+                float(source["dynamic_power_w"]) * frequency_scale
+            )
+            module["leakage_power_w"] = float(source["leakage_power_w"])
+            module["total_power_w"] = (
+                module["dynamic_power_w"] + module["leakage_power_w"]
+            )
+            validate_power_triplet(
+                module, f"scaled window {window['index']} module {module['name']}"
+            )
+            modules.append(module)
+        scaled_windows.append({
+            **window,
+            "duration_s": float(window["duration_s"]) / frequency_scale,
+            "modules": modules,
+            "totals": {
+                field: sum(float(module[field]) for module in modules)
+                for field in POWER_FIELDS
+            },
+        })
+    power_summary = summarize_power_windows(scaled_windows)
     rows_by_field: dict[str, list[list[float]]] = {field: [] for field in POWER_FIELDS}
     trace_names: list[str] | None = None
     conservation = []
-    for window in windows:
-        by_name = {module["name"]: module for module in window["modules"]}
-        window_layout = {**layout, "modules": []}
-        for source in layout["modules"]:
-            module = dict(source)
-            powers = by_name[module["name"]]
-            validate_power_triplet(
-                powers, f"window {window['index']} module {module['name']}"
-            )
+    for period_index in range(period_repeats):
+        for window in scaled_windows:
+            by_name = {module["name"]: module for module in window["modules"]}
+            window_layout = {**layout, "modules": []}
+            for source in layout["modules"]:
+                module = dict(source)
+                powers = by_name[module["name"]]
+                validate_power_triplet(
+                    powers, f"window {window['index']} module {module['name']}"
+                )
+                for field in POWER_FIELDS:
+                    module[field] = float(powers[field])
+                window_layout["modules"].append(module)
+            gridded = grid_power(window_layout, grid_size)
+            cells = [cell for tier in gridded["tiers"] for cell in tier["cells"]]
+            names = [cell["name"] for cell in cells]
+            trace_names = trace_names or names
+            if names != trace_names:
+                raise ValueError("HotSpot grid cell order changed between windows")
             for field in POWER_FIELDS:
-                module[field] = float(powers[field])
-            window_layout["modules"].append(module)
-        gridded = grid_power(window_layout, grid_size)
-        cells = [cell for tier in gridded["tiers"] for cell in tier["cells"]]
-        names = [cell["name"] for cell in cells]
-        trace_names = trace_names or names
-        if names != trace_names:
-            raise ValueError("HotSpot grid cell order changed between windows")
-        for field in POWER_FIELDS:
-            rows_by_field[field].append([float(cell[field]) for cell in cells])
-        conservation.append({
-            "window_index": window["index"],
-            "tiers": gridded["power_conservation"],
-        })
+                rows_by_field[field].append([float(cell[field]) for cell in cells])
+            conservation.append({
+                "period_index": period_index,
+                "window_index": window["index"],
+                "tiers": gridded["power_conservation"],
+            })
 
     if not trace_names or not rows_by_field["total_power_w"]:
         raise ValueError("no transient power rows were generated")
@@ -138,8 +177,19 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
     for field, filename in filenames.items():
         write_trace(output_dir / filename, trace_names, rows_by_field[field])
 
-    actual_duration_s = float(timeline_audit["total_duration_s"])
-    hotspot_duration_s = float(timeline_audit["hotspot_trace_duration_s"])
+    source_actual_duration_s = float(timeline_audit["total_duration_s"])
+    source_hotspot_duration_s = float(timeline_audit["hotspot_trace_duration_s"])
+    actual_duration_s = source_actual_duration_s * period_repeats / frequency_scale
+    hotspot_duration_s = source_hotspot_duration_s * period_repeats / frequency_scale
+    trace_timeline_audit = {
+        **timeline_audit,
+        "source_window_count": int(timeline_audit["window_count"]),
+        "window_count": len(scaled_windows) * period_repeats,
+        "source_total_duration_s": source_actual_duration_s,
+        "source_hotspot_trace_duration_s": source_hotspot_duration_s,
+        "total_duration_s": actual_duration_s,
+        "hotspot_trace_duration_s": hotspot_duration_s,
+    }
     maximum_grid_residual_w = max(
         abs(tier[field]["residual"])
         for window in conservation
@@ -155,7 +205,17 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
         "source_layout": str(layout_path.resolve()),
         "source_power_windows": str(power_windows_path.resolve()),
         "sample_interval_s": sample_interval_s,
-        "window_count": len(windows),
+        "nominal_sample_interval_s": nominal_sample_interval_s,
+        "window_count": len(scaled_windows) * period_repeats,
+        "windows_per_period": len(scaled_windows),
+        "period_repeats": period_repeats,
+        "frequency_scaling": {
+            "frequency_scale": frequency_scale,
+            "dynamic_power_scale": frequency_scale,
+            "leakage_power_scale": 1.0,
+            "time_scale": 1.0 / frequency_scale,
+            "model": "fixed-voltage dynamic-power scaling with fixed leakage",
+        },
         "grid_cell_count": len(trace_names),
         "actual_gem5_duration_s": actual_duration_s,
         "hotspot_trace_duration_s": hotspot_duration_s,
@@ -165,7 +225,7 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
             "sampling interval; the padding is recorded explicitly."
         ),
         "power_summary": power_summary,
-        "timeline_audit": timeline_audit,
+        "timeline_audit": trace_timeline_audit,
         "maximum_grid_residual_w": maximum_grid_residual_w,
         "raw_power_evidence": {
             "power_provenance": RAW_POWER_PROVENANCE,
@@ -187,7 +247,9 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
                 "actual_duration_within_hotspot_duration": (
                     actual_duration_s <= hotspot_duration_s
                 ),
-                "raw_unscaled_power": True,
+                "raw_unscaled_power": frequency_scale == 1.0,
+                "source_power_is_raw": True,
+                "frequency_transform_is_explicit": True,
                 "module_power_conservation": True,
                 "grid_power_conservation": True,
             },

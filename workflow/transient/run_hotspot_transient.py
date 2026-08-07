@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import shutil
 import subprocess
 import time
@@ -37,12 +38,15 @@ def read_named_temperatures(path: Path) -> list[tuple[str, float]]:
     return values
 
 
-def parse_ttrace(path: Path, interval_s: float) -> list[dict]:
+def parse_ttrace_grid(path: Path) -> tuple[list[str], list[list[float]]]:
+    """Read all finite HotSpot grid temperatures without scalar reduction."""
     lines = path.read_text(encoding="utf-8").splitlines()
     if len(lines) < 2:
         raise ValueError(f"temperature trace has no samples: {path}")
     names = lines[0].split()
-    samples = []
+    if not names:
+        raise ValueError(f"temperature trace lacks unit names: {path}")
+    rows = []
     for index, line in enumerate(lines[1:]):
         fields = line.split()
         if len(fields) != len(names):
@@ -51,6 +55,16 @@ def parse_ttrace(path: Path, interval_s: float) -> list[dict]:
                 f"expected {len(names)}"
             )
         values = [float(value) for value in fields]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f"temperature trace row {index} has non-finite value")
+        rows.append(values)
+    return names, rows
+
+
+def parse_ttrace(path: Path, interval_s: float) -> list[dict]:
+    names, rows = parse_ttrace_grid(path)
+    samples = []
+    for index, values in enumerate(rows):
         peak_index = max(range(len(values)), key=values.__getitem__)
         samples.append({
             "index": index,
@@ -61,6 +75,50 @@ def parse_ttrace(path: Path, interval_s: float) -> list[dict]:
             "tavg_c": sum(values) / len(values) - 273.15,
         })
     return samples
+
+
+def summarize_period_end_convergence(rows_k: list[list[float]],
+                                     windows_per_period: int) -> dict:
+    """Compare all grid cells at adjacent period ends for PSS convergence."""
+    if isinstance(windows_per_period, bool) or not isinstance(
+        windows_per_period, int
+    ) or windows_per_period < 1:
+        raise ValueError("windows_per_period must be a positive integer")
+    if not rows_k or len(rows_k) % windows_per_period:
+        raise ValueError(
+            "temperature rows must contain an exact positive number of periods"
+        )
+    width = len(rows_k[0])
+    if width < 1 or any(len(row) != width for row in rows_k):
+        raise ValueError("temperature rows must have one consistent nonzero width")
+    if any(not math.isfinite(value) for row in rows_k for value in row):
+        raise ValueError("temperature rows contain a non-finite value")
+    period_ends = [
+        rows_k[index]
+        for index in range(windows_per_period - 1, len(rows_k), windows_per_period)
+    ]
+    deltas = []
+    for period_index in range(1, len(period_ends)):
+        previous = period_ends[period_index - 1]
+        current = period_ends[period_index]
+        unit_index = max(
+            range(width), key=lambda index: abs(current[index] - previous[index])
+        )
+        deltas.append({
+            "from_period_index": period_index - 1,
+            "to_period_index": period_index,
+            "delta_max_c": abs(current[unit_index] - previous[unit_index]),
+            "unit_index": unit_index,
+        })
+    last = deltas[-1] if deltas else None
+    return {
+        "period_count": len(period_ends),
+        "grid_cell_count": width,
+        "period_end_tmax_c": [max(row) - 273.15 for row in period_ends],
+        "period_end_deltas": deltas,
+        "last_delta_max_c": None if last is None else last["delta_max_c"],
+        "last_delta_unit_index": None if last is None else last["unit_index"],
+    }
 
 
 def summarize_temperature_samples(samples: list[dict], initial_peak: dict) -> dict:
