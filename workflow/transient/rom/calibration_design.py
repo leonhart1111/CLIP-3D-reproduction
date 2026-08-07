@@ -114,6 +114,8 @@ def make_prbs_input(module_names: list[str], l2_name: str, settings: ROMSettings
         raise ValueError("module_names must not contain duplicates")
     if l2_name not in module_names:
         raise ValueError("l2_name must be present in module_names")
+    if not 0.0 < settings.prbs_fraction < 1.0:
+        raise ValueError("settings must produce strictly positive PRBS multipliers")
 
     multipliers = {}
     for name in module_names:
@@ -156,20 +158,69 @@ def _exactly_one_l2(layout: dict) -> dict:
 def _rectangle_anchors(base_layout: dict, l2: dict, tier: int,
                        existing: list[dict]) -> list[dict]:
     maximum_x, maximum_y = _coordinate_limits(base_layout, l2)
-    extremes = (
-        ("lower_left", 0.0, 0.0),
-        ("lower_right", maximum_x, 0.0),
-        ("upper_left", 0.0, maximum_y),
-        ("upper_right", maximum_x, maximum_y),
-    )
-    anchors = []
-    for rule, x_mm, y_mm in extremes:
-        point = _legal_point(
-            base_layout, l2, tier, x_mm, y_mm, existing + anchors,
-            rule=rule, identifier=f"a{len(existing) + len(anchors)}",
+    if _rectangle_is_legal(base_layout, tier, _rectangle_coordinates(maximum_x, maximum_y, 0.0), existing):
+        scale = 0.0
+    else:
+        scale = _find_rectangle_shrink(base_layout, tier, maximum_x, maximum_y, existing)
+    rules = ("lower_left", "lower_right", "upper_left", "upper_right")
+    return [
+        {
+            "id": f"a{len(existing) + index}",
+            "tier": tier,
+            "x_mm": coordinates[0],
+            "y_mm": coordinates[1],
+            "rule": rule,
+        }
+        for index, (rule, coordinates) in enumerate(
+            zip(rules, _rectangle_coordinates(maximum_x, maximum_y, scale))
         )
-        anchors.append(point)
-    return anchors
+    ]
+
+
+def _find_rectangle_shrink(base_layout: dict, tier: int, maximum_x: float,
+                           maximum_y: float, existing: Iterable[dict]) -> float:
+    """Shrink all four extremes together until they form one legal rectangle."""
+    upper_step = _SEARCH_GRID // 2
+    for step in range(1, upper_step + 1):
+        scale = step / _SEARCH_GRID
+        coordinates = _rectangle_coordinates(maximum_x, maximum_y, scale)
+        if not _rectangle_is_legal(base_layout, tier, coordinates, existing):
+            continue
+        lower, upper = (step - 1) / _SEARCH_GRID, scale
+        for _ in range(_BISECTION_STEPS):
+            middle = (lower + upper) / 2.0
+            coordinates = _rectangle_coordinates(maximum_x, maximum_y, middle)
+            if _rectangle_is_legal(base_layout, tier, coordinates, existing):
+                upper = middle
+            else:
+                lower = middle
+        return upper
+    raise ValueError(
+        f"cannot construct a legal axis-aligned bilinear rectangle on tier {tier}"
+    )
+
+
+def _rectangle_coordinates(maximum_x: float, maximum_y: float,
+                           scale: float) -> tuple[tuple[float, float], ...]:
+    minimum_x = scale * maximum_x / 2.0
+    maximum_x = maximum_x - minimum_x
+    minimum_y = scale * maximum_y / 2.0
+    maximum_y = maximum_y - minimum_y
+    return (
+        (minimum_x, minimum_y),
+        (maximum_x, minimum_y),
+        (minimum_x, maximum_y),
+        (maximum_x, maximum_y),
+    )
+
+
+def _rectangle_is_legal(base_layout: dict, tier: int,
+                        coordinates: Iterable[tuple[float, float]],
+                        existing: Iterable[dict]) -> bool:
+    candidates = list(coordinates)
+    if len({x_mm for x_mm, _ in candidates}) != 2 or len({y_mm for _, y_mm in candidates}) != 2:
+        return False
+    return all(_is_legal_unique(base_layout, tier, candidate, existing) for candidate in candidates)
 
 
 def _single_tier_anchors(base_layout: dict, l2: dict, tier: int,
@@ -326,6 +377,12 @@ def _domain_for_tier(training: list[dict], tier: int, *, two_tier: bool) -> dict
     if two_tier:
         if len(points) != 4:
             raise ValueError("bilinear interpolation requires four anchors per tier")
+        x_values = {point["x_mm"] for point in points}
+        y_values = {point["y_mm"] for point in points}
+        if len(x_values) != 2 or len(y_values) != 2 or {
+            (point["x_mm"], point["y_mm"]) for point in points
+        } != {(x_mm, y_mm) for x_mm in x_values for y_mm in y_values}:
+            raise ValueError("bilinear interpolation requires an axis-aligned legal rectangle")
         return {"kind": "bilinear", "anchor_ids": [point["id"] for point in points],
                 "corners": coordinates}
     if len(points) != 8:
@@ -339,93 +396,15 @@ def _domain_for_tier(training: list[dict], tier: int, *, two_tier: bool) -> dict
 
 
 def _delaunay_simplices(points: list[list[float]]) -> list[list[int]]:
-    """Persist SciPy's deterministic triangulation, with a no-dependency fallback."""
+    """Persist SciPy's deterministic Delaunay triangulation."""
     try:
         from scipy.spatial import Delaunay  # type: ignore[import-not-found]
-    except ModuleNotFoundError:
-        return _bowyer_watson_simplices(points)
+    except ModuleNotFoundError as error:
+        raise ValueError(
+            "SciPy is required for single-tier Delaunay interpolation but is not installed"
+        ) from error
     triangulation = Delaunay(points)
     return [list(map(int, simplex)) for simplex in triangulation.simplices.tolist()]
-
-
-def _bowyer_watson_simplices(points: list[list[float]]) -> list[list[int]]:
-    """Small deterministic Delaunay fallback for environments without SciPy."""
-    minimum_x = min(point[0] for point in points)
-    maximum_x = max(point[0] for point in points)
-    minimum_y = min(point[1] for point in points)
-    maximum_y = max(point[1] for point in points)
-    span = max(maximum_x - minimum_x, maximum_y - minimum_y)
-    if span <= _TOLERANCE_MM:
-        raise ValueError("Delaunay triangulation is degenerate")
-    center_x = (minimum_x + maximum_x) / 2.0
-    center_y = (minimum_y + maximum_y) / 2.0
-    augmented = points + [
-        [center_x - 32.0 * span, center_y - span],
-        [center_x, center_y + 32.0 * span],
-        [center_x + 32.0 * span, center_y - span],
-    ]
-    triangles = [_counterclockwise((len(points), len(points) + 1, len(points) + 2), augmented)]
-    for index in range(len(points)):
-        bad = [
-            triangle for triangle in triangles
-            if _inside_circumcircle(augmented[index], triangle, augmented)
-        ]
-        edge_counts: dict[tuple[int, int], int] = {}
-        for first, second, third in bad:
-            for edge in ((first, second), (second, third), (third, first)):
-                canonical = tuple(sorted(edge))
-                edge_counts[canonical] = edge_counts.get(canonical, 0) + 1
-        triangles = [triangle for triangle in triangles if triangle not in bad]
-        for first, second in sorted(edge for edge, count in edge_counts.items() if count == 1):
-            triangle = _counterclockwise((first, second, index), augmented)
-            if _orientation(triangle, augmented) > _TOLERANCE_MM:
-                triangles.append(triangle)
-    simplices = [
-        list(triangle) for triangle in triangles
-        if all(vertex < len(points) for vertex in triangle)
-        and _orientation(triangle, augmented) > _TOLERANCE_MM
-    ]
-    if not simplices:
-        raise ValueError("Delaunay triangulation is degenerate")
-    return simplices
-
-
-def _inside_circumcircle(point: list[float], triangle: tuple[int, int, int],
-                         coordinates: list[list[float]]) -> bool:
-    first, second, third = (coordinates[index] for index in triangle)
-    circle = _circumcircle(first, second, third)
-    if circle is None:
-        return False
-    center_x, center_y, radius_squared = circle
-    distance_squared = (point[0] - center_x) ** 2 + (point[1] - center_y) ** 2
-    return distance_squared <= radius_squared + _TOLERANCE_MM
-
-
-def _counterclockwise(triangle: tuple[int, int, int], coordinates: list[list[float]]) -> tuple[int, int, int]:
-    first, second, third = triangle
-    if _orientation(triangle, coordinates) < 0.0:
-        return first, third, second
-    return triangle
-
-
-def _orientation(triangle: tuple[int, int, int], coordinates: list[list[float]]) -> float:
-    first, second, third = (coordinates[index] for index in triangle)
-    return (second[0] - first[0]) * (third[1] - first[1]) - (second[1] - first[1]) * (third[0] - first[0])
-
-
-def _circumcircle(first: list[float], second: list[float], third: list[float]):
-    ax, ay = first
-    bx, by = second
-    cx, cy = third
-    denominator = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
-    if abs(denominator) <= _TOLERANCE_MM:
-        return None
-    aa = ax * ax + ay * ay
-    bb = bx * bx + by * by
-    cc = cx * cx + cy * cy
-    center_x = (aa * (by - cy) + bb * (cy - ay) + cc * (ay - by)) / denominator
-    center_y = (aa * (cx - bx) + bb * (ax - cx) + cc * (bx - ax)) / denominator
-    return center_x, center_y, (ax - center_x) ** 2 + (ay - center_y) ** 2
 
 
 def _module_seed(seed: int, name: str) -> int:

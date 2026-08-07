@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from workflow.common import write_json
@@ -70,6 +72,10 @@ class ROMContractTests(unittest.TestCase):
             parse_settings({"transient_rom": {"pod_energy_threshold": 1.0}})
         with self.assertRaisesRegex(ValueError, "sample_interval_ms"):
             parse_settings({"transient_rom": {"sample_interval_ms": float("inf")}})
+
+    def test_parse_settings_rejects_prbs_fraction_that_can_zero_power(self):
+        with self.assertRaisesRegex(ValueError, "prbs_fraction must be less than 1"):
+            parse_settings({"transient_rom": {"prbs_fraction": 1.0}})
 
     def test_rom_input_identity_records_all_scientific_provenance(self):
         identity = self.identity()
@@ -154,6 +160,15 @@ class CalibrationDesignTests(unittest.TestCase):
         for point in design["training"] + design["holdout"]:
             layout_for_point(design["base_layout"], point)
 
+    def test_single_tier_design_requires_scipy_delaunay(self):
+        with patch.dict("sys.modules", {"scipy": None, "scipy.spatial": None}):
+            with self.assertRaisesRegex(ValueError, "SciPy is required for single-tier Delaunay"):
+                build_design(self.model(), [1], self.settings())
+
+    @unittest.skipUnless(
+        __import__("importlib").util.find_spec("scipy") is not None,
+        "SciPy is unavailable in this test environment",
+    )
     def test_single_tier_design_has_eight_anchors_and_two_holdouts(self):
         design = build_design(self.model(), [1], self.settings())
 
@@ -177,6 +192,31 @@ class CalibrationDesignTests(unittest.TestCase):
             self.assertEqual(len(values), self.settings().calibration_windows)
             self.assertTrue(all(value > 0.0 for value in values))
             self.assertAlmostEqual(sum(values) / len(values), 1.0, places=12)
+
+    def test_prbs_rejects_settings_that_can_generate_zero_multiplier(self):
+        unsafe_settings = replace(self.settings(), prbs_fraction=1.0)
+
+        with self.assertRaisesRegex(ValueError, "positive PRBS multipliers"):
+            make_prbs_input(["core0", "shared_l2"], "shared_l2", unsafe_settings)
+
+    def test_two_tier_design_repairs_obstructed_corners_as_one_rectangle(self):
+        model = self.model()
+        noc = next(module for module in model["modules"] if module["name"] == "noc")
+        noc["preferred_width_mm"] = 2.25
+
+        design = build_design(model, [0, 1], self.settings())
+        anchors = [point for point in design["training"] if point["tier"] == 1]
+        x_values = {point["x_mm"] for point in anchors}
+        y_values = {point["y_mm"] for point in anchors}
+
+        self.assertEqual(len(x_values), 2)
+        self.assertEqual(len(y_values), 2)
+        self.assertEqual(
+            {(point["x_mm"], point["y_mm"]) for point in anchors},
+            {(x_mm, y_mm) for x_mm in x_values for y_mm in y_values},
+        )
+        for point in anchors:
+            layout_for_point(design["base_layout"], point)
 
 
 if __name__ == "__main__":

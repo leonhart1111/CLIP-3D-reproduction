@@ -111,8 +111,8 @@ def parse_settings(config: dict) -> ROMSettings:
     calibration_windows = _integer(setting["calibration_windows"], "calibration_windows")
     prbs_seed = _integer(setting["prbs_seed"], "prbs_seed", minimum=0)
     prbs_fraction = _positive(setting["prbs_fraction"], "prbs_fraction")
-    if prbs_fraction > 1.0:
-        raise ValueError("prbs_fraction must not exceed 1")
+    if prbs_fraction >= 1.0:
+        raise ValueError("prbs_fraction must be less than 1")
     pod_energy_threshold = _positive(
         setting["pod_energy_threshold"], "pod_energy_threshold"
     )
