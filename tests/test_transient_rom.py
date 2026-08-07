@@ -1499,6 +1499,11 @@ class ROMPipelineTests(unittest.TestCase):
         self.assertFalse(summary["paper_equivalent"])
         self.assertIn("bips1_trans_rom_pred", summary)
         self.assertIn("bips2_trans", summary)
+        self.assertEqual(summary["bips1_trans_rom_pred"], 3.8)
+        self.assertEqual(summary["bips2_trans"], 2.7)
+        self.assertNotEqual(
+            summary["bips1_trans_rom_pred"], summary["bips2_trans"]
+        )
         self.assertNotIn("bips2", summary)
 
     def test_pipeline_rejects_reused_steady_preflight_with_r2_measurement(self):
