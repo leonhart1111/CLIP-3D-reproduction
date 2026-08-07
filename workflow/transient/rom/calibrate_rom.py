@@ -118,6 +118,9 @@ def validate_calibration_holdouts(
         recorded_names = (
             recorded_pss.get("grid_unit_names") if isinstance(recorded_pss, dict) else None
         )
+        temperature_grid_identity_match = (
+            recorded_names == names and tuple(names) == model.grid_unit_names
+        )
         hotspot_converged = (
             isinstance(recorded_pss, dict)
             and recorded_pss.get("full_grid_converged") is True
@@ -158,6 +161,7 @@ def validate_calibration_holdouts(
             "input_identity_match": power_hash_match,
             "frequency_match": frequency_match,
             "hotspot_trace_identity_match": trace_hash_match,
+            "temperature_grid_identity_match": temperature_grid_identity_match,
             "rom": rom,
             "hotspot": hotspot,
         })

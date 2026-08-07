@@ -28,6 +28,7 @@ class StateSpaceModel:
     b_fixed: numpy.ndarray
     b_l2_anchors: dict[str, numpy.ndarray]
     module_names: tuple[str, ...]
+    grid_unit_names: tuple[str, ...]
 
 
 def _finite_real_array(value: Any, name: str, ndim: int) -> numpy.ndarray:
@@ -61,6 +62,11 @@ def _validated_model(model: StateSpaceModel) -> tuple[int, int]:
         raise ValueError("module_names must contain non-empty strings")
     if len(set(model.module_names)) != len(model.module_names):
         raise ValueError("module_names must not contain duplicates")
+    if (len(model.grid_unit_names) != basis.shape[0]
+            or any(not isinstance(name, str) or not name for name in model.grid_unit_names)):
+        raise ValueError("grid_unit_names must identify every temperature_basis row")
+    if len(set(model.grid_unit_names)) != len(model.grid_unit_names):
+        raise ValueError("grid_unit_names must not contain duplicates")
     if not isinstance(model.b_l2_anchors, dict) or not model.b_l2_anchors:
         raise ValueError("b_l2_anchors must be a non-empty dictionary")
     for anchor, column in model.b_l2_anchors.items():
@@ -311,6 +317,7 @@ def fit_state_space(training_cases: list[dict], settings: ROMSettings) -> tuple[
         b_fixed=b_fixed,
         b_l2_anchors=b_l2,
         module_names=fixed_names,
+        grid_unit_names=grid_names,
     )
     _validated_model(model)
     report = {
@@ -387,6 +394,9 @@ def save_model(path: Path, model: StateSpaceModel, metadata: dict) -> None:
     _validated_model(model)
     if not isinstance(metadata, dict):
         raise ValueError("metadata must be a dictionary")
+    if ("grid_unit_names" in metadata
+            and metadata.get("grid_unit_names") != list(model.grid_unit_names)):
+        raise ValueError("metadata grid_unit_names differ from the POD model")
     try:
         metadata_json = json.dumps(
             metadata, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -407,6 +417,7 @@ def save_model(path: Path, model: StateSpaceModel, metadata: dict) -> None:
                 [numpy.asarray(model.b_l2_anchors[name], dtype=float)[:, 0] for name in anchors]
             ),
             module_names=numpy.asarray(model.module_names, dtype=str),
+            grid_unit_names=numpy.asarray(model.grid_unit_names, dtype=str),
             metadata_json=numpy.asarray(metadata_json),
         )
 
@@ -419,6 +430,7 @@ def load_model(path: Path) -> tuple[StateSpaceModel, dict]:
     required = {
         "temperature_basis", "a_continuous", "b_fixed", "b_l2_anchor_ids",
         "b_l2_anchor_values", "module_names", "metadata_json",
+        "grid_unit_names",
     }
     try:
         with numpy.load(source, allow_pickle=False) as archive:
@@ -442,6 +454,9 @@ def load_model(path: Path) -> tuple[StateSpaceModel, dict]:
             module_name_array = archive["module_names"]
             if module_name_array.ndim != 1:
                 raise ValueError("POD model module_names must be one-dimensional")
+            grid_name_array = archive["grid_unit_names"]
+            if grid_name_array.ndim != 1:
+                raise ValueError("POD model grid_unit_names must be one-dimensional")
             model = StateSpaceModel(
                 temperature_basis=numpy.array(_finite_real_array(
                     archive["temperature_basis"], "temperature_basis", 2
@@ -457,10 +472,14 @@ def load_model(path: Path) -> tuple[StateSpaceModel, dict]:
                     for index, name in enumerate(anchor_ids)
                 },
                 module_names=tuple(str(value) for value in module_name_array.tolist()),
+                grid_unit_names=tuple(str(value) for value in grid_name_array.tolist()),
             )
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError("POD model archive is invalid") from error
     if not isinstance(metadata, dict):
         raise ValueError("POD model metadata must be a dictionary")
     _validated_model(model)
+    if ("grid_unit_names" in metadata
+            and metadata.get("grid_unit_names") != list(model.grid_unit_names)):
+        raise ValueError("POD model metadata grid_unit_names differ from stored order")
     return model, metadata

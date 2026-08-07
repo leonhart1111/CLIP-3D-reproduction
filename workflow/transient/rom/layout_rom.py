@@ -206,6 +206,10 @@ def _period_inputs(model: StateSpaceModel, design: dict,
     windows = power_windows["windows"]
     if not windows:
         raise ValueError("power_windows must contain at least one window")
+    nominal_duration = _positive(
+        power_windows.get("nominal_sample_interval_ms"),
+        "power_windows nominal_sample_interval_ms",
+    ) / 1000.0
     l2_name = design.get("l2_name")
     expected_order = (*model.module_names, l2_name)
     if (not isinstance(l2_name, str) or not l2_name
@@ -217,6 +221,18 @@ def _period_inputs(model: StateSpaceModel, design: dict,
         if not isinstance(window, dict):
             raise ValueError(f"window {index} must be a dictionary")
         duration = _positive(window.get("duration_s"), f"window {index} duration_s")
+        if duration > nominal_duration and not math.isclose(
+            duration, nominal_duration, rel_tol=1e-12, abs_tol=1e-15
+        ):
+            raise ValueError(
+                f"window {index} duration_s exceeds the HotSpot sampling interval"
+            )
+        if index < len(windows) - 1 and not math.isclose(
+            duration, nominal_duration, rel_tol=1e-12, abs_tol=1e-15
+        ):
+            raise ValueError(
+                f"non-final window {index} duration_s differs from the HotSpot sampling interval"
+            )
         modules = window.get("modules")
         if not isinstance(modules, list):
             raise ValueError(f"window {index} modules must be a list")
@@ -241,7 +257,10 @@ def _period_inputs(model: StateSpaceModel, design: dict,
         ], dtype=float)
         if not numpy.all(numpy.isfinite(powers)) or numpy.any(powers < 0.0):
             raise ValueError(f"window {index} has invalid frequency-scaled module power")
-        result.append((duration / scale, powers))
+        # HotSpot accepts one power row per fixed sampling interval.  Its last
+        # partial gem5 window is therefore held through the remaining padding,
+        # so the ROM must integrate that row for the same fixed interval.
+        result.append((nominal_duration / scale, powers))
     return result
 
 
@@ -395,19 +414,24 @@ def validate_holdouts(holdouts: list[dict], settings: ROMSettings, *,
             "hotspot_trace_identity": (
                 comparison.get("hotspot_trace_identity_match") is True
             ),
+            "temperature_grid_identity": (
+                comparison.get("temperature_grid_identity_match") is True
+            ),
             "periodic_steady_state": (
                 rom.get("converged") is True and hotspot.get("converged") is True
             ),
         }
-        rom_grid = _finite_grid(
-            rom.get("final_period_grid_c"), f"holdout {identifier} ROM grid"
-        )
-        hotspot_grid = _finite_grid(
-            hotspot.get("final_period_grid_c"), f"holdout {identifier} HotSpot grid"
-        )
-        if rom_grid.shape != hotspot_grid.shape:
-            raise ValueError(f"holdout {identifier} ROM/HotSpot grids differ in shape")
-        rmse = float(numpy.sqrt(numpy.mean((rom_grid - hotspot_grid) ** 2)))
+        rmse = None
+        if gate["temperature_grid_identity"]:
+            rom_grid = _finite_grid(
+                rom.get("final_period_grid_c"), f"holdout {identifier} ROM grid"
+            )
+            hotspot_grid = _finite_grid(
+                hotspot.get("final_period_grid_c"), f"holdout {identifier} HotSpot grid"
+            )
+            if rom_grid.shape != hotspot_grid.shape:
+                raise ValueError(f"holdout {identifier} ROM/HotSpot grids differ in shape")
+            rmse = float(numpy.sqrt(numpy.mean((rom_grid - hotspot_grid) ** 2)))
         rom_peak = _finite(
             rom.get("last_period_peak_c"), f"holdout {identifier} ROM peak"
         )
@@ -419,12 +443,15 @@ def validate_holdouts(holdouts: list[dict], settings: ROMSettings, *,
         if not isinstance(rom_safe, bool) or not isinstance(hotspot_safe, bool):
             raise ValueError(f"holdout {identifier} lacks boolean safety classes")
         gate.update({
-            "grid_rmse": rmse <= settings.max_holdout_grid_rmse_c,
+            "grid_rmse": (
+                None if rmse is None
+                else rmse <= settings.max_holdout_grid_rmse_c
+            ),
             "peak_temperature_error": peak_error <= settings.max_holdout_peak_error_c,
             "safety_classification": rom_safe == hotspot_safe,
         })
         for name, passed in gate.items():
-            if not passed and name not in failures:
+            if passed is False and name not in failures:
                 failures.append(name)
         cases.append({
             "id": identifier,

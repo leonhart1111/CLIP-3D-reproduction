@@ -469,6 +469,7 @@ class StateSpaceTests(unittest.TestCase):
             b_fixed=numpy.empty((1, 0), dtype=float),
             b_l2_anchors={"a0": numpy.array([[b]], dtype=float)},
             module_names=(),
+            grid_unit_names=("cell0",),
         )
 
     def settings(self):
@@ -565,6 +566,7 @@ class StateSpaceTests(unittest.TestCase):
             b_l2_anchor_ids=numpy.array(["a0", "a0"]),
             b_l2_anchor_values=numpy.array([[1.0], [2.0]]),
             module_names=numpy.array([], dtype=str),
+            grid_unit_names=numpy.array(["cell0"], dtype=str),
             metadata_json=numpy.asarray("{}"),
         )
 
@@ -583,6 +585,7 @@ class StateSpaceTests(unittest.TestCase):
             b_l2_anchor_ids=numpy.array(["a0"]),
             b_l2_anchor_values=numpy.array([[1.0]]),
             module_names=numpy.array([], dtype=str),
+            grid_unit_names=numpy.array(["cell0"], dtype=str),
             metadata_json=numpy.asarray("{}"),
         )
 
@@ -612,6 +615,28 @@ class StateSpaceTests(unittest.TestCase):
         self.assertEqual(loaded.module_names, model.module_names)
         self.assertEqual(loaded_metadata, metadata)
 
+    def test_loaded_model_persists_temperature_grid_order(self):
+        # Break caught: without ordered grid identities in the loaded model,
+        # holdout cells can be compared positionally against the wrong POD rows.
+        path = self.root / "grid-names.npz"
+        numpy.savez_compressed(
+            path,
+            temperature_basis=numpy.ones((2, 1)),
+            a_continuous=numpy.array([[-1.0]]),
+            b_fixed=numpy.empty((1, 0)),
+            b_l2_anchor_ids=numpy.array(["a0"]),
+            b_l2_anchor_values=numpy.array([[1.0]]),
+            module_names=numpy.array([], dtype=str),
+            grid_unit_names=numpy.array(["cell0", "cell1"], dtype=str),
+            metadata_json=numpy.asarray('{"grid_unit_names":["cell0","cell1"]}'),
+        )
+
+        loaded, _ = load_model(path)
+
+        self.assertEqual(
+            getattr(loaded, "grid_unit_names", None), ("cell0", "cell1")
+        )
+
 
 class ROMEvaluationTests(unittest.TestCase):
     @staticmethod
@@ -627,6 +652,7 @@ class ROMEvaluationTests(unittest.TestCase):
                 "a3": numpy.array([[8.0]]),
             },
             module_names=("core0",),
+            grid_unit_names=("cell0",),
         )
 
     @staticmethod
@@ -658,6 +684,7 @@ class ROMEvaluationTests(unittest.TestCase):
     @staticmethod
     def power_windows() -> dict:
         return {
+            "nominal_sample_interval_ms": 1000.0,
             "windows": [{
                 "duration_s": 1.0,
                 "modules": [
@@ -728,6 +755,31 @@ class ROMEvaluationTests(unittest.TestCase):
         self.assertTrue(result["last_period_peak"]["includes_period_initial_state"])
         self.assertTrue(result["converged"])
 
+    def test_partial_final_window_uses_full_hotspot_sampling_interval(self):
+        # Break caught: integrating the final partial ROI duration makes the
+        # ROM use less thermal time than HotSpot, whose last row is held for a
+        # complete sampling interval before frequency scaling.
+        power_windows = self.power_windows()
+        partial = {
+            **power_windows["windows"][0],
+            "duration_s": 0.25,
+            "modules": [dict(module) for module in power_windows["windows"][0]["modules"]],
+        }
+        power_windows["windows"].append(partial)
+
+        result = evaluate_layout_rom(
+            self.model(), self.design(), power_windows, self.layout(),
+            4.0, self.settings(),
+            {"frequency": {"f0_ghz": 2.0, "ambient_c": 25.0,
+                           "tsafe_c": 100.0}},
+        )
+
+        expected_rise = 10.0 * (1.0 - math.exp(-2.0))
+        self.assertAlmostEqual(
+            result["final_period_grid_c"][-1][0], 25.0 + expected_rise,
+            places=12,
+        )
+
     def test_evaluation_rejects_changed_or_malformed_module_inputs(self):
         # Break caught: accepting an incomplete window shifts B columns and can
         # apply one module's power to another module's spatial input.
@@ -776,6 +828,7 @@ class ROMEvaluationTests(unittest.TestCase):
                 "id": "h0", "geometry_match": True,
                 "input_identity_match": True, "frequency_match": True,
                 "hotspot_trace_identity_match": True,
+                "temperature_grid_identity_match": True,
                 "rom": {
                     "converged": True,
                     "final_period_grid_c": [[30.0, 31.0]],
@@ -791,6 +844,7 @@ class ROMEvaluationTests(unittest.TestCase):
                 "id": "h1", "geometry_match": True,
                 "input_identity_match": True, "frequency_match": True,
                 "hotspot_trace_identity_match": True,
+                "temperature_grid_identity_match": True,
                 "rom": {
                     "converged": False,
                     "final_period_grid_c": [[30.0, 30.0]],
@@ -855,57 +909,68 @@ class ROMEvaluationTests(unittest.TestCase):
                 )
             self.assertFalse((output / "rom_acceptance.json").exists())
 
-    def test_calibration_holdouts_compare_the_recorded_geometry_input_and_frequency(self):
-        # Break caught: validating a prediction against a trace from another
-        # placement, power artifact, or frequency can falsely accept the ROM.
+    def _write_holdout_cases(self, root: Path, model: StateSpaceModel,
+                             trace_names: tuple[str, ...]) -> tuple[dict, list[dict]]:
         config = {"frequency": {"f0_ghz": 2.0, "ambient_c": 25.0,
                                 "tsafe_c": 100.0}}
         expected = evaluate_layout_rom(
-            self.model(), self.design(), self.power_windows(), self.layout(),
+            model, self.design(), self.power_windows(), self.layout(),
             4.0, self.settings(), config,
         )
 
         def sha256(path: Path) -> str:
             return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
+        cases = []
+        for index in range(2):
+            case_dir = root / f"h{index}"
+            case_dir.mkdir()
+            layout_path = case_dir / "layout.json"
+            power_path = case_dir / "power.json"
+            trace_path = case_dir / "transient.ttrace"
+            write_json(layout_path, self.layout())
+            write_json(power_path, self.power_windows())
+            rows = [expected["period_start_grid_c"], expected["final_period_grid_c"][-1]]
+            trace_path.write_text(
+                "\t".join(trace_names) + "\n"
+                + "\n".join(
+                    "\t".join(f"{value + 273.15:.15f}" for value in row)
+                    for row in rows
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            cases.append({
+                "id": f"h{index}",
+                "point": {"id": f"h{index}", "tier": 0,
+                          "x_mm": 0.0, "y_mm": 0.0},
+                "frequency_ghz": 4.0,
+                "frequency_scale": 2.0,
+                "artifacts": {
+                    "layout": str(layout_path),
+                    "power_windows": str(power_path),
+                    "temperature_trace": str(trace_path),
+                    "sha256": {
+                        "layout": sha256(layout_path),
+                        "power_windows": sha256(power_path),
+                        "temperature_trace": sha256(trace_path),
+                    },
+                },
+                "periodic_steady_state": {
+                    "full_grid_converged": True,
+                    "grid_unit_names": list(trace_names),
+                },
+            })
+        return config, cases
+
+    def test_calibration_holdouts_compare_the_recorded_geometry_input_and_frequency(self):
+        # Break caught: validating a prediction against a trace from another
+        # placement, power artifact, or frequency can falsely accept the ROM.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            cases = []
-            for index in range(2):
-                case_dir = root / f"h{index}"
-                case_dir.mkdir()
-                layout_path = case_dir / "layout.json"
-                power_path = case_dir / "power.json"
-                trace_path = case_dir / "transient.ttrace"
-                write_json(layout_path, self.layout())
-                write_json(power_path, self.power_windows())
-                trace_path.write_text(
-                    "cell0\n"
-                    f"{expected['period_start_grid_c'][0] + 273.15:.15f}\n"
-                    f"{expected['final_period_grid_c'][-1][0] + 273.15:.15f}\n",
-                    encoding="utf-8",
-                )
-                cases.append({
-                    "id": f"h{index}",
-                    "point": {"id": f"h{index}", "tier": 0,
-                              "x_mm": 0.0, "y_mm": 0.0},
-                    "frequency_ghz": 4.0,
-                    "frequency_scale": 2.0,
-                    "artifacts": {
-                        "layout": str(layout_path),
-                        "power_windows": str(power_path),
-                        "temperature_trace": str(trace_path),
-                        "sha256": {
-                            "layout": sha256(layout_path),
-                            "power_windows": sha256(power_path),
-                            "temperature_trace": sha256(trace_path),
-                        },
-                    },
-                    "periodic_steady_state": {
-                        "full_grid_converged": True,
-                        "grid_unit_names": ["cell0"],
-                    },
-                })
+            config, cases = self._write_holdout_cases(
+                root, self.model(), ("cell0",)
+            )
 
             report = validate_calibration_holdouts(
                 self.model(), self.design(), cases, self.settings(), config,
@@ -923,6 +988,28 @@ class ROMEvaluationTests(unittest.TestCase):
             )
             self.assertFalse(rejected["accepted"])
             self.assertIn("hotspot_trace_identity", rejected["failure_reasons"])
+
+    def test_calibration_rejects_reordered_hotspot_grid_before_rmse(self):
+        # Break caught: equal-width arrays with a reordered HotSpot header must
+        # not be compared positionally against differently ordered POD rows.
+        model = replace(
+            self.model(), temperature_basis=numpy.ones((2, 1)),
+            grid_unit_names=("cell0", "cell1"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config, cases = self._write_holdout_cases(
+                root, model, ("cell1", "cell0")
+            )
+
+            report = validate_calibration_holdouts(
+                model, self.design(), cases, self.settings(), config,
+                output_dir=root / "package", identity=ROMContractTests.identity(),
+            )
+
+            self.assertFalse(report["accepted"])
+            self.assertIn("temperature_grid_identity", report["failure_reasons"])
+            self.assertIsNone(report["holdouts"][0]["grid_rmse_c"])
 
 
 if __name__ == "__main__":
