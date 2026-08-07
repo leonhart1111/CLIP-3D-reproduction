@@ -50,7 +50,13 @@ from workflow.transient.run_hotspot_transient import (
     summarize_period_end_convergence,
 )
 from workflow.transient.validation import power_trace_identity, validate_power_windows
-from workflow.transient.verify_sustainable_frequency import find_sustainable_frequency
+from workflow.transient.verify_sustainable_frequency import (
+    find_sustainable_frequency,
+    last_period_peak,
+)
+
+
+_USE_DERIVED_FINAL_VALIDATION = object()
 
 
 def canonical_json_sha256(value: object) -> str:
@@ -2142,54 +2148,103 @@ class ROMPipelineTests(unittest.TestCase):
         }
 
     @staticmethod
-    def final_validation(evaluations: list[dict] | None = None) -> dict:
-        """Return a result built by the real canonical frequency-search helper."""
+    def final_validation_trace_rows(
+        frequency_ghz: float, profile: str,
+    ) -> list[list[float]]:
+        """Return independent two-window, two-cell temperature facts in C."""
+        if profile == "baseline":
+            last_period_initial_peak_c = (
+                49.0 if frequency_ghz <= 1.8 else 51.0
+            )
+            period_end_peaks_c = [
+                last_period_initial_peak_c + (18 - index) * 0.005
+                for index in range(20)
+            ]
+        elif profile == "nonconverged":
+            last_period_peak_c = 48.0 + 0.5 * (frequency_ghz - 1.0)
+            period_end_peaks_c = [
+                last_period_peak_c - (19 - index)
+                for index in range(20)
+            ]
+        elif profile == "all_unsafe":
+            last_period_initial_peak_c = 51.0 + 0.5 * (frequency_ghz - 1.0)
+            period_end_peaks_c = [
+                last_period_initial_peak_c + (18 - index) * 0.005
+                for index in range(20)
+            ]
+        else:
+            raise ValueError(f"unknown final validation trace profile: {profile}")
+
+        rows_c = []
+        for period_end_peak_c in period_end_peaks_c:
+            rows_c.extend([
+                [period_end_peak_c - 1.5, period_end_peak_c - 0.75],
+                [period_end_peak_c - 0.5, period_end_peak_c],
+            ])
+        return rows_c
+
+    @classmethod
+    def write_final_validation_trace(
+        cls, output_dir: Path, frequency_ghz: float, profile: str,
+    ) -> None:
+        """Write trace facts without consulting any mocked search evaluation."""
+        rows_c = cls.final_validation_trace_rows(frequency_ghz, profile)
+        case_dir = output_dir / f"frequency_{frequency_ghz.hex()}_ghz"
+        case_dir.mkdir(parents=True, exist_ok=True)
+        write_json(case_dir / "transient_trace_manifest.json", {
+            "window_count": len(rows_c),
+            "windows_per_period": 2,
+            "period_repeats": 20,
+            "grid_cell_count": 2,
+            "frequency_scaling": {
+                "frequency_scale": frequency_ghz / 2.0,
+            },
+        })
+        (case_dir / "transient.ttrace").write_text(
+            "cell0\tcell1\n"
+            + "\n".join(
+                "\t".join(f"{temperature_c + 273.15:.17g}" for temperature_c in row)
+                for row in rows_c
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def final_validation(
+        self, profile: str = "baseline", output_dir: Path | None = None,
+    ) -> dict:
+        """Derive a canonical search solely from materialized trace facts."""
         grid = [1.0, 1.8, 2.0]
-        supplied = None if evaluations is None else {
-            float(evaluation["frequency_ghz"]): dict(evaluation)
-            for evaluation in evaluations
-        }
+        artifact_root = (
+            self.root / f"derived_final_validation_{profile}"
+            if output_dir is None else Path(output_dir)
+        )
+        artifact_root.mkdir(parents=True, exist_ok=True)
 
         def evaluate(frequency_ghz: float) -> dict:
-            if supplied is None:
-                converged = True
-                peak_c = 49.0 if frequency_ghz <= 1.8 else 51.0
-            else:
-                recorded = supplied[frequency_ghz]
-                converged = recorded["converged"]
-                peak_c = recorded["last_period_peak_c"]
-            last_delta = 0.0 if converged else 1.0
-            period_end_tmax_c = (
-                [peak_c] * 20 if converged
-                else [peak_c - (19 - index) for index in range(20)]
+            self.write_final_validation_trace(
+                artifact_root, frequency_ghz, profile,
             )
-            deltas = [
-                {
-                    "from_period_index": index - 1,
-                    "to_period_index": index,
-                    "delta_max_c": last_delta,
-                    "unit_index": 0,
-                }
-                for index in range(1, 20)
-            ]
+            case_dir = artifact_root / f"frequency_{frequency_ghz.hex()}_ghz"
+            names, rows_k = parse_ttrace_grid(case_dir / "transient.ttrace")
+            convergence = summarize_period_end_convergence(rows_k, 2)
+            peak = last_period_peak(rows_k, 2)
             return {
                 "frequency_ghz": frequency_ghz,
-                "converged": converged,
-                "last_period_peak_c": peak_c,
-                "last_period_peak_unit": "cell0",
-                "period_end_convergence": {
-                    "period_count": 20,
-                    "grid_cell_count": 1,
-                    "period_end_tmax_c": period_end_tmax_c,
-                    "period_end_deltas": deltas,
-                    "last_delta_max_c": last_delta,
-                    "last_delta_unit_index": 0,
-                },
-                "trace_peak_c": peak_c,
+                "converged": (
+                    convergence["period_count"] >= 2
+                    and convergence["last_delta_max_c"] <= 0.01
+                ),
+                "last_period_peak_c": peak["tmax_c"],
+                "last_period_peak_unit": names[peak["unit_index"]],
+                "period_end_convergence": convergence,
+                "trace_peak_c": max(
+                    temperature for row in rows_k for temperature in row
+                ) - 273.15,
             }
 
         search = find_sustainable_frequency(evaluate, grid, 50.0, 0.01)
-        return {
+        result = {
             "schema_version": 1,
             "state": search["state"],
             "f_sus_trans_ghz": search["sustainable_frequency_ghz"],
@@ -2199,56 +2254,32 @@ class ROMPipelineTests(unittest.TestCase):
             },
             "search": search,
         }
+        write_json(
+            artifact_root / "transient_sustainable_frequency.json", result,
+        )
+        return result
 
-    @staticmethod
-    def write_final_validation_artifacts(output_dir: Path, result: object) -> None:
-        """Materialize one-cell trace evidence for a mocked final search."""
-        search = result.get("search") if isinstance(result, dict) else None
-        evaluations = search.get("evaluations") if isinstance(search, dict) else None
-        if not isinstance(evaluations, list):
-            return
-        for evaluation in evaluations:
-            if not isinstance(evaluation, dict):
-                continue
-            frequency = evaluation.get("frequency_ghz")
-            if isinstance(frequency, bool) or not isinstance(frequency, (int, float)):
-                continue
-            evidence = evaluation.get("period_end_convergence")
-            period_end_tmax_c = (
-                evidence.get("period_end_tmax_c")
-                if isinstance(evidence, dict) else None
-            )
-            if not isinstance(period_end_tmax_c, list) or not period_end_tmax_c:
-                continue
-            case_dir = output_dir / f"frequency_{float(frequency).hex()}_ghz"
-            case_dir.mkdir(parents=True, exist_ok=True)
-            write_json(case_dir / "transient_trace_manifest.json", {
-                "window_count": len(period_end_tmax_c),
-                "windows_per_period": 1,
-                "period_repeats": len(period_end_tmax_c),
-                "grid_cell_count": 1,
-                "frequency_scaling": {
-                    "frequency_scale": float(frequency) / 2.0,
-                },
-            })
-            (case_dir / "transient.ttrace").write_text(
-                "cell0\n"
-                + "\n".join(
-                    f"{float(temperature) + 273.15:.17g}"
-                    for temperature in period_end_tmax_c
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-    def final_validation_side_effect(self, result: object):
+    def final_validation_side_effect(
+        self, result: object = _USE_DERIVED_FINAL_VALIDATION, *,
+        profile: str = "baseline", artifact_mutation=None,
+    ):
         def run(*args, **_kwargs):
-            self.write_final_validation_artifacts(Path(args[3]), result)
-            return result
+            output_dir = Path(args[3])
+            derived = self.final_validation(profile, output_dir)
+            if artifact_mutation is not None:
+                artifact_mutation(output_dir, derived)
+            return (
+                derived
+                if result is _USE_DERIVED_FINAL_VALIDATION
+                else result
+            )
 
         return run
 
-    def run_with_final_validation(self, final_validation: object):
+    def run_with_final_validation(
+        self, final_validation: object = _USE_DERIVED_FINAL_VALIDATION,
+        *, artifact_mutation=None,
+    ):
         """Run the pipeline to the final validation boundary with tools mocked."""
         from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
 
@@ -2277,7 +2308,9 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"ipc2": 1.5},
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            side_effect=self.final_validation_side_effect(final_validation),
+            side_effect=self.final_validation_side_effect(
+                final_validation, artifact_mutation=artifact_mutation,
+            ),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2317,7 +2350,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"ipc2": 1.5},
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            side_effect=self.final_validation_side_effect(self.final_validation()),
+            side_effect=self.final_validation_side_effect(),
         ):
             return run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2406,9 +2439,7 @@ class ROMPipelineTests(unittest.TestCase):
 
         def final_side_effect(*args, **kwargs):
             events.append("hotspot")
-            result = self.final_validation()
-            self.write_final_validation_artifacts(Path(args[3]), result)
-            return result
+            return self.final_validation(output_dir=Path(args[3]))
 
         with patch(
             "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
@@ -2530,6 +2561,44 @@ class ROMPipelineTests(unittest.TestCase):
 
         prepare.assert_not_called()
 
+    def test_final_validation_fixture_derives_multicell_search_and_allows_r2(self):
+        # Break caught: synthesizing trace artifacts from the mocked search
+        # result makes the artifact-binding check circular instead of proving
+        # that canonical multi-window, multi-cell trace evidence supports R2.
+        result, _build_vector_mock, run_r2_mock = self.run_with_final_validation()
+
+        validation = read_json(
+            self.output
+            / "final_hotspot_validation/transient_sustainable_frequency.json"
+        )
+        evaluations = validation["search"]["evaluations"]
+        self.assertGreater(len(evaluations), 3)
+        for evaluation in evaluations:
+            frequency = evaluation["frequency_ghz"]
+            case_dir = (
+                self.output / "final_hotspot_validation"
+                / f"frequency_{frequency.hex()}_ghz"
+            )
+            manifest = read_json(case_dir / "transient_trace_manifest.json")
+            names, rows_k = parse_ttrace_grid(case_dir / "transient.ttrace")
+            self.assertEqual(manifest["windows_per_period"], 2)
+            self.assertEqual(manifest["grid_cell_count"], 2)
+            self.assertEqual(names, ["cell0", "cell1"])
+            self.assertEqual(len(rows_k), 40)
+            peak = last_period_peak(rows_k, 2)
+            self.assertEqual(peak["phase"], "period_initial_state")
+            self.assertEqual(
+                evaluation["last_period_peak_c"], peak["tmax_c"]
+            )
+            self.assertEqual(
+                evaluation["period_end_convergence"],
+                summarize_period_end_convergence(rows_k, 2),
+            )
+
+        run_r2_mock.assert_called_once()
+        self.assertEqual(result["final_validation_classification"], "validated")
+        self.assertTrue(result["r2_executed"])
+
     def test_pipeline_rejects_steady_preflight_cacti_path_before_power_or_r2(self):
         # Break caught: a steady summary pointing at a different CACTI result
         # must not silently authorize the expected-path file for R2 derivation.
@@ -2619,20 +2688,9 @@ class ROMPipelineTests(unittest.TestCase):
             "workflow.transient.rom.run_pipeline.run_r2"
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            side_effect=self.final_validation_side_effect(self.final_validation([
-                {
-                    "frequency_ghz": 1.0, "converged": False,
-                    "last_period_peak_c": 48.0, "safe": False,
-                },
-                {
-                    "frequency_ghz": 1.8, "converged": False,
-                    "last_period_peak_c": 48.5, "safe": False,
-                },
-                {
-                    "frequency_ghz": 2.0, "converged": False,
-                    "last_period_peak_c": 49.0, "safe": False,
-                },
-            ])),
+            side_effect=self.final_validation_side_effect(
+                profile="nonconverged"
+            ),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2841,6 +2899,32 @@ class ROMPipelineTests(unittest.TestCase):
 
         self.assert_final_validation_contract_failure(returned)
 
+    def test_final_trace_mutation_is_contract_failure_and_skips_r2(self):
+        # Break caught: artifact validation must compare the independently
+        # returned search with the trace bytes, not merely replay JSON fields.
+        def mutate_trace(output_dir: Path, returned: dict) -> None:
+            frequency = returned["search"]["evaluations"][0]["frequency_ghz"]
+            trace = (
+                output_dir / f"frequency_{frequency.hex()}_ghz/transient.ttrace"
+            )
+            lines = trace.read_text(encoding="utf-8").splitlines()
+            fields = lines[-1].split()
+            fields[-1] = f"{float(fields[-1]) + 1.0:.17g}"
+            lines[-1] = "\t".join(fields)
+            trace.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        result, build_vector_mock, run_r2_mock = self.run_with_final_validation(
+            artifact_mutation=mutate_trace,
+        )
+
+        build_vector_mock.assert_not_called()
+        run_r2_mock.assert_not_called()
+        self.assertEqual(result["state"], "rom_final_validation_failed")
+        self.assertEqual(
+            result["final_validation_failure"]["category"],
+            "validation_contract_error",
+        )
+
     def test_final_huge_json_number_is_validation_contract_failure(self):
         returned = self.final_validation()
         returned["search"]["evaluations"][0]["last_period_peak_c"] = 10**400
@@ -2883,20 +2967,9 @@ class ROMPipelineTests(unittest.TestCase):
             "workflow.transient.rom.run_pipeline.run_r2"
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            side_effect=self.final_validation_side_effect(self.final_validation([
-                {
-                    "frequency_ghz": 1.0, "converged": True,
-                    "last_period_peak_c": 51.0, "safe": False,
-                },
-                {
-                    "frequency_ghz": 1.8, "converged": True,
-                    "last_period_peak_c": 51.5, "safe": False,
-                },
-                {
-                    "frequency_ghz": 2.0, "converged": True,
-                    "last_period_peak_c": 52.0, "safe": False,
-                },
-            ])),
+            side_effect=self.final_validation_side_effect(
+                profile="all_unsafe"
+            ),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2974,7 +3047,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"critical_l1d_to_l2_cycles": 7},
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            side_effect=self.final_validation_side_effect(self.final_validation()),
+            side_effect=self.final_validation_side_effect(),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -3045,7 +3118,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"critical_l1d_to_l2_cycles": 7},
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            side_effect=self.final_validation_side_effect(self.final_validation()),
+            side_effect=self.final_validation_side_effect(),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, second_output, self.config_path,
@@ -3151,7 +3224,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"ipc2": 1.5},
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            side_effect=self.final_validation_side_effect(self.final_validation()),
+            side_effect=self.final_validation_side_effect(),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,

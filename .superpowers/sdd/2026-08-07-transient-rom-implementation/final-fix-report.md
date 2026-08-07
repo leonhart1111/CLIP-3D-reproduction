@@ -10,6 +10,9 @@ Latest replay-hardening round base:
 Latest artifact-binding round base:
 `94c0ca639c3d8053ed7ba2bb222dd3447e7d03e6`
 
+Latest fixture-independence round base:
+`9a3bb1511d084a6b4af4d345442d4f4f52364c7b`
+
 Scope: final correctness, reuse-integrity, failure-semantics, and auditability
 fixes for the non-formal transient-ROM path. The steady Eq. 13 implementation
 was intentionally left unchanged.
@@ -70,6 +73,11 @@ was intentionally left unchanged.
     and replay identically into the rebuilt search. The root cause was binding
     search control flow to the canonical algorithm without binding each thermal
     evaluation to the actual per-frequency manifest and temperature trace.
+12. The first artifact-binding regression fixture generated each temperature
+    trace from the already-mocked final-search evaluation. Returned JSON and
+    artifact evidence therefore shared the same asserted values, so a
+    self-consistent but physically arbitrary mismatch could pass the binding
+    validator. The production validator was sound; the test helper was circular.
 
 ## Implemented behavior
 
@@ -149,6 +157,16 @@ was intentionally left unchanged.
   evidence becomes `validation_contract_error`, writes the failure JSON, and
   prevents latency-vector/R2 execution. This read-only replay makes no
   additional HotSpot call and imposes no guessed grid-size cap.
+- Final-pipeline tests now define independent two-window, two-cell temperature
+  traces and manifests first. The fixture parses those files and calls the
+  shared PSS summarizer, inclusive final-period peak helper, and canonical
+  frequency search to derive the mocked return. The converged baseline puts its
+  final-period maximum in the period-initial state, so it exercises the exact
+  peak boundary while independently supporting normal mocked R2 execution.
+  Nonconverged and all-unsafe scenarios are likewise trace profiles rather than
+  predeclared evaluation dictionaries. Returned-JSON mutations and trace-byte
+  mutations are applied separately; both are rejected before latency-vector
+  construction or R2.
 - The standalone `calibrate_rom` CLI now finalizes
   `rom_artifact_manifest.json` through the same shared package-finalization
   helpers as pipeline calibration.
@@ -250,6 +268,28 @@ Manual boundary checks also confirmed that both a missing and a malformed
 `transient.ttrace` produce `validation_contract_error`, write
 `final_validation_failure.json`, and skip latency-vector construction and R2.
 
+The fixture-independence round used two test-first API regressions:
+
+```text
+RED 1: test_final_validation_fixture_derives_multicell_search_and_allows_r2
+       failed because the old result-first helper required a prebuilt search:
+       TypeError: run_with_final_validation() missing ... 'final_validation'.
+
+GREEN 1: independent 20-period x 2-window x 2-cell trace facts are written
+         first; parse_ttrace_grid(), summarize_period_end_convergence(),
+         last_period_peak(), and find_sustainable_frequency() derive the
+         returned search, which passes artifact binding and permits mocked R2.
+
+RED 2: test_final_trace_mutation_is_contract_failure_and_skips_r2 failed
+       because the helper had no independent artifact-mutation boundary:
+       TypeError: unexpected keyword argument 'artifact_mutation'.
+
+GREEN 2: changing only one trace sample while returning the independently
+         derived baseline search produces validation_contract_error and calls
+         neither build_vector nor run_r2. Existing JSON-only mutations continue
+         to regenerate untouched trace facts and fail the same binding gate.
+```
+
 ## Fresh verification
 
 Focused package-reuse, final-pipeline, and calibration-case suites:
@@ -261,7 +301,9 @@ Focused package-reuse, final-pipeline, and calibration-case suites:
   tests.test_transient_rom.ROMCalibrationCaseTests -v
 ```
 
-Result: `53 tests` passed.
+Artifact-binding round result: `53 tests` passed.
+
+Fixture-independence result: `55 tests` passed.
 
 Complete transient-ROM test module:
 
@@ -271,6 +313,8 @@ Complete transient-ROM test module:
 ```
 
 Result: `90 tests` passed.
+
+Fixture-independence result: `92 tests` passed.
 
 Relevant integration suite, after the replay-hardening fixes:
 
@@ -282,14 +326,20 @@ Relevant integration suite, after the replay-hardening fixes:
 Result: `226 tests` passed; `2` expected skips for unavailable live HotSpot
 tests.
 
+Fixture-independence result: `228 tests` passed; `2` expected skips for
+unavailable live HotSpot tests.
+
 Full discovery, after the replay-hardening fixes:
 
 ```bash
 /home/zyjiang/Agenticflow/CLIP/.venv/bin/python -m unittest discover -s tests
 ```
 
-Result: `374 tests` run; `1` error and `2` expected skips. The only error is the
-pre-existing historical fixture gap in
+Artifact-binding round result: `374 tests` run; `1` error and `2` expected
+skips.
+
+Fixture-independence result: `376 tests` run; `1` error and `2` expected skips.
+The only error in both rounds is the pre-existing historical fixture gap in
 `test_lambda_wire_exploratory_config.py`:
 
 ```text
@@ -321,6 +371,12 @@ canonical final-search replay, overflow-safe contract failure, and
 non-self-asserting replay from immutable final HotSpot artifacts—are covered by
 the seven-test and artifact-binding RED/GREEN rounds above, in addition to the
 preceding 12-test reuse/final-validation round.
+
+The artifact-binding production validator was not weakened in the
+fixture-independence round. Only the test fixture and this report changed; the
+new baseline derives its search from independent trace bytes, and separate JSON
+and artifact mutations demonstrate that the validator still rejects either
+side of a mismatch before R2.
 
 No live HotSpot, gem5, McPAT, CACTI, R1, R2, or EDA tool was invoked during
 these fixes or verification. Tests use synthetic artifacts and mocks at the
