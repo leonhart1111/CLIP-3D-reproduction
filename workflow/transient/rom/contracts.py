@@ -208,17 +208,25 @@ def require_accepted_package(package_dir: Path, identity: dict) -> dict:
     if not isinstance(acceptance, dict) or acceptance.get("accepted") is not True:
         raise ValueError("ROM package is not accepted")
     package_identity = acceptance.get("identity")
-    if not isinstance(package_identity, dict):
-        raise ValueError("ROM package is not accepted: missing identity")
-    if not isinstance(identity, dict):
-        raise ValueError("requested ROM identity must be a dictionary")
-
-    for name in _REQUIRED_IDENTITY_FIELDS:
-        if name not in package_identity:
-            raise ValueError(_IDENTITY_LABELS[name])
-    for name, requested_value in identity.items():
-        if package_identity.get(name) != requested_value:
-            if name in _IDENTITY_LABELS:
+    package_identity = _normalized_identity(package_identity, "ROM package")
+    identity = _normalized_identity(identity, "requested ROM")
+    if package_identity != identity:
+        for name in _REQUIRED_IDENTITY_FIELDS:
+            if package_identity[name] != identity[name]:
                 raise ValueError(_IDENTITY_LABELS[name])
-            raise ValueError(f"{name} identity")
+        raise ValueError("ROM package identity differs")
     return acceptance
+
+
+def _normalized_identity(value: Any, context: str) -> dict:
+    """Require a JSON-normalized identity with exactly the scientific fields."""
+    normalized = _json_value(value, f"{context} identity")
+    if not isinstance(normalized, dict):
+        raise ValueError(f"{context} identity must be a dictionary")
+    for name in _REQUIRED_IDENTITY_FIELDS:
+        if name not in normalized:
+            raise ValueError(_IDENTITY_LABELS[name])
+    extras = set(normalized) - set(_REQUIRED_IDENTITY_FIELDS)
+    if extras:
+        raise ValueError(f"{context} identity contains unsupported fields")
+    return normalized

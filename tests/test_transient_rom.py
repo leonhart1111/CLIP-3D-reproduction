@@ -86,7 +86,18 @@ class ROMContractTests(unittest.TestCase):
         })
 
         with self.assertRaisesRegex(ValueError, "power trace identity"):
-            require_accepted_package(self.package, {"power_trace": "changed"})
+            require_accepted_package(
+                self.package, {**self.identity(), "power_trace": "changed"}
+            )
+
+    def test_require_accepted_package_rejects_partial_matching_identity(self):
+        write_json(self.package / "rom_acceptance.json", {
+            "accepted": True,
+            "identity": self.identity(),
+        })
+
+        with self.assertRaisesRegex(ValueError, "canonical R1 metadata hash identity"):
+            require_accepted_package(self.package, {"power_trace": "sha256:power"})
 
     def test_require_accepted_package_rejects_unaccepted_or_incomplete_identity(self):
         write_json(self.package / "rom_acceptance.json", {"accepted": False})
