@@ -10,6 +10,12 @@ from workflow.transient.rom.contracts import (
     require_accepted_package,
     rom_input_identity,
 )
+from workflow.transient.rom.calibration_design import (
+    build_design,
+    interpolation_domain,
+    layout_for_point,
+    make_prbs_input,
+)
 
 
 class ROMContractTests(unittest.TestCase):
@@ -110,6 +116,67 @@ class ROMContractTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "canonical R1 metadata hash identity"):
             require_accepted_package(self.package, self.identity())
+
+
+class CalibrationDesignTests(unittest.TestCase):
+    @staticmethod
+    def model() -> dict:
+        modules = []
+        for core in range(4):
+            modules.append({
+                "name": f"core{core}_logic", "kind": "core_logic", "core": core,
+                "area_mm2": 1.0, "dynamic_power_w": 0.8,
+                "leakage_power_w": 0.2, "total_power_w": 1.0,
+            })
+        modules.extend((
+            {"name": "shared_l2", "kind": "l2", "area_mm2": 0.0025,
+             "dynamic_power_w": 0.4, "leakage_power_w": 0.1, "total_power_w": 0.5},
+            {"name": "noc", "kind": "interconnect", "area_mm2": 0.1,
+             "dynamic_power_w": 0.1, "leakage_power_w": 0.01, "total_power_w": 0.11},
+        ))
+        return {"schema_version": 1, "modules": modules}
+
+    @staticmethod
+    def settings():
+        return parse_settings({})
+
+    def test_two_tier_design_has_four_legal_anchors_per_tier(self):
+        design = build_design(self.model(), [0, 1], self.settings())
+
+        self.assertEqual(len(design["training"]), 8)
+        self.assertEqual(design["allowed_l2_tiers"], [0, 1])
+        self.assertEqual(
+            {point["tier"] for point in design["training"]}, {0, 1}
+        )
+        self.assertEqual({point["tier"] for point in design["holdout"]}, {0, 1})
+        self.assertEqual(interpolation_domain(design, 0)["kind"], "bilinear")
+        self.assertEqual(interpolation_domain(design, 1)["kind"], "bilinear")
+        for point in design["training"] + design["holdout"]:
+            layout_for_point(design["base_layout"], point)
+
+    def test_single_tier_design_has_eight_anchors_and_two_holdouts(self):
+        design = build_design(self.model(), [1], self.settings())
+
+        self.assertEqual(len(design["training"]), 8)
+        self.assertEqual(len(design["holdout"]), 2)
+        self.assertEqual(design["allowed_l2_tiers"], [1])
+        self.assertEqual({point["tier"] for point in design["training"]}, {1})
+        self.assertEqual(interpolation_domain(design, 1)["kind"], "delaunay")
+        self.assertEqual(len(interpolation_domain(design, 1)["simplices"]), 6)
+        for point in design["training"] + design["holdout"]:
+            layout_for_point(design["base_layout"], point)
+
+    def test_prbs_is_repeatable_positive_and_independent(self):
+        a = make_prbs_input(["core0", "shared_l2"], "shared_l2", self.settings())
+        b = make_prbs_input(["core0", "shared_l2"], "shared_l2", self.settings())
+
+        self.assertEqual(a, b)
+        self.assertNotEqual(a["multipliers"]["core0"], a["multipliers"]["shared_l2"])
+        self.assertEqual(set(a["multipliers"]), {"core0", "shared_l2"})
+        for values in a["multipliers"].values():
+            self.assertEqual(len(values), self.settings().calibration_windows)
+            self.assertTrue(all(value > 0.0 for value in values))
+            self.assertAlmostEqual(sum(values) / len(values), 1.0, places=12)
 
 
 if __name__ == "__main__":
