@@ -152,7 +152,12 @@ git add workflow/common.py workflow/floorplan/build_module_model.py \
 git commit -m "fix: support legacy cpu0 scope metadata"
 ```
 
-### Task 2: Validate and recover the saved operational smoke
+## Post-merge operational validation (not an SDD task)
+
+Run this only after Task 1 has passed its task and whole-branch reviews and
+has been merged into `main`.  The command intentionally writes the existing
+main-worktree experiment outputs, so it cannot execute from the isolated
+implementation worktree.
 
 **Files:**
 - Read: `runs/operational_balanced50_traffic_weighted/fixed_bin/fft/l1d_16kB/l2_128kB/gem5_r2/`
@@ -162,7 +167,7 @@ git commit -m "fix: support legacy cpu0 scope metadata"
 - Consumes: the merged Task-1 code and the existing fixed/CLIP layout-only roots.
 - Produces: one certified smoke pair in `runs/operational_balanced50_traffic_weighted/paired_r2_status/`.
 
-- [ ] **Step 1: Snapshot the existing successful gem5 result**
+1. **Snapshot the existing successful gem5 result**
 
 Before executing the paired runner, record the SHA-256 values of:
 
@@ -173,7 +178,7 @@ sha256sum \
   runs/operational_balanced50_traffic_weighted/fixed_bin/fft/l1d_16kB/l2_128kB/gem5_r2/status.json
 ```
 
-- [ ] **Step 2: Run the fixed-first one-pair smoke without `--rerun`**
+2. **Run the fixed-first one-pair smoke without `--rerun`**
 
 ```bash
 source scripts/env.sh
@@ -191,7 +196,7 @@ Expected: the pair state is `success`; `physical_r2_runs` reflects the
 certified fixed result plus a CLIP run only if the two complete override
 vectors differ.  No command may contain `--rerun`.
 
-- [ ] **Step 3: Prove that the saved fixed R2 was not rerun**
+3. **Prove that the saved fixed R2 was not rerun**
 
 Run the same three `sha256sum` inputs from Step 1 after smoke, then inspect:
 
@@ -210,7 +215,7 @@ PY
 Expected: all pre/post SHA-256 values are identical and the pair state is
 `success`.
 
-- [ ] **Step 4: Commit only code and tests; leave experiment outputs ignored**
+4. **Keep experiment outputs out of Git**
 
 ```bash
 git status --short
