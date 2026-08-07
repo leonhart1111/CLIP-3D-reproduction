@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import json
 import math
 import tempfile
 import unittest
@@ -1020,6 +1021,9 @@ class ROMOptimizerTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.modules = self.root / "modules.json"
         self.power_windows = self.root / "power_windows.json"
+        self.config_path = self.root / "config.json"
+        self.hotspot = self.root / "hotspot"
+        self.canonical_r1 = self.root / "canonical-r1"
         self.accepted_package = self.root / "accepted"
         self.rejected_package = self.root / "rejected"
         self.output = self.root / "output"
@@ -1029,6 +1033,10 @@ class ROMOptimizerTests(unittest.TestCase):
         model = CalibrationDesignTests.model()
         model["ipc1"] = 2.0
         write_json(self.modules, model)
+        self.canonical_r1.mkdir()
+        write_json(self.canonical_r1 / "r1_metadata.json", {"source": "synthetic-r1"})
+        self.hotspot.write_text("mock executable", encoding="utf-8")
+        write_json(self.config_path, self.config())
         settings = parse_settings({})
         design = build_design(model, [1], settings)
         fixed_names = tuple(
@@ -1048,23 +1056,37 @@ class ROMOptimizerTests(unittest.TestCase):
         )
         for package in (self.accepted_package, self.rejected_package):
             save_model(package / "pod_model.npz", rom, {})
-            write_json(package / "calibration_cases.json", {
-                "source_power_windows": str(self.power_windows),
-            })
-        write_json(self.power_windows, {
-            "nominal_sample_interval_ms": 2.0,
-            "windows": [{
-                "duration_s": 0.002,
-                "modules": [dict(module) for module in model["modules"]],
-            }],
-        })
-        identity = {
-            **ROMContractTests.identity(),
-            "modules_geometry_hash": "sha256:" + hashlib.sha256(
+        power_windows = ROMCalibrationCaseTests.raw_windows()
+        power_windows["canonical_source_r1"] = str(self.canonical_r1)
+        write_json(self.power_windows, power_windows)
+        config = read_json(self.config_path)
+        physical = config["physical"]
+        identity = rom_input_identity(
+            canonical_r1_metadata_hash="sha256:" + hashlib.sha256(
+                (self.canonical_r1 / "r1_metadata.json").read_bytes()
+            ).hexdigest(),
+            power_trace=power_trace_identity(power_windows),
+            modules_geometry_hash="sha256:" + hashlib.sha256(
                 self.modules.read_bytes()
             ).hexdigest(),
-            "allowed_l2_tiers": [1],
-        }
+            layout_geometry_hash="sha256:" + hashlib.sha256(json.dumps(
+                design["base_layout"], sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False,
+            ).encode("utf-8")).hexdigest(),
+            configuration_hash="sha256:" + hashlib.sha256(
+                self.config_path.read_bytes()
+            ).hexdigest(),
+            hotspot_hash="sha256:" + hashlib.sha256(
+                self.hotspot.read_bytes()
+            ).hexdigest(),
+            grid={"rows": physical["grid_size"], "columns": physical["grid_size"]},
+            stack=physical["thermal_stack"],
+            cooling={
+                "ambient_c": config["frequency"]["ambient_c"],
+                "r_convec_k_per_w": physical["r_convec_k_per_w"],
+            },
+            allowed_l2_tiers=config["layout_optimizer"]["allowed_l2_tiers"],
+        )
         write_json(self.accepted_package / "rom_acceptance.json", {
             "accepted": True,
             "identity": identity,
@@ -1082,10 +1104,16 @@ class ROMOptimizerTests(unittest.TestCase):
                 "fmin_ghz": 1.0,
                 "tsafe_c": 50.0,
             },
-            "physical": {"utilization": 0.70},
+            "physical": {
+                "utilization": 0.70,
+                "grid_size": 1,
+                "r_convec_k_per_w": 0.1,
+                "thermal_stack": {"layers": ["silicon", "tim"]},
+            },
             "layout_optimizer": {
                 "lambda_wire": 0.25,
                 "wire_objective": "continuous",
+                "allowed_l2_tiers": [1],
             },
             "delay": {"wire_aggregation": "mean", "wire_rounding": "nearest"},
         }
@@ -1111,6 +1139,10 @@ class ROMOptimizerTests(unittest.TestCase):
             "safe_unsafe_brackets": [],
         }
 
+    @staticmethod
+    def _search_must_not_run(*_args, **_kwargs):
+        raise AssertionError("ROM search ran before the current identity gate")
+
     def test_optimizer_selects_higher_rom_bips_without_hotspot(self):
         # Break caught: proxy search, sparse grids, or hidden HotSpot calls can
         # select a layout without the accepted ROM evidence required by Task 7.
@@ -1119,7 +1151,8 @@ class ROMOptimizerTests(unittest.TestCase):
             side_effect=self._frequency_evidence,
         ):
             report = optimize_transient_layout(
-                self.modules, self.accepted_package, self.output, self.config()
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
             )
 
         self.assertEqual(report["hotspot_calls_inside_optimizer"], 0)
@@ -1143,8 +1176,49 @@ class ROMOptimizerTests(unittest.TestCase):
         # marker bypasses the scientific gate on every optimized result.
         with self.assertRaisesRegex(ValueError, "ROM package is not accepted"):
             optimize_transient_layout(
-                self.modules, self.rejected_package, self.output, self.config()
+                self.modules, self.rejected_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
             )
+
+    def test_optimizer_rejects_changed_current_power_trace_before_search(self):
+        # Break caught: copying power identity out of the acceptance marker lets
+        # a different current workload drive a ROM accepted for another trace.
+        power = read_json(self.power_windows)
+        module = power["windows"][0]["modules"][0]
+        module["dynamic_power_w"] += 0.125
+        module["total_power_w"] += 0.125
+        power["windows"][0]["totals"]["dynamic_power_w"] += 0.125
+        power["windows"][0]["totals"]["total_power_w"] += 0.125
+        write_json(self.power_windows, power)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "power trace identity"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_changed_current_config_before_search(self):
+        # Break caught: copying configuration_hash out of acceptance makes a
+        # changed thermal environment appear compatible with the accepted ROM.
+        config = self.config()
+        config["frequency"]["ambient_c"] = 26.0
+        write_json(self.config_path, config)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "configuration hash identity"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from numbers import Real
 from pathlib import Path
@@ -18,12 +19,17 @@ from workflow.floorplan.layout_metrics import (
     round_wire_cycles,
 )
 from workflow.transient.rom.calibration_design import build_design
-from workflow.transient.rom.contracts import parse_settings, require_accepted_package
+from workflow.transient.rom.contracts import (
+    parse_settings,
+    require_accepted_package,
+    rom_input_identity,
+)
 from workflow.transient.rom.layout_rom import (
     find_rom_sustainable_frequency,
     interpolate_l2_input,
 )
 from workflow.transient.rom.pod_state_space import load_model
+from workflow.transient.validation import power_trace_identity
 
 
 _LATTICE_POINTS_PER_AXIS = 25
@@ -51,30 +57,50 @@ def _sha256(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _accepted_package(package_dir: Path, modules_path: Path) -> tuple[dict, dict]:
-    try:
-        raw = read_json(package_dir / "rom_acceptance.json")
-    except (OSError, ValueError):
-        raw = {}
-    identity = raw.get("identity") if isinstance(raw, dict) else None
-    requested = dict(identity) if isinstance(identity, dict) else {}
-    requested["modules_geometry_hash"] = _sha256(modules_path)
-    acceptance = require_accepted_package(package_dir, requested)
-    return acceptance, requested
+def _json_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def _package_power_windows(package_dir: Path) -> tuple[Path, dict]:
-    cases = read_json(package_dir / "calibration_cases.json")
-    source = cases.get("source_power_windows") if isinstance(cases, dict) else None
-    if not isinstance(source, str) or not source:
-        raise ValueError("ROM package lacks source_power_windows provenance")
-    path = Path(source)
-    if not path.is_absolute():
-        path = package_dir / path
-    path = path.resolve()
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    return path, read_json(path)
+def _requested_identity(modules_path: Path, config_path: Path, hotspot: Path,
+                        power_windows: dict, config: dict, design: dict) -> dict:
+    canonical_source = power_windows.get("canonical_source_r1")
+    if not isinstance(canonical_source, str) or not canonical_source:
+        raise ValueError("power windows lack canonical_source_r1 provenance")
+    canonical_metadata = Path(canonical_source) / "r1_metadata.json"
+    if not canonical_metadata.is_file():
+        raise FileNotFoundError(canonical_metadata)
+    physical = config.get("physical")
+    frequency = config.get("frequency")
+    optimizer = config.get("layout_optimizer")
+    if not isinstance(physical, dict) or not isinstance(frequency, dict):
+        raise ValueError("config lacks physical/frequency identity settings")
+    if not isinstance(optimizer, dict):
+        raise ValueError("config lacks layout_optimizer identity settings")
+    grid_size = physical.get("grid_size")
+    if isinstance(grid_size, bool) or not isinstance(grid_size, int) or grid_size < 1:
+        raise ValueError("physical.grid_size must be a positive integer")
+    tiers = optimizer.get("allowed_l2_tiers")
+    if tiers != design.get("allowed_l2_tiers"):
+        raise ValueError("layout_optimizer.allowed_l2_tiers differs from ROM design")
+    return rom_input_identity(
+        canonical_r1_metadata_hash=_sha256(canonical_metadata),
+        power_trace=power_trace_identity(power_windows),
+        modules_geometry_hash=_sha256(modules_path),
+        layout_geometry_hash=_json_sha256(design.get("base_layout")),
+        configuration_hash=_sha256(config_path),
+        hotspot_hash=_sha256(hotspot),
+        grid={"rows": grid_size, "columns": grid_size},
+        stack=physical.get("thermal_stack"),
+        cooling={
+            "ambient_c": frequency.get("ambient_c"),
+            "r_convec_k_per_w": physical.get("r_convec_k_per_w"),
+        },
+        allowed_l2_tiers=tiers,
+    )
 
 
 def _frequency_grid(config: dict) -> list[float]:
@@ -123,26 +149,32 @@ def _temperature_evidence(search: dict, sustainable: float) -> dict:
 
 
 def optimize_transient_layout(modules_path: Path, package_dir: Path,
-                              output_dir: Path, config: dict) -> dict:
+                              output_dir: Path, config_path: Path,
+                              power_windows_path: Path, *, hotspot: Path) -> dict:
     """Search a fixed 25x25 lattice and five local refinements with ROM calls only."""
     modules_path = Path(modules_path).resolve()
     package_dir = Path(package_dir).resolve()
     output_dir = Path(output_dir).resolve()
-    if not modules_path.is_file():
-        raise FileNotFoundError(modules_path)
+    config_path = Path(config_path).resolve()
+    power_windows_path = Path(power_windows_path).resolve()
+    hotspot = Path(hotspot).resolve()
+    for path in (modules_path, config_path, power_windows_path, hotspot):
+        if not path.is_file():
+            raise FileNotFoundError(path)
     if not package_dir.is_dir():
         raise FileNotFoundError(package_dir)
-    if not isinstance(config, dict):
-        raise ValueError("configuration must be a dictionary")
-
-    acceptance, identity = _accepted_package(package_dir, modules_path)
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"ROM optimizer output directory is not empty: {output_dir}")
-    source_power_path, power_windows = _package_power_windows(package_dir)
-    model, model_metadata = load_model(package_dir / "pod_model.npz")
+
     modules = read_json(modules_path)
     if not isinstance(modules, dict) or not isinstance(modules.get("modules"), list):
         raise ValueError("modules must contain a module list")
+    config = read_json(config_path)
+    if not isinstance(config, dict):
+        raise ValueError("configuration must be a dictionary")
+    power_windows = read_json(power_windows_path)
+    if not isinstance(power_windows, dict):
+        raise ValueError("power windows must be a dictionary")
     ipc1 = _finite(modules.get("ipc1"), "modules IPC1", minimum=0.0)
     if ipc1 <= 0.0:
         raise ValueError("modules IPC1 must be finite and positive")
@@ -152,8 +184,14 @@ def optimize_transient_layout(modules_path: Path, package_dir: Path,
         raise ValueError("transient ROM search_grid_points_per_axis must equal 25")
     if settings.refinement_starts != _REFINEMENT_STARTS:
         raise ValueError("transient ROM refinement_starts must equal 5")
-    tiers = identity["allowed_l2_tiers"]
+    optimizer = config.get("layout_optimizer", {})
+    tiers = optimizer.get("allowed_l2_tiers") if isinstance(optimizer, dict) else None
     design = build_design(modules, tiers, settings)
+    identity = _requested_identity(
+        modules_path, config_path, hotspot, power_windows, config, design,
+    )
+    acceptance = require_accepted_package(package_dir, identity)
+    model, model_metadata = load_model(package_dir / "pod_model.npz")
     base = design["base_layout"]
     l2_name = design["l2_name"]
     original = next(
@@ -165,7 +203,6 @@ def optimize_transient_layout(modules_path: Path, package_dir: Path,
     if min(upper_x, upper_y) < 0.0:
         raise ValueError("L2 geometry does not fit inside the die")
 
-    optimizer = config.get("layout_optimizer", {})
     delay = config.get("delay", {})
     if not isinstance(optimizer, dict) or not isinstance(delay, dict):
         raise ValueError("config layout_optimizer and delay must be dictionaries")
@@ -339,8 +376,11 @@ def optimize_transient_layout(modules_path: Path, package_dir: Path,
         "hotspot_calls_inside_optimizer": 0,
         "modules": str(modules_path),
         "package_dir": str(package_dir),
-        "source_power_windows": str(source_power_path),
+        "power_windows": str(power_windows_path),
+        "config": str(config_path),
+        "hotspot": str(hotspot),
         "package_acceptance": acceptance,
+        "requested_identity": identity,
         "model_metadata": model_metadata,
         "parameters": {
             "ipc1": ipc1,
