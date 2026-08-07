@@ -41,7 +41,17 @@ Add focused tests for:
    with the field absent.
 3. Local R2 attachment still rejects an explicit incompatible scope.
 
-After the code tests pass, run the one selected paired smoke against the
-existing operational roots.  It must validate and attach the successful
-fixed-bin R2 cache; it must not execute gem5.  Only after that smoke succeeds
-may the full Balanced-50 paired command be resumed.
+After the code tests pass, run a fixed-only local attachment smoke against
+`fixed_bin/fft/l1d_16kB/l2_128kB` in the existing operational roots.  It uses
+the hash-guarded `python -m workflow.r2.attach_result --point-dir ...` command
+to validate and attach the already successful fixed-bin R2 cache; it must not
+execute gem5 or claim a complete paired status.  Before and after the command,
+the SHA-256 values of that fixed point's `gem5_r2/stats.txt`,
+`gem5_r2/r2_result.json`, and `gem5_r2/status.json` must match exactly.  The
+command publishes only fixed-point attachment-derived outputs such as
+`performance.json` and `pipeline_summary.json`.
+
+The full paired sweep is outside this no-gem5 compatibility smoke.  It
+continues to follow the `50+K` rule: when a fixed and CLIP point have different
+complete latency-override vectors, CLIP requires its own R2 result and cannot
+be represented as a reuse of the fixed result.

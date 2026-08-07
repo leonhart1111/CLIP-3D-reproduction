@@ -4,7 +4,7 @@
 
 **Goal:** Accept pre-schema canonical R1/module evidence with an absent instruction-window scope as `cpu0`, record that default in newly generated module models, and recover the saved R2 smoke without rerunning gem5.
 
-**Architecture:** Add one shared normalization function that defaults only an absent key to `cpu0`; explicit values remain unchanged.  Use it when building future module models and when comparing legacy module architecture to canonical R1 during local attachment.  The existing immutable R1/R2 outputs remain inputs; the final smoke only attaches the proven local gem5 cache.
+**Architecture:** Add one shared normalization function that defaults only an absent key to `cpu0`; explicit values remain unchanged.  Use it when building future module models and when comparing legacy module architecture to canonical R1 during local attachment.  The existing immutable R1/R2 outputs remain inputs; the final fixed-only smoke only attaches the proven local gem5 cache.
 
 **Tech Stack:** Python 3 standard library, `unittest`, gem5 workflow JSON artifacts.
 
@@ -161,61 +161,73 @@ implementation worktree.
 
 **Files:**
 - Read: `runs/operational_balanced50_traffic_weighted/fixed_bin/fft/l1d_16kB/l2_128kB/gem5_r2/`
-- Write: existing `performance.json`, `pipeline_summary.json`, and paired-status files only through `workflow.r2.run_paired_sweep`
+- Write: `runs/operational_balanced50_traffic_weighted/fixed_bin/fft/l1d_16kB/l2_128kB/performance.json` and `pipeline_summary.json` only through `workflow.r2.attach_result`
 
 **Interfaces:**
-- Consumes: the merged Task-1 code and the existing fixed/CLIP layout-only roots.
-- Produces: one certified smoke pair in `runs/operational_balanced50_traffic_weighted/paired_r2_status/`.
+- Consumes: the merged Task-1 code and the existing successful fixed-bin R2 result.
+- Produces: refreshed, locally certified fixed-point attachment-derived outputs; it does not produce a paired status.
 
 1. **Snapshot the existing successful gem5 result**
 
-Before executing the paired runner, record the SHA-256 values of:
+Before executing the attachment command, record the SHA-256 values of the
+immutable R2 evidence in a temporary guard file:
 
 ```bash
 sha256sum \
   runs/operational_balanced50_traffic_weighted/fixed_bin/fft/l1d_16kB/l2_128kB/gem5_r2/stats.txt \
   runs/operational_balanced50_traffic_weighted/fixed_bin/fft/l1d_16kB/l2_128kB/gem5_r2/r2_result.json \
-  runs/operational_balanced50_traffic_weighted/fixed_bin/fft/l1d_16kB/l2_128kB/gem5_r2/status.json
+  runs/operational_balanced50_traffic_weighted/fixed_bin/fft/l1d_16kB/l2_128kB/gem5_r2/status.json \
+  > /tmp/legacy-scope-fixed-r2-before.sha256
 ```
 
-2. **Run the fixed-first one-pair smoke without `--rerun`**
+2. **Run the fixed-only local attachment smoke**
 
 ```bash
 source scripts/env.sh
-python -m workflow.r2.run_paired_sweep \
-  --r1-root runs/architecture_sweep/r1/paper \
-  --fixed-root runs/operational_balanced50_traffic_weighted/fixed_bin \
-  --clip-root runs/operational_balanced50_traffic_weighted/clip3d \
-  --selection configs/experiments/balanced50_traffic_weighted.json \
-  --config configs/experiments/clip3d_constrained_5p0_raw_power_p1_lambda0020119_traffic_weighted_exploratory.json \
-  --status-root runs/operational_balanced50_traffic_weighted/paired_r2_status \
-  --jobs 1 --limit 1
+python -m workflow.r2.attach_result --point-dir \
+  runs/operational_balanced50_traffic_weighted/fixed_bin/fft/l1d_16kB/l2_128kB
 ```
 
-Expected: the pair state is `success`; `physical_r2_runs` reflects the
-certified fixed result plus a CLIP run only if the two complete override
-vectors differ.  No command may contain `--rerun`.
+Expected: the command validates the saved fixed-bin R2 and publishes only its
+attachment-derived `performance.json` and `pipeline_summary.json` outputs.
+It does not run gem5, touch CLIP, create a paired-status file, or claim a
+complete pair.
 
 3. **Prove that the saved fixed R2 was not rerun**
 
-Run the same three `sha256sum` inputs from Step 1 after smoke, then inspect:
+Regenerate the same hashes and require an exact match with Step 1 before
+inspecting the fixed attachment fields:
 
 ```bash
+sha256sum \
+  runs/operational_balanced50_traffic_weighted/fixed_bin/fft/l1d_16kB/l2_128kB/gem5_r2/stats.txt \
+  runs/operational_balanced50_traffic_weighted/fixed_bin/fft/l1d_16kB/l2_128kB/gem5_r2/r2_result.json \
+  runs/operational_balanced50_traffic_weighted/fixed_bin/fft/l1d_16kB/l2_128kB/gem5_r2/status.json \
+  | diff -u /tmp/legacy-scope-fixed-r2-before.sha256 -
 python - <<'PY'
 import json
 from pathlib import Path
-status = json.loads(Path(
-    "runs/operational_balanced50_traffic_weighted/paired_r2_status/"
-    "fft/l1d_16kB/l2_128kB/pair_status.json"
+summary = json.loads(Path(
+    "runs/operational_balanced50_traffic_weighted/fixed_bin/"
+    "fft/l1d_16kB/l2_128kB/pipeline_summary.json"
 ).read_text())
-print(status["state"], status.get("fixed_complete"), status.get("clip_complete"))
+print(summary["ipc2"], summary["bips2"], summary["r2_source"])
 PY
 ```
 
-Expected: all pre/post SHA-256 values are identical and the pair state is
-`success`.
+Expected: `diff` exits zero, so all pre/post SHA-256 values are identical.  The printed `ipc2`,
+`bips2`, and `r2_source` are the fixed point's locally verifiable attachment
+fields; `r2_source` names its existing `gem5_r2/r2_result.json`.
 
-4. **Keep experiment outputs out of Git**
+4. **Defer the full paired sweep to its authorized workflow**
+
+This smoke is intentionally not a paired sweep.  The later full Balanced-50
+run follows `50+K`: if a fixed and CLIP point have different complete latency
+override vectors, CLIP must run an independent R2 and cannot be recorded as a
+reuse of fixed-bin evidence.  That possible CLIP gem5 work is outside this
+no-gem5 compatibility smoke.
+
+5. **Keep experiment outputs out of Git**
 
 ```bash
 git status --short
