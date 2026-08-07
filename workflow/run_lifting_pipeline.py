@@ -763,6 +763,9 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
                 if selection is not None else None
             ),
         },
+        "artifact_sha256": {
+            "cacti": sha256(cacti_json),
+        },
     }
     write_json(output_dir / "pipeline_summary.json", summary)
     return summary
@@ -809,10 +812,6 @@ def main() -> None:
         default="steady",
     )
     parser.add_argument("--rerun-transient-r1", action="store_true")
-    parser.add_argument(
-        "--transient-rom-dir", type=Path,
-        help="transient-ROM output root (default: output-dir/transient_rom)",
-    )
     parser.add_argument(
         "--transient-rom-calibrate", action="store_true",
         help="create and holdout-gate a new ROM package before optimization",
@@ -882,11 +881,7 @@ def main() -> None:
         summary = run_transient_rom_pipeline(
             source_r1_dir=args.r1_dir.resolve(),
             steady_preflight_dir=steady_preflight_dir,
-            output_dir=(
-                args.transient_rom_dir.resolve()
-                if args.transient_rom_dir
-                else (args.output_dir / "transient_rom").resolve()
-            ),
+            output_dir=(args.output_dir / "transient_rom").resolve(),
             config_path=args.config.resolve(),
             transient_r1_dir=(
                 args.transient_rom_r1_dir.resolve()

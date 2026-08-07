@@ -274,6 +274,14 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
     config_path = Path(config_path).resolve()
     hotspot = Path(DEFAULT_HOTSPOT).resolve()
     reject_overlapping_output(output_dir, [source_r1_dir, steady_preflight_dir])
+    final_validation_dir = output_dir / "final_hotspot_validation"
+    if (rerun_r2 and final_validation_dir.exists()
+            and (not final_validation_dir.is_dir()
+                 or any(final_validation_dir.iterdir()))):
+        raise ValueError(
+            "refusing to reuse existing final HotSpot validation artifacts: "
+            "--rerun-r2 is only for retries that failed before final HotSpot"
+        )
     if transient_r1_dir is not None:
         transient_r1_dir = Path(transient_r1_dir).resolve()
         reject_overlapping_output(output_dir, [transient_r1_dir])
@@ -309,6 +317,25 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
     for path in (modules_path, cacti_path):
         if not path.is_file():
             raise FileNotFoundError(path)
+    steady_artifacts = steady_summary.get("artifacts")
+    recorded_cacti = (
+        steady_artifacts.get("cacti")
+        if isinstance(steady_artifacts, dict) else None
+    )
+    if (not isinstance(recorded_cacti, str)
+            or Path(recorded_cacti).resolve() != cacti_path):
+        raise ValueError(
+            "steady preflight CACTI artifact path does not match "
+            "steady_preflight/cacti/cacti_characterization.json"
+        )
+    artifact_sha256 = steady_summary.get("artifact_sha256")
+    recorded_cacti_sha256 = (
+        artifact_sha256.get("cacti")
+        if isinstance(artifact_sha256, dict) else None
+    )
+    if (not isinstance(recorded_cacti_sha256, str)
+            or recorded_cacti_sha256 != sha256_file(cacti_path)):
+        raise ValueError("steady preflight CACTI artifact sha256 does not match")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     if transient_r1_dir is None:
@@ -422,7 +449,6 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
     frequency_grid = optimization.get("parameters", {}).get("frequency_grid_ghz")
     if frequency_grid is None:
         frequency_grid = _frequency_grid(config)
-    final_validation_dir = output_dir / "final_hotspot_validation"
     final_validation = search_layout_frequency(
         modules_path, proposed_layout, power_windows_path,
         final_validation_dir, config_path,
@@ -475,6 +501,10 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
         "f_sus_trans_hotspot_ghz": f_hotspot,
         "bips1_trans_rom_pred": bips1_rom,
         "ipc2_trans": r2_result.get("ipc2") if r2_result else None,
+        "bips2_trans": (
+            float(r2_result["ipc2"]) * float(f_hotspot)
+            if r2_result is not None and f_hotspot is not None else None
+        ),
         "r2_executed": execute_r2,
         "r2_critical_path_cycles": vector.get("critical_l1d_to_l2_cycles"),
         "artifacts": {
@@ -506,8 +536,6 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
         "steady_preflight_layout_method": steady_summary.get("layout_method"),
         "final_hotspot_state": final_validation.get("state"),
     }
-    if r2_result is not None and f_hotspot is not None:
-        summary["bips2_trans"] = float(r2_result["ipc2"]) * float(f_hotspot)
     if _contains_key(summary, "bips2"):
         raise AssertionError("transient ROM summary must not contain ambiguous bips2")
     write_json(output_dir / "transient_rom_summary.json", summary)

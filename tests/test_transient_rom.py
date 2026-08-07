@@ -1302,6 +1302,26 @@ class ROMPipelineTests(unittest.TestCase):
             },
         }
 
+    def steady_summary(self, *, cacti_path: Path | None = None,
+                       cacti_sha256: str | None = None,
+                       **overrides: object) -> dict:
+        summary = {
+            "layout_method": "fixed-bin",
+            "ipc2": None,
+            "bips2": None,
+            "r2_source": None,
+            "artifacts": {
+                "cacti": str((cacti_path or self.cacti).resolve()),
+            },
+            "artifact_sha256": {
+                "cacti": cacti_sha256 or hashlib.sha256(
+                    self.cacti.read_bytes()
+                ).hexdigest(),
+            },
+        }
+        summary.update(overrides)
+        return summary
+
     @staticmethod
     def bind_package(package: Path) -> None:
         classification = {
@@ -1360,11 +1380,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"metadata": {"workload": "matmul"}},
         ), patch(
             "workflow.transient.rom.run_pipeline.validate_steady_output",
-            return_value={
-                "summary": {
-                    "layout_method": "fixed-bin", "ipc2": None, "bips2": None,
-                }
-            },
+            return_value={"summary": self.steady_summary()},
         ), patch(
             "workflow.transient.rom.run_pipeline.prepare_power_windows",
             return_value=self.prepared(),
@@ -1451,9 +1467,7 @@ class ROMPipelineTests(unittest.TestCase):
         ), patch(
             "workflow.transient.rom.run_pipeline.validate_steady_output",
             return_value={
-                "summary": {
-                    "layout_method": "fixed-bin", "ipc2": 1.25, "bips2": 2.5,
-                }
+                "summary": self.steady_summary(ipc2=1.25, bips2=2.5),
             },
         ), patch(
             "workflow.transient.rom.run_pipeline.prepare_power_windows"
@@ -1466,9 +1480,68 @@ class ROMPipelineTests(unittest.TestCase):
 
         prepare.assert_not_called()
 
-    def test_failed_final_hotspot_or_skipped_r2_omits_bips2_trans(self):
-        # Break caught: publishing a null/estimated BIPS2 as if it survived both
-        # the real final HotSpot gate and the optional R2 measurement.
+    def test_pipeline_rejects_steady_preflight_cacti_path_before_power_or_r2(self):
+        # Break caught: a steady summary pointing at a different CACTI result
+        # must not silently authorize the expected-path file for R2 derivation.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        other_cacti = self.root / "other/cacti_characterization.json"
+        other_cacti.parent.mkdir(parents=True)
+        write_json(other_cacti, {"frequency_ghz": 9.0, "records": []})
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": self.steady_summary(cacti_path=other_cacti)},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows"
+        ) as prepare, patch(
+            "workflow.transient.rom.run_pipeline.build_vector"
+        ) as build_vector_mock:
+            with self.assertRaisesRegex(ValueError, "CACTI artifact path"):
+                run_transient_rom_pipeline(
+                    self.source_r1, self.steady, self.output, self.config_path,
+                    self.transient_r1, calibrate=False, execute_r2=False,
+                )
+
+        prepare.assert_not_called()
+        build_vector_mock.assert_not_called()
+
+    def test_pipeline_rejects_replaced_steady_preflight_cacti_before_power_or_r2(self):
+        # Break caught: replacing CACTI after the steady summary was written
+        # must invalidate its recorded identity before any ROM/R2 work begins.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        steady_summary = self.steady_summary()
+        write_json(self.cacti, {"frequency_ghz": 7.0, "records": []})
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": steady_summary},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows"
+        ) as prepare, patch(
+            "workflow.transient.rom.run_pipeline.build_vector"
+        ) as build_vector_mock:
+            with self.assertRaisesRegex(ValueError, "CACTI artifact sha256"):
+                run_transient_rom_pipeline(
+                    self.source_r1, self.steady, self.output, self.config_path,
+                    self.transient_r1, calibrate=False, execute_r2=False,
+                )
+
+        prepare.assert_not_called()
+        build_vector_mock.assert_not_called()
+
+    def test_failed_final_hotspot_or_skipped_r2_reports_null_bips2_trans(self):
+        # Break caught: omitting the field makes the summary schema unstable,
+        # while a number would claim success without both required measurements.
         from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
 
         package = self.output / "rom_package"
@@ -1482,7 +1555,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"metadata": {"workload": "matmul"}},
         ), patch(
             "workflow.transient.rom.run_pipeline.validate_steady_output",
-            return_value={"summary": {"layout_method": "fixed-bin"}},
+            return_value={"summary": self.steady_summary()},
         ), patch(
             "workflow.transient.rom.run_pipeline.prepare_power_windows",
             return_value=self.prepared(),
@@ -1505,7 +1578,8 @@ class ROMPipelineTests(unittest.TestCase):
 
         run_r2_mock.assert_not_called()
         self.assertIsNone(result["f_sus_trans_hotspot_ghz"])
-        self.assertNotIn("bips2_trans", result)
+        self.assertIn("bips2_trans", result)
+        self.assertIsNone(result["bips2_trans"])
         self.assertNotIn("bips2", result)
 
     def test_calibration_builds_and_accepts_package_before_optimization(self):
@@ -1541,7 +1615,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"metadata": {"workload": "matmul"}},
         ), patch(
             "workflow.transient.rom.run_pipeline.validate_steady_output",
-            return_value={"summary": {"layout_method": "fixed-bin"}},
+            return_value={"summary": self.steady_summary()},
         ), patch(
             "workflow.transient.rom.run_pipeline.prepare_power_windows",
             return_value=self.prepared(),
@@ -1626,7 +1700,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"metadata": {"workload": "matmul"}},
         ), patch(
             "workflow.transient.rom.run_pipeline.validate_steady_output",
-            return_value={"summary": {"layout_method": "fixed-bin"}},
+            return_value={"summary": self.steady_summary()},
         ), patch(
             "workflow.transient.rom.run_pipeline.prepare_power_windows",
             return_value=prepared,
@@ -1673,7 +1747,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"metadata": {"workload": "matmul"}},
         ), patch(
             "workflow.transient.rom.run_pipeline.validate_steady_output",
-            return_value={"summary": {"layout_method": "fixed-bin"}},
+            return_value={"summary": self.steady_summary()},
         ), patch(
             "workflow.transient.rom.run_pipeline.prepare_power_windows",
             return_value=self.prepared(),
@@ -1718,7 +1792,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"metadata": {"workload": "matmul"}},
         ), patch(
             "workflow.transient.rom.run_pipeline.validate_steady_output",
-            return_value={"summary": {"layout_method": "fixed-bin"}},
+            return_value={"summary": self.steady_summary()},
         ), patch(
             "workflow.transient.rom.run_pipeline._reuse_prepared_power_windows",
             return_value=self.prepared(),
@@ -1752,6 +1826,45 @@ class ROMPipelineTests(unittest.TestCase):
         self.assertTrue(run_r2_mock.call_args.kwargs["rerun"])
         self.assertEqual(result["bips2_trans"], 2.7)
         self.assertEqual(result["rom_package_status"], "reused-calibration")
+
+    def test_rerun_r2_refuses_existing_final_hotspot_validation(self):
+        # Break caught: retrying after final HotSpot has started would overwrite
+        # or silently mix validation state whose completeness is unknown.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        final_dir = self.output / "final_hotspot_validation"
+        write_json(
+            final_dir / "transient_sustainable_frequency.json",
+            {"state": "success", "f_sus_trans_ghz": 1.8},
+        )
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1"
+        ) as validate_r1, patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows"
+        ) as prepare, patch(
+            "workflow.transient.rom.run_pipeline.build_vector"
+        ) as build_vector_mock, patch(
+            "workflow.transient.rom.run_pipeline.run_r2"
+        ) as run_r2_mock, patch(
+            "workflow.transient.rom.run_pipeline.search_layout_frequency"
+        ) as final_search:
+            with self.assertRaisesRegex(
+                ValueError,
+                "--rerun-r2 is only for retries that failed before final HotSpot",
+            ):
+                run_transient_rom_pipeline(
+                    self.source_r1, self.steady, self.output, self.config_path,
+                    self.transient_r1, calibrate=False, execute_r2=True,
+                    rerun_r2=True,
+                )
+
+        validate_r1.assert_not_called()
+        prepare.assert_not_called()
+        build_vector_mock.assert_not_called()
+        run_r2_mock.assert_not_called()
+        final_search.assert_not_called()
 
     def test_exploratory_config_uses_exact_nonformal_rom_settings(self):
         # Break caught: a hidden threshold or formal label would make a run

@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from io import StringIO
 from pathlib import Path
@@ -1964,6 +1964,26 @@ class ThermalModeDispatchTests(unittest.TestCase):
             self.invoke_cli(
                 "--thermal-mode", "transient-rom", "--transient", "true"
             )
+
+    def test_rom_mode_rejects_arbitrary_output_directory_option(self):
+        # Break caught: allowing callers to relocate ROM outputs breaks the
+        # fixed OUTPUT/transient_rom sibling identity required for auditing.
+        with patch(
+            "workflow.run_lifting_pipeline.run_pipeline"
+        ) as steady, patch(
+            "workflow.transient.rom.run_pipeline.run_transient_rom_pipeline"
+        ) as rom:
+            stderr = StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
+                self.invoke_cli(
+                    "--thermal-mode", "transient-rom",
+                    "--transient-rom-dir", str(self.root / "elsewhere"),
+                )
+
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("unrecognized arguments: --transient-rom-dir", stderr.getvalue())
+        steady.assert_not_called()
+        rom.assert_not_called()
 
 
 if __name__ == "__main__":
