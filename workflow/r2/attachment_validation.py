@@ -19,6 +19,7 @@ from workflow.thermal.sustainable_frequency import derive
 
 
 _NO_R2 = object()
+_SUPPORTED_INSTRUCTION_WINDOW_SCOPES = frozenset({"cpu0", "all-cores"})
 
 
 def _finite_number(value: object) -> bool:
@@ -83,6 +84,11 @@ def validate_physical_coherence(
         if actual != expected:
             reasons.append(
                 "target modules architecture instruction_window_scope differs from canonical R1"
+            )
+        if (expected not in _SUPPORTED_INSTRUCTION_WINDOW_SCOPES
+                or actual not in _SUPPORTED_INSTRUCTION_WINDOW_SCOPES):
+            reasons.append(
+                "target modules architecture instruction_window_scope is unsupported"
             )
     if not _path_matches(modules.get("source_r1"), r1_dir):
         reasons.append("target modules source_r1 differs from canonical R1")
