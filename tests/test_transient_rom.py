@@ -1302,6 +1302,45 @@ class ROMPipelineTests(unittest.TestCase):
             },
         }
 
+    def completed_rom_summary(self) -> dict:
+        """Produce an audited completed-run summary with external work mocked."""
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        package = self.output / "rom_package"
+        package.mkdir(parents=True)
+        write_json(package / "rom_acceptance.json", {"accepted": True})
+        self.bind_package(package)
+        write_json(self.power_windows, {"mock": "power windows"})
+        write_json(self.proposed_layout, {"mock": "proposed layout"})
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": self.steady_summary()},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows",
+            return_value=self.prepared(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.optimize_transient_layout",
+            return_value=self.optimization(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.build_vector",
+            return_value={"critical_l1d_to_l2_cycles": 7},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.run_r2",
+            return_value={"ipc2": 1.5},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.search_layout_frequency",
+            return_value={"f_sus_trans_ghz": 1.8, "search": {"evaluations": []}},
+        ):
+            return run_transient_rom_pipeline(
+                self.source_r1, self.steady, self.output, self.config_path,
+                self.transient_r1, calibrate=False, execute_r2=True,
+            )
+
     def steady_summary(self, *, cacti_path: Path | None = None,
                        cacti_sha256: str | None = None,
                        **overrides: object) -> dict:
@@ -1453,6 +1492,14 @@ class ROMPipelineTests(unittest.TestCase):
                 "non_formal": True,
                 "paper_equivalent": False,
             })
+
+    def test_summary_separates_predicted_and_validated_transient_results(self):
+        summary = self.completed_rom_summary()
+        self.assertTrue(summary["non_formal"])
+        self.assertFalse(summary["paper_equivalent"])
+        self.assertIn("bips1_trans_rom_pred", summary)
+        self.assertIn("bips2_trans", summary)
+        self.assertNotIn("bips2", summary)
 
     def test_pipeline_rejects_reused_steady_preflight_with_r2_measurement(self):
         # Break caught: a reused pilot with R2 is not the fixed-bin/R2-disabled
