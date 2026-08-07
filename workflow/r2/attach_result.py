@@ -11,9 +11,15 @@ import math
 from pathlib import Path
 import tempfile
 
-from workflow.common import atomic_write_bytes, read_json, write_json
+from workflow.common import (
+    atomic_write_bytes,
+    instruction_window_scope,
+    read_json,
+    write_json,
+)
 from workflow.r2.attachment_validation import (
     exclusive_point_lock,
+    is_supported_instruction_window_scope,
     validate_physical_coherence,
 )
 from workflow.r2.run_r2 import validate_local_result
@@ -209,6 +215,19 @@ def attach(point_dir: Path) -> dict:
             _capture(status_path, snapshots)
         except (OSError, UnicodeDecodeError, ValueError) as error:
             raise ValueError(f"cannot capture local attachment inputs: {error}") from error
+
+        architecture = modules.get("architecture")
+        if (not isinstance(architecture, dict)
+                or not is_supported_instruction_window_scope(
+                    instruction_window_scope(metadata)
+                )
+                or not is_supported_instruction_window_scope(
+                    instruction_window_scope(architecture)
+                )):
+            raise ValueError(
+                "local attachment rejected: target modules architecture "
+                "instruction_window_scope is unsupported"
+            )
 
         local = validate_local_result(r1_dir, vector_path, point_dir / "gem5_r2")
         if local.get("accepted") is not True or local.get("result") != result:

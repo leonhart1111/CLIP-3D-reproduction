@@ -1419,6 +1419,21 @@ class StrictR2ReuseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "instruction_window_scope"):
             attach(self.fixed)
 
+    def test_local_attach_rejects_explicit_nonstring_scope(self):
+        """JSON collection scopes must be rejected rather than raising TypeError."""
+        from workflow.r2.attach_result import attach
+
+        self.metadata["instruction_window_scope"] = ["cpu0"]
+        write_json(self.r1 / "r1_metadata.json", self.metadata)
+        modules_path = self.fixed / "modules.json"
+        modules = read_json(modules_path)
+        modules["architecture"]["instruction_window_scope"] = ["cpu0"]
+        write_json(modules_path, modules)
+        self._write_source_result()
+
+        with self.assertRaisesRegex(ValueError, "instruction_window_scope"):
+            attach(self.fixed)
+
     def test_local_successful_cache_accepts_matching_latency_and_r1_identity(self):
         """Changing any requested local cache identity must make acceptance fail."""
         from workflow.r2.run_r2 import run, validate_local_result

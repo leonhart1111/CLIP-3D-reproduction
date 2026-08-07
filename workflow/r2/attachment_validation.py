@@ -22,6 +22,12 @@ _NO_R2 = object()
 _SUPPORTED_INSTRUCTION_WINDOW_SCOPES = frozenset({"cpu0", "all-cores"})
 
 
+def is_supported_instruction_window_scope(value: object) -> bool:
+    """Return whether a normalized scope belongs to the supported gem5 domain."""
+    return (isinstance(value, str)
+            and value in _SUPPORTED_INSTRUCTION_WINDOW_SCOPES)
+
+
 def _finite_number(value: object) -> bool:
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(float(value)))
@@ -85,8 +91,8 @@ def validate_physical_coherence(
             reasons.append(
                 "target modules architecture instruction_window_scope differs from canonical R1"
             )
-        if (expected not in _SUPPORTED_INSTRUCTION_WINDOW_SCOPES
-                or actual not in _SUPPORTED_INSTRUCTION_WINDOW_SCOPES):
+        if (not is_supported_instruction_window_scope(expected)
+                or not is_supported_instruction_window_scope(actual)):
             reasons.append(
                 "target modules architecture instruction_window_scope is unsupported"
             )
