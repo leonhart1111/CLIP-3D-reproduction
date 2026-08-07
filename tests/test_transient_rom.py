@@ -25,6 +25,7 @@ from workflow.transient.rom.materialize_calibration import (
     build_prbs_power_windows,
     execute_calibration_cases,
 )
+from workflow.transient.validation import power_trace_identity, validate_power_windows
 
 
 class ROMContractTests(unittest.TestCase):
@@ -360,19 +361,33 @@ class ROMCalibrationCaseTests(unittest.TestCase):
             for case in report["training_cases"] + report["holdout_cases"]
         ))
         self.assertTrue(all(
-            case["artifacts"]["sha256"]["power_windows"].startswith("sha256:")
+            case["artifacts"]["sha256"]["modules"].startswith("sha256:")
+            and case["artifacts"]["sha256"]["layout"].startswith("sha256:")
+            and case["artifacts"]["sha256"]["power_windows"].startswith("sha256:")
             and case["artifacts"]["sha256"]["power_trace"].startswith("sha256:")
             and case["artifacts"]["sha256"]["temperature_trace"].startswith("sha256:")
+            for case in report["training_cases"] + report["holdout_cases"]
+        ))
+        self.assertTrue(all(
+            case["hotspot"] == {
+                "command": [str(self.hotspot.resolve()), "-c", "hotspot.config"],
+                "elapsed_seconds": 0.125,
+            }
             for case in report["training_cases"] + report["holdout_cases"]
         ))
         self.assertEqual(
             [case["frequency_ghz"] for case in report["holdout_cases"]],
             [2.0, 1.6],
         )
-        self.assertTrue(all(
-            case["periodic_steady_state"]["full_grid_converged"]
-            for case in report["holdout_cases"]
-        ))
+        for case in report["holdout_cases"]:
+            pss = case["periodic_steady_state"]
+            self.assertEqual(pss["period_repeats"], 20)
+            self.assertEqual(pss["grid_unit_names"], ["t0_r00_c00", "t1_r00_c00"])
+            self.assertTrue(pss["full_grid_converged"])
+            self.assertEqual(pss["evidence"]["period_count"], 20)
+            self.assertEqual(pss["evidence"]["grid_cell_count"], 2)
+            self.assertEqual(len(pss["evidence"]["period_end_deltas"]), 19)
+            self.assertEqual(pss["evidence"]["last_delta_max_c"], 0.0)
 
     def test_prbs_windows_preserve_power_triplets(self):
         # Break caught: scaling only one power component or retaining a stale
@@ -383,10 +398,29 @@ class ROMCalibrationCaseTests(unittest.TestCase):
 
         self.assertEqual(result["window_count"], 64)
         self.assertEqual(result["power_provenance"], self.raw_windows()["power_provenance"])
+        self.assertEqual(validate_power_windows(result)["window_count"], 64)
+        self.assertEqual(
+            [window["source_stats_sha256"] for window in result["windows"]],
+            ["sha256:stats-0", "sha256:stats-1"] * 32,
+        )
+        self.assertEqual(
+            result["prbs_excitation"]["source_power_trace_identity"],
+            power_trace_identity(self.raw_windows()),
+        )
         self.assertTrue(all(
             module["total_power_w"]
             == module["dynamic_power_w"] + module["leakage_power_w"]
             for window in result["windows"] for module in window["modules"]
+        ))
+        self.assertTrue(all(
+            power >= 0.0
+            for window in result["windows"]
+            for module in [*window["modules"], window["totals"]]
+            for power in (
+                module["dynamic_power_w"],
+                module["leakage_power_w"],
+                module["total_power_w"],
+            )
         ))
 
     def test_calibration_rejects_a_nonempty_output_directory(self):
