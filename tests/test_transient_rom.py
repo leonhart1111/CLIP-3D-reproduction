@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy
 
-from workflow.common import write_json
+from workflow.common import read_json, write_json
 from workflow.transient.rom.contracts import (
     parse_settings,
     require_accepted_package,
@@ -36,6 +36,7 @@ from workflow.transient.rom.layout_rom import (
     interpolate_l2_input,
     validate_holdouts,
 )
+from workflow.transient.rom.optimize_layout import optimize_transient_layout
 from workflow.transient.rom.pod_state_space import (
     StateSpaceModel,
     discretize,
@@ -1010,6 +1011,140 @@ class ROMEvaluationTests(unittest.TestCase):
             self.assertFalse(report["accepted"])
             self.assertIn("temperature_grid_identity", report["failure_reasons"])
             self.assertIsNone(report["holdouts"][0]["grid_rmse_c"])
+
+
+class ROMOptimizerTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.modules = self.root / "modules.json"
+        self.power_windows = self.root / "power_windows.json"
+        self.accepted_package = self.root / "accepted"
+        self.rejected_package = self.root / "rejected"
+        self.output = self.root / "output"
+        self.accepted_package.mkdir()
+        self.rejected_package.mkdir()
+
+        model = CalibrationDesignTests.model()
+        model["ipc1"] = 2.0
+        write_json(self.modules, model)
+        settings = parse_settings({})
+        design = build_design(model, [1], settings)
+        fixed_names = tuple(
+            module["name"] for module in model["modules"]
+            if module["kind"] != "l2"
+        )
+        rom = StateSpaceModel(
+            temperature_basis=numpy.ones((1, 1)),
+            a_continuous=numpy.array([[-1.0]]),
+            b_fixed=numpy.zeros((1, len(fixed_names))),
+            b_l2_anchors={
+                point["id"]: numpy.ones((1, 1))
+                for point in design["training"]
+            },
+            module_names=fixed_names,
+            grid_unit_names=("cell0",),
+        )
+        for package in (self.accepted_package, self.rejected_package):
+            save_model(package / "pod_model.npz", rom, {})
+            write_json(package / "calibration_cases.json", {
+                "source_power_windows": str(self.power_windows),
+            })
+        write_json(self.power_windows, {
+            "nominal_sample_interval_ms": 2.0,
+            "windows": [{
+                "duration_s": 0.002,
+                "modules": [dict(module) for module in model["modules"]],
+            }],
+        })
+        identity = {
+            **ROMContractTests.identity(),
+            "modules_geometry_hash": "sha256:" + hashlib.sha256(
+                self.modules.read_bytes()
+            ).hexdigest(),
+            "allowed_l2_tiers": [1],
+        }
+        write_json(self.accepted_package / "rom_acceptance.json", {
+            "accepted": True,
+            "identity": identity,
+        })
+        write_json(self.rejected_package / "rom_acceptance.json", {
+            "accepted": False,
+        })
+
+    @staticmethod
+    def config() -> dict:
+        return {
+            "frequency": {
+                "ambient_c": 25.0,
+                "f0_ghz": 2.0,
+                "fmin_ghz": 1.0,
+                "tsafe_c": 50.0,
+            },
+            "physical": {"utilization": 0.70},
+            "layout_optimizer": {
+                "lambda_wire": 0.25,
+                "wire_objective": "continuous",
+            },
+            "delay": {"wire_aggregation": "mean", "wire_rounding": "nearest"},
+        }
+
+    @staticmethod
+    def _frequency_evidence(_model, _design, _powers, layout, _grid,
+                            _settings, _config):
+        l2 = next(module for module in layout["modules"] if module["kind"] == "l2")
+        frequency = 2.0 if l2["x_mm"] > 0.5 else 1.0
+        temperature = 40.0 if frequency == 2.0 else 49.0
+        evaluation = {
+            "frequency_ghz": frequency,
+            "converged": True,
+            "last_period_peak_c": temperature,
+            "safe": True,
+        }
+        return {
+            "frequency_grid_ghz": [1.0, 2.0],
+            "sustainable_frequency_ghz": frequency,
+            "state": "thermal_headroom_within_grid",
+            "evaluations": [evaluation],
+            "grid_evaluations": [evaluation],
+            "safe_unsafe_brackets": [],
+        }
+
+    def test_optimizer_selects_higher_rom_bips_without_hotspot(self):
+        # Break caught: proxy search, sparse grids, or hidden HotSpot calls can
+        # select a layout without the accepted ROM evidence required by Task 7.
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._frequency_evidence,
+        ):
+            report = optimize_transient_layout(
+                self.modules, self.accepted_package, self.output, self.config()
+            )
+
+        self.assertEqual(report["hotspot_calls_inside_optimizer"], 0)
+        self.assertEqual(report["search"]["lattice_points_attempted"], 25 * 25)
+        self.assertEqual(len(report["search"]["refinements"]), 5)
+        self.assertTrue(report["search"]["rejections"])
+        self.assertGreater(report["selected"]["f_sus_trans_rom_ghz"], 1.0)
+        self.assertEqual(report["selected"]["bips1_trans_rom_pred"], 4.0)
+        for candidate in report["search"]["legal_seeds"]:
+            expected = (
+                -2.0 * candidate["f_sus_trans_rom_ghz"]
+                + 0.25 * 2.0 * candidate["wire_objective_cycles"]
+            )
+            self.assertAlmostEqual(candidate["score"], expected, places=12)
+        proposed = self.output / "proposed_layout.json"
+        self.assertTrue(proposed.is_file())
+        self.assertEqual(read_json(proposed), report["selected_layout"])
+
+    def test_optimizer_rejects_unaccepted_package(self):
+        # Break caught: consuming a model archive without the holdout acceptance
+        # marker bypasses the scientific gate on every optimized result.
+        with self.assertRaisesRegex(ValueError, "ROM package is not accepted"):
+            optimize_transient_layout(
+                self.modules, self.rejected_package, self.output, self.config()
+            )
 
 
 if __name__ == "__main__":
