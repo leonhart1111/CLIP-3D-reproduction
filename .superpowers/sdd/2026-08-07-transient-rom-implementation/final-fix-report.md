@@ -7,6 +7,9 @@ Base commit: `d95e3b440255e3e65e9cad36309281795fc72e07`
 Latest replay-hardening round base:
 `bff1704444f1ec4fec5394f2c3869b658ba6f2ca`
 
+Latest artifact-binding round base:
+`94c0ca639c3d8053ed7ba2bb222dd3447e7d03e6`
+
 Scope: final correctness, reuse-integrity, failure-semantics, and auditability
 fixes for the non-formal transient-ROM path. The steady Eq. 13 implementation
 was intentionally left unchanged.
@@ -61,6 +64,12 @@ was intentionally left unchanged.
     `float()` conversion of an arbitrarily large JSON integer could escape as
     `OverflowError`. The root cause was validating a summary of the search
     instead of replaying the search algorithm from safely normalized evidence.
+11. Canonical search replay still treated each returned evaluation as its own
+    source of truth. In particular, an arbitrary positive integer—including
+    `10**400`—could be recorded as `grid_cell_count`, survive structural checks,
+    and replay identically into the rebuilt search. The root cause was binding
+    search control flow to the canonical algorithm without binding each thermal
+    evaluation to the actual per-frequency manifest and temperature trace.
 
 ## Implemented behavior
 
@@ -129,6 +138,17 @@ was intentionally left unchanged.
   frequency—must equal the returned search before R2 can start. Numeric
   normalization converts non-finite and non-convertible/overflowing JSON
   numbers into a validation-contract `ValueError` inside the recovery boundary.
+- Every returned grid and refinement evaluation is now also bound to its
+  canonical `frequency_<float.hex()>_ghz` case under the final-validation
+  directory. The validator loads `transient_trace_manifest.json` and
+  `transient.ttrace`, then uses the shared full-grid parser, PSS summarizer, and
+  inclusive final-period peak helper. It requires the manifest frequency scale,
+  repeat/window/sample counts, unique trace names and real grid width, complete
+  PSS dictionary, peak value/unit, trace peak, convergence, and safety class to
+  agree with the returned evaluation. Missing, malformed, or mismatched case
+  evidence becomes `validation_contract_error`, writes the failure JSON, and
+  prevents latency-vector/R2 execution. This read-only replay makes no
+  additional HotSpot call and imposes no guessed grid-size cap.
 - The standalone `calibrate_rom` CLI now finalizes
   `rom_artifact_manifest.json` through the same shared package-finalization
   helpers as pipeline calibration.
@@ -213,6 +233,23 @@ with no latency-vector construction or R2 launch. The validator does not modify
 the forged persisted report while checking it.
 ```
 
+The artifact-binding round then added one independent RED regression before
+its production change:
+
+```text
+RED: test_final_enormous_grid_cell_count_is_validation_contract_failure
+     reached the R2 boundary with a forged grid_cell_count of 10**400
+     (`Expected build_vector not called, but it was called once`).
+
+GREEN: the same regression becomes validation_contract_error with no latency
+       vector or R2 launch after every returned evaluation is replayed from its
+       canonical trace manifest and transient.ttrace artifact.
+```
+
+Manual boundary checks also confirmed that both a missing and a malformed
+`transient.ttrace` produce `validation_contract_error`, write
+`final_validation_failure.json`, and skip latency-vector construction and R2.
+
 ## Fresh verification
 
 Focused package-reuse, final-pipeline, and calibration-case suites:
@@ -224,7 +261,7 @@ Focused package-reuse, final-pipeline, and calibration-case suites:
   tests.test_transient_rom.ROMCalibrationCaseTests -v
 ```
 
-Result: `52 tests` passed.
+Result: `53 tests` passed.
 
 Complete transient-ROM test module:
 
@@ -233,7 +270,7 @@ Complete transient-ROM test module:
   tests.test_transient_rom -v
 ```
 
-Result: `89 tests` passed.
+Result: `90 tests` passed.
 
 Relevant integration suite, after the replay-hardening fixes:
 
@@ -242,7 +279,7 @@ Relevant integration suite, after the replay-hardening fixes:
   tests.test_transient_rom tests.test_transient tests.test_workflow
 ```
 
-Result: `225 tests` passed; `2` expected skips for unavailable live HotSpot
+Result: `226 tests` passed; `2` expected skips for unavailable live HotSpot
 tests.
 
 Full discovery, after the replay-hardening fixes:
@@ -251,7 +288,7 @@ Full discovery, after the replay-hardening fixes:
 /home/zyjiang/Agenticflow/CLIP/.venv/bin/python -m unittest discover -s tests
 ```
 
-Result: `373 tests` run; `1` error and `2` expected skips. The only error is the
+Result: `374 tests` run; `1` error and `2` expected skips. The only error is the
 pre-existing historical fixture gap in
 `test_lambda_wire_exploratory_config.py`:
 
@@ -280,9 +317,10 @@ steady layout-optimizer implementation relative to the requested base.
 
 No Critical review finding remains. All confirmed Important findings were
 implemented. The latest conditions—complete two-sided holdout recomputation,
-canonical final-search replay, and overflow-safe contract failure—are covered
-by the seven-test RED/GREEN round above, in addition to the preceding 12-test
-reuse/final-validation round.
+canonical final-search replay, overflow-safe contract failure, and
+non-self-asserting replay from immutable final HotSpot artifacts—are covered by
+the seven-test and artifact-binding RED/GREEN rounds above, in addition to the
+preceding 12-test reuse/final-validation round.
 
 No live HotSpot, gem5, McPAT, CACTI, R1, R2, or EDA tool was invoked during
 these fixes or verification. Tests use synthetic artifacts and mocks at the

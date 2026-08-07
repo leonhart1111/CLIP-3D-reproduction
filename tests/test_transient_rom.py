@@ -2158,7 +2158,11 @@ class ROMPipelineTests(unittest.TestCase):
                 recorded = supplied[frequency_ghz]
                 converged = recorded["converged"]
                 peak_c = recorded["last_period_peak_c"]
-            last_delta = 0.0 if converged else 0.02
+            last_delta = 0.0 if converged else 1.0
+            period_end_tmax_c = (
+                [peak_c] * 20 if converged
+                else [peak_c - (19 - index) for index in range(20)]
+            )
             deltas = [
                 {
                     "from_period_index": index - 1,
@@ -2176,7 +2180,7 @@ class ROMPipelineTests(unittest.TestCase):
                 "period_end_convergence": {
                     "period_count": 20,
                     "grid_cell_count": 1,
-                    "period_end_tmax_c": [peak_c] * 20,
+                    "period_end_tmax_c": period_end_tmax_c,
                     "period_end_deltas": deltas,
                     "last_delta_max_c": last_delta,
                     "last_delta_unit_index": 0,
@@ -2195,6 +2199,54 @@ class ROMPipelineTests(unittest.TestCase):
             },
             "search": search,
         }
+
+    @staticmethod
+    def write_final_validation_artifacts(output_dir: Path, result: object) -> None:
+        """Materialize one-cell trace evidence for a mocked final search."""
+        search = result.get("search") if isinstance(result, dict) else None
+        evaluations = search.get("evaluations") if isinstance(search, dict) else None
+        if not isinstance(evaluations, list):
+            return
+        for evaluation in evaluations:
+            if not isinstance(evaluation, dict):
+                continue
+            frequency = evaluation.get("frequency_ghz")
+            if isinstance(frequency, bool) or not isinstance(frequency, (int, float)):
+                continue
+            evidence = evaluation.get("period_end_convergence")
+            period_end_tmax_c = (
+                evidence.get("period_end_tmax_c")
+                if isinstance(evidence, dict) else None
+            )
+            if not isinstance(period_end_tmax_c, list) or not period_end_tmax_c:
+                continue
+            case_dir = output_dir / f"frequency_{float(frequency).hex()}_ghz"
+            case_dir.mkdir(parents=True, exist_ok=True)
+            write_json(case_dir / "transient_trace_manifest.json", {
+                "window_count": len(period_end_tmax_c),
+                "windows_per_period": 1,
+                "period_repeats": len(period_end_tmax_c),
+                "grid_cell_count": 1,
+                "frequency_scaling": {
+                    "frequency_scale": float(frequency) / 2.0,
+                },
+            })
+            (case_dir / "transient.ttrace").write_text(
+                "cell0\n"
+                + "\n".join(
+                    f"{float(temperature) + 273.15:.17g}"
+                    for temperature in period_end_tmax_c
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+    def final_validation_side_effect(self, result: object):
+        def run(*args, **_kwargs):
+            self.write_final_validation_artifacts(Path(args[3]), result)
+            return result
+
+        return run
 
     def run_with_final_validation(self, final_validation: object):
         """Run the pipeline to the final validation boundary with tools mocked."""
@@ -2225,7 +2277,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"ipc2": 1.5},
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value=final_validation,
+            side_effect=self.final_validation_side_effect(final_validation),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2265,7 +2317,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"ipc2": 1.5},
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value=self.final_validation(),
+            side_effect=self.final_validation_side_effect(self.final_validation()),
         ):
             return run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2354,7 +2406,9 @@ class ROMPipelineTests(unittest.TestCase):
 
         def final_side_effect(*args, **kwargs):
             events.append("hotspot")
-            return self.final_validation()
+            result = self.final_validation()
+            self.write_final_validation_artifacts(Path(args[3]), result)
+            return result
 
         with patch(
             "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
@@ -2565,7 +2619,7 @@ class ROMPipelineTests(unittest.TestCase):
             "workflow.transient.rom.run_pipeline.run_r2"
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value=self.final_validation([
+            side_effect=self.final_validation_side_effect(self.final_validation([
                 {
                     "frequency_ghz": 1.0, "converged": False,
                     "last_period_peak_c": 48.0, "safe": False,
@@ -2578,7 +2632,7 @@ class ROMPipelineTests(unittest.TestCase):
                     "frequency_ghz": 2.0, "converged": False,
                     "last_period_peak_c": 49.0, "safe": False,
                 },
-            ]),
+            ])),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2793,6 +2847,14 @@ class ROMPipelineTests(unittest.TestCase):
 
         self.assert_final_validation_contract_failure(returned)
 
+    def test_final_enormous_grid_cell_count_is_validation_contract_failure(self):
+        returned = self.final_validation()
+        returned["search"]["evaluations"][0]["period_end_convergence"][
+            "grid_cell_count"
+        ] = 10**400
+
+        self.assert_final_validation_contract_failure(returned)
+
     def test_all_converged_unsafe_grid_is_true_thermal_infeasible_not_tool_error(self):
         # Break caught: folding a valid unsafe result into tool/nonconvergence
         # failure makes physical infeasibility indistinguishable from bad evidence.
@@ -2821,7 +2883,7 @@ class ROMPipelineTests(unittest.TestCase):
             "workflow.transient.rom.run_pipeline.run_r2"
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value=self.final_validation([
+            side_effect=self.final_validation_side_effect(self.final_validation([
                 {
                     "frequency_ghz": 1.0, "converged": True,
                     "last_period_peak_c": 51.0, "safe": False,
@@ -2834,7 +2896,7 @@ class ROMPipelineTests(unittest.TestCase):
                     "frequency_ghz": 2.0, "converged": True,
                     "last_period_peak_c": 52.0, "safe": False,
                 },
-            ]),
+            ])),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2912,7 +2974,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"critical_l1d_to_l2_cycles": 7},
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value=self.final_validation(),
+            side_effect=self.final_validation_side_effect(self.final_validation()),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2983,7 +3045,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"critical_l1d_to_l2_cycles": 7},
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value=self.final_validation(),
+            side_effect=self.final_validation_side_effect(self.final_validation()),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, second_output, self.config_path,
@@ -3089,7 +3151,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"ipc2": 1.5},
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value=self.final_validation(),
+            side_effect=self.final_validation_side_effect(self.final_validation()),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,

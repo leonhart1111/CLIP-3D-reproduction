@@ -33,7 +33,11 @@ from workflow.transient.rom.optimize_layout import (
     optimize_transient_layout,
 )
 from workflow.transient.rom.pod_state_space import fit_state_space, save_model
-from workflow.transient.run_hotspot_transient import DEFAULT_HOTSPOT
+from workflow.transient.run_hotspot_transient import (
+    DEFAULT_HOTSPOT,
+    parse_ttrace_grid,
+    summarize_period_end_convergence,
+)
 from workflow.transient.run_transient_pipeline import (
     prepare_power_windows,
     reject_overlapping_output,
@@ -45,6 +49,7 @@ from workflow.transient.run_transient_r1 import run as run_transient_r1
 from workflow.transient.validation import power_trace_identity, validate_power_windows
 from workflow.transient.verify_sustainable_frequency import (
     find_sustainable_frequency,
+    last_period_peak,
     search_layout_frequency,
 )
 
@@ -83,7 +88,7 @@ def _frequency_grid(config: dict) -> list[float]:
 
 def _validate_final_search_result(
     value: object, frequency_grid: list[float], settings: ROMSettings,
-    config: dict,
+    config: dict, final_validation_dir: Path,
 ) -> dict:
     """Replay and require one canonical real-HotSpot frequency search."""
     def finite_number(item: object, label: str, *, positive: bool = False,
@@ -186,6 +191,7 @@ def _validate_final_search_result(
     f0_ghz = finite_number(
         frequency.get("f0_ghz"), "frequency.f0_ghz", positive=True,
     )
+    artifact_root = Path(final_validation_dir).resolve()
     if not isinstance(frequency_grid, list) or not frequency_grid:
         raise ValueError("final HotSpot frequency grid is invalid")
     grid = sorted({
@@ -220,26 +226,84 @@ def _validate_final_search_result(
             raise ValueError(
                 f"final HotSpot evaluation {index} lacks boolean convergence"
             )
-        last_delta = convergence_delta(
-            evaluation.get("period_end_convergence"), index,
-        )
+        recorded_convergence = evaluation.get("period_end_convergence")
+        convergence_delta(recorded_convergence, index)
+        case_dir = artifact_root / f"frequency_{item_frequency.hex()}_ghz"
+        try:
+            manifest = read_json(case_dir / "transient_trace_manifest.json")
+            if not isinstance(manifest, dict):
+                raise ValueError("trace manifest must be a dictionary")
+            windows_per_period = integer(
+                manifest.get("windows_per_period"),
+                "trace manifest windows_per_period", positive=True,
+            )
+            period_repeats = integer(
+                manifest.get("period_repeats"),
+                "trace manifest period_repeats", positive=True,
+            )
+            window_count = integer(
+                manifest.get("window_count"),
+                "trace manifest window_count", positive=True,
+            )
+            manifest_grid_cells = integer(
+                manifest.get("grid_cell_count"),
+                "trace manifest grid_cell_count", positive=True,
+            )
+            scaling = manifest.get("frequency_scaling")
+            if not isinstance(scaling, dict):
+                raise ValueError("trace manifest lacks frequency scaling")
+            manifest_scale = finite_number(
+                scaling.get("frequency_scale"),
+                "trace manifest frequency scale", positive=True,
+            )
+            names, rows_k = parse_ttrace_grid(case_dir / "transient.ttrace")
+            if (period_repeats != settings.pss_period_repeats
+                    or window_count != windows_per_period * period_repeats
+                    or len(rows_k) != window_count
+                    or manifest_grid_cells != len(names)
+                    or len(set(names)) != len(names)
+                    or manifest_scale != item_frequency / f0_ghz):
+                raise ValueError("trace manifest and temperature samples differ")
+            artifact_convergence = summarize_period_end_convergence(
+                rows_k, windows_per_period,
+            )
+            artifact_peak = last_period_peak(rows_k, windows_per_period)
+            artifact_trace_peak_c = max(
+                temperature for row in rows_k for temperature in row
+            ) - 273.15
+        except (OSError, ValueError, OverflowError) as error:
+            raise ValueError(
+                f"final HotSpot evaluation {index} artifact evidence is invalid"
+            ) from error
+        if recorded_convergence != artifact_convergence:
+            raise ValueError(
+                f"final HotSpot evaluation {index} PSS evidence differs from trace"
+            )
         expected_converged = (
-            settings.pss_period_repeats >= 2
-            and last_delta <= settings.pss_tolerance_c
+            artifact_convergence["period_count"] >= 2
+            and artifact_convergence["last_delta_max_c"]
+            <= settings.pss_tolerance_c
         )
         if converged is not expected_converged:
             raise ValueError(
                 f"final HotSpot evaluation {index} convergence is inconsistent"
             )
         peak_unit = evaluation.get("last_period_peak_unit")
-        if not isinstance(peak_unit, str) or not peak_unit:
+        artifact_peak_unit = names[artifact_peak["unit_index"]]
+        if (not isinstance(peak_unit, str) or not peak_unit
+                or peak_unit != artifact_peak_unit
+                or peak_c != artifact_peak["tmax_c"]):
             raise ValueError(
-                f"final HotSpot evaluation {index} lacks a peak unit"
+                f"final HotSpot evaluation {index} period peak differs from trace"
             )
-        finite_number(
+        trace_peak_c = finite_number(
             evaluation.get("trace_peak_c"),
             f"final HotSpot evaluation {index} trace peak",
         )
+        if trace_peak_c != artifact_trace_peak_c:
+            raise ValueError(
+                f"final HotSpot evaluation {index} trace peak differs from trace"
+            )
         expected_safe = expected_converged and peak_c <= tsafe_c
         if not isinstance(safe, bool) or safe is not expected_safe:
             raise ValueError(
@@ -682,6 +746,7 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
         )
         final_validation = _validate_final_search_result(
             final_validation, frequency_grid, settings, config,
+            final_validation_dir,
         )
     except (OSError, RuntimeError, ValueError) as error:
         final_validation_dir.mkdir(parents=True, exist_ok=True)
