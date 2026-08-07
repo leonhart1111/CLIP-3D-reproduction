@@ -869,7 +869,7 @@ class TransientTraceTests(unittest.TestCase):
             def fake_grid(path):
                 frequency = rows_by_case[str(path.parent)]
                 if frequency == 1.0:
-                    return ["a", "b"], [[300.0, 300.0], [300.0, 300.0],
+                    return ["a", "b"], [[300.0, 300.0], [301.0, 300.0],
                                             [300.0, 300.0], [300.0, 301.0]]
                 if frequency >= 2.0:
                     return ["a", "b"], [[300.0, 330.0], [300.0, 330.0],
@@ -898,6 +898,11 @@ class TransientTraceTests(unittest.TestCase):
 
             evaluations = {item["frequency_ghz"]: item for item in result["search"]["evaluations"]}
             self.assertFalse(evaluations[1.0]["converged"])
+            self.assertFalse(evaluations[1.0]["safe"])
+            self.assertAlmostEqual(
+                evaluations[1.0]["period_end_convergence"]["period_end_tmax_c"][0],
+                evaluations[1.0]["period_end_convergence"]["period_end_tmax_c"][1],
+            )
             self.assertGreater(evaluations[2.0]["last_period_peak_c"], 50.0)
             self.assertEqual(evaluations[2.0]["last_period_peak_unit"], "b")
             self.assertEqual(len(result["search"]["safe_unsafe_brackets"]), 2)
