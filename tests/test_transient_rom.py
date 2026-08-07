@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import math
 import tempfile
 import unittest
@@ -24,9 +25,16 @@ from workflow.transient.rom.calibration_design import (
     layout_for_point,
     make_prbs_input,
 )
+from workflow.transient.rom.calibrate_rom import validate_calibration_holdouts
 from workflow.transient.rom.materialize_calibration import (
     build_prbs_power_windows,
     execute_calibration_cases,
+)
+from workflow.transient.rom.layout_rom import (
+    evaluate_layout_rom,
+    find_rom_sustainable_frequency,
+    interpolate_l2_input,
+    validate_holdouts,
 )
 from workflow.transient.rom.pod_state_space import (
     StateSpaceModel,
@@ -603,6 +611,318 @@ class StateSpaceTests(unittest.TestCase):
         ))
         self.assertEqual(loaded.module_names, model.module_names)
         self.assertEqual(loaded_metadata, metadata)
+
+
+class ROMEvaluationTests(unittest.TestCase):
+    @staticmethod
+    def model() -> StateSpaceModel:
+        return StateSpaceModel(
+            temperature_basis=numpy.ones((1, 1)),
+            a_continuous=numpy.array([[-1.0]]),
+            b_fixed=numpy.array([[1.0]]),
+            b_l2_anchors={
+                "a0": numpy.array([[2.0]]),
+                "a1": numpy.array([[4.0]]),
+                "a2": numpy.array([[6.0]]),
+                "a3": numpy.array([[8.0]]),
+            },
+            module_names=("core0",),
+        )
+
+    @staticmethod
+    def design() -> dict:
+        return {
+            "l2_name": "shared_l2",
+            "allowed_l2_tiers": [0],
+            "domains": {
+                "0": {
+                    "kind": "bilinear",
+                    "anchor_ids": ["a0", "a1", "a2", "a3"],
+                    "corners": [[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 2.0]],
+                },
+            },
+        }
+
+    @staticmethod
+    def layout(x_mm: float = 0.0, y_mm: float = 0.0) -> dict:
+        return {
+            "modules": [
+                {"name": "core0", "kind": "core_logic", "tier": 0,
+                 "x_mm": 0.0, "y_mm": 0.0, "width_mm": 1.0, "height_mm": 1.0},
+                {"name": "shared_l2", "kind": "l2", "tier": 0,
+                 "x_mm": x_mm, "y_mm": y_mm,
+                 "width_mm": 0.25, "height_mm": 0.25},
+            ],
+        }
+
+    @staticmethod
+    def power_windows() -> dict:
+        return {
+            "windows": [{
+                "duration_s": 1.0,
+                "modules": [
+                    {"name": "shared_l2", "kind": "l2",
+                     "dynamic_power_w": 1.0, "leakage_power_w": 0.5,
+                     "total_power_w": 1.5},
+                    {"name": "core0", "kind": "core_logic",
+                     "dynamic_power_w": 2.0, "leakage_power_w": 1.0,
+                     "total_power_w": 3.0},
+                ],
+            }],
+        }
+
+    @staticmethod
+    def settings():
+        return replace(
+            parse_settings({}), pss_period_repeats=2, pss_tolerance_c=100.0
+        )
+
+    def test_anchor_interpolation_is_exact_and_extrapolation_fails(self):
+        # Break caught: blending tiers/anchors or silently extrapolating can
+        # manufacture an input matrix unsupported by calibration evidence.
+        actual = interpolate_l2_input(self.model(), self.design(), 0, 0.0, 0.0)
+
+        self.assertTrue(numpy.array_equal(actual, numpy.array([[2.0]])))
+        with self.assertRaisesRegex(ValueError, "outside ROM interpolation domain"):
+            interpolate_l2_input(self.model(), self.design(), 0, -0.01, 0.5)
+
+    def test_single_tier_interpolation_uses_persisted_barycentric_simplex(self):
+        # Break caught: nearest-anchor selection or inverse-distance weights do
+        # not implement the persisted single-tier Delaunay domain.
+        model = replace(self.model(), b_l2_anchors={
+            "a0": numpy.array([[1.0]]),
+            "a1": numpy.array([[3.0]]),
+            "a2": numpy.array([[5.0]]),
+        })
+        design = {
+            "domains": {"1": {
+                "kind": "delaunay", "anchor_ids": ["a0", "a1", "a2"],
+                "points": [[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]],
+                "simplices": [[0, 1, 2]],
+            }},
+        }
+
+        actual = interpolate_l2_input(model, design, 1, 0.5, 0.5)
+
+        self.assertTrue(numpy.allclose(actual, numpy.array([[2.5]]), atol=1e-15))
+        with self.assertRaisesRegex(ValueError, "outside ROM interpolation domain"):
+            interpolate_l2_input(model, design, 1, 1.5, 1.5)
+
+    def test_evaluation_scales_dynamic_power_and_window_time_separately(self):
+        # Break caught: scaling total power or retaining nominal duration loses
+        # the specified leakage+s*dynamic, duration/s frequency transform.
+        result = evaluate_layout_rom(
+            self.model(), self.design(), self.power_windows(), self.layout(),
+            4.0, self.settings(),
+            {"frequency": {"f0_ghz": 2.0, "ambient_c": 25.0,
+                           "tsafe_c": 100.0}},
+        )
+
+        expected_rise = 10.0 * (1.0 - math.exp(-1.0))
+        self.assertAlmostEqual(result["frequency_scale"], 2.0)
+        self.assertEqual(result["module_order"], ["core0", "shared_l2"])
+        self.assertAlmostEqual(result["final_period_grid_c"][-1][0],
+                               25.0 + expected_rise, places=12)
+        self.assertAlmostEqual(result["last_period_peak_c"],
+                               25.0 + expected_rise, places=12)
+        self.assertTrue(result["last_period_peak"]["includes_period_initial_state"])
+        self.assertTrue(result["converged"])
+
+    def test_evaluation_rejects_changed_or_malformed_module_inputs(self):
+        # Break caught: accepting an incomplete window shifts B columns and can
+        # apply one module's power to another module's spatial input.
+        malformed = self.power_windows()
+        malformed["windows"][0]["modules"].pop()
+
+        with self.assertRaisesRegex(ValueError, "module set"):
+            evaluate_layout_rom(
+                self.model(), self.design(), malformed, self.layout(), 2.0,
+                self.settings(),
+                {"frequency": {"f0_ghz": 2.0, "ambient_c": 25.0,
+                               "tsafe_c": 100.0}},
+            )
+
+    def test_frequency_search_preserves_task1_local_bracket_semantics(self):
+        # Break caught: a global monotonic binary search would miss the second
+        # observed safe/unsafe transition in this deliberately nonmonotone grid.
+        def evaluation(_model, _design, _powers, _layout, frequency, _settings, _config):
+            safe = frequency < 1.25 or 1.5 <= frequency < 1.75
+            return {
+                "frequency_ghz": frequency, "converged": True,
+                "last_period_peak_c": 40.0 if safe else 60.0,
+            }
+
+        with patch(
+            "workflow.transient.rom.layout_rom.evaluate_layout_rom",
+            side_effect=evaluation,
+        ):
+            result = find_rom_sustainable_frequency(
+                self.model(), self.design(), self.power_windows(), self.layout(),
+                [1.0, 1.25, 1.5], self.settings(),
+                {"frequency": {"f0_ghz": 2.0, "ambient_c": 25.0,
+                               "tsafe_c": 50.0}},
+            )
+
+        self.assertEqual(len(result["safe_unsafe_brackets"]), 2)
+        self.assertTrue(all(
+            bracket["local_boundary_assumption"]
+            for bracket in result["safe_unsafe_brackets"]
+        ))
+
+    @staticmethod
+    def failed_holdouts() -> list[dict]:
+        return [
+            {
+                "id": "h0", "geometry_match": True,
+                "input_identity_match": True, "frequency_match": True,
+                "hotspot_trace_identity_match": True,
+                "rom": {
+                    "converged": True,
+                    "final_period_grid_c": [[30.0, 31.0]],
+                    "last_period_peak_c": 31.0, "safe": True,
+                },
+                "hotspot": {
+                    "converged": True,
+                    "final_period_grid_c": [[31.0, 33.0]],
+                    "last_period_peak_c": 33.0, "safe": False,
+                },
+            },
+            {
+                "id": "h1", "geometry_match": True,
+                "input_identity_match": True, "frequency_match": True,
+                "hotspot_trace_identity_match": True,
+                "rom": {
+                    "converged": False,
+                    "final_period_grid_c": [[30.0, 30.0]],
+                    "last_period_peak_c": 30.0, "safe": True,
+                },
+                "hotspot": {
+                    "converged": True,
+                    "final_period_grid_c": [[30.0, 30.0]],
+                    "last_period_peak_c": 30.0, "safe": True,
+                },
+            },
+        ]
+
+    def test_holdout_gate_rejects_pss_peak_grid_or_safety_mismatch(self):
+        # Break caught: accepting on average error alone can publish a ROM that
+        # misses a peak, flips safety, or never reaches periodic steady state.
+        result = validate_holdouts(self.failed_holdouts(), self.settings())
+
+        self.assertFalse(result["accepted"])
+        self.assertIn("periodic_steady_state", result["failure_reasons"])
+        self.assertIn("grid_rmse", result["failure_reasons"])
+        self.assertIn("peak_temperature_error", result["failure_reasons"])
+        self.assertIn("safety_classification", result["failure_reasons"])
+
+    def test_acceptance_artifact_is_published_only_after_every_gate_passes(self):
+        # Break caught: leaving an acceptance marker after a failed validation
+        # allows downstream optimization to consume an invalid package.
+        identity = ROMContractTests.identity()
+        passed = self.failed_holdouts()
+        for holdout in passed:
+            holdout["rom"] = {
+                "converged": True,
+                "final_period_grid_c": [[30.0, 30.5]],
+                "last_period_peak_c": 30.5, "safe": True,
+            }
+            holdout["hotspot"] = {
+                "converged": True,
+                "final_period_grid_c": [[30.25, 30.75]],
+                "last_period_peak_c": 30.75, "safe": True,
+            }
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            accepted = validate_holdouts(
+                passed, self.settings(), output_dir=output, identity=identity
+            )
+            self.assertTrue(accepted["accepted"])
+            self.assertTrue((output / "validation_report.json").is_file())
+            self.assertTrue((output / "rom_acceptance.json").is_file())
+
+            rejected = validate_holdouts(
+                self.failed_holdouts(), self.settings(), output_dir=output,
+                identity=identity,
+            )
+            self.assertFalse(rejected["accepted"])
+            self.assertTrue((output / "validation_report.json").is_file())
+            self.assertFalse((output / "rom_acceptance.json").exists())
+
+            with self.assertRaisesRegex(ValueError, "canonical R1 metadata hash"):
+                validate_holdouts(
+                    passed, self.settings(), output_dir=output,
+                    identity={"power_trace": "sha256:power"},
+                )
+            self.assertFalse((output / "rom_acceptance.json").exists())
+
+    def test_calibration_holdouts_compare_the_recorded_geometry_input_and_frequency(self):
+        # Break caught: validating a prediction against a trace from another
+        # placement, power artifact, or frequency can falsely accept the ROM.
+        config = {"frequency": {"f0_ghz": 2.0, "ambient_c": 25.0,
+                                "tsafe_c": 100.0}}
+        expected = evaluate_layout_rom(
+            self.model(), self.design(), self.power_windows(), self.layout(),
+            4.0, self.settings(), config,
+        )
+
+        def sha256(path: Path) -> str:
+            return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = []
+            for index in range(2):
+                case_dir = root / f"h{index}"
+                case_dir.mkdir()
+                layout_path = case_dir / "layout.json"
+                power_path = case_dir / "power.json"
+                trace_path = case_dir / "transient.ttrace"
+                write_json(layout_path, self.layout())
+                write_json(power_path, self.power_windows())
+                trace_path.write_text(
+                    "cell0\n"
+                    f"{expected['period_start_grid_c'][0] + 273.15:.15f}\n"
+                    f"{expected['final_period_grid_c'][-1][0] + 273.15:.15f}\n",
+                    encoding="utf-8",
+                )
+                cases.append({
+                    "id": f"h{index}",
+                    "point": {"id": f"h{index}", "tier": 0,
+                              "x_mm": 0.0, "y_mm": 0.0},
+                    "frequency_ghz": 4.0,
+                    "frequency_scale": 2.0,
+                    "artifacts": {
+                        "layout": str(layout_path),
+                        "power_windows": str(power_path),
+                        "temperature_trace": str(trace_path),
+                        "sha256": {
+                            "layout": sha256(layout_path),
+                            "power_windows": sha256(power_path),
+                            "temperature_trace": sha256(trace_path),
+                        },
+                    },
+                    "periodic_steady_state": {
+                        "full_grid_converged": True,
+                        "grid_unit_names": ["cell0"],
+                    },
+                })
+
+            report = validate_calibration_holdouts(
+                self.model(), self.design(), cases, self.settings(), config,
+                output_dir=root / "package", identity=ROMContractTests.identity(),
+            )
+
+            self.assertTrue(report["accepted"])
+            self.assertTrue((root / "package" / "validation_report.json").is_file())
+            self.assertTrue((root / "package" / "rom_acceptance.json").is_file())
+
+            cases[0]["artifacts"]["sha256"]["temperature_trace"] = "sha256:changed"
+            rejected = validate_calibration_holdouts(
+                self.model(), self.design(), cases, self.settings(), config,
+                output_dir=root / "tampered", identity=ROMContractTests.identity(),
+            )
+            self.assertFalse(rejected["accepted"])
+            self.assertIn("hotspot_trace_identity", rejected["failure_reasons"])
 
 
 if __name__ == "__main__":
