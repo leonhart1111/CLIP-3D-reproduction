@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from numbers import Real
 from pathlib import Path
 
 from workflow.common import read_json, sha256_file, write_json
@@ -75,6 +76,131 @@ def _frequency_grid(config: dict) -> list[float]:
     if not result or any(not math.isfinite(value) or value <= 0.0 for value in result):
         raise ValueError("transient ROM frequencies_ghz must be finite and positive")
     return result
+
+
+def _validate_final_search_result(
+    value: object, frequency_grid: list[float], settings: ROMSettings,
+    config: dict,
+) -> dict:
+    """Require one internally consistent real-HotSpot search result."""
+    if not isinstance(value, dict):
+        raise ValueError("final HotSpot validation result must be a dictionary")
+    search = value.get("search")
+    if not isinstance(search, dict):
+        raise ValueError("final HotSpot validation lacks a search report")
+    evaluations = search.get("evaluations")
+    if not isinstance(evaluations, list) or not evaluations:
+        raise ValueError("final HotSpot validation evaluations must be non-empty")
+    frequency = config.get("frequency") if isinstance(config, dict) else None
+    if not isinstance(frequency, dict):
+        raise ValueError("config lacks frequency settings")
+    tsafe_c = frequency.get("tsafe_c")
+    f0_ghz = frequency.get("f0_ghz")
+    if (isinstance(tsafe_c, bool) or not isinstance(tsafe_c, Real)
+            or not math.isfinite(float(tsafe_c))):
+        raise ValueError("frequency.tsafe_c must be finite")
+    if (isinstance(f0_ghz, bool) or not isinstance(f0_ghz, Real)
+            or not math.isfinite(float(f0_ghz)) or float(f0_ghz) <= 0.0):
+        raise ValueError("frequency.f0_ghz must be finite and positive")
+    grid = sorted({float(item) for item in frequency_grid})
+    if (not grid or any(not math.isfinite(item) or item <= 0.0 for item in grid)):
+        raise ValueError("final HotSpot frequency grid is invalid")
+
+    by_frequency: dict[float, dict] = {}
+    ordered_frequencies = []
+    for index, evaluation in enumerate(evaluations):
+        if not isinstance(evaluation, dict):
+            raise ValueError(
+                f"final HotSpot evaluation {index} must be a dictionary"
+            )
+        item_frequency = evaluation.get("frequency_ghz")
+        if (isinstance(item_frequency, bool) or not isinstance(item_frequency, Real)
+                or not math.isfinite(float(item_frequency))
+                or not grid[0] <= float(item_frequency) <= grid[-1]):
+            raise ValueError(
+                f"final HotSpot evaluation {index} has invalid frequency"
+            )
+        item_frequency = float(item_frequency)
+        if item_frequency in by_frequency:
+            raise ValueError("final HotSpot evaluations contain duplicate frequencies")
+        converged = evaluation.get("converged")
+        peak_c = evaluation.get("last_period_peak_c")
+        safe = evaluation.get("safe")
+        if not isinstance(converged, bool):
+            raise ValueError(
+                f"final HotSpot evaluation {index} lacks boolean convergence"
+            )
+        if (isinstance(peak_c, bool) or not isinstance(peak_c, Real)
+                or not math.isfinite(float(peak_c))):
+            raise ValueError(
+                f"final HotSpot evaluation {index} lacks a finite period peak"
+            )
+        expected_safe = converged and float(peak_c) <= float(tsafe_c)
+        if not isinstance(safe, bool) or safe is not expected_safe:
+            raise ValueError(
+                f"final HotSpot evaluation {index} safety is inconsistent"
+            )
+        by_frequency[item_frequency] = evaluation
+        ordered_frequencies.append(item_frequency)
+    if ordered_frequencies != sorted(ordered_frequencies):
+        raise ValueError("final HotSpot evaluations are not frequency ordered")
+    if any(item not in by_frequency for item in grid):
+        raise ValueError("final HotSpot evaluations do not cover the frequency grid")
+    grid_evaluations = [by_frequency[item] for item in grid]
+
+    safe_frequencies = [
+        item for item, evaluation in by_frequency.items()
+        if evaluation["safe"]
+    ]
+    expected_sustainable = max(safe_frequencies) if safe_frequencies else None
+    reported_sustainable = value.get("f_sus_trans_ghz")
+    search_sustainable = search.get("sustainable_frequency_ghz")
+    if expected_sustainable is None:
+        if reported_sustainable is not None or search_sustainable is not None:
+            raise ValueError(
+                "final HotSpot sustainable frequency is inconsistent with safety"
+            )
+    else:
+        for candidate in (reported_sustainable, search_sustainable):
+            if (isinstance(candidate, bool) or not isinstance(candidate, Real)
+                    or not math.isfinite(float(candidate))
+                    or float(candidate) != expected_sustainable):
+                raise ValueError(
+                    "final HotSpot sustainable frequency is missing or inconsistent"
+                )
+
+    floor_infeasible = not grid_evaluations[0]["safe"]
+    expected_state = (
+        "thermally_infeasible" if expected_sustainable is None
+        else "thermally_infeasible_at_fmin" if floor_infeasible
+        else "thermal_headroom_within_grid" if grid_evaluations[-1]["safe"]
+        else "thermally_limited"
+    )
+    if value.get("state") != expected_state or search.get("state") != expected_state:
+        raise ValueError("final HotSpot state is inconsistent with evaluations")
+    monotonic = not any(
+        not left["safe"] and right["safe"]
+        for left, right in zip(grid_evaluations, grid_evaluations[1:])
+    )
+    if (search.get("frequency_grid_ghz") != grid
+            or search.get("grid_evaluations") != grid_evaluations
+            or search.get("tsafe_c") != float(tsafe_c)
+            or search.get("frequency_tolerance_ghz")
+            != settings.frequency_tolerance_ghz
+            or search.get("thermally_infeasible_at_fmin") is not floor_infeasible
+            or search.get("monotonic_grid_safe_to_unsafe") is not monotonic
+            or not isinstance(search.get("safe_unsafe_brackets"), list)):
+        raise ValueError("final HotSpot search evidence is inconsistent")
+    if value.get("frequency") != {
+        "f0_ghz": float(f0_ghz), "tsafe_c": float(tsafe_c), "grid_ghz": grid,
+    }:
+        raise ValueError("final HotSpot frequency evidence is inconsistent")
+    if value.get("periodic_steady_state") != {
+        "period_repeats": settings.pss_period_repeats,
+        "pss_tolerance_c": settings.pss_tolerance_c,
+    }:
+        raise ValueError("final HotSpot PSS settings are inconsistent")
+    return value
 
 
 def _contains_key(value: object, key: str) -> bool:
@@ -437,6 +563,9 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
             pss_tolerance_c=settings.pss_tolerance_c,
             frequency_tolerance_ghz=settings.frequency_tolerance_ghz,
             hotspot=hotspot,
+        )
+        final_validation = _validate_final_search_result(
+            final_validation, frequency_grid, settings, config,
         )
     except (OSError, RuntimeError, ValueError) as error:
         final_validation_dir.mkdir(parents=True, exist_ok=True)

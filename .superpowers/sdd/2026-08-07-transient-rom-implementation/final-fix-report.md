@@ -37,6 +37,14 @@ was intentionally left unchanged.
    training powers could still retain truthful PRBS metadata without actually
    being generated from the bound source trace. The root cause was byte-level
    inventory checking without a semantic reconstruction of the excitation.
+7. Reuse still treated each holdout's `full_grid_converged` flag and validation
+   report as declarations. It hashed the temperature trace but did not parse it,
+   so a rehashed one-row trace, absent frequency, forged convergence metrics,
+   or peak/safety claim could retain an accepted package marker.
+8. The final-search exception boundary covered the call but not its returned
+   value. A non-dictionary return escaped through `.get()`, while missing or
+   malformed evaluations, non-finite sustainable frequency, and inconsistent
+   state/safety could be mislabeled or reach the R2 boundary.
 
 ## Implemented behavior
 
@@ -59,6 +67,14 @@ was intentionally left unchanged.
   the validator rebuilds the complete PRBS power windows from the bound holdout
   source with the persisted multipliers and requires exact equality with the
   packaged excitation.
+- Calibration now packages the exact hashed config bytes. Reuse resolves that
+  package-relative config, validates the two specified holdout frequencies
+  (`f0` and `0.6*f0 + 0.4*fmin`), re-parses every holdout temperature trace,
+  and calls the existing `summarize_period_end_convergence()` and
+  `last_period_peak()` helpers. It requires the exact repeated-period sample
+  count, full-grid convergence, exact recorded PSS metrics/grid order, model
+  grid identity, and validation-report HotSpot peak/safety derived from the
+  trace and bound `tsafe_c`.
 - Reuse preserves historical calibration evidence and reports the historical
   8 training, 2 holdout, and 10 total HotSpot calls separately from zero calls
   made by the current reuse invocation.
@@ -71,6 +87,14 @@ was intentionally left unchanged.
   distinct failure reasons under the failed final-validation outcome. R2 is
   skipped on all validation failures, ROM predictions remain in the summary,
   and partial validation calls are counted.
+- The result of `search_layout_frequency()` is now validated inside the same
+  recovery boundary as the call. The validator requires a dictionary, a
+  non-empty ordered evaluation list covering the configured grid, finite
+  in-range frequencies/peaks, boolean convergence, safety consistent with
+  convergence and `tsafe_c`, matching sustainable frequency/state, and
+  consistent grid/search/PSS metadata. Contract failures write
+  `final_validation_failure.json`, preserve ROM predictions, and never build an
+  R2 vector or launch R2.
 - The standalone `calibrate_rom` CLI now finalizes
   `rom_artifact_manifest.json` through the same shared package-finalization
   helpers as pipeline calibration.
@@ -119,25 +143,43 @@ training power not derived from the bound source, missing holdout evidence, and
 an incomplete/stale artifact manifest. A relocated self-contained package is
 accepted and reused without regeneration or HotSpot inside the optimizer.
 
+The final re-review round added two independent RED groups before production
+changes:
+
+```text
+Holdout RED (5 tests): missing frequency, one-row rehashed trace, forged PSS
+metrics, forged trace peak, and forged safety all passed the package gate and
+reached ROM search (`ROM search ran before the current identity gate`).
+
+Final-search RED (7 tests): non-dict returned an uncaught AttributeError;
+missing/invalid evaluations were mislabeled `missing_pss_evidence`; missing or
+non-finite sustainable frequency and inconsistent state/safety were accepted or
+reached R2.
+
+GREEN: all 12 focused regressions pass. Existing pss_nonconvergence remains a
+distinct validation failure, and an all-converged unsafe grid remains genuine
+`thermally_infeasible` rather than a contract/tool error.
+```
+
 ## Fresh verification
 
-Relevant integration suite, after the final PRBS fix:
+Relevant integration suite, after the final re-review fixes:
 
 ```bash
 /home/zyjiang/Agenticflow/CLIP/.venv/bin/python -m unittest \
   tests.test_transient_rom tests.test_transient tests.test_workflow
 ```
 
-Result: `206 tests` passed; `2` expected skips for unavailable live HotSpot
+Result: `218 tests` passed; `2` expected skips for unavailable live HotSpot
 tests.
 
-Full discovery, after the final PRBS fix:
+Full discovery, after the final re-review fixes:
 
 ```bash
 /home/zyjiang/Agenticflow/CLIP/.venv/bin/python -m unittest discover -s tests
 ```
 
-Result: `354 tests` run; `1` error and `2` expected skips. The only error is the
+Result: `366 tests` run; `1` error and `2` expected skips. The only error is the
 pre-existing historical fixture gap in
 `test_lambda_wire_exploratory_config.py`:
 
@@ -164,9 +206,10 @@ steady layout-optimizer implementation relative to the requested base.
 
 ## Review status and remaining concerns
 
-No Critical review finding remains. All Important findings were implemented.
-The final focused reviewer condition was the semantic PRBS derivation check;
-the RED/GREEN regression above verifies that condition on the final tree.
+No Critical review finding remains. All confirmed Important findings were
+implemented. The final two conditions—semantic holdout evidence replay and
+post-call final-search result validation—are covered by the 12-test RED/GREEN
+round above.
 
 No live HotSpot, gem5, McPAT, CACTI, R1, R2, or EDA tool was invoked during
 these fixes or verification. Tests use synthetic artifacts and mocks at the

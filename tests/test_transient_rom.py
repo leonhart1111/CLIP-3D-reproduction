@@ -45,7 +45,12 @@ from workflow.transient.rom.pod_state_space import (
     load_model,
     save_model,
 )
+from workflow.transient.run_hotspot_transient import (
+    parse_ttrace_grid,
+    summarize_period_end_convergence,
+)
 from workflow.transient.validation import power_trace_identity, validate_power_windows
+from workflow.transient.verify_sustainable_frequency import last_period_peak
 
 
 def canonical_json_sha256(value: object) -> str:
@@ -81,7 +86,7 @@ def write_test_artifact_manifest(package: Path) -> None:
 
 def write_synthetic_accepted_package(
     package: Path, design: dict, identity: dict, settings: object,
-    model: StateSpaceModel, modules_source: Path,
+    model: StateSpaceModel, modules_source: Path, config_source: Path,
     source_power_windows: dict,
 ) -> None:
     """Write one internally consistent, fully audited synthetic ROM package."""
@@ -105,6 +110,13 @@ def write_synthetic_accepted_package(
         source_power_windows, design["prbs"]["multipliers"],
         settings.calibration_windows,
     )
+    package_config = package / "config.json"
+    package_config.write_bytes(Path(config_source).read_bytes())
+    config = read_json(package_config)
+    f0_ghz = float(config["frequency"]["f0_ghz"])
+    fmin_ghz = float(config["frequency"]["fmin_ghz"])
+    tsafe_c = float(config["frequency"]["tsafe_c"])
+    holdout_frequencies = (f0_ghz, 0.6 * f0_ghz + 0.4 * fmin_ghz)
     write_json(package / "anchors.json", design)
     write_json(package / "calibration_manifest.json", {
         "schema_version": 1,
@@ -124,6 +136,7 @@ def write_synthetic_accepted_package(
             "power_trace_identity": identity["power_trace"],
             "power_windows": "source_power_windows.json",
             "power_windows_sha256": source_power_sha256,
+            "config": "config.json",
             "config_sha256": identity["configuration_hash"],
             "hotspot_sha256": identity["hotspot_hash"],
         },
@@ -131,7 +144,9 @@ def write_synthetic_accepted_package(
         "holdout_ids": [point["id"] for point in design["holdout"]],
     })
 
-    def evidence_case(point: dict, kind: str) -> dict:
+    holdout_semantics = {}
+
+    def evidence_case(point: dict, kind: str, index: int) -> dict:
         case_dir = package / f"{kind}_{point['id']}"
         case_dir.mkdir(exist_ok=True)
         artifact_paths = {
@@ -152,14 +167,24 @@ def write_synthetic_accepted_package(
         artifact_paths["power_trace"].write_text(
             "shared_l2\n1.0\n", encoding="utf-8"
         )
+        frequency_ghz = (
+            f0_ghz if kind == "training" else holdout_frequencies[index]
+        )
+        period_rows = (
+            1 if kind == "training"
+            else len(source_power_windows["windows"]) * settings.pss_period_repeats
+        )
         artifact_paths["temperature_trace"].write_text(
-            "cell0\n300.0\n", encoding="utf-8"
+            "cell0\n" + "300.0\n" * period_rows, encoding="utf-8"
         )
         case = {
             "id": point["id"],
             "kind": kind,
             "point": point,
             "initial_temperature": "ambient",
+            "frequency_ghz": frequency_ghz,
+            "frequency_scale": frequency_ghz / f0_ghz,
+            "window_count": period_rows,
             "hotspot": {"command": ["hotspot"], "elapsed_seconds": 0.1},
             "artifacts": {
                 **{
@@ -173,14 +198,34 @@ def write_synthetic_accepted_package(
             },
         }
         if kind == "holdout":
+            names, rows = parse_ttrace_grid(artifact_paths["temperature_trace"])
+            windows_per_period = len(source_power_windows["windows"])
+            convergence = summarize_period_end_convergence(
+                rows, windows_per_period
+            )
+            peak = last_period_peak(rows, windows_per_period)
             case["periodic_steady_state"] = {
+                "period_repeats": settings.pss_period_repeats,
+                "pss_tolerance_c": settings.pss_tolerance_c,
                 "full_grid_converged": True,
-                "evidence": {"period_count": 20, "last_delta_max_c": 0.0},
+                "grid_unit_names": names,
+                "evidence": convergence,
+            }
+            holdout_semantics[point["id"]] = {
+                "frequency_ghz": frequency_ghz,
+                "peak_c": peak["tmax_c"],
+                "safe": peak["tmax_c"] <= tsafe_c,
             }
         return case
 
-    training = [evidence_case(point, "training") for point in design["training"]]
-    holdouts = [evidence_case(point, "holdout") for point in design["holdout"]]
+    training = [
+        evidence_case(point, "training", index)
+        for index, point in enumerate(design["training"])
+    ]
+    holdouts = [
+        evidence_case(point, "holdout", index)
+        for index, point in enumerate(design["holdout"])
+    ]
     write_json(package / "calibration_cases.json", {
         "schema_version": 1,
         "training_hotspot_calls": 8,
@@ -247,13 +292,17 @@ def write_synthetic_accepted_package(
         "holdouts": [
             {
                 "id": point["id"],
+                "frequency_ghz": holdout_semantics[point["id"]]["frequency_ghz"],
                 "accepted": True,
                 "grid_rmse_c": 0.2 + index * 0.1,
                 "peak_temperature_error_c": 0.4 + index * 0.1,
-                "rom_peak_c": 60.0 + index,
-                "hotspot_peak_c": 60.4 + 1.1 * index,
-                "rom_safe": True,
-                "hotspot_safe": True,
+                "rom_peak_c": (
+                    holdout_semantics[point["id"]]["peak_c"]
+                    - (0.4 + index * 0.1)
+                ),
+                "hotspot_peak_c": holdout_semantics[point["id"]]["peak_c"],
+                "rom_safe": holdout_semantics[point["id"]]["safe"],
+                "hotspot_safe": holdout_semantics[point["id"]]["safe"],
                 "gates": gates,
             }
             for index, point in enumerate(design["holdout"])
@@ -1485,7 +1534,7 @@ class ROMOptimizerTests(unittest.TestCase):
         )
         write_synthetic_accepted_package(
             self.accepted_package, design, identity, settings, rom,
-            self.modules, power_windows,
+            self.modules, self.config_path, power_windows,
         )
         write_json(self.rejected_package / "rom_acceptance.json", {
             "accepted": False,
@@ -1806,6 +1855,113 @@ class ROMOptimizerTests(unittest.TestCase):
 
         self.assertFalse(self.output.exists())
 
+    def test_optimizer_rejects_holdout_without_recorded_frequency(self):
+        # Break caught: an accepted marker cannot stand in for the real
+        # frequency at which a reusable holdout trace was produced.
+        cases_path = self.accepted_package / "calibration_cases.json"
+        cases = read_json(cases_path)
+        cases["holdout_cases"][0].pop("frequency_ghz")
+        write_json(cases_path, cases)
+        write_test_artifact_manifest(self.accepted_package)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "invalid frequency_ghz"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_one_row_holdout_trace_after_rehash(self):
+        # Break caught: a one-row trace cannot prove repeated-period full-grid
+        # PSS even when every package and case hash has been regenerated.
+        cases_path = self.accepted_package / "calibration_cases.json"
+        cases = read_json(cases_path)
+        case = cases["holdout_cases"][0]
+        trace_path = self.accepted_package / case["artifacts"]["temperature_trace"]
+        trace_path.write_text("cell0\n300.0\n", encoding="utf-8")
+        case["artifacts"]["sha256"]["temperature_trace"] = (
+            "sha256:" + hashlib.sha256(trace_path.read_bytes()).hexdigest()
+        )
+        write_json(cases_path, cases)
+        write_test_artifact_manifest(self.accepted_package)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "temperature trace period structure"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_recorded_holdout_pss_metrics_that_differ(self):
+        # Break caught: declarative full_grid_converged cannot override the
+        # convergence metrics recomputed from the immutable temperature trace.
+        cases_path = self.accepted_package / "calibration_cases.json"
+        cases = read_json(cases_path)
+        cases["holdout_cases"][0]["periodic_steady_state"]["evidence"][
+            "period_count"
+        ] = 999
+        write_json(cases_path, cases)
+        write_test_artifact_manifest(self.accepted_package)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "PSS evidence differs"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_holdout_peak_not_derived_from_trace(self):
+        # Break caught: an accepted validation report cannot assert a HotSpot
+        # peak that differs from the inclusive final-period trace peak.
+        validation_path = self.accepted_package / "validation_report.json"
+        validation = read_json(validation_path)
+        validation["holdouts"][0]["hotspot_peak_c"] += 1.0
+        write_json(validation_path, validation)
+        write_test_artifact_manifest(self.accepted_package)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "HotSpot peak evidence differs"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_holdout_safety_not_derived_from_trace(self):
+        # Break caught: the saved safety class must be recomputed from the real
+        # trace peak and the bound configuration's thermal safety threshold.
+        validation_path = self.accepted_package / "validation_report.json"
+        validation = read_json(validation_path)
+        validation["holdouts"][0]["hotspot_safe"] = False
+        write_json(validation_path, validation)
+        write_test_artifact_manifest(self.accepted_package)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "HotSpot safety evidence differs"):
+            optimize_transient_layout(
+                self.modules, self.accepted_package, self.output,
+                self.config_path, self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
     def test_optimizer_rejects_changed_current_power_trace_before_search(self):
         # Break caught: copying power identity out of the acceptance marker lets
         # a different current workload drive a ROM accepted for another trace.
@@ -1956,6 +2112,109 @@ class ROMPipelineTests(unittest.TestCase):
             },
         }
 
+    @staticmethod
+    def final_validation(evaluations: list[dict] | None = None) -> dict:
+        """Return one internally consistent synthetic final HotSpot search."""
+        if evaluations is None:
+            evaluations = [
+                {
+                    "frequency_ghz": 1.0, "converged": True,
+                    "last_period_peak_c": 45.0, "safe": True,
+                },
+                {
+                    "frequency_ghz": 1.8, "converged": True,
+                    "last_period_peak_c": 49.0, "safe": True,
+                },
+                {
+                    "frequency_ghz": 2.0, "converged": True,
+                    "last_period_peak_c": 51.0, "safe": False,
+                },
+            ]
+        evaluations = [dict(evaluation) for evaluation in evaluations]
+        by_frequency = {
+            float(evaluation["frequency_ghz"]): evaluation
+            for evaluation in evaluations
+        }
+        grid = [1.0, 2.0]
+        grid_evaluations = [by_frequency[frequency] for frequency in grid]
+        safe_frequencies = [
+            frequency for frequency, evaluation in by_frequency.items()
+            if evaluation["safe"]
+        ]
+        sustainable = max(safe_frequencies) if safe_frequencies else None
+        floor_infeasible = not grid_evaluations[0]["safe"]
+        state = (
+            "thermally_infeasible" if sustainable is None
+            else "thermally_infeasible_at_fmin" if floor_infeasible
+            else "thermal_headroom_within_grid" if grid_evaluations[-1]["safe"]
+            else "thermally_limited"
+        )
+        monotonic = not any(
+            not left["safe"] and right["safe"]
+            for left, right in zip(grid_evaluations, grid_evaluations[1:])
+        )
+        search = {
+            "frequency_grid_ghz": grid,
+            "tsafe_c": 50.0,
+            "frequency_tolerance_ghz": 0.01,
+            "monotonic_grid_safe_to_unsafe": monotonic,
+            "thermally_infeasible_at_fmin": floor_infeasible,
+            "sustainable_frequency_ghz": sustainable,
+            "state": state,
+            "safe_unsafe_brackets": [],
+            "grid_evaluations": grid_evaluations,
+            "evaluations": sorted(
+                evaluations, key=lambda evaluation: evaluation["frequency_ghz"]
+            ),
+        }
+        return {
+            "schema_version": 1,
+            "state": state,
+            "f_sus_trans_ghz": sustainable,
+            "frequency": {"f0_ghz": 2.0, "tsafe_c": 50.0, "grid_ghz": grid},
+            "periodic_steady_state": {
+                "period_repeats": 20, "pss_tolerance_c": 0.01,
+            },
+            "search": search,
+        }
+
+    def run_with_final_validation(self, final_validation: object):
+        """Run the pipeline to the final validation boundary with tools mocked."""
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        package = self.output / "rom_package"
+        package.mkdir(parents=True)
+        self.bind_package(package)
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": self.steady_summary()},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows",
+            return_value=self.prepared(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.optimize_transient_layout",
+            return_value=self.optimization(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.build_vector",
+            return_value={"critical_l1d_to_l2_cycles": 7},
+        ) as build_vector_mock, patch(
+            "workflow.transient.rom.run_pipeline.run_r2",
+            return_value={"ipc2": 1.5},
+        ) as run_r2_mock, patch(
+            "workflow.transient.rom.run_pipeline.search_layout_frequency",
+            return_value=final_validation,
+        ):
+            result = run_transient_rom_pipeline(
+                self.source_r1, self.steady, self.output, self.config_path,
+                self.transient_r1, calibrate=False, execute_r2=True,
+            )
+        return result, build_vector_mock, run_r2_mock
+
     def completed_rom_summary(self) -> dict:
         """Produce an audited completed-run summary with external work mocked."""
         from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
@@ -1988,13 +2247,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"ipc2": 1.5},
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value={
-                "state": "thermally_limited", "f_sus_trans_ghz": 1.8,
-                "search": {"evaluations": [{
-                    "frequency_ghz": 1.8, "converged": True,
-                    "last_period_peak_c": 49.0, "safe": True,
-                }]},
-            },
+            return_value=self.final_validation(),
         ):
             return run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2031,6 +2284,9 @@ class ROMPipelineTests(unittest.TestCase):
             "modules_geometry_hash": "sha256:" + hashlib.sha256(
                 self.modules.read_bytes()
             ).hexdigest(),
+            "configuration_hash": "sha256:" + hashlib.sha256(
+                self.config_path.read_bytes()
+            ).hexdigest(),
             "power_trace": power_trace_identity(
                 ROMCalibrationCaseTests.raw_windows()
             ),
@@ -2053,6 +2309,7 @@ class ROMPipelineTests(unittest.TestCase):
         )
         write_synthetic_accepted_package(
             package, design, identity, settings, model, self.modules,
+            self.config_path,
             ROMCalibrationCaseTests.raw_windows(),
         )
 
@@ -2079,14 +2336,7 @@ class ROMPipelineTests(unittest.TestCase):
 
         def final_side_effect(*args, **kwargs):
             events.append("hotspot")
-            return {
-                "f_sus_trans_ghz": 1.8,
-                "state": "thermally_limited",
-                "search": {"evaluations": [{
-                    "frequency_ghz": 1.8, "converged": True,
-                    "last_period_peak_c": 49.0, "safe": True,
-                }]},
-            }
+            return self.final_validation()
 
         with patch(
             "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
@@ -2297,14 +2547,16 @@ class ROMPipelineTests(unittest.TestCase):
             "workflow.transient.rom.run_pipeline.run_r2"
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value={
-                "state": "thermally_infeasible",
-                "f_sus_trans_ghz": None,
-                "search": {"evaluations": [{
+            return_value=self.final_validation([
+                {
                     "frequency_ghz": 1.0, "converged": False,
                     "last_period_peak_c": 48.0, "safe": False,
-                }]},
-            },
+                },
+                {
+                    "frequency_ghz": 2.0, "converged": False,
+                    "last_period_peak_c": 49.0, "safe": False,
+                },
+            ]),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2432,6 +2684,69 @@ class ROMPipelineTests(unittest.TestCase):
             result["final_validation_failure"]["error_type"], "ValueError"
         )
 
+    def assert_final_validation_contract_failure(self, returned: object) -> dict:
+        result, build_vector_mock, run_r2_mock = self.run_with_final_validation(
+            returned
+        )
+        build_vector_mock.assert_not_called()
+        run_r2_mock.assert_not_called()
+        self.assertEqual(result["state"], "rom_final_validation_failed")
+        self.assertEqual(
+            result["final_validation_failure"]["category"],
+            "validation_contract_error",
+        )
+        failure_path = self.output / "final_hotspot_validation/final_validation_failure.json"
+        self.assertTrue(failure_path.is_file())
+        self.assertEqual(
+            read_json(failure_path)["category"], "validation_contract_error"
+        )
+        return result
+
+    def test_final_non_dictionary_result_is_validation_contract_failure(self):
+        # Break caught: `.get()` on an unchecked final-search return escaped the
+        # failure writer and left no ROM-preserving summary.
+        self.assert_final_validation_contract_failure(None)
+
+    def test_final_missing_evaluations_is_validation_contract_failure(self):
+        returned = self.final_validation()
+        returned["search"].pop("evaluations")
+
+        self.assert_final_validation_contract_failure(returned)
+
+    def test_final_invalid_evaluations_is_validation_contract_failure(self):
+        returned = self.final_validation()
+        returned["search"]["evaluations"] = {"not": "a list"}
+
+        self.assert_final_validation_contract_failure(returned)
+
+    def test_final_missing_sustainable_frequency_is_contract_failure(self):
+        returned = self.final_validation()
+        returned["f_sus_trans_ghz"] = None
+        returned["search"]["sustainable_frequency_ghz"] = None
+
+        self.assert_final_validation_contract_failure(returned)
+
+    def test_final_nonfinite_sustainable_frequency_is_contract_failure(self):
+        returned = self.final_validation()
+        returned["f_sus_trans_ghz"] = float("nan")
+        returned["search"]["sustainable_frequency_ghz"] = float("nan")
+
+        self.assert_final_validation_contract_failure(returned)
+
+    def test_final_inconsistent_state_is_validation_contract_failure(self):
+        returned = self.final_validation()
+        returned["state"] = "thermally_infeasible"
+        returned["search"]["state"] = "thermally_infeasible"
+
+        self.assert_final_validation_contract_failure(returned)
+
+    def test_final_inconsistent_safety_is_validation_contract_failure(self):
+        returned = self.final_validation()
+        returned["search"]["evaluations"][0]["safe"] = False
+        returned["search"]["grid_evaluations"][0]["safe"] = False
+
+        self.assert_final_validation_contract_failure(returned)
+
     def test_all_converged_unsafe_grid_is_true_thermal_infeasible_not_tool_error(self):
         # Break caught: folding a valid unsafe result into tool/nonconvergence
         # failure makes physical infeasibility indistinguishable from bad evidence.
@@ -2460,14 +2775,16 @@ class ROMPipelineTests(unittest.TestCase):
             "workflow.transient.rom.run_pipeline.run_r2"
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value={
-                "state": "thermally_infeasible",
-                "f_sus_trans_ghz": None,
-                "search": {"evaluations": [{
+            return_value=self.final_validation([
+                {
                     "frequency_ghz": 1.0, "converged": True,
                     "last_period_peak_c": 51.0, "safe": False,
-                }]},
-            },
+                },
+                {
+                    "frequency_ghz": 2.0, "converged": True,
+                    "last_period_peak_c": 52.0, "safe": False,
+                },
+            ]),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2545,13 +2862,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"critical_l1d_to_l2_cycles": 7},
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value={
-                "state": "thermally_limited", "f_sus_trans_ghz": 1.8,
-                "search": {"evaluations": [{
-                    "frequency_ghz": 1.8, "converged": True,
-                    "last_period_peak_c": 49.0, "safe": True,
-                }]},
-            },
+            return_value=self.final_validation(),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,
@@ -2621,13 +2932,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"critical_l1d_to_l2_cycles": 7},
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value={
-                "state": "thermally_limited", "f_sus_trans_ghz": 1.8,
-                "search": {"evaluations": [{
-                    "frequency_ghz": 1.8, "converged": True,
-                    "last_period_peak_c": 49.0, "safe": True,
-                }]},
-            },
+            return_value=self.final_validation(),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, second_output, self.config_path,
@@ -2736,13 +3041,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value={"ipc2": 1.5},
         ) as run_r2_mock, patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
-            return_value={
-                "state": "thermally_limited", "f_sus_trans_ghz": 1.8,
-                "search": {"evaluations": [{
-                    "frequency_ghz": 1.8, "converged": True,
-                    "last_period_peak_c": 49.0, "safe": True,
-                }]},
-            },
+            return_value=self.final_validation(),
         ):
             result = run_transient_rom_pipeline(
                 self.source_r1, self.steady, self.output, self.config_path,

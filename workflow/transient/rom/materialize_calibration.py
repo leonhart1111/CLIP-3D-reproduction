@@ -281,7 +281,11 @@ def execute_calibration_cases(modules_path: Path, source_power_windows_path: Pat
         raise ValueError("calibration allowed tiers identity differs")
     output_dir.mkdir(parents=True, exist_ok=True)
     package_modules_path = output_dir / "modules.json"
+    package_power_windows_path = output_dir / "source_power_windows.json"
+    package_config_path = output_dir / "config.json"
     shutil.copyfile(modules_path, package_modules_path)
+    shutil.copyfile(source_power_windows_path, package_power_windows_path)
+    shutil.copyfile(config_path, package_config_path)
     write_json(output_dir / "anchors.json", design)
     write_json(output_dir / "calibration_manifest.json", {
         "schema_version": 1,
@@ -299,13 +303,13 @@ def execute_calibration_cases(modules_path: Path, source_power_windows_path: Pat
             "validation_runs": 2,
         },
         "sources": {
-            "modules": str(modules_path),
-            "modules_sha256": _sha256(modules_path),
-            "power_windows": str(source_power_windows_path),
-            "power_windows_sha256": _sha256(source_power_windows_path),
+            "modules": "modules.json",
+            "modules_sha256": _sha256(package_modules_path),
+            "power_windows": "source_power_windows.json",
+            "power_windows_sha256": _sha256(package_power_windows_path),
             "power_trace_identity": power_trace_identity(source_power_windows),
-            "config": str(config_path),
-            "config_sha256": _sha256(config_path),
+            "config": "config.json",
+            "config_sha256": _sha256(package_config_path),
             "hotspot": str(hotspot),
             "hotspot_sha256": _sha256(hotspot),
         },
