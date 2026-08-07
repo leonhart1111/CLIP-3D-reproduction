@@ -13,6 +13,9 @@ from workflow.transient.rom.contracts import (
     rom_input_identity,
 )
 from workflow.transient.rom.calibration_design import (
+    _find_rectangle_shrink,
+    _rectangle_coordinates,
+    _rectangle_is_legal,
     build_design,
     interpolation_domain,
     layout_for_point,
@@ -217,6 +220,25 @@ class CalibrationDesignTests(unittest.TestCase):
         )
         for point in anchors:
             layout_for_point(design["base_layout"], point)
+
+    def test_rectangle_search_reaches_a_legal_scale_above_one_half(self):
+        base_layout = {
+            "die_width_mm": 10.0,
+            "modules": [
+                {"name": "shared_l2", "kind": "l2", "tier": 1,
+                 "x_mm": 9.0, "y_mm": 9.0, "width_mm": 1.0, "height_mm": 1.0},
+                {"name": "blocker", "kind": "interconnect", "tier": 1,
+                 "x_mm": 0.0, "y_mm": 0.0, "width_mm": 3.0, "height_mm": 3.0},
+            ],
+        }
+
+        scale = _find_rectangle_shrink(base_layout, 1, 9.0, 9.0, [])
+
+        self.assertGreater(scale, 0.5)
+        self.assertLess(scale, 0.7)
+        self.assertTrue(_rectangle_is_legal(
+            base_layout, 1, _rectangle_coordinates(9.0, 9.0, scale), []
+        ))
 
 
 if __name__ == "__main__":

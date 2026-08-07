@@ -180,8 +180,9 @@ def _rectangle_anchors(base_layout: dict, l2: dict, tier: int,
 def _find_rectangle_shrink(base_layout: dict, tier: int, maximum_x: float,
                            maximum_y: float, existing: Iterable[dict]) -> float:
     """Shrink all four extremes together until they form one legal rectangle."""
-    upper_step = _SEARCH_GRID // 2
-    for step in range(1, upper_step + 1):
+    # Exclude scale 1.0, where both axis bounds collapse, but otherwise search
+    # the full nondegenerate centered-rectangle interval.
+    for step in range(1, _SEARCH_GRID):
         scale = step / _SEARCH_GRID
         coordinates = _rectangle_coordinates(maximum_x, maximum_y, scale)
         if not _rectangle_is_legal(base_layout, tier, coordinates, existing):
