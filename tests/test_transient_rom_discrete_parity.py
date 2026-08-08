@@ -2,6 +2,7 @@ from pathlib import Path
 import unittest
 
 from workflow.common import read_json
+from workflow.floorplan.discrete_partition import search_discrete_partitions
 from workflow.run_lifting_pipeline import validate_config
 
 
@@ -79,6 +80,92 @@ class TransientROMParityConfigTests(unittest.TestCase):
         self.assertFalse(rom["formal_validation"]["strict_p1"])
         self.assertFalse(rom["formal_validation"]["accepted"])
         validate_config(rom, "clip3d")
+
+
+class DiscretePartitionEngineTests(unittest.TestCase):
+    """Catch grid, geometry, fixed-baseline, partition, or tie-break drift."""
+
+    @staticmethod
+    def base_layout():
+        return {
+            "die_width_mm": 2.0,
+            "die_height_mm": 2.0,
+            "modules": [
+                {
+                    "name": "HOT",
+                    "kind": "core",
+                    "tier": 1,
+                    "x_mm": 0.0,
+                    "y_mm": 0.0,
+                    "width_mm": 1.0,
+                    "height_mm": 1.0,
+                },
+                {
+                    "name": "L2",
+                    "kind": "l2",
+                    "tier": 1,
+                    "x_mm": 1.0,
+                    "y_mm": 1.0,
+                    "width_mm": 1.0,
+                    "height_mm": 1.0,
+                },
+            ],
+        }
+
+    @staticmethod
+    def evaluator(layout, origin, start):
+        l2 = next(module for module in layout["modules"] if module["name"] == "L2")
+        x_mm = float(l2["x_mm"])
+        y_mm = float(l2["y_mm"])
+        tier = int(l2["tier"])
+        cycle = int(x_mm + y_mm + 0.5)
+        return {
+            "objective_loss": abs(x_mm - 1.0) + cycle,
+            "continuous_selected_wire_cycles": float(cycle) + x_mm / 100.0,
+            "r2_wire_cycles": cycle,
+            "x_mm": x_mm,
+            "y_mm": y_mm,
+            "tier": tier,
+            "origin": origin,
+            "start": start,
+        }
+
+    def test_search_includes_fixed_and_one_deterministic_best_per_cycle(self):
+        first = search_discrete_partitions(
+            self.base_layout(), "L2", [1], 3, True, self.evaluator
+        )
+        second = search_discrete_partitions(
+            self.base_layout(), "L2", [1], 3, True, self.evaluator
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["total_grid_candidates"], 9)
+        self.assertTrue(first["fixed_baseline_included"])
+        self.assertEqual(first["fixed_baseline"]["origin"], "fixed-bin")
+        self.assertEqual(len(first["geometry_rejections"]), 4)
+        grid_cycles = {
+            item["r2_wire_cycles"]
+            for item in first["legal_grid_candidates_detail"]
+        }
+        self.assertEqual(
+            [item["r2_wire_cycles"] for item in first["partitions"]],
+            sorted(grid_cycles),
+        )
+        self.assertIn(first["selected"], first["candidates"])
+
+    def test_search_rejects_invalid_partition_controls(self):
+        for steps in (2, 4):
+            with self.subTest(steps=steps), self.assertRaisesRegex(
+                ValueError, "odd integer"
+            ):
+                search_discrete_partitions(
+                    self.base_layout(), "L2", [1], steps, True,
+                    self.evaluator,
+                )
+        with self.assertRaisesRegex(ValueError, "fixed-bin baseline"):
+            search_discrete_partitions(
+                self.base_layout(), "L2", [1], 3, False, self.evaluator
+            )
 
 
 if __name__ == "__main__":
