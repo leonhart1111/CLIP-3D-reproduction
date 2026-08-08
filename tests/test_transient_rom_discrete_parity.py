@@ -1,10 +1,15 @@
 from pathlib import Path
+from copy import deepcopy
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from workflow.common import read_json
+import tests.test_transient_rom as transient_tests
+from workflow.common import read_json, write_json
 from workflow.floorplan.discrete_partition import search_discrete_partitions
 from workflow.run_lifting_pipeline import validate_config
+from workflow.transient.rom.calibration_design import build_design
+from workflow.transient.rom.contracts import parse_settings
 from workflow.transient.rom.paired_validation import (
     branch_metrics,
     publish_paired_comparison,
@@ -262,6 +267,200 @@ class PairedValidationUnitTests(unittest.TestCase):
             self.assertTrue((output / "paired_comparison.csv").is_file())
             self.assertTrue(report["non_formal"])
             self.assertFalse(report["paper_equivalent"])
+
+
+class TransientROMPairedPipelineTests(unittest.TestCase):
+    """Catch single-layout validation or partially paired measured evidence."""
+
+    def setUp(self):
+        self.fixture = transient_tests.ROMPipelineTests(
+            "test_summary_separates_predicted_and_validated_transient_results"
+        )
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.temporary.cleanup)
+        config = self.fixture.config()
+        config["layout_optimizer"].update({
+            "lambda_wire": 0.0020119160767721133,
+            "wire_objective": "discrete-partition",
+            "partition_grid_steps": 41,
+            "include_fixed_baseline": True,
+        })
+        config["delay"]["wire_aggregation"] = "traffic-weighted"
+        write_json(self.fixture.config_path, config)
+
+        design = build_design(
+            transient_tests.CalibrationDesignTests.model(),
+            [1],
+            parse_settings(config),
+        )
+        self.fixed_layout = self.fixture.steady / "hotspot/layout.json"
+        write_json(self.fixed_layout, design["base_layout"])
+        proposed = deepcopy(design["base_layout"])
+        proposed_l2 = next(
+            module for module in proposed["modules"] if module["kind"] == "l2"
+        )
+        proposed_l2["x_mm"] = float(proposed_l2["x_mm"]) + 0.01
+        write_json(self.fixture.proposed_layout, proposed)
+
+        package = self.fixture.output / "rom_package"
+        package.mkdir(parents=True)
+        self.fixture.bind_package(package)
+        self.optimization = self.fixture.optimization()
+        fixed_l2 = next(
+            module for module in design["base_layout"]["modules"]
+            if module["kind"] == "l2"
+        )
+        self.optimization["parameters"].update({
+            "wire_objective": "discrete-partition",
+            "lambda_wire": 0.0020119160767721133,
+            "wire_aggregation": "traffic-weighted",
+            "wire_rounding": "nearest",
+        })
+        self.optimization["selected"].update({
+            "tier": int(proposed_l2["tier"]),
+            "x_mm": float(proposed_l2["x_mm"]),
+            "y_mm": float(proposed_l2["y_mm"]),
+            "r2_wire_cycles": 7,
+        })
+        self.optimization["search"] = {
+            "fixed_baseline_included": True,
+            "fixed_baseline": {
+                "tier": int(fixed_l2["tier"]),
+                "x_mm": float(fixed_l2["x_mm"]),
+                "y_mm": float(fixed_l2["y_mm"]),
+                "r2_wire_cycles": 8,
+            },
+        }
+
+    @staticmethod
+    def vector(cycle: int) -> dict:
+        return {
+            "critical_l1d_to_l2_cycles": 12 + cycle,
+            "components_cycles": {"layout_wire": cycle},
+            "wire_cycle_aggregation_for_r2": "traffic-weighted",
+            "layout_delays": {"traffic_weighted_wire_cycles": cycle},
+        }
+
+    def run_pipeline(self, *, execute_r2: bool, clip_cycle: int = 7):
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        fixture = self.fixture
+        search_dirs = []
+
+        def final_search(*args, **kwargs):
+            output_dir = Path(args[3])
+            search_dirs.append(output_dir)
+            return fixture.final_validation(output_dir=output_dir)
+
+        def build_vector(*args, **kwargs):
+            layout = Path(args[5]).resolve()
+            cycle = 8 if layout == self.fixed_layout.resolve() else clip_cycle
+            vector = self.vector(cycle)
+            write_json(Path(args[2]), vector)
+            return vector
+
+        def run_r2(*args, **kwargs):
+            output_dir = Path(args[2])
+            ipc2 = 1.4 if output_dir.parent.name == "fixed_bin" else 1.5
+            result = {"ipc2": ipc2}
+            write_json(output_dir / "r2_result.json", result)
+            return result
+
+        with patch(
+            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", fixture.hotspot
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_source_r1",
+            return_value={"metadata": {"workload": "matmul"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.validate_steady_output",
+            return_value={"summary": fixture.steady_summary()},
+        ), patch(
+            "workflow.transient.rom.run_pipeline.prepare_power_windows",
+            return_value=fixture.prepared(),
+        ), patch(
+            "workflow.transient.rom.run_pipeline.optimize_transient_layout",
+            return_value=self.optimization,
+        ), patch(
+            "workflow.transient.rom.run_pipeline.search_layout_frequency",
+            side_effect=final_search,
+        ), patch(
+            "workflow.transient.rom.run_pipeline.build_vector",
+            side_effect=build_vector,
+        ) as build_vector_mock, patch(
+            "workflow.transient.rom.run_pipeline.run_r2",
+            side_effect=run_r2,
+        ) as run_r2_mock:
+            summary = run_transient_rom_pipeline(
+                fixture.source_r1, fixture.steady, fixture.output,
+                fixture.config_path, fixture.transient_r1,
+                calibrate=False, execute_r2=execute_r2,
+            )
+        return summary, search_dirs, build_vector_mock, run_r2_mock
+
+    def test_discrete_mode_validates_both_layouts_without_publishing_unmeasured_pair(self):
+        summary, search_dirs, build_vector_mock, run_r2_mock = self.run_pipeline(
+            execute_r2=False
+        )
+
+        self.assertEqual(search_dirs, [
+            self.fixture.output / "final_validation/fixed_bin",
+            self.fixture.output / "final_validation/clip3d",
+        ])
+        self.assertEqual(build_vector_mock.call_count, 2)
+        self.assertEqual(
+            build_vector_mock.call_args_list[0].args[5], self.fixed_layout.resolve()
+        )
+        self.assertEqual(
+            build_vector_mock.call_args_list[1].args[5],
+            self.fixture.proposed_layout.resolve(),
+        )
+        run_r2_mock.assert_not_called()
+        self.assertFalse(
+            (self.fixture.output / "final_validation/paired_comparison.json").exists()
+        )
+        self.assertIsNone(
+            summary["branches"]["fixed_bin"]["measured_bips2_trans"]
+        )
+        self.assertIsNone(
+            summary["branches"]["clip3d"]["measured_bips2_trans"]
+        )
+
+    def test_discrete_mode_publishes_two_real_hotspot_and_r2_measurements(self):
+        summary, _search_dirs, _build_vector, run_r2_mock = self.run_pipeline(
+            execute_r2=True
+        )
+
+        self.assertEqual(run_r2_mock.call_count, 2)
+        fixed = summary["branches"]["fixed_bin"]
+        clip = summary["branches"]["clip3d"]
+        self.assertEqual(fixed["measured_bips2_trans"], 1.4 * 1.8)
+        self.assertEqual(clip["measured_bips2_trans"], 1.5 * 1.8)
+        paired = read_json(
+            self.fixture.output / "final_validation/paired_comparison.json"
+        )
+        self.assertEqual(
+            paired["bips2_trans_improvement_percent"],
+            ((1.5 * 1.8) - (1.4 * 1.8)) / (1.4 * 1.8) * 100.0,
+        )
+        self.assertNotIn("bips2", summary)
+
+    def test_cycle_mismatch_fails_closed_before_either_r2(self):
+        summary, _search_dirs, _build_vector, run_r2_mock = self.run_pipeline(
+            execute_r2=True, clip_cycle=6
+        )
+
+        run_r2_mock.assert_not_called()
+        self.assertEqual(
+            summary["branches"]["clip3d"]["failure"]["category"],
+            "integer_cycle_identity",
+        )
+        self.assertTrue(
+            (self.fixture.output
+             / "final_validation/clip3d/branch_summary.json").is_file()
+        )
+        self.assertFalse(
+            (self.fixture.output / "final_validation/paired_comparison.json").exists()
+        )
 
 
 if __name__ == "__main__":

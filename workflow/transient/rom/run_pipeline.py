@@ -34,6 +34,11 @@ from workflow.transient.rom.optimize_layout import (
     canonical_frequency_grid,
     optimize_transient_layout,
 )
+from workflow.transient.rom.paired_validation import (
+    branch_metrics,
+    publish_paired_comparison,
+    require_selected_cycle_identity,
+)
 from workflow.transient.rom.pod_state_space import fit_state_space, save_model
 from workflow.transient.run_hotspot_transient import (
     DEFAULT_HOTSPOT,
@@ -521,6 +526,265 @@ def _calibrate_package(modules_path: Path, power_windows_path: Path,
     return cases, acceptance
 
 
+def _candidate_matches_layout(candidate: dict, layout_path: Path,
+                              label: str) -> None:
+    """Bind an optimizer candidate to the sole L2 in one persisted layout."""
+    if not isinstance(candidate, dict):
+        raise ValueError(f"{label} optimizer candidate is missing")
+    layout = read_json(layout_path)
+    modules = layout.get("modules") if isinstance(layout, dict) else None
+    l2_modules = [
+        module for module in modules or []
+        if isinstance(module, dict) and module.get("kind") == "l2"
+    ]
+    if len(l2_modules) != 1:
+        raise ValueError(f"{label} layout must contain exactly one L2")
+    l2 = l2_modules[0]
+    try:
+        matches = (
+            int(candidate["tier"]) == int(l2["tier"])
+            and math.isclose(
+                float(candidate["x_mm"]), float(l2["x_mm"]),
+                rel_tol=0.0, abs_tol=1e-12,
+            )
+            and math.isclose(
+                float(candidate["y_mm"]), float(l2["y_mm"]),
+                rel_tol=0.0, abs_tol=1e-12,
+            )
+        )
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"{label} optimizer candidate has invalid L2 coordinates"
+        ) from error
+    if not matches:
+        raise ValueError(
+            f"{label} persisted layout differs from its optimizer candidate"
+        )
+
+
+def _run_final_branch(
+    *, branch: str, layout_path: Path, selected: dict | None,
+    modules_path: Path, cacti_path: Path, power_windows_path: Path,
+    output_dir: Path, config_path: Path, config: dict, settings: ROMSettings,
+    frequency_grid: list[float], hotspot: Path, source_r1_dir: Path,
+    execute_r2: bool, rerun_r2: bool,
+) -> dict:
+    """Validate one layout with real HotSpot, bind its R2 vector, and optionally run gem5."""
+    if branch not in ("fixed-bin", "clip3d"):
+        raise ValueError("final transient ROM branch must be fixed-bin or clip3d")
+    layout_path = Path(layout_path).resolve()
+    output_dir = Path(output_dir).resolve()
+    _candidate_matches_layout(selected, layout_path, branch)
+    delay = config.get("delay")
+    optimizer = config.get("layout_optimizer")
+    if not isinstance(delay, dict) or not isinstance(optimizer, dict):
+        raise ValueError("config lacks delay or layout_optimizer settings")
+    controls = {
+        "lambda_wire": optimizer.get("lambda_wire"),
+        "wire_aggregation": delay.get("wire_aggregation", "mean"),
+        "wire_rounding": delay.get("wire_rounding", "nearest"),
+        "wire_objective": optimizer.get("wire_objective"),
+    }
+    failure = None
+    try:
+        validation = search_layout_frequency(
+            modules_path, layout_path, power_windows_path, output_dir,
+            config_path, frequencies_ghz=frequency_grid,
+            period_repeats=settings.pss_period_repeats,
+            pss_tolerance_c=settings.pss_tolerance_c,
+            frequency_tolerance_ghz=settings.frequency_tolerance_ghz,
+            hotspot=hotspot,
+        )
+        validation = _validate_final_search_result(
+            validation, frequency_grid, settings, config, output_dir,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        failure = {
+            "category": (
+                "validation_contract_error"
+                if isinstance(error, ValueError) else "tool_error"
+            ),
+            "error_type": type(error).__name__,
+            "message": str(error),
+            "artifact_dir": str(output_dir),
+        }
+        validation = {
+            "schema_version": 1,
+            "state": "rom_final_validation_failed",
+            "f_sus_trans_ghz": None,
+            "search": {"evaluations": []},
+            "failure": failure,
+        }
+
+    search = validation.get("search")
+    evaluations = search.get("evaluations") if isinstance(search, dict) else None
+    if not isinstance(evaluations, list):
+        evaluations = []
+    materialized = (
+        sum(
+            1 for path in output_dir.iterdir()
+            if path.is_dir() and path.name.startswith("frequency_")
+        )
+        if output_dir.is_dir() else 0
+    )
+    hotspot_calls = max(len(evaluations), materialized)
+    f_hotspot = validation.get("f_sus_trans_ghz")
+    if failure is None:
+        nonconverged = [
+            evaluation for evaluation in evaluations
+            if not isinstance(evaluation, dict)
+            or evaluation.get("converged") is not True
+        ]
+        if not evaluations:
+            failure = {
+                "category": "missing_pss_evidence",
+                "message": "final HotSpot validation recorded no PSS evaluations",
+                "artifact_dir": str(output_dir),
+                "evaluations": [],
+            }
+        elif nonconverged:
+            failure = {
+                "category": "pss_nonconvergence",
+                "message": "one or more final HotSpot evaluations did not reach PSS",
+                "artifact_dir": str(output_dir),
+                "evaluations": nonconverged,
+            }
+        if failure is not None:
+            f_hotspot = None
+
+    if failure is not None:
+        state = "rom_final_validation_failed"
+        classification = failure["category"]
+    elif f_hotspot is None:
+        state = "thermally_infeasible"
+        classification = "true_thermal_infeasible"
+    else:
+        state = str(validation.get("state") or "validated")
+        classification = "validated"
+
+    latency_path = (output_dir / "r2_latency.json").resolve()
+    vector = None
+    if classification == "validated":
+        vector = build_vector(
+            modules_path, cacti_path, latency_path, None, None, layout_path,
+            controls["wire_rounding"], int(delay.get("cycles_per_tsv", 2)),
+            int(delay.get("l1_pipeline_cycles", 1)),
+            controls["wire_aggregation"],
+        )
+        if branch == "clip3d":
+            try:
+                require_selected_cycle_identity(
+                    selected, vector, controls["wire_aggregation"]
+                )
+            except ValueError as error:
+                failure = {
+                    "category": "integer_cycle_identity",
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                    "artifact_dir": str(output_dir),
+                }
+                state = "rom_final_validation_failed"
+                classification = failure["category"]
+                f_hotspot = None
+
+    if failure is not None:
+        write_json(output_dir / "final_validation_failure.json", failure)
+
+    result_path = output_dir / "gem5_r2/r2_result.json"
+    hotspot_result = output_dir / "transient_sustainable_frequency.json"
+    summary = {
+        "schema_version": 1,
+        "branch": branch,
+        "state": state,
+        "validation_classification": classification,
+        "failure": failure,
+        "controls": controls,
+        "optimizer_candidate": selected,
+        "predicted": (
+            {
+                "f_sus_trans_rom_ghz": selected.get("f_sus_trans_rom_ghz"),
+                "bips1_trans_rom_pred": selected.get("bips1_trans_rom_pred"),
+            }
+            if branch == "clip3d" else None
+        ),
+        **branch_metrics(None, f_hotspot),
+        "hotspot_evaluations": hotspot_calls,
+        "r2_requested": execute_r2,
+        "r2_executed": False,
+        "r2_critical_path_cycles": (
+            vector.get("critical_l1d_to_l2_cycles") if vector else None
+        ),
+        "r2_wire_cycles": (
+            vector.get("components_cycles", {}).get("layout_wire")
+            if vector else None
+        ),
+        "artifacts": {
+            "layout": str(layout_path),
+            "layout_sha256": sha256_file(layout_path),
+            "hotspot": str(hotspot_result.resolve()) if hotspot_result.is_file() else None,
+            "hotspot_sha256": (
+                sha256_file(hotspot_result) if hotspot_result.is_file() else None
+            ),
+            "r2_latency": str(latency_path) if vector else None,
+            "r2_latency_sha256": sha256_file(latency_path) if vector else None,
+            "r2_result": str(result_path.resolve()) if result_path.is_file() else None,
+            "r2_result_sha256": sha256_file(result_path) if result_path.is_file() else None,
+        },
+    }
+    write_json(output_dir / "branch_summary.json", summary)
+    if execute_r2 and classification == "validated":
+        summary = _execute_branch_r2(
+            summary, source_r1_dir, output_dir, rerun_r2=rerun_r2
+        )
+    return summary
+
+
+def _execute_branch_r2(branch: dict, source_r1_dir: Path, output_dir: Path,
+                       *, rerun_r2: bool) -> dict:
+    """Complete one already validated branch with one real gem5 R2 run."""
+    output_dir = Path(output_dir).resolve()
+    updated = dict(branch)
+    updated["r2_requested"] = True
+    if updated.get("validation_classification") != "validated":
+        write_json(output_dir / "branch_summary.json", updated)
+        return updated
+    latency_value = updated.get("artifacts", {}).get("r2_latency")
+    if not isinstance(latency_value, str):
+        raise ValueError("validated transient ROM branch lacks an R2 vector")
+    latency_path = Path(latency_value).resolve()
+    r2_dir = output_dir / "gem5_r2"
+    try:
+        r2_result = run_r2(
+            source_r1_dir, latency_path, r2_dir, rerun=rerun_r2,
+        )
+        metrics = branch_metrics(
+            r2_result.get("ipc2"),
+            updated.get("validated_f_sus_trans_hotspot_ghz"),
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        updated["state"] = "r2_failed"
+        updated["failure"] = {
+            "category": "r2_error",
+            "error_type": type(error).__name__,
+            "message": str(error),
+            "artifact_dir": str(r2_dir),
+        }
+        write_json(output_dir / "branch_summary.json", updated)
+        return updated
+    updated.update(metrics)
+    updated["r2_executed"] = True
+    result_path = r2_dir / "r2_result.json"
+    artifacts = dict(updated["artifacts"])
+    artifacts.update({
+        "r2_result": str(result_path.resolve()) if result_path.is_file() else None,
+        "r2_result_sha256": sha256_file(result_path) if result_path.is_file() else None,
+    })
+    updated["artifacts"] = artifacts
+    write_json(output_dir / "branch_summary.json", updated)
+    return updated
+
+
 def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
                                output_dir: Path, config_path: Path,
                                transient_r1_dir: Path | None,
@@ -535,18 +799,22 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
     hotspot = Path(DEFAULT_HOTSPOT).resolve()
     reject_overlapping_output(output_dir, [source_r1_dir, steady_preflight_dir])
     final_validation_dir = output_dir / "final_hotspot_validation"
-    if (final_validation_dir.exists()
-            and (not final_validation_dir.is_dir()
-                 or any(final_validation_dir.iterdir()))):
-        if rerun_r2:
-            raise ValueError(
-                "refusing to reuse existing final HotSpot validation artifacts: "
-                "--rerun-r2 is only for retries that failed before final HotSpot"
+    paired_validation_dir = output_dir / "final_validation"
+    for guarded_validation_dir in (
+        final_validation_dir, paired_validation_dir,
+    ):
+        if (guarded_validation_dir.exists()
+                and (not guarded_validation_dir.is_dir()
+                     or any(guarded_validation_dir.iterdir()))):
+            if rerun_r2:
+                raise ValueError(
+                    "refusing to reuse existing final HotSpot validation artifacts: "
+                    "--rerun-r2 is only for retries that failed before final HotSpot"
+                )
+            raise FileExistsError(
+                "final HotSpot validation output directory is not empty: "
+                f"{guarded_validation_dir}"
             )
-        raise FileExistsError(
-            "final HotSpot validation output directory is not empty: "
-            f"{final_validation_dir}"
-        )
     if transient_r1_dir is not None:
         transient_r1_dir = Path(transient_r1_dir).resolve()
         reject_overlapping_output(output_dir, [transient_r1_dir])
@@ -707,6 +975,183 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
     ):
         if not path.is_file():
             raise FileNotFoundError(path)
+    optimizer = config.get("layout_optimizer")
+    if not isinstance(optimizer, dict):
+        raise ValueError("config lacks layout_optimizer settings")
+    if optimizer.get("wire_objective", "continuous") == "discrete-partition":
+        fixed_layout = (steady_preflight_dir / "hotspot/layout.json").resolve()
+        if not fixed_layout.is_file():
+            raise FileNotFoundError(fixed_layout)
+        search_evidence = optimization.get("search")
+        if (not isinstance(search_evidence, dict)
+                or search_evidence.get("fixed_baseline_included") is not True
+                or not isinstance(search_evidence.get("fixed_baseline"), dict)):
+            raise ValueError(
+                "discrete transient ROM optimization lacks its fixed baseline"
+            )
+        fixed_candidate = search_evidence["fixed_baseline"]
+        _candidate_matches_layout(fixed_candidate, fixed_layout, "fixed-bin")
+        _candidate_matches_layout(selected, proposed_layout, "clip3d")
+
+        fixed_dir = paired_validation_dir / "fixed_bin"
+        clip_dir = paired_validation_dir / "clip3d"
+        fixed_branch = _run_final_branch(
+            branch="fixed-bin", layout_path=fixed_layout,
+            selected=fixed_candidate, modules_path=modules_path,
+            cacti_path=cacti_path, power_windows_path=power_windows_path,
+            output_dir=fixed_dir, config_path=config_path, config=config,
+            settings=settings, frequency_grid=frequency_grid, hotspot=hotspot,
+            source_r1_dir=source_r1_dir, execute_r2=False,
+            rerun_r2=rerun_r2,
+        )
+        clip_branch = _run_final_branch(
+            branch="clip3d", layout_path=proposed_layout, selected=selected,
+            modules_path=modules_path, cacti_path=cacti_path,
+            power_windows_path=power_windows_path, output_dir=clip_dir,
+            config_path=config_path, config=config, settings=settings,
+            frequency_grid=frequency_grid, hotspot=hotspot,
+            source_r1_dir=source_r1_dir, execute_r2=False,
+            rerun_r2=rerun_r2,
+        )
+        for branch_summary, branch_dir in (
+            (fixed_branch, fixed_dir), (clip_branch, clip_dir),
+        ):
+            branch_summary["r2_requested"] = execute_r2
+            write_json(branch_dir / "branch_summary.json", branch_summary)
+
+        both_validated = all(
+            branch.get("validation_classification") == "validated"
+            for branch in (fixed_branch, clip_branch)
+        )
+        if execute_r2 and both_validated:
+            fixed_branch = _execute_branch_r2(
+                fixed_branch, source_r1_dir, fixed_dir, rerun_r2=rerun_r2
+            )
+            clip_branch = _execute_branch_r2(
+                clip_branch, source_r1_dir, clip_dir, rerun_r2=rerun_r2
+            )
+        paired = publish_paired_comparison(
+            fixed_branch, clip_branch, paired_validation_dir,
+            r2_requested=execute_r2,
+        )
+
+        cases = calibration_cases or {}
+        historical_training_calls = int(cases.get("training_hotspot_calls", 0))
+        historical_holdout_calls = int(cases.get("holdout_hotspot_calls", 0))
+        invocation_training_calls = (
+            historical_training_calls if package_status == "calibrated" else 0
+        )
+        invocation_holdout_calls = (
+            historical_holdout_calls if package_status == "calibrated" else 0
+        )
+        branches = {"fixed_bin": fixed_branch, "clip3d": clip_branch}
+        if any(branch.get("failure") is not None for branch in branches.values()):
+            pipeline_state = "rom_final_validation_failed"
+        elif any(
+            branch.get("validation_classification") == "true_thermal_infeasible"
+            for branch in branches.values()
+        ):
+            pipeline_state = "thermally_infeasible"
+        elif execute_r2 and paired is None:
+            pipeline_state = "r2_failed"
+        else:
+            pipeline_state = "success" if paired is not None else "validated"
+        summary = {
+            "schema_version": 1,
+            "mode": "paired transient ROM discrete-partition validation",
+            "thermal_mode": "transient-rom",
+            "non_formal": True,
+            "paper_equivalent": False,
+            "state": pipeline_state,
+            "source_r1": str(source_r1_dir),
+            "steady_preflight": str(steady_preflight_dir),
+            "output": str(output_dir),
+            "config": str(config_path),
+            "transient_r1": str(transient_r1_dir),
+            "transient_r1_source": transient_r1_source,
+            "transient_r1_status": r1_status,
+            "sample_interval_ms": settings.sample_interval_ms,
+            "power_windows_preparations": 1,
+            "power_windows_reused": power_windows_reused,
+            "power_windows_preparations_this_run": 0 if power_windows_reused else 1,
+            "power_trace_identity": prepared.get("power_trace_identity"),
+            "rom_package": str(package_dir),
+            "rom_package_status": package_status,
+            "rom_acceptance": package_acceptance,
+            "rom_holdout_validation": calibration_acceptance,
+            "training_hotspot_calls": historical_training_calls,
+            "holdout_hotspot_calls": historical_holdout_calls,
+            "calibration_hotspot_calls": (
+                historical_training_calls + historical_holdout_calls
+            ),
+            "training_hotspot_calls_this_invocation": invocation_training_calls,
+            "holdout_hotspot_calls_this_invocation": invocation_holdout_calls,
+            "calibration_hotspot_calls_this_invocation": (
+                invocation_training_calls + invocation_holdout_calls
+            ),
+            "optimizer_hotspot_calls": optimization.get(
+                "hotspot_calls_inside_optimizer"
+            ),
+            "optimization_reused": optimization_reused,
+            "final_validation_hotspot_calls": sum(
+                int(branch["hotspot_evaluations"])
+                for branch in branches.values()
+            ),
+            "r2_requested": execute_r2,
+            "r2_executed": all(
+                branch.get("r2_executed") is True for branch in branches.values()
+            ),
+            "branches": branches,
+            "predicted": {
+                "clip3d": clip_branch.get("predicted"),
+            },
+            "validated": {
+                name: {
+                    "f_sus_trans_hotspot_ghz": branch.get(
+                        "validated_f_sus_trans_hotspot_ghz"
+                    ),
+                    "classification": branch.get("validation_classification"),
+                }
+                for name, branch in branches.items()
+            },
+            "measured": {
+                name: {
+                    "ipc2": branch.get("measured_ipc2"),
+                    "bips2_trans": branch.get("measured_bips2_trans"),
+                }
+                for name, branch in branches.items()
+            },
+            "paired_comparison": paired,
+            "artifacts": {
+                "modules": str(modules_path),
+                "cacti": str(cacti_path),
+                "power_windows": str(power_windows_path),
+                "rom_package": str(package_dir),
+                "optimization_report": str(
+                    (optimization_dir / "optimization_report.json").resolve()
+                ),
+                "proposed_layout": str(proposed_layout),
+                "fixed_layout": str(fixed_layout),
+                "fixed_branch": str((fixed_dir / "branch_summary.json").resolve()),
+                "clip3d_branch": str((clip_dir / "branch_summary.json").resolve()),
+                "paired_comparison": (
+                    str((paired_validation_dir / "paired_comparison.json").resolve())
+                    if paired is not None else None
+                ),
+                "rom_artifact_manifest": str(
+                    (output_dir / "rom_artifact_manifest.json").resolve()
+                ),
+            },
+            "steady_preflight_layout_method": steady_summary.get("layout_method"),
+        }
+        if _contains_key(summary, "bips2"):
+            raise AssertionError(
+                "transient ROM summary must not contain ambiguous bips2"
+            )
+        write_json(output_dir / "transient_rom_summary.json", summary)
+        _write_artifact_manifest(output_dir)
+        return summary
+
     final_validation_failure = None
     try:
         final_validation = search_layout_frequency(
