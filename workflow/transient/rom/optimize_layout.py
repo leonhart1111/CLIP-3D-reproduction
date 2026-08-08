@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from workflow.common import read_json, write_json
+from workflow.floorplan.discrete_partition import search_discrete_partitions
 from workflow.floorplan.generate_hotspot_inputs import check_geometry
 from workflow.floorplan.layout_metrics import (
     aggregate_wire_cycles,
@@ -208,10 +209,6 @@ def optimize_transient_layout(modules_path: Path, package_dir: Path,
         raise ValueError("modules IPC1 must be finite and positive")
 
     settings = parse_settings(config)
-    if settings.search_grid_points_per_axis != _LATTICE_POINTS_PER_AXIS:
-        raise ValueError("transient ROM search_grid_points_per_axis must equal 25")
-    if settings.refinement_starts != _REFINEMENT_STARTS:
-        raise ValueError("transient ROM refinement_starts must equal 5")
     optimizer = config.get("layout_optimizer", {})
     tiers = optimizer.get("allowed_l2_tiers") if isinstance(optimizer, dict) else None
     design = load_calibration_design(package_dir)
@@ -251,8 +248,15 @@ def optimize_transient_layout(modules_path: Path, package_dir: Path,
         optimizer.get("lambda_wire"), "layout_optimizer.lambda_wire", minimum=0.0
     )
     wire_objective = optimizer.get("wire_objective", "continuous")
-    if wire_objective not in ("continuous", "r2-quantized"):
+    if wire_objective not in (
+        "continuous", "r2-quantized", "discrete-partition"
+    ):
         raise ValueError("layout_optimizer.wire_objective is invalid")
+    if wire_objective != "discrete-partition":
+        if settings.search_grid_points_per_axis != _LATTICE_POINTS_PER_AXIS:
+            raise ValueError("transient ROM search_grid_points_per_axis must equal 25")
+        if settings.refinement_starts != _REFINEMENT_STARTS:
+            raise ValueError("transient ROM refinement_starts must equal 5")
     wire_aggregation = delay.get("wire_aggregation", "mean")
     if wire_aggregation not in ("mean", "maximum", "traffic-weighted"):
         raise ValueError("delay.wire_aggregation is invalid")
@@ -300,12 +304,15 @@ def optimize_transient_layout(modules_path: Path, package_dir: Path,
             continuous_wire if wire_objective == "continuous"
             else float(round_wire_cycles(continuous_wire, wire_rounding))
         )
+        rounded_wire = round_wire_cycles(continuous_wire, wire_rounding)
         candidate = {
             **point,
             "f_sus_trans_rom_ghz": sustainable,
             "wire_objective_cycles": objective_wire,
             "wire_aggregation": wire_aggregation,
             "wire_objective": wire_objective,
+            "continuous_selected_wire_cycles": continuous_wire,
+            "r2_wire_cycles": rounded_wire,
             "layout_delays": layout_delays,
             "frequency_evidence": search,
         }
@@ -326,85 +333,141 @@ def optimize_transient_layout(modules_path: Path, package_dir: Path,
             "bips1_trans_rom_pred": ipc1 * sustainable,
             "temperature_evidence": temperature,
         })
+        candidate["objective_loss"] = candidate["score"]
+        if wire_aggregation == "traffic-weighted":
+            candidate["traffic_weighted_wire_cycles"] = continuous_wire
         return candidate
 
-    legal_seeds = []
-    for tier in tiers:
-        for y_index in range(_LATTICE_POINTS_PER_AXIS):
-            y_mm = upper_y * y_index / (_LATTICE_POINTS_PER_AXIS - 1)
-            for x_index in range(_LATTICE_POINTS_PER_AXIS):
-                x_mm = upper_x * x_index / (_LATTICE_POINTS_PER_AXIS - 1)
-                candidate = evaluate(tier, x_mm, y_mm, "lattice")
-                if candidate is not None:
-                    legal_seeds.append(candidate)
+    partition_search = None
+    if wire_objective == "discrete-partition":
+        partition_grid_steps = optimizer.get("partition_grid_steps", 41)
+        include_fixed_baseline = optimizer.get("include_fixed_baseline", True)
 
-    selectable = [candidate for candidate in legal_seeds
-                  if candidate["score"] is not None]
-    if len(selectable) < _REFINEMENT_STARTS:
-        raise RuntimeError(
-            "ROM optimizer found fewer than five selectable legal lattice seeds"
-        )
-    ranked = sorted(
-        selectable,
-        key=lambda item: (item["score"], item["tier"], item["x_mm"], item["y_mm"]),
-    )
-    seeds = ranked[:_REFINEMENT_STARTS]
-    lattice_step = max(
-        upper_x / (_LATTICE_POINTS_PER_AXIS - 1),
-        upper_y / (_LATTICE_POINTS_PER_AXIS - 1),
-    )
-    coordinate_tolerance = max(max(upper_x, upper_y) * 1e-5, 1e-6)
-    refinements = []
-    refined_candidates = []
-    for index, seed in enumerate(seeds):
-        current = seed
-        step = max(lattice_step / 2.0, coordinate_tolerance * 2.0)
-        iterations = 0
-        legal_trials = []
-        while step > coordinate_tolerance:
-            trials = []
-            seen = set()
-            for dx, dy in _NEIGHBORS:
-                x_mm = min(max(current["x_mm"] + dx * step, 0.0), upper_x)
-                y_mm = min(max(current["y_mm"] + dy * step, 0.0), upper_y)
-                key = (x_mm.hex(), y_mm.hex())
-                if key in seen or (x_mm == current["x_mm"] and y_mm == current["y_mm"]):
-                    continue
-                seen.add(key)
-                candidate = evaluate(seed["tier"], x_mm, y_mm, f"refinement-{index}")
-                if candidate is not None:
-                    legal_trials.append(candidate)
-                    if candidate["score"] is not None:
-                        trials.append(candidate)
-            best = min(
-                trials,
-                key=lambda item: (item["score"], item["x_mm"], item["y_mm"]),
-                default=None,
+        def evaluate_partition(layout: dict, origin: str, start: str) -> dict | None:
+            l2 = next(module for module in layout["modules"] if module["kind"] == "l2")
+            candidate = evaluate(
+                int(l2["tier"]), float(l2["x_mm"]), float(l2["y_mm"]),
+                origin,
             )
-            if best is not None and best["score"] < current["score"]:
-                current = best
-            else:
-                step /= 2.0
-            iterations += 1
-            if iterations >= 1000:
-                raise RuntimeError("ROM pattern refinement exceeded 1000 iterations")
-        refinements.append({
-            "index": index,
-            "seed": seed,
-            "selected": current,
-            "iterations": iterations,
-            "legal_candidates": legal_trials,
-        })
-        refined_candidates.append(current)
+            if candidate is None or candidate["score"] is None:
+                return None
+            candidate["origin"] = origin
+            candidate["start"] = start
+            return candidate
 
-    selected = min(
-        [*selectable, *refined_candidates],
-        key=lambda item: (item["score"], item["tier"], item["x_mm"], item["y_mm"]),
-    )
+        partition_search = search_discrete_partitions(
+            base_layout=base,
+            l2_name=l2_name,
+            allowed_tiers=tiers,
+            grid_steps=partition_grid_steps,
+            include_fixed_baseline=include_fixed_baseline,
+            evaluate=evaluate_partition,
+        )
+        selected = partition_search["selected"]
+        search_report = {
+            **partition_search,
+            "shared_partition_engine": True,
+            "rejections": rejections,
+        }
+    else:
+        legal_seeds = []
+        for tier in tiers:
+            for y_index in range(_LATTICE_POINTS_PER_AXIS):
+                y_mm = upper_y * y_index / (_LATTICE_POINTS_PER_AXIS - 1)
+                for x_index in range(_LATTICE_POINTS_PER_AXIS):
+                    x_mm = upper_x * x_index / (_LATTICE_POINTS_PER_AXIS - 1)
+                    candidate = evaluate(tier, x_mm, y_mm, "lattice")
+                    if candidate is not None:
+                        legal_seeds.append(candidate)
+
+        selectable = [candidate for candidate in legal_seeds
+                      if candidate["score"] is not None]
+        if len(selectable) < _REFINEMENT_STARTS:
+            raise RuntimeError(
+                "ROM optimizer found fewer than five selectable legal lattice seeds"
+            )
+        ranked = sorted(
+            selectable,
+            key=lambda item: (
+                item["score"], item["tier"], item["x_mm"], item["y_mm"]
+            ),
+        )
+        seeds = ranked[:_REFINEMENT_STARTS]
+        lattice_step = max(
+            upper_x / (_LATTICE_POINTS_PER_AXIS - 1),
+            upper_y / (_LATTICE_POINTS_PER_AXIS - 1),
+        )
+        coordinate_tolerance = max(max(upper_x, upper_y) * 1e-5, 1e-6)
+        refinements = []
+        refined_candidates = []
+        for index, seed in enumerate(seeds):
+            current = seed
+            step = max(lattice_step / 2.0, coordinate_tolerance * 2.0)
+            iterations = 0
+            legal_trials = []
+            while step > coordinate_tolerance:
+                trials = []
+                seen = set()
+                for dx, dy in _NEIGHBORS:
+                    x_mm = min(max(current["x_mm"] + dx * step, 0.0), upper_x)
+                    y_mm = min(max(current["y_mm"] + dy * step, 0.0), upper_y)
+                    key = (x_mm.hex(), y_mm.hex())
+                    if key in seen or (
+                        x_mm == current["x_mm"] and y_mm == current["y_mm"]
+                    ):
+                        continue
+                    seen.add(key)
+                    candidate = evaluate(
+                        seed["tier"], x_mm, y_mm, f"refinement-{index}"
+                    )
+                    if candidate is not None:
+                        legal_trials.append(candidate)
+                        if candidate["score"] is not None:
+                            trials.append(candidate)
+                best = min(
+                    trials,
+                    key=lambda item: (item["score"], item["x_mm"], item["y_mm"]),
+                    default=None,
+                )
+                if best is not None and best["score"] < current["score"]:
+                    current = best
+                else:
+                    step /= 2.0
+                iterations += 1
+                if iterations >= 1000:
+                    raise RuntimeError("ROM pattern refinement exceeded 1000 iterations")
+            refinements.append({
+                "index": index,
+                "seed": seed,
+                "selected": current,
+                "iterations": iterations,
+                "legal_candidates": legal_trials,
+            })
+            refined_candidates.append(current)
+
+        selected = min(
+            [*selectable, *refined_candidates],
+            key=lambda item: (
+                item["score"], item["tier"], item["x_mm"], item["y_mm"]
+            ),
+        )
+        search_report = {
+            "lattice_points_per_axis": _LATTICE_POINTS_PER_AXIS,
+            "lattice_points_attempted": len(tiers) * _LATTICE_POINTS_PER_AXIS ** 2,
+            "legal_seeds": legal_seeds,
+            "rejections": rejections,
+            "refinement_starts": _REFINEMENT_STARTS,
+            "coordinate_tolerance_mm": coordinate_tolerance,
+            "refinements": refinements,
+        }
     selected_layout = _layout(
         base, l2_name, selected["tier"], selected["x_mm"], selected["y_mm"]
     )
-    selected_layout["policy"] = "accepted transient ROM grid-plus-refinement proposal"
+    selected_layout["policy"] = (
+        "accepted transient ROM integer-cycle partition proposal"
+        if wire_objective == "discrete-partition"
+        else "accepted transient ROM grid-plus-refinement proposal"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     proposed_path = output_dir / "proposed_layout.json"
     write_json(proposed_path, selected_layout)
@@ -438,18 +501,12 @@ def optimize_transient_layout(modules_path: Path, package_dir: Path,
                 "-IPC1*f_sus_trans_rom + lambda_wire*IPC1*wire_objective_cycles"
             ),
         },
-        "search": {
-            "lattice_points_per_axis": _LATTICE_POINTS_PER_AXIS,
-            "lattice_points_attempted": len(tiers) * _LATTICE_POINTS_PER_AXIS ** 2,
-            "legal_seeds": legal_seeds,
-            "rejections": rejections,
-            "refinement_starts": _REFINEMENT_STARTS,
-            "coordinate_tolerance_mm": coordinate_tolerance,
-            "refinements": refinements,
-        },
+        "search": search_report,
         "selected": selected,
         "selected_layout": selected_layout,
         "proposed_layout": str(proposed_path),
     }
+    if partition_search is not None:
+        write_json(output_dir / "partition_search.json", search_report)
     write_json(output_dir / "optimization_report.json", report)
     return report

@@ -1906,6 +1906,86 @@ class ROMOptimizerTests(unittest.TestCase):
         self.assertTrue(proposed.is_file())
         self.assertEqual(read_json(proposed), report["selected_layout"])
 
+    def _discrete_package(self, name, *, grid_steps=3, include_fixed=True):
+        self.model_data["communication_profile"] = {
+            "status": "available",
+            "per_core": {
+                "0": {"normalized_weight": 0.4},
+                "1": {"normalized_weight": 0.3},
+                "2": {"normalized_weight": 0.2},
+                "3": {"normalized_weight": 0.1},
+            },
+        }
+        write_json(self.modules, self.model_data)
+        config = self.config()
+        config["layout_optimizer"].update({
+            "lambda_wire": 0.0020119160767721133,
+            "wire_objective": "discrete-partition",
+            "partition_grid_steps": grid_steps,
+            "include_fixed_baseline": include_fixed,
+        })
+        config["delay"]["wire_aggregation"] = "traffic-weighted"
+        write_json(self.config_path, config)
+        package = self.root / name
+        package.mkdir()
+        design = build_design(self.model_data, [1], parse_settings(config))
+        self._write_self_consistent_package(package, design)
+        return package
+
+    def test_optimizer_uses_nonzero_lambda_traffic_weighted_integer_partitions(self):
+        # Break caught: accepting the config but retaining the old continuous
+        # 25x25+refinement search would reproduce the rounding bug in ROM mode.
+        package = self._discrete_package("discrete-package")
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._frequency_evidence,
+        ):
+            report = optimize_transient_layout(
+                self.modules, package, self.output, self.config_path,
+                self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertEqual(
+            report["parameters"]["wire_objective"], "discrete-partition"
+        )
+        self.assertEqual(
+            report["parameters"]["lambda_wire"], 0.0020119160767721133
+        )
+        self.assertEqual(
+            report["parameters"]["wire_aggregation"], "traffic-weighted"
+        )
+        self.assertEqual(report["hotspot_calls_inside_optimizer"], 0)
+        self.assertTrue(report["search"]["fixed_baseline_included"])
+        self.assertTrue(report["search"]["shared_partition_engine"])
+        self.assertEqual(
+            report["selected"]["wire_objective_cycles"],
+            report["selected"]["r2_wire_cycles"],
+        )
+        self.assertIsInstance(report["selected"]["r2_wire_cycles"], int)
+        self.assertTrue((self.output / "partition_search.json").is_file())
+
+    def test_discrete_optimizer_rejects_invalid_controls_before_rom_search(self):
+        for index, (steps, include_fixed, message) in enumerate((
+            (2, True, "odd integer"),
+            (40, True, "odd integer"),
+            (3, False, "fixed-bin baseline"),
+        )):
+            with self.subTest(steps=steps, include_fixed=include_fixed):
+                package = self._discrete_package(
+                    f"invalid-discrete-{index}", grid_steps=steps,
+                    include_fixed=include_fixed,
+                )
+                output = self.root / f"invalid-output-{index}"
+                with patch(
+                    "workflow.transient.rom.optimize_layout."
+                    "find_rom_sustainable_frequency",
+                    side_effect=self._search_must_not_run,
+                ), self.assertRaisesRegex(ValueError, message):
+                    optimize_transient_layout(
+                        self.modules, package, output, self.config_path,
+                        self.power_windows, hotspot=self.hotspot,
+                    )
+
     def test_optimizer_loads_saved_design_without_regenerating_it(self):
         # Break caught: rerunning current design-generation code can change the
         # anchor/simplex meaning of B_L2 columns in an already accepted model.
