@@ -278,6 +278,50 @@ tau_traffic = sum_i(q_i * tau_i)
 
 热代理只用于提出候选。由于论文没有公开代理系数，而且实测表明代理梯度可能与 detailed-3D HotSpot 不一致，流水线会对 optimized 和 fixed-bin 各运行一次真实 HotSpot。选择时先比较 `IPC1×f_sus`；仅在数值相同时再比较 R2 真正使用的离散平均线延迟，最后比较真实 Tmax。若 optimized 更差则回退 fixed-bin，并在 `layout_selection.json` 中记录原因。该保护是复现工程的防回归措施，不宣称为论文原算法；它避免把代理失配误报成布局收益。
 
+#### 整数周期分区搜索修正
+
+历史 `continuous` 模式在公式(15)中使用浮点线延迟，优化结束后才按
+`delay.wire_rounding` 生成 R2 整数周期。若位置从 1.358 周期移动到
+1.558 周期，连续目标只看到 0.2 周期变化，但 `nearest` 会使 R2 从 1
+周期跳到 2 周期。该模式继续保留用于历史和论文式连续代理对照，新实验应使用：
+
+```json
+"layout_optimizer": {
+  "wire_objective": "discrete-partition",
+  "partition_grid_steps": 41,
+  "include_fixed_baseline": true
+}
+```
+
+`discrete-partition` 在单个可移动 L2 的合法区域上进行确定性 41×41
+网格搜索，使用与 R2 相同的 `round_wire_cycles` 将位置划分为整数周期区间。
+每个非空区间只保留离散目标最好的代表，并与 fixed-bin 候选一起选择。
+同一整数周期内才使用连续线延迟打破平局。因此，连续差异不能再掩盖一个
+完整周期的性能代价。搜索仍只调用闭式热代理，最终保持一次 HotSpot 验证，
+不会在 1681 个候选中反复调用 HotSpot 或 gem5。
+
+修正入口是：
+
+```text
+configs/experiments/clip3d_constrained_5p0_raw_power_p1_lambda0020119_traffic_weighted_discrete_partition_exploratory.json
+```
+
+Cholesky `L1D=128kB/L2=1024kB` 的 lifting-only 验证命令为：
+
+```bash
+python -m workflow.run_lifting_pipeline \
+  --r1-dir runs/architecture_sweep/r1/paper/cholesky/l1d_128kB/l2_1024kB \
+  --output-dir runs/discrete_partition_validation/cholesky_128kB_1024kB_20260808 \
+  --config configs/experiments/clip3d_constrained_5p0_raw_power_p1_lambda0020119_traffic_weighted_discrete_partition_exploratory.json \
+  --layout-method clip3d \
+  --transient false
+```
+
+旧的 `runs/operational_balanced50_traffic_weighted` 50点实验使用连续目标，
+现仅作为历史探索数据保留，不能与修正模式结果合并汇总。分区搜索只修正
+连续延迟与整数R2不一致；当前共享 `lambda_wire` 的跨工作负载有效性和
+gem5 IPC非单调问题仍未解决，因此该配置继续标记为非正式探索实验。
+
 ## 4. 正式扫描与排名
 
 正式流程包括两种冷却条件、严格R2、表III锚点和四种布局方法，且第二种固定布局冷却条件可以在延迟向量完全相同时复用第一次R2。为避免把代理BIPS、不同热阻或不同布局方法混在一起，完整命令统一列在 `docs/formal_reproduction_zh.md`。
