@@ -31,6 +31,8 @@ Files:
 - Create: workflow/transient/rom/evidence.py
 - Modify: workflow/transient/rom/contracts.py
 - Modify: workflow/transient/rom/materialize_calibration.py
+- Modify: workflow/transient/rom/run_pipeline.py
+- Modify: workflow/transient/rom/calibrate_rom.py
 - Modify: tests/test_transient_rom.py
 
 Interfaces:
