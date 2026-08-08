@@ -59,7 +59,7 @@
       "beta": "non-formal: fixed_unidentifiable_under_p1",
       "cross_tier_weight": "non-formal: retained from the measured held-out selection",
       "lambda_wire": {
-        "source": "results/parameter_studies/raw_power_strict_20260730/r2_wire/fft/lambda_wire_report.json",
+        "source": "manifests/parameter_provenance/lambda_wire_fft_rejected.json",
         "field": "lambda_wire",
         "value": 0.0020119160767721133,
         "accepted_for_formal_or_shared_use": false,

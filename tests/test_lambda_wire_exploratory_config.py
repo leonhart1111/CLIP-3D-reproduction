@@ -11,9 +11,9 @@ EXPLORATORY = (
     ROOT
     / "configs/experiments/clip3d_constrained_5p0_raw_power_p1_lambda0020119_exploratory.json"
 )
-REPORT = (
+PROVENANCE = (
     ROOT
-    / "results/parameter_studies/raw_power_strict_20260730/r2_wire/fft/lambda_wire_report.json"
+    / "manifests/parameter_provenance/lambda_wire_fft_rejected.json"
 )
 
 
@@ -22,7 +22,7 @@ class LambdaWireExploratoryConfigTests(unittest.TestCase):
         self.assertTrue(EXPLORATORY.is_file(), f"missing exploratory config: {EXPLORATORY}")
         source = read_json(SOURCE)
         candidate = read_json(EXPLORATORY)
-        report = read_json(REPORT)
+        report = read_json(PROVENANCE)
 
         self.assertEqual(source["layout_optimizer"]["lambda_wire"], 0.0)
         self.assertEqual(
@@ -50,7 +50,7 @@ class LambdaWireExploratoryConfigTests(unittest.TestCase):
         provenance = candidate["layout_optimizer"]["parameter_provenance"][
             "lambda_wire"
         ]
-        self.assertEqual(provenance["source"], str(REPORT.relative_to(ROOT)))
+        self.assertEqual(provenance["source"], str(PROVENANCE.relative_to(ROOT)))
         self.assertEqual(provenance["field"], "lambda_wire")
         self.assertEqual(provenance["value"], report["lambda_wire"])
         self.assertFalse(provenance["accepted_for_formal_or_shared_use"])

@@ -1,0 +1,130 @@
+{
+  "schema_version": 2,
+  "method": "multi-level ordinary least-squares regression of gem5 R2 IPC",
+  "samples": [
+    {
+      "label": "0",
+      "result": "/home/zyjiang/Agenticflow/CLIP/results/parameter_studies/raw_power_strict_20260730/r2_wire/fft/wire_0/r2_result.json",
+      "latency": "/home/zyjiang/Agenticflow/CLIP/results/parameter_studies/raw_power_strict_20260730/r2_wire/fft/wire_0/latency.json",
+      "ipc2": 3.3823926736932575,
+      "wire_cycles": 0,
+      "gem5_overrides": {
+        "l1i_tag_latency": 1,
+        "l1i_data_latency": 1,
+        "l1i_response_latency": 1,
+        "l1d_tag_latency": 1,
+        "l1d_data_latency": 1,
+        "l1d_response_latency": 1,
+        "l2_tag_latency": 3,
+        "l2_data_latency": 3,
+        "l2_response_latency": 1,
+        "xbar_frontend_latency": 1,
+        "xbar_forward_latency": 5,
+        "xbar_response_latency": 1,
+        "xbar_snoop_response_latency": 1
+      },
+      "predicted_ipc2": 3.3861661549697337,
+      "residual_ipc2": -0.0037734812764762538
+    },
+    {
+      "label": "1",
+      "result": "/home/zyjiang/Agenticflow/CLIP/results/parameter_studies/raw_power_strict_20260730/r2_wire/fft/wire_1/r2_result.json",
+      "latency": "/home/zyjiang/Agenticflow/CLIP/results/parameter_studies/raw_power_strict_20260730/r2_wire/fft/wire_1/latency.json",
+      "ipc2": 3.3862638936965124,
+      "wire_cycles": 1,
+      "gem5_overrides": {
+        "l1i_tag_latency": 1,
+        "l1i_data_latency": 1,
+        "l1i_response_latency": 1,
+        "l1d_tag_latency": 1,
+        "l1d_data_latency": 1,
+        "l1d_response_latency": 1,
+        "l2_tag_latency": 3,
+        "l2_data_latency": 3,
+        "l2_response_latency": 1,
+        "xbar_frontend_latency": 1,
+        "xbar_forward_latency": 6,
+        "xbar_response_latency": 1,
+        "xbar_snoop_response_latency": 1
+      },
+      "predicted_ipc2": 3.379061294617489,
+      "residual_ipc2": 0.007202599079023209
+    },
+    {
+      "label": "2",
+      "result": "/home/zyjiang/Agenticflow/CLIP/results/parameter_studies/raw_power_strict_20260730/r2_wire/fft/wire_2/r2_result.json",
+      "latency": "/home/zyjiang/Agenticflow/CLIP/results/parameter_studies/raw_power_strict_20260730/r2_wire/fft/wire_2/latency.json",
+      "ipc2": 3.3688716799366265,
+      "wire_cycles": 2,
+      "gem5_overrides": {
+        "l1i_tag_latency": 1,
+        "l1i_data_latency": 1,
+        "l1i_response_latency": 1,
+        "l1d_tag_latency": 1,
+        "l1d_data_latency": 1,
+        "l1d_response_latency": 1,
+        "l2_tag_latency": 3,
+        "l2_data_latency": 3,
+        "l2_response_latency": 1,
+        "xbar_frontend_latency": 1,
+        "xbar_forward_latency": 7,
+        "xbar_response_latency": 1,
+        "xbar_snoop_response_latency": 1
+      },
+      "predicted_ipc2": 3.3719564342652446,
+      "residual_ipc2": -0.0030847543286181
+    },
+    {
+      "label": "3",
+      "result": "/home/zyjiang/Agenticflow/CLIP/results/parameter_studies/raw_power_strict_20260730/r2_wire/fft/wire_3/r2_result.json",
+      "latency": "/home/zyjiang/Agenticflow/CLIP/results/parameter_studies/raw_power_strict_20260730/r2_wire/fft/wire_3/latency.json",
+      "ipc2": 3.3645072104390708,
+      "wire_cycles": 3,
+      "gem5_overrides": {
+        "l1i_tag_latency": 1,
+        "l1i_data_latency": 1,
+        "l1i_response_latency": 1,
+        "l1d_tag_latency": 1,
+        "l1d_data_latency": 1,
+        "l1d_response_latency": 1,
+        "l2_tag_latency": 3,
+        "l2_data_latency": 3,
+        "l2_response_latency": 1,
+        "xbar_frontend_latency": 1,
+        "xbar_forward_latency": 8,
+        "xbar_response_latency": 1,
+        "xbar_snoop_response_latency": 1
+      },
+      "predicted_ipc2": 3.364851573913,
+      "residual_ipc2": -0.0003443634739292989
+    }
+  ],
+  "ipc1": 3.4295015037165895,
+  "reference_sustainable_frequency_ghz": 0.9711477592183363,
+  "fit": {
+    "equation": "IPC2 = intercept - ipc_loss_per_added_cycle * wire_cycles",
+    "intercept": 3.3861661549697337,
+    "ipc_loss_per_added_cycle": 0.007104860352244602,
+    "r_squared": 0.7691549845761521,
+    "monotonic_violations": [
+      {
+        "lower_cycle_sample": "0",
+        "higher_cycle_sample": "1"
+      }
+    ]
+  },
+  "lambda_wire": 0.0020119160767721133,
+  "lambda_equation": "lambda_wire = f_sus * ipc_loss_per_added_cycle / IPC1",
+  "units": "GHz per wire cycle in the current IPC1-scaled equation-(15) implementation",
+  "recommendation": {
+    "accepted_for_this_workload": false,
+    "acceptance": "R^2 >= 0.95 and no monotonicity violation",
+    "cross_workload_transfer_validated": false,
+    "action": "repeat for every workload and report the distribution before choosing a shared value"
+  },
+  "limitations": [
+    "The regression is local to one workload and architecture.",
+    "All samples must differ only in the injected wire-cycle latency.",
+    "The fitted value is cooling-point dependent because BIPS latency loss scales with frequency."
+  ]
+}
