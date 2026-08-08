@@ -27,6 +27,7 @@ from workflow.transient.rom.contracts import (
     require_rom_artifact_manifest,
     write_rom_artifact_manifest,
 )
+from workflow.transient.rom.evidence import ROM_CLASSIFICATION
 from workflow.transient.rom.materialize_calibration import execute_calibration_cases
 from workflow.transient.rom.optimize_layout import (
     _requested_identity,
@@ -393,11 +394,7 @@ def _contains_key(value: object, key: str) -> bool:
     return False
 
 
-_CLASSIFICATION = {
-    "thermal_mode": "transient-rom",
-    "non_formal": True,
-    "paper_equivalent": False,
-}
+_CLASSIFICATION = ROM_CLASSIFICATION
 
 
 def _write_artifact_manifest(output_dir: Path) -> dict:
@@ -527,6 +524,7 @@ def _calibrate_package(modules_path: Path, power_windows_path: Path,
     )
     fit_report = {
         **fit_report,
+        **ROM_CLASSIFICATION,
         "calibration_design_hash": calibration_design_hash(design),
     }
     save_model(package_dir / "pod_model.npz", model, fit_report)

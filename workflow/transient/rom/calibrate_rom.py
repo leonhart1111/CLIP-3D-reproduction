@@ -18,6 +18,7 @@ from workflow.transient.rom.contracts import (
     rom_input_identity,
     write_rom_artifact_manifest,
 )
+from workflow.transient.rom.evidence import ROM_CLASSIFICATION
 from workflow.transient.rom.calibration_design import calibration_design_hash
 from workflow.transient.rom.layout_rom import evaluate_layout_rom, validate_holdouts
 from workflow.transient.rom.materialize_calibration import execute_calibration_cases
@@ -287,6 +288,7 @@ def main() -> None:
     )
     fit_report = {
         **fit_report,
+        **ROM_CLASSIFICATION,
         "calibration_design_hash": calibration_design_hash(design),
     }
     save_model(args.output_dir / "pod_model.npz", model, fit_report)

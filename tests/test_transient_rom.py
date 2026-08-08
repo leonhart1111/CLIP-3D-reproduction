@@ -251,6 +251,7 @@ def write_synthetic_accepted_package(
     ordered_training = sorted(training, key=lambda case: case["id"])
     fit_report = {
         "schema_version": 1,
+        **classification,
         "case_order": [case["id"] for case in ordered_training],
         "calibration_design_hash": canonical_json_sha256(design),
         "temperature_trace_sha256": {
@@ -506,6 +507,22 @@ class ROMContractTests(unittest.TestCase):
     def test_reuse_rejects_missing_packaged_source_power(self):
         self.remove_packaged_source("source_power_windows.json")
         with self.assertRaisesRegex(ValueError, "source power"):
+            require_package_calibration_evidence(
+                self.package, self.reuse_identity(), self.settings(),
+            )
+
+    def test_reuse_rejects_contradictory_fit_report_classification(self):
+        # Break caught: a rehashed fit report must not reinterpret a transient
+        # ROM model as formal steady-state evidence during package reuse.
+        fit_path = self.package / "fit_report.json"
+        fit_report = read_json(fit_path)
+        fit_report.update({"thermal_mode": "steady", "non_formal": False})
+        write_json(fit_path, fit_report)
+        model, _ = load_model(self.package / "pod_model.npz")
+        save_model(self.package / "pod_model.npz", model, fit_report)
+        write_test_artifact_manifest(self.package)
+
+        with self.assertRaisesRegex(ValueError, "classification"):
             require_package_calibration_evidence(
                 self.package, self.reuse_identity(), self.settings(),
             )

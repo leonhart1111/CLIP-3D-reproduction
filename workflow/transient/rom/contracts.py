@@ -372,6 +372,7 @@ def require_package_calibration_evidence(
     except ValueError as error:
         raise ValueError("reusable ROM calibration manifest classification differs") from error
     require_rom_classification(cases, "reusable ROM calibration cases report")
+    require_rom_classification(fit_report, "reusable ROM fit report")
     if (manifest.get("identity") != acceptance["identity"]
             or manifest.get("calibration_design_hash") != design_identity
             or manifest.get("calibration_runs") != 8
