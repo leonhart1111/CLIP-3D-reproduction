@@ -8,7 +8,7 @@ import math
 from numbers import Integral, Real
 from pathlib import Path
 
-from workflow.common import atomic_write_bytes, write_json
+from workflow.common import atomic_write_bytes, read_json, sha256_file, write_json
 
 
 def _finite_optional(value: object, label: str) -> float | None:
@@ -73,19 +73,54 @@ def branch_metrics(ipc2: float | None, f_hotspot_ghz: float | None) -> dict:
     }
 
 
+def _validated_artifact(artifacts: dict, field: str, label: str) -> Path:
+    value = artifacts.get(field)
+    digest = artifacts.get(f"{field}_sha256")
+    if not isinstance(value, str) or not value or not isinstance(digest, str):
+        raise ValueError(f"{label} lacks measured artifact identity for {field}")
+    path = Path(value).resolve()
+    if not path.is_file() or sha256_file(path) != digest:
+        raise ValueError(f"{label} measured artifact identity differs for {field}")
+    return path
+
+
 def _validated_branch(branch: dict, expected_name: str) -> tuple[float, dict]:
     if not isinstance(branch, dict) or branch.get("branch") != expected_name:
         raise ValueError(f"paired comparison requires the {expected_name} branch")
-    bips = _finite_optional(
+    if branch.get("r2_executed") is not True:
+        raise ValueError(f"{expected_name} lacks a completed real R2 measurement")
+    if (branch.get("failure") is not None
+            or branch.get("validation_classification") != "validated"):
+        raise ValueError(f"{expected_name} is not a validated measured branch")
+    ipc = _finite_optional(branch.get("measured_ipc2"), f"{expected_name} IPC2")
+    frequency = _finite_optional(
+        branch.get("validated_f_sus_trans_hotspot_ghz"),
+        f"{expected_name} HotSpot frequency",
+    )
+    claimed_bips = _finite_optional(
         branch.get("measured_bips2_trans"),
         f"{expected_name} measured BIPS2_trans",
     )
-    if bips is None:
-        raise ValueError(f"{expected_name} lacks measured BIPS2_trans")
+    if ipc is None or frequency is None or claimed_bips is None:
+        raise ValueError(f"{expected_name} lacks measured BIPS2_trans inputs")
+    bips = ipc * frequency
+    if not math.isclose(claimed_bips, bips, rel_tol=1e-12, abs_tol=0.0):
+        raise ValueError(f"{expected_name} measured BIPS2_trans is inconsistent")
     controls = branch.get("controls")
     artifacts = branch.get("artifacts")
     if not isinstance(controls, dict) or not isinstance(artifacts, dict):
         raise ValueError(f"{expected_name} lacks controls or artifact identity")
+    _validated_artifact(artifacts, "layout", expected_name)
+    hotspot_path = _validated_artifact(artifacts, "hotspot", expected_name)
+    _validated_artifact(artifacts, "r2_latency", expected_name)
+    r2_path = _validated_artifact(artifacts, "r2_result", expected_name)
+    hotspot_result = read_json(hotspot_path)
+    r2_result = read_json(r2_path)
+    if (not isinstance(hotspot_result, dict)
+            or hotspot_result.get("f_sus_trans_ghz") != frequency):
+        raise ValueError(f"{expected_name} HotSpot artifact frequency differs")
+    if not isinstance(r2_result, dict) or r2_result.get("ipc2") != ipc:
+        raise ValueError(f"{expected_name} R2 artifact IPC2 differs")
     return bips, controls
 
 
@@ -109,8 +144,13 @@ def publish_paired_comparison(
         csv_path.unlink(missing_ok=True)
         return None
 
-    fixed_bips, fixed_controls = _validated_branch(fixed, "fixed-bin")
-    clip_bips, clip_controls = _validated_branch(clip3d, "clip3d")
+    try:
+        fixed_bips, fixed_controls = _validated_branch(fixed, "fixed-bin")
+        clip_bips, clip_controls = _validated_branch(clip3d, "clip3d")
+    except (OSError, ValueError):
+        json_path.unlink(missing_ok=True)
+        csv_path.unlink(missing_ok=True)
+        raise
     if fixed_controls != clip_controls:
         raise ValueError("paired branches use different optimization controls")
     lambda_wire = _finite_optional(

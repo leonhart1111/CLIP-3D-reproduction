@@ -2636,15 +2636,17 @@ class ROMPipelineTests(unittest.TestCase):
             ])
         return rows_c
 
-    @classmethod
     def write_final_validation_trace(
-        cls, output_dir: Path, frequency_ghz: float, profile: str,
+        self, output_dir: Path, frequency_ghz: float, profile: str,
+        *, modules_path: Path | None = None, layout_path: Path | None = None,
+        power_windows_path: Path | None = None,
+        config_path: Path | None = None,
     ) -> None:
         """Write trace facts without consulting any mocked search evaluation."""
-        rows_c = cls.final_validation_trace_rows(frequency_ghz, profile)
+        rows_c = self.final_validation_trace_rows(frequency_ghz, profile)
         case_dir = output_dir / f"frequency_{frequency_ghz.hex()}_ghz"
         case_dir.mkdir(parents=True, exist_ok=True)
-        write_json(case_dir / "transient_trace_manifest.json", {
+        manifest = {
             "window_count": len(rows_c),
             "windows_per_period": 2,
             "period_repeats": 20,
@@ -2652,7 +2654,23 @@ class ROMPipelineTests(unittest.TestCase):
             "frequency_scaling": {
                 "frequency_scale": frequency_ghz / 2.0,
             },
-        })
+        }
+        if all(path is not None for path in (
+            modules_path, layout_path, power_windows_path, config_path,
+        )):
+            trace_config = case_dir / "trace_input_config.json"
+            write_json(trace_config, read_json(config_path))
+            manifest.update({
+                "source_modules": str(Path(modules_path).resolve()),
+                "source_layout": str(Path(layout_path).resolve()),
+                "source_power_windows": str(Path(power_windows_path).resolve()),
+                "trace_input_identity": trace_input_identity(
+                    Path(modules_path), Path(layout_path),
+                    Path(power_windows_path), trace_config,
+                    frequency_ghz / 2.0,
+                ),
+            })
+        write_json(case_dir / "transient_trace_manifest.json", manifest)
         (case_dir / "transient.ttrace").write_text(
             "cell0\tcell1\n"
             + "\n".join(
@@ -2665,6 +2683,9 @@ class ROMPipelineTests(unittest.TestCase):
 
     def final_validation(
         self, profile: str = "baseline", output_dir: Path | None = None,
+        *, modules_path: Path | None = None, layout_path: Path | None = None,
+        power_windows_path: Path | None = None,
+        config_path: Path | None = None, hotspot_path: Path | None = None,
     ) -> dict:
         """Derive a canonical search solely from materialized trace facts."""
         grid = [1.0, 1.8, 2.0]
@@ -2677,6 +2698,9 @@ class ROMPipelineTests(unittest.TestCase):
         def evaluate(frequency_ghz: float) -> dict:
             self.write_final_validation_trace(
                 artifact_root, frequency_ghz, profile,
+                modules_path=modules_path, layout_path=layout_path,
+                power_windows_path=power_windows_path,
+                config_path=config_path,
             )
             case_dir = artifact_root / f"frequency_{frequency_ghz.hex()}_ghz"
             names, rows_k = parse_ttrace_grid(case_dir / "transient.ttrace")
@@ -2707,6 +2731,17 @@ class ROMPipelineTests(unittest.TestCase):
             },
             "search": search,
         }
+        if all(path is not None for path in (
+            modules_path, layout_path, power_windows_path, config_path,
+            hotspot_path,
+        )):
+            result.update({
+                "modules": str(Path(modules_path).resolve()),
+                "layout": str(Path(layout_path).resolve()),
+                "power_windows": str(Path(power_windows_path).resolve()),
+                "config": str(Path(config_path).resolve()),
+                "hotspot": str(Path(hotspot_path).resolve()),
+            })
         write_json(
             artifact_root / "transient_sustainable_frequency.json", result,
         )
@@ -2718,7 +2753,11 @@ class ROMPipelineTests(unittest.TestCase):
     ):
         def run(*args, **_kwargs):
             output_dir = Path(args[3])
-            derived = self.final_validation(profile, output_dir)
+            derived = self.final_validation(
+                profile, output_dir, modules_path=Path(args[0]),
+                layout_path=Path(args[1]), power_windows_path=Path(args[2]),
+                config_path=Path(args[4]), hotspot_path=Path(_kwargs["hotspot"]),
+            )
             if artifact_mutation is not None:
                 artifact_mutation(output_dir, derived)
             return (
@@ -2892,7 +2931,11 @@ class ROMPipelineTests(unittest.TestCase):
 
         def final_side_effect(*args, **kwargs):
             events.append("hotspot")
-            return self.final_validation(output_dir=Path(args[3]))
+            return self.final_validation(
+                output_dir=Path(args[3]), modules_path=Path(args[0]),
+                layout_path=Path(args[1]), power_windows_path=Path(args[2]),
+                config_path=Path(args[4]), hotspot_path=Path(kwargs["hotspot"]),
+            )
 
         with patch(
             "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot

@@ -45,6 +45,7 @@ from workflow.transient.run_hotspot_transient import (
     parse_ttrace_grid,
     summarize_period_end_convergence,
 )
+from workflow.transient.generate_hotspot_trace import trace_input_identity
 from workflow.transient.run_transient_pipeline import (
     prepare_power_windows,
     reject_overlapping_output,
@@ -72,7 +73,9 @@ def package_identity(modules_path: Path, power_windows_path: Path,
 
 def _validate_final_search_result(
     value: object, frequency_grid: list[float], settings: ROMSettings,
-    config: dict, final_validation_dir: Path,
+    config: dict, final_validation_dir: Path, *, modules_path: Path,
+    layout_path: Path, power_windows_path: Path, config_path: Path,
+    hotspot: Path,
 ) -> dict:
     """Replay and require one canonical real-HotSpot frequency search."""
     canonical_grid = canonical_frequency_grid(config)
@@ -165,6 +168,19 @@ def _validate_final_search_result(
 
     if not isinstance(value, dict):
         raise ValueError("final HotSpot validation result must be a dictionary")
+    expected_paths = {
+        "modules": Path(modules_path).resolve(),
+        "layout": Path(layout_path).resolve(),
+        "power_windows": Path(power_windows_path).resolve(),
+        "config": Path(config_path).resolve(),
+        "hotspot": Path(hotspot).resolve(),
+    }
+    for field, expected in expected_paths.items():
+        recorded = value.get(field)
+        if not isinstance(recorded, str) or Path(recorded).resolve() != expected:
+            raise ValueError(
+                f"final HotSpot result {field} input identity differs"
+            )
     search = value.get("search")
     if not isinstance(search, dict):
         raise ValueError("final HotSpot validation lacks a search report")
@@ -217,6 +233,16 @@ def _validate_final_search_result(
             manifest = read_json(case_dir / "transient_trace_manifest.json")
             if not isinstance(manifest, dict):
                 raise ValueError("trace manifest must be a dictionary")
+            expected_sources = {
+                "source_modules": expected_paths["modules"],
+                "source_layout": expected_paths["layout"],
+                "source_power_windows": expected_paths["power_windows"],
+            }
+            for field, expected in expected_sources.items():
+                recorded = manifest.get(field)
+                if (not isinstance(recorded, str)
+                        or Path(recorded).resolve() != expected):
+                    raise ValueError(f"trace manifest {field} differs")
             windows_per_period = integer(
                 manifest.get("windows_per_period"),
                 "trace manifest windows_per_period", positive=True,
@@ -240,6 +266,16 @@ def _validate_final_search_result(
                 scaling.get("frequency_scale"),
                 "trace manifest frequency scale", positive=True,
             )
+            trace_config = case_dir / "trace_input_config.json"
+            if read_json(trace_config) != config:
+                raise ValueError("trace manifest config payload differs")
+            expected_trace_identity = trace_input_identity(
+                expected_paths["modules"], expected_paths["layout"],
+                expected_paths["power_windows"], trace_config,
+                item_frequency / f0_ghz,
+            )
+            if manifest.get("trace_input_identity") != expected_trace_identity:
+                raise ValueError("trace manifest input identity differs")
             names, rows_k = parse_ttrace_grid(case_dir / "transient.ttrace")
             if (period_repeats != settings.pss_period_repeats
                     or window_count != windows_per_period * period_repeats
@@ -597,6 +633,9 @@ def _run_final_branch(
         )
         validation = _validate_final_search_result(
             validation, frequency_grid, settings, config, output_dir,
+            modules_path=modules_path, layout_path=layout_path,
+            power_windows_path=power_windows_path, config_path=config_path,
+            hotspot=hotspot,
         )
     except (OSError, RuntimeError, ValueError) as error:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -672,21 +711,20 @@ def _run_final_branch(
             int(delay.get("l1_pipeline_cycles", 1)),
             controls["wire_aggregation"],
         )
-        if branch == "clip3d":
-            try:
-                require_selected_cycle_identity(
-                    selected, vector, controls["wire_aggregation"]
-                )
-            except ValueError as error:
-                failure = {
-                    "category": "integer_cycle_identity",
-                    "error_type": type(error).__name__,
-                    "message": str(error),
-                    "artifact_dir": str(output_dir),
-                }
-                state = "rom_final_validation_failed"
-                classification = failure["category"]
-                f_hotspot = None
+        try:
+            require_selected_cycle_identity(
+                selected, vector, controls["wire_aggregation"]
+            )
+        except ValueError as error:
+            failure = {
+                "category": "integer_cycle_identity",
+                "error_type": type(error).__name__,
+                "message": str(error),
+                "artifact_dir": str(output_dir),
+            }
+            state = "rom_final_validation_failed"
+            classification = failure["category"]
+            f_hotspot = None
 
     if failure is not None:
         write_json(output_dir / "final_validation_failure.json", failure)
@@ -1166,6 +1204,9 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
         final_validation = _validate_final_search_result(
             final_validation, frequency_grid, settings, config,
             final_validation_dir,
+            modules_path=modules_path, layout_path=proposed_layout,
+            power_windows_path=power_windows_path, config_path=config_path,
+            hotspot=hotspot,
         )
     except (OSError, RuntimeError, ValueError) as error:
         final_validation_dir.mkdir(parents=True, exist_ok=True)

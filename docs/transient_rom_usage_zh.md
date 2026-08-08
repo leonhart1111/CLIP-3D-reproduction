@@ -76,7 +76,7 @@ python -m workflow.run_lifting_pipeline \
   --run-r2
 ```
 
-公共入口会在复用稳态预检之前校验离散搜索控制；偶数网格、未包含 fixed-bin、非法 tier 或不受支持的通信聚合会直接拒绝。优化器输出的 `r2_wire_cycles` 还必须与 CLIP 分支 `r2_latency.json` 的 `components_cycles.layout_wire` 及 `layout_delays.traffic_weighted_wire_cycles` 完全相等，否则两次 R2 都不会启动，并在 CLIP 分支留下 `integer_cycle_identity` 失败记录。
+公共入口会在复用稳态预检之前校验离散搜索控制；偶数网格、未包含 fixed-bin、非法 tier 或不受支持的通信聚合会直接拒绝。fixed-bin 与 CLIP 两个优化候选各自输出的 `r2_wire_cycles` 都必须与本分支 `r2_latency.json` 的 `components_cycles.layout_wire` 及 `layout_delays.traffic_weighted_wire_cycles` 完全相等，否则两次 R2 都不会启动，并在不一致的分支留下 `integer_cycle_identity` 失败记录。
 
 接受包会绑定 canonical R1 元数据、窗口功耗、模块与布局几何、配置、HotSpot 二进制、网格、热堆栈、冷却、允许的 L2 tier，以及完整校准设计（8 个锚点、2 个留出点、插值域和 Delaunay simplices）的哈希/identity。复用只读取包内 `anchors.json`，不会用当前代码重新生成设计；`pod_model.npz` 中的 B_L2 anchor ID、拟合 case 顺序、训练输入/温度哈希、转换阈值和设计哈希必须与 `fit_report.json` 完全一致。复用还会重新读取 `calibration_cases.json` 与 `validation_report.json`，校验 8+2 case 的点/布局映射、包内 artifact 哈希、全部留出 gate 和误差阈值，并保留历史留出 RMSE/峰温误差。case artifact 路径只允许相对于包根目录，源 `modules.json` 的原始字节也会复制进包，因此完整包可整体移动后复用；路径逃逸、symlink、证据缺失、清单缺失或清单哈希陈旧都会拒绝复用。不得只复制或修改接受标记。
 

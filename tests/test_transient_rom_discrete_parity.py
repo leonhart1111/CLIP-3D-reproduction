@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import tests.test_transient_rom as transient_tests
-from workflow.common import read_json, write_json
+from workflow.common import read_json, sha256_file, write_json
 from workflow.floorplan.discrete_partition import search_discrete_partitions
 from workflow.run_lifting_pipeline import validate_config
 from workflow.transient.rom.calibration_design import build_design
@@ -207,6 +207,35 @@ class PairedValidationUnitTests(unittest.TestCase):
             },
         }
 
+    def materialized_branch(self, root: Path, name: str,
+                            ipc2: float, frequency: float) -> dict:
+        branch_dir = root / name
+        layout = branch_dir / "layout.json"
+        hotspot = branch_dir / "transient_sustainable_frequency.json"
+        latency = branch_dir / "r2_latency.json"
+        r2_result = branch_dir / "gem5_r2/r2_result.json"
+        write_json(layout, {"branch": name})
+        write_json(hotspot, {"f_sus_trans_ghz": frequency})
+        write_json(latency, {"branch": name, "layout_wire": 7})
+        write_json(r2_result, {"ipc2": ipc2})
+        branch = self.branch(name, ipc2, frequency)
+        branch.update({
+            "r2_executed": True,
+            "failure": None,
+            "validation_classification": "validated",
+            "artifacts": {
+                "layout": str(layout.resolve()),
+                "layout_sha256": sha256_file(layout),
+                "hotspot": str(hotspot.resolve()),
+                "hotspot_sha256": sha256_file(hotspot),
+                "r2_latency": str(latency.resolve()),
+                "r2_latency_sha256": sha256_file(latency),
+                "r2_result": str(r2_result.resolve()),
+                "r2_result_sha256": sha256_file(r2_result),
+            },
+        })
+        return branch
+
     def test_selected_cycle_must_equal_every_r2_representation(self):
         self.assertEqual(
             require_selected_cycle_identity(
@@ -253,7 +282,10 @@ class PairedValidationUnitTests(unittest.TestCase):
             self.assertFalse((output / "paired_comparison.json").exists())
             self.assertFalse((output / "paired_comparison.csv").exists())
 
-            clip = self.branch("clip3d", 1.5, 1.9)
+            fixed = self.materialized_branch(
+                output, "fixed-bin", 1.4, 1.8
+            )
+            clip = self.materialized_branch(output, "clip3d", 1.5, 1.9)
             report = publish_paired_comparison(
                 fixed, clip, output, r2_requested=True
             )
@@ -267,6 +299,48 @@ class PairedValidationUnitTests(unittest.TestCase):
             self.assertTrue((output / "paired_comparison.csv").is_file())
             self.assertTrue(report["non_formal"])
             self.assertFalse(report["paper_equivalent"])
+
+    def test_paired_report_rejects_claimed_measurements_without_real_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            fixed = self.branch("fixed-bin", 1.4, 1.8)
+            clip = self.branch("clip3d", 1.5, 1.9)
+            fixed["r2_executed"] = False
+            fixed["measured_bips2_trans"] = 999.0
+
+            with self.assertRaisesRegex(
+                ValueError, "measurement|artifact|R2"
+            ):
+                publish_paired_comparison(
+                    fixed, clip, output, r2_requested=True
+                )
+            self.assertFalse((output / "paired_comparison.json").exists())
+            self.assertFalse((output / "paired_comparison.csv").exists())
+
+    def test_paired_report_recomputes_bips_and_checks_artifact_hashes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            fixed = self.materialized_branch(
+                output, "fixed-bin", 1.4, 1.8
+            )
+            clip = self.materialized_branch(output, "clip3d", 1.5, 1.9)
+            fixed["measured_bips2_trans"] = 999.0
+            with self.assertRaisesRegex(ValueError, "BIPS2_trans"):
+                publish_paired_comparison(
+                    fixed, clip, output, r2_requested=True
+                )
+
+            fixed = self.materialized_branch(
+                output, "fixed-bin", 1.4, 1.8
+            )
+            r2_path = Path(fixed["artifacts"]["r2_result"])
+            write_json(r2_path, {"ipc2": 9.0})
+            with self.assertRaisesRegex(ValueError, "artifact identity"):
+                publish_paired_comparison(
+                    fixed, clip, output, r2_requested=True
+                )
+            self.assertFalse((output / "paired_comparison.json").exists())
+            self.assertFalse((output / "paired_comparison.csv").exists())
 
 
 class TransientROMPairedPipelineTests(unittest.TestCase):
@@ -341,7 +415,9 @@ class TransientROMPairedPipelineTests(unittest.TestCase):
             "layout_delays": {"traffic_weighted_wire_cycles": cycle},
         }
 
-    def run_pipeline(self, *, execute_r2: bool, clip_cycle: int = 7):
+    def run_pipeline(self, *, execute_r2: bool, fixed_cycle: int = 8,
+                     clip_cycle: int = 7,
+                     mutate_fixed_trace_identity: bool = False):
         from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
 
         fixture = self.fixture
@@ -350,11 +426,28 @@ class TransientROMPairedPipelineTests(unittest.TestCase):
         def final_search(*args, **kwargs):
             output_dir = Path(args[3])
             search_dirs.append(output_dir)
-            return fixture.final_validation(output_dir=output_dir)
+            result = fixture.final_validation(
+                output_dir=output_dir, modules_path=Path(args[0]),
+                layout_path=Path(args[1]), power_windows_path=Path(args[2]),
+                config_path=Path(args[4]), hotspot_path=Path(kwargs["hotspot"]),
+            )
+            if mutate_fixed_trace_identity and output_dir.name == "fixed_bin":
+                for manifest_path in output_dir.glob(
+                    "frequency_*_ghz/transient_trace_manifest.json"
+                ):
+                    manifest = read_json(manifest_path)
+                    manifest["source_layout"] = str(
+                        fixture.proposed_layout.resolve()
+                    )
+                    write_json(manifest_path, manifest)
+            return result
 
         def build_vector(*args, **kwargs):
             layout = Path(args[5]).resolve()
-            cycle = 8 if layout == self.fixed_layout.resolve() else clip_cycle
+            cycle = (
+                fixed_cycle if layout == self.fixed_layout.resolve()
+                else clip_cycle
+            )
             vector = self.vector(cycle)
             write_json(Path(args[2]), vector)
             return vector
@@ -457,6 +550,34 @@ class TransientROMPairedPipelineTests(unittest.TestCase):
         self.assertTrue(
             (self.fixture.output
              / "final_validation/clip3d/branch_summary.json").is_file()
+        )
+        self.assertFalse(
+            (self.fixture.output / "final_validation/paired_comparison.json").exists()
+        )
+
+    def test_cross_layout_hotspot_trace_fails_before_either_r2(self):
+        summary, _search_dirs, _build_vector, run_r2_mock = self.run_pipeline(
+            execute_r2=True, mutate_fixed_trace_identity=True
+        )
+
+        run_r2_mock.assert_not_called()
+        self.assertEqual(
+            summary["branches"]["fixed_bin"]["failure"]["category"],
+            "validation_contract_error",
+        )
+        self.assertFalse(
+            (self.fixture.output / "final_validation/paired_comparison.json").exists()
+        )
+
+    def test_fixed_cycle_mismatch_fails_closed_before_either_r2(self):
+        summary, _search_dirs, _build_vector, run_r2_mock = self.run_pipeline(
+            execute_r2=True, fixed_cycle=9
+        )
+
+        run_r2_mock.assert_not_called()
+        self.assertEqual(
+            summary["branches"]["fixed_bin"]["failure"]["category"],
+            "integer_cycle_identity",
         )
         self.assertFalse(
             (self.fixture.output / "final_validation/paired_comparison.json").exists()

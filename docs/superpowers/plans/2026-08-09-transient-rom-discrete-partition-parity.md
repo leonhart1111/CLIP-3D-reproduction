@@ -547,7 +547,7 @@ def _run_final_branch(
     """Validate one layout with real HotSpot, bind its R2 vector, and optionally run gem5."""
 ```
 
-The helper must run and validate real HotSpot, count its evaluations, build the branch vector, enforce selected-cycle identity for CLIP, run R2 only after all gates pass, calculate namespaced metrics, and write `branch_summary.json`. The fixed branch still records its vector cycle and fixed optimizer candidate identity even though it does not enforce the selected-CLIP assertion.
+The helper must run and validate real HotSpot, count its evaluations, build the branch vector, enforce selected-cycle identity for both fixed-bin and CLIP, run R2 only after all gates pass, calculate namespaced metrics, and write `branch_summary.json`. The fixed branch records and enforces its own optimizer candidate/vector identity independently of the selected CLIP candidate.
 
 - [ ] **Step 4: Dispatch only discrete mode to paired validation**
 
