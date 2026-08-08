@@ -14,6 +14,7 @@ import math
 from pathlib import Path
 
 from workflow.common import read_json, write_json
+from workflow.floorplan.discrete_partition import search_discrete_partitions
 from workflow.floorplan.generate_hotspot_inputs import baseline_layout, check_geometry, overlap
 from workflow.floorplan.layout_metrics import (
     aggregate_wire_cycles,
@@ -202,11 +203,12 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
             1.0 - model["gamma"]
         ) * (fmin_ghz / f0_ghz)
 
-        def evaluate_discrete(tier: int, x_mm: float, y_mm: float,
-                              origin: str, start: str) -> dict:
-            l2 = dict(original, x_mm=float(x_mm), y_mm=float(y_mm), tier=tier)
-            modules = fixed + [l2]
-            collision = collision_area(l2, fixed)
+        def evaluate_discrete(layout: dict, origin: str, start: str) -> dict:
+            modules = layout["modules"]
+            l2 = next(module for module in modules if module["kind"] == "l2")
+            tier = int(l2["tier"])
+            x_mm = float(l2["x_mm"])
+            y_mm = float(l2["y_mm"])
             proxy = proxy_temperature(
                 modules, side, ambient, r_convec, alpha, beta,
                 cross_tier_weight, proxy_spatial_model,
@@ -223,8 +225,8 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
             candidate = {
                 "origin": origin, "tier": tier, "start": start,
                 "x_mm": float(x_mm), "y_mm": float(y_mm),
-                "loss": score + 1e4 * collision, "evaluations": 1,
-                "collision_mm2": collision, "proxy_tmax_c": proxy,
+                "loss": score, "objective_loss": score, "evaluations": 1,
+                "collision_mm2": 0.0, "proxy_tmax_c": proxy,
                 "proxy_frequency_ghz": frequency,
                 "proxy_unclamped_frequency_ghz": raw_frequency,
                 "proxy_frequency_state": frequency_state,
@@ -244,66 +246,30 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                 candidate["traffic_weighted_wire_cycles"] = selected_wire
             return candidate
 
-        def discrete_key(candidate: dict) -> tuple[float, float, int, float, float]:
-            return (
-                candidate["loss"],
-                candidate["continuous_selected_wire_cycles"],
-                candidate["tier"], candidate["y_mm"], candidate["x_mm"],
-            )
-
-        fixed_candidate = evaluate_discrete(
-            int(original["tier"]), float(original["x_mm"]),
-            float(original["y_mm"]), "fixed-bin", "FIXED",
+        shared_search = search_discrete_partitions(
+            base_layout=base,
+            l2_name=original["name"],
+            allowed_tiers=tiers,
+            grid_steps=partition_grid_steps,
+            include_fixed_baseline=include_fixed_baseline,
+            evaluate=evaluate_discrete,
         )
-        if fixed_candidate["collision_mm2"] > 1e-8:
-            raise RuntimeError("fixed-bin baseline contains an L2 overlap")
-
-        xs = [
-            upper[0] * index / (partition_grid_steps - 1)
-            for index in range(partition_grid_steps)
-        ]
-        ys = [
-            upper[1] * index / (partition_grid_steps - 1)
-            for index in range(partition_grid_steps)
-        ]
-        partition_best: dict[int, dict] = {}
-        legal_count = 0
-        rejected_count = 0
-        for tier in tiers:
-            for y_index, y_mm in enumerate(ys):
-                for x_index, x_mm in enumerate(xs):
-                    candidate = evaluate_discrete(
-                        tier, x_mm, y_mm, "partition-grid",
-                        f"GRID-{y_index}-{x_index}",
-                    )
-                    if candidate["collision_mm2"] > 1e-8:
-                        rejected_count += 1
-                        continue
-                    legal_count += 1
-                    cycle = candidate["r2_wire_cycles"]
-                    incumbent = partition_best.get(cycle)
-                    if (incumbent is None
-                            or discrete_key(candidate) < discrete_key(incumbent)):
-                        partition_best[cycle] = candidate
-        if legal_count == 0:
-            raise RuntimeError(
-                "layout optimizer found no non-overlapping L2 grid placement"
-            )
-        partition_records = [
-            partition_best[cycle] for cycle in sorted(partition_best)
-        ]
-        candidates = [fixed_candidate, *partition_records]
-        best = min(candidates, key=discrete_key)
+        candidates = shared_search["candidates"]
+        best = shared_search["selected"]
         discrete_search = {
-            "grid_steps": partition_grid_steps,
-            "total_grid_candidates": (
-                len(tiers) * partition_grid_steps * partition_grid_steps
-            ),
-            "legal_grid_candidates": legal_count,
-            "rejected_grid_candidates": rejected_count,
-            "fixed_baseline_included": True,
-            "fixed_baseline": fixed_candidate,
-            "partitions": partition_records,
+            "grid_steps": shared_search["grid_steps"],
+            "total_grid_candidates": shared_search["total_grid_candidates"],
+            "legal_grid_candidates": shared_search["legal_grid_candidates"],
+            "legal_grid_candidates_detail": shared_search[
+                "legal_grid_candidates_detail"
+            ],
+            "rejected_grid_candidates": shared_search["rejected_grid_candidates"],
+            "fixed_baseline_included": shared_search["fixed_baseline_included"],
+            "fixed_baseline": shared_search["fixed_baseline"],
+            "partitions": shared_search["partitions"],
+            "geometry_rejections": shared_search["geometry_rejections"],
+            "evaluator_rejections": shared_search["evaluator_rejections"],
+            "shared_partition_engine": True,
         }
     else:
         starts = ((0.0, 0.0), (upper[0] / 2.0, upper[1] / 2.0), upper)

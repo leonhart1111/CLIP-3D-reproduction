@@ -30,6 +30,9 @@ from workflow.floorplan.layout_metrics import (
     derive_layout_delays,
     select_rounded_wire_cycles,
 )
+from workflow.floorplan.discrete_partition import (
+    search_discrete_partitions as shared_discrete_partition_search,
+)
 from workflow.floorplan.optimize_layout import (
     discrete_wire_score,
     optimize,
@@ -927,6 +930,30 @@ class GridTests(unittest.TestCase):
                 reports[0]["discrete_search"]["partitions"],
                 reports[1]["discrete_search"]["partitions"],
             )
+
+    def test_steady_discrete_optimizer_delegates_to_shared_partition_engine(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+
+            with patch(
+                "workflow.floorplan.optimize_layout.search_discrete_partitions",
+                wraps=shared_discrete_partition_search,
+            ) as shared_search:
+                report = optimize(
+                    root / "modules.json", root / "layout.json",
+                    root / "report.json", allowed_l2_tiers=[1],
+                    require_scipy=False, wire_objective="discrete-partition",
+                    wire_aggregation="mean", partition_grid_steps=5,
+                    include_fixed_baseline=True,
+                )
+
+            shared_search.assert_called_once()
+            self.assertEqual(shared_search.call_args.kwargs["grid_steps"], 5)
+            self.assertTrue(
+                shared_search.call_args.kwargs["include_fixed_baseline"]
+            )
+            self.assertTrue(report["discrete_search"]["shared_partition_engine"])
 
     def test_pipeline_forwards_discrete_partition_options_to_optimizer(self):
         with tempfile.TemporaryDirectory() as temporary:
