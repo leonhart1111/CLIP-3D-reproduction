@@ -227,6 +227,10 @@ def _materialize_case(*, kind: str, point: dict, case_dir: Path,
     thermal = run_hotspot_transient(
         case_dir, hotspot=hotspot, initial_temperature="ambient"
     )
+    trace_manifest = read_json(case_dir / "transient_trace_manifest.json")
+    temperature_names, _ = parse_ttrace_grid(case_dir / "transient.ttrace")
+    trace_manifest["temperature_grid_unit_names"] = temperature_names
+    write_json(case_dir / "transient_trace_manifest.json", trace_manifest)
     result = {
         "id": point["id"],
         "kind": kind,

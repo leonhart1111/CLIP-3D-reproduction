@@ -58,11 +58,12 @@ def validate_materialized_trace(case_dir: Path, expected_identity: dict,
         lines = path.read_text(encoding="utf-8").splitlines()
         if len(lines) != count + 1:
             raise ValueError("materialized trace row count differs")
-        if lines[0].split() != expected_names:
+        names = manifest.get("temperature_grid_unit_names", expected_names) if name == "transient.ttrace" else expected_names
+        if lines[0].split() != names:
             raise ValueError("materialized trace grid differs")
         for row in lines[1:]:
             cells = row.split()
-            if len(cells) != grid_count:
+            if len(cells) != len(names):
                 raise ValueError("materialized trace grid differs")
             try:
                 if not all(math.isfinite(float(value)) for value in cells):

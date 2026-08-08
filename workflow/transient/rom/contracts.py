@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 import math
+import tempfile
 from numbers import Real
 from pathlib import Path
 from typing import Any
@@ -338,7 +339,7 @@ def require_package_calibration_evidence(
         load_calibration_design,
     )
     from workflow.transient.generate_hotspot_trace import (
-        trace_input_identity, validate_materialized_trace,
+        materialize_trace, trace_input_identity, validate_materialized_trace,
     )
 
     design = load_calibration_design(package_dir)
@@ -554,6 +555,23 @@ def require_package_calibration_evidence(
                 ) from error
             if trace_manifest.get("hotspot_sha256") != acceptance["identity"]["hotspot_hash"]:
                 raise ValueError(f"reusable ROM {expected_kind} case {identifier} HotSpot trace identity differs")
+            repeats = case.get("window_count")
+            windows_count = len(power_windows.get("windows", [])) if isinstance(power_windows, dict) else 0
+            if not isinstance(repeats, int) or not windows_count or repeats % windows_count:
+                raise ValueError(f"reusable ROM {expected_kind} case {identifier} trace duration differs")
+            with tempfile.TemporaryDirectory() as temporary:
+                replay_dir = Path(temporary) / "trace"
+                materialize_trace(
+                    resolved_artifacts["modules"], resolved_artifacts["layout"],
+                    resolved_artifacts["power_windows"], replay_dir, packaged_config,
+                    frequency_scale=float(case["frequency_scale"]),
+                    period_repeats=repeats // windows_count,
+                )
+                for filename in ("power_transient.ptrace", "power_dynamic_transient.ptrace", "power_leakage_transient.ptrace"):
+                    actual = (resolved_artifacts["power_trace"].parent / filename).read_text(encoding="utf-8")
+                    expected = (replay_dir / filename).read_text(encoding="utf-8")
+                    if actual != expected:
+                        raise ValueError(f"reusable ROM {expected_kind} case {identifier} power trace payload differs")
 
     holdout_power_hashes = {
         artifact_hashes[identifier]["power_windows"]
