@@ -522,7 +522,8 @@ def main() -> None:
     )
     parser.add_argument("--proxy-quadrature-order", type=int, choices=(1, 2, 3), default=2)
     parser.add_argument(
-        "--wire-objective", choices=("continuous", "r2-quantized"),
+        "--wire-objective",
+        choices=("continuous", "r2-quantized", "discrete-partition"),
         default="continuous",
     )
     parser.add_argument("--wire-rounding", choices=("nearest", "ceil", "floor"), default="nearest")
