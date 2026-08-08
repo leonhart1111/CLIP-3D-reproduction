@@ -107,23 +107,47 @@ def _requested_identity(modules_path: Path, config_path: Path, hotspot: Path,
     )
 
 
-def _frequency_grid(config: dict) -> list[float]:
+def canonical_frequency_grid(config: dict) -> list[float]:
+    """Return the configured finite, endpoint-bounded ROM frequency grid."""
     frequency = config.get("frequency")
     if not isinstance(frequency, dict):
-        raise ValueError("config lacks frequency settings")
+        raise ValueError("frequency grid config lacks frequency settings")
+
+    def endpoint(name: str) -> float:
+        value = frequency.get(name)
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(f"frequency grid {name} must be finite and positive")
+        result = float(value)
+        if not math.isfinite(result) or result <= 0.0:
+            raise ValueError(f"frequency grid {name} must be finite and positive")
+        return result
+
+    fmin = endpoint("fmin_ghz")
+    f0 = endpoint("f0_ghz")
+    if fmin > f0:
+        raise ValueError("frequency grid fmin_ghz must not exceed f0_ghz")
     rom = config.get("transient_rom", {})
     if rom is None:
         rom = {}
     if not isinstance(rom, dict):
-        raise ValueError("transient_rom must be a dictionary")
+        raise ValueError("frequency grid transient_rom must be a dictionary")
     values = rom.get("frequencies_ghz", frequency.get("grid_ghz"))
     if values is None:
-        values = [frequency.get("fmin_ghz"), frequency.get("f0_ghz")]
+        values = [fmin, f0]
     if not isinstance(values, list) or not values:
-        raise ValueError("transient ROM frequencies_ghz must be a non-empty list")
-    result = sorted({_finite(value, "frequencies_ghz", minimum=0.0) for value in values})
-    if not result or result[0] <= 0.0:
-        raise ValueError("frequencies_ghz must contain finite positive numbers")
+        raise ValueError("frequency grid must be a non-empty list")
+    result = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError("frequency grid values must be finite and positive")
+        normalized = float(value)
+        if (not math.isfinite(normalized) or normalized <= 0.0
+                or normalized < fmin or normalized > f0):
+            raise ValueError("frequency grid values must lie within configured bounds")
+        result.append(normalized)
+    result = sorted(set(result))
+    if fmin not in result or f0 not in result:
+        raise ValueError("frequency grid must include fmin_ghz and f0_ghz")
     return result
 
 
@@ -236,7 +260,7 @@ def optimize_transient_layout(modules_path: Path, package_dir: Path,
     communication_weights = communication_weights_from_model(
         modules, required=wire_aggregation == "traffic-weighted"
     )
-    frequencies = _frequency_grid(config)
+    frequencies = canonical_frequency_grid(config)
     rejections: list[dict] = []
 
     def evaluate(tier: int, x_mm: float, y_mm: float, stage: str) -> dict | None:

@@ -40,7 +40,10 @@ from workflow.transient.rom.layout_rom import (
     interpolate_l2_input,
     validate_holdouts,
 )
-from workflow.transient.rom.optimize_layout import optimize_transient_layout
+from workflow.transient.rom.optimize_layout import (
+    canonical_frequency_grid,
+    optimize_transient_layout,
+)
 from workflow.transient.rom.pod_state_space import (
     StateSpaceModel,
     discretize,
@@ -1331,6 +1334,42 @@ class ROMEvaluationTests(unittest.TestCase):
             parse_settings({}), pss_period_repeats=2, pss_tolerance_c=100.0
         )
 
+    @staticmethod
+    def non_normal_model() -> StateSpaceModel:
+        # Its period-to-period response dips below 0.11 C on the first
+        # comparison, then rises above it on the final comparison.
+        return StateSpaceModel(
+            temperature_basis=numpy.eye(2),
+            a_continuous=numpy.array([
+                [math.log(0.9), 100.0 / 9.0],
+                [0.0, math.log(0.9)],
+            ]),
+            b_fixed=numpy.zeros((2, 1)),
+            b_l2_anchors={
+                identifier: numpy.array([
+                    [-0.03833730356990477], [0.007024033786918412],
+                ])
+                for identifier in ("a0", "a1", "a2", "a3")
+            },
+            module_names=("core0",),
+            grid_unit_names=("cell0", "cell1"),
+        )
+
+    @staticmethod
+    def config() -> dict:
+        return {
+            "frequency": {
+                "f0_ghz": 2.0, "fmin_ghz": 1.0,
+                "ambient_c": 25.0, "tsafe_c": 100.0,
+            },
+        }
+
+    def config_with_grid(self, values: list[float]) -> dict:
+        return {
+            **self.config(),
+            "transient_rom": {"frequencies_ghz": values},
+        }
+
     def test_anchor_interpolation_is_exact_and_extrapolation_fails(self):
         # Break caught: blending tiers/anchors or silently extrapolating can
         # manufacture an input matrix unsupported by calibration evidence.
@@ -1381,6 +1420,21 @@ class ROMEvaluationTests(unittest.TestCase):
                                25.0 + expected_rise, places=12)
         self.assertTrue(result["last_period_peak"]["includes_period_initial_state"])
         self.assertTrue(result["converged"])
+
+    def test_rom_does_not_accept_an_early_tolerance_dip(self):
+        # Break caught: stopping at any early small endpoint delta can certify
+        # a non-normal ROM response whose final fixed-horizon delta is unsafe.
+        settings = replace(
+            self.settings(), pss_period_repeats=3, pss_tolerance_c=0.11,
+        )
+
+        result = evaluate_layout_rom(
+            self.non_normal_model(), self.design(), self.power_windows(),
+            self.layout(), 2.0, settings, self.config(),
+        )
+
+        self.assertEqual(result["periods_evaluated"], settings.pss_period_repeats)
+        self.assertFalse(result["converged"])
 
     def test_partial_final_window_uses_full_hotspot_sampling_interval(self):
         # Break caught: integrating the final partial ROI duration makes the
@@ -1788,6 +1842,16 @@ class ROMOptimizerTests(unittest.TestCase):
             },
             "delay": {"wire_aggregation": "mean", "wire_rounding": "nearest"},
         }
+
+    def test_frequency_grid_requires_fmin_and_f0_inside_bounds(self):
+        # Break caught: a grid omitting a configured endpoint, or including an
+        # out-of-range value, lets ROM and final-HotSpot searches differ.
+        for values in ([1.2], [0.8, 2.0], [1.0, 2.2], [1.1, 1.9]):
+            with self.assertRaisesRegex(ValueError, "frequency grid"):
+                canonical_frequency_grid({
+                    **self.config(),
+                    "transient_rom": {"frequencies_ghz": values},
+                })
 
     @staticmethod
     def _frequency_evidence(_model, _design, _powers, layout, _grid,
@@ -2363,7 +2427,9 @@ class ROMPipelineTests(unittest.TestCase):
             directory.mkdir(parents=True)
         self.cacti.parent.mkdir(parents=True)
         self.hotspot.write_text("mock hotspot", encoding="utf-8")
-        write_json(self.modules, {"ipc1": 2.0, "modules": []})
+        module_model = CalibrationDesignTests.model()
+        module_model["ipc1"] = 2.0
+        write_json(self.modules, module_model)
         write_json(self.cacti, {"frequency_ghz": 2.0, "records": []})
         write_json(self.config_path, self.config())
 
@@ -2399,6 +2465,7 @@ class ROMPipelineTests(unittest.TestCase):
                 "enabled": True,
                 "calibration_runs": 8,
                 "validation_runs": 2,
+                "frequencies_ghz": [1.0, 1.8, 2.0],
             },
         }
 

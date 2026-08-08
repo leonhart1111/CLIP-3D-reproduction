@@ -315,12 +315,9 @@ def evaluate_layout_rom(model: StateSpaceModel, design: dict, power_windows: dic
         if period > 0:
             delta = numpy.abs(current_end - previous_end)
             period_end_deltas.append(float(numpy.max(delta)))
-            if period_end_deltas[-1] <= settings.pss_tolerance_c:
-                converged = True
-                periods = period + 1
-                break
         previous_end = current_end.copy()
         periods = period + 1
+    converged = period_end_deltas[-1] <= settings.pss_tolerance_c
     inclusive = [final_start, *final_rows]
     peak_sample, peak_unit = max(
         ((sample, unit) for sample in range(len(inclusive))

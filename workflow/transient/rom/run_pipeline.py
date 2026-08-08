@@ -31,6 +31,7 @@ from workflow.transient.rom.evidence import ROM_CLASSIFICATION
 from workflow.transient.rom.materialize_calibration import execute_calibration_cases
 from workflow.transient.rom.optimize_layout import (
     _requested_identity,
+    canonical_frequency_grid,
     optimize_transient_layout,
 )
 from workflow.transient.rom.pod_state_space import fit_state_space, save_model
@@ -64,34 +65,14 @@ def package_identity(modules_path: Path, power_windows_path: Path,
     )
 
 
-def _frequency_grid(config: dict) -> list[float]:
-    frequency = config.get("frequency")
-    if not isinstance(frequency, dict):
-        raise ValueError("config lacks frequency settings")
-    transient_rom = config.get("transient_rom", {})
-    if transient_rom is None:
-        transient_rom = {}
-    if not isinstance(transient_rom, dict):
-        raise ValueError("transient_rom must be a dictionary")
-    values = transient_rom.get("frequencies_ghz", frequency.get("grid_ghz"))
-    if values is None:
-        values = [frequency.get("fmin_ghz"), frequency.get("f0_ghz")]
-    if not isinstance(values, list) or not values:
-        raise ValueError("transient ROM frequencies_ghz must be a non-empty list")
-    try:
-        result = sorted({float(value) for value in values})
-    except (TypeError, ValueError) as error:
-        raise ValueError("transient ROM frequencies_ghz must be numeric") from error
-    if not result or any(not math.isfinite(value) or value <= 0.0 for value in result):
-        raise ValueError("transient ROM frequencies_ghz must be finite and positive")
-    return result
-
-
 def _validate_final_search_result(
     value: object, frequency_grid: list[float], settings: ROMSettings,
     config: dict, final_validation_dir: Path,
 ) -> dict:
     """Replay and require one canonical real-HotSpot frequency search."""
+    canonical_grid = canonical_frequency_grid(config)
+    if frequency_grid != canonical_grid:
+        raise ValueError("final HotSpot frequency grid is not canonical")
     def finite_number(item: object, label: str, *, positive: bool = False,
                       nonnegative: bool = False) -> float:
         if isinstance(item, bool) or not isinstance(item, Real):
@@ -195,10 +176,7 @@ def _validate_final_search_result(
     artifact_root = Path(final_validation_dir).resolve()
     if not isinstance(frequency_grid, list) or not frequency_grid:
         raise ValueError("final HotSpot frequency grid is invalid")
-    grid = sorted({
-        finite_number(item, "final HotSpot frequency grid", positive=True)
-        for item in frequency_grid
-    })
+    grid = canonical_grid
 
     by_frequency: dict[float, dict] = {}
     ordered_frequencies = []
@@ -723,9 +701,7 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
     delay = config.get("delay")
     if not isinstance(delay, dict):
         raise ValueError("config lacks delay settings")
-    frequency_grid = optimization.get("parameters", {}).get("frequency_grid_ghz")
-    if frequency_grid is None:
-        frequency_grid = _frequency_grid(config)
+    frequency_grid = canonical_frequency_grid(config)
     for path in (
         modules_path, proposed_layout, power_windows_path, config_path, hotspot,
     ):
