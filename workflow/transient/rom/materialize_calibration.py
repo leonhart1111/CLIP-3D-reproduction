@@ -19,6 +19,7 @@ from workflow.transient.generate_hotspot_trace import materialize_trace
 from workflow.transient.rom.calibration_design import (
     calibration_design_hash,
     layout_for_point,
+    require_design_matches_modules,
 )
 from workflow.transient.rom.contracts import ROMSettings
 from workflow.transient.rom.evidence import (
@@ -157,6 +158,7 @@ def _require_case_inputs(modules_path: Path, source_power_windows_path: Path,
     modules = read_json(modules_path)
     if not isinstance(modules.get("modules"), list):
         raise ValueError("modules must contain a module list")
+    require_design_matches_modules(design, modules)
     source = read_json(source_power_windows_path)
     names = {module.get("name") for module in modules["modules"]}
     validate_power_windows(source, names)

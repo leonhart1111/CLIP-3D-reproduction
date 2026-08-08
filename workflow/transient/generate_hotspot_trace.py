@@ -7,7 +7,7 @@ import argparse
 import math
 from pathlib import Path
 
-from workflow.common import read_json, write_json
+from workflow.common import read_json, sha256_file, write_json
 from workflow.floorplan.generate_hotspot_inputs import grid_power, materialize
 from workflow.transient.validation import (
     summarize_power_windows,
@@ -17,6 +17,47 @@ from workflow.transient.validation import (
 
 
 POWER_FIELDS = ("dynamic_power_w", "leakage_power_w", "total_power_w")
+
+
+def trace_input_identity(modules: Path, layout: Path, power_windows: Path,
+                         config: Path, frequency_scale: float) -> dict:
+    """Bind a materialized trace to the immutable inputs that produced it."""
+    if not math.isfinite(float(frequency_scale)) or float(frequency_scale) <= 0.0:
+        raise ValueError("frequency_scale must be finite and positive")
+    return {
+        "modules_sha256": sha256_file(Path(modules)),
+        "layout_sha256": sha256_file(Path(layout)),
+        "power_windows_sha256": sha256_file(Path(power_windows)),
+        "config_sha256": sha256_file(Path(config)),
+        "frequency_scale": float(frequency_scale),
+    }
+
+
+def validate_materialized_trace(case_dir: Path, expected_identity: dict,
+                               require_temperature_trace: bool) -> dict:
+    """Check trace manifest identity and parse every emitted trace grid row."""
+    case_dir = Path(case_dir)
+    manifest = read_json(case_dir / "transient_trace_manifest.json")
+    if manifest.get("trace_input_identity") != expected_identity:
+        raise ValueError("materialized trace input identity differs")
+    required = ["power_transient.ptrace", "power_dynamic_transient.ptrace",
+                "power_leakage_transient.ptrace"]
+    if require_temperature_trace:
+        required.append("transient.ttrace")
+    count = manifest.get("window_count")
+    grid_count = manifest.get("grid_cell_count")
+    if not isinstance(count, int) or count < 1 or not isinstance(grid_count, int) or grid_count < 1:
+        raise ValueError("materialized trace manifest shape is invalid")
+    for name in required:
+        path = case_dir / name
+        if not path.is_file():
+            raise ValueError(f"materialized trace lacks {name}")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) != count + 1:
+            raise ValueError("materialized trace row count differs")
+        if len(lines[0].split()) != grid_count or any(len(row.split()) != grid_count for row in lines[1:]):
+            raise ValueError("materialized trace grid differs")
+    return manifest
 RAW_POWER_PROVENANCE = {
     "dynamic": "McPAT Runtime Dynamic",
     "subthreshold_leakage": "McPAT Subthreshold Leakage",
@@ -196,6 +237,8 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
         for tier in window["tiers"]
         for field in POWER_FIELDS
     )
+    config_path = output_dir / "trace_input_config.json"
+    write_json(config_path, config)
     result = {
         "schema_version": 1,
         "mode": "operational transient validation",
@@ -204,6 +247,9 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
         "source_modules": str(modules_path.resolve()),
         "source_layout": str(layout_path.resolve()),
         "source_power_windows": str(power_windows_path.resolve()),
+        "trace_input_identity": trace_input_identity(
+            modules_path, layout_path, power_windows_path, config_path, frequency_scale,
+        ),
         "sample_interval_s": sample_interval_s,
         "nominal_sample_interval_s": nominal_sample_interval_s,
         "window_count": len(scaled_windows) * period_repeats,

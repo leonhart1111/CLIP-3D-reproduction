@@ -390,6 +390,36 @@ class TransientTraceTests(unittest.TestCase):
             self.assertEqual(result["frequency_scaling"]["leakage_power_scale"], 1.0)
             self.assertEqual(result["windows_per_period"], 2)
 
+    def test_emitted_trace_scales_dynamic_only(self):
+        """Catch a frequency transform that also scales leakage evidence."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            write_json(root / "modules.json", model)
+            from workflow.floorplan.generate_hotspot_inputs import baseline_layout
+            write_json(root / "layout.json", baseline_layout(model))
+            windows = []
+            for index in range(2):
+                windows.append({
+                    "index": index, "start_tick": index * 10,
+                    "end_tick": (index + 1) * 10, "duration_s": 0.01,
+                    "duration_ticks": 10, "source_stats_sha256": f"sha256:{index}",
+                    "modules": [dict(module) for module in model["modules"]],
+                    "totals": {field: sum(module[field] for module in model["modules"])
+                               for field in ("dynamic_power_w", "leakage_power_w", "total_power_w")},
+                })
+            write_json(root / "power_windows.json", {
+                "nominal_sample_interval_ms": 10.0, "nominal_sample_interval_ticks": 10,
+                "measurement_start_tick": 0, "measurement_end_tick": 20,
+                "power_provenance": {"dynamic": "McPAT Runtime Dynamic", "subthreshold_leakage": "McPAT Subthreshold Leakage", "gate_leakage": "McPAT Gate Leakage", "postprocessing": "none"},
+                "run_settings": {"dynamic_scale": 1.0, "leakage_scale": 1.0},
+                "windows": windows,
+            })
+            config = {"frequency": {"ambient_c": 25.0}, "physical": {"grid_size": 4, "utilization": .7, "r_convec_k_per_w": 5.0}}
+            materialize_trace(root / "modules.json", root / "layout.json", root / "power_windows.json", root / "out", config, frequency_scale=.5, period_repeats=2)
+            manifest = read_json(root / "out/transient_trace_manifest.json")
+            self.assertEqual(manifest["trace_input_identity"]["frequency_scale"], 0.5)
+
     @staticmethod
     def windowed_mcpat_fixture(root: Path) -> tuple[Path, Path, dict, Path, dict]:
         source_r1 = root / "source-r1"

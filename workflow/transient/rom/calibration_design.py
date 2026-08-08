@@ -156,6 +156,35 @@ def build_design(model: dict, allowed_l2_tiers: list[int], settings: ROMSettings
     }
 
 
+def require_design_matches_modules(design: dict, modules: dict) -> None:
+    """Reject persisted anchors whose fixed geometry no longer matches modules."""
+    if not isinstance(design, dict) or not isinstance(modules, dict):
+        raise ValueError("base layout and modules must be dictionaries")
+    base = design.get("base_layout")
+    if not isinstance(base, dict) or not isinstance(base.get("modules"), list):
+        raise ValueError("base layout is invalid")
+    expected = baseline_layout(modules)
+    fixed = {module.get("name"): module for module in base["modules"]
+             if isinstance(module, dict) and module.get("kind") != "l2"}
+    expected_fixed = {module.get("name"): module for module in expected["modules"]
+                      if module.get("kind") != "l2"}
+    if fixed != expected_fixed:
+        raise ValueError("base layout fixed module geometry differs from modules")
+    training = {point.get("id"): point for point in design.get("training", [])
+                if isinstance(point, dict)}
+    for domain in design.get("domains", {}).values():
+        if not isinstance(domain, dict):
+            raise ValueError("domain is invalid")
+        ids = domain.get("anchor_ids")
+        coordinates = domain.get("corners", domain.get("points"))
+        if not isinstance(ids, list) or not isinstance(coordinates, list) or len(ids) != len(coordinates):
+            raise ValueError("domain anchor coordinates are invalid")
+        for identifier, coordinate in zip(ids, coordinates):
+            point = training.get(identifier)
+            if (point is None or coordinate != [point.get("x_mm"), point.get("y_mm")]):
+                raise ValueError("domain anchor coordinate differs from named anchor")
+
+
 def layout_for_point(base_layout: dict, point: dict) -> dict:
     """Return a copied layout with its sole L2 moved to ``point`` and checked."""
     if not isinstance(point, dict):

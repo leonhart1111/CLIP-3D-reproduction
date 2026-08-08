@@ -21,6 +21,7 @@ from workflow.floorplan.layout_metrics import (
 from workflow.transient.rom.calibration_design import (
     calibration_design_hash,
     load_calibration_design,
+    require_design_matches_modules,
 )
 from workflow.transient.rom.contracts import (
     parse_settings,
@@ -190,6 +191,7 @@ def optimize_transient_layout(modules_path: Path, package_dir: Path,
     optimizer = config.get("layout_optimizer", {})
     tiers = optimizer.get("allowed_l2_tiers") if isinstance(optimizer, dict) else None
     design = load_calibration_design(package_dir)
+    require_design_matches_modules(design, modules)
     identity = _requested_identity(
         modules_path, config_path, hotspot, power_windows, config, design,
     )

@@ -495,6 +495,14 @@ def require_package_calibration_evidence(
                     f"reusable ROM {expected_kind} case {identifier} "
                     "modules evidence differs"
                 )
+            trace = resolved_artifacts["power_trace"]
+            trace_rows = trace.read_text(encoding="utf-8").splitlines()
+            expected_rows = settings.calibration_windows if expected_kind == "training" else case.get("window_count")
+            if (not isinstance(expected_rows, int) or expected_rows < 1
+                    or len(trace_rows) != expected_rows + 1):
+                raise ValueError(
+                    f"reusable ROM {expected_kind} case {identifier} training trace differs"
+                )
             expected_layout = layout_for_point(
                 design["base_layout"], expected_points[identifier]
             )

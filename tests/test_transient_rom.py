@@ -165,17 +165,17 @@ def write_synthetic_accepted_package(
         case_power_windows = (
             prbs_power_windows if kind == "training" else source_power_windows
         )
+        period_rows = (
+            settings.calibration_windows if kind == "training"
+            else len(source_power_windows["windows"]) * settings.pss_period_repeats
+        )
         write_json(artifact_paths["layout"], layout)
         write_json(artifact_paths["power_windows"], case_power_windows)
         artifact_paths["power_trace"].write_text(
-            "shared_l2\n1.0\n", encoding="utf-8"
+            "shared_l2\n" + "1.0\n" * period_rows, encoding="utf-8"
         )
         frequency_ghz = (
             f0_ghz if kind == "training" else holdout_frequencies[index]
-        )
-        period_rows = (
-            1 if kind == "training"
-            else len(source_power_windows["windows"]) * settings.pss_period_repeats
         )
         if kind == "holdout":
             rom = evaluate_layout_rom(
@@ -507,6 +507,21 @@ class ROMContractTests(unittest.TestCase):
     def test_reuse_rejects_missing_packaged_source_power(self):
         self.remove_packaged_source("source_power_windows.json")
         with self.assertRaisesRegex(ValueError, "source power"):
+            require_package_calibration_evidence(
+                self.package, self.reuse_identity(), self.settings(),
+            )
+
+    def test_reuse_rejects_rehashed_malformed_training_trace(self):
+        """Catch a rehashed trace whose rows cannot represent the PRBS training input."""
+        cases = read_json(self.package / "calibration_cases.json")
+        case = cases["training_cases"][0]
+        trace = self.package / case["artifacts"]["power_trace"]
+        trace.write_text("cell0\n1.0\n", encoding="utf-8")
+        digest = "sha256:" + hashlib.sha256(trace.read_bytes()).hexdigest()
+        case["artifacts"]["sha256"]["power_trace"] = digest
+        write_json(self.package / "calibration_cases.json", cases)
+        write_test_artifact_manifest(self.package)
+        with self.assertRaisesRegex(ValueError, "training.*trace"):
             require_package_calibration_evidence(
                 self.package, self.reuse_identity(), self.settings(),
             )
