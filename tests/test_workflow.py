@@ -29,7 +29,11 @@ from workflow.floorplan.layout_metrics import (
     derive_layout_delays,
     select_rounded_wire_cycles,
 )
-from workflow.floorplan.optimize_layout import optimize, proxy_temperature
+from workflow.floorplan.optimize_layout import (
+    discrete_wire_score,
+    optimize,
+    proxy_temperature,
+)
 from workflow.mcpat.parse_mcpat import parse_mcpat_text, subtract
 from workflow.r2.calibrate_lambda_wire import (
     calibrate as calibrate_lambda_wire,
@@ -813,6 +817,81 @@ class GridTests(unittest.TestCase):
         return {"schema_version": 1, "ipc1": 4.0, "gamma": 0.21,
                 "modules": modules, "totals": {"total_power_w": 4.61,
                 "dynamic_power_w": 3.7, "leakage_power_w": 0.91}}
+
+    def test_discrete_wire_score_blocks_harmful_rounding_boundary(self):
+        ipc1 = 4.31314420772608
+        lambda_wire = 0.0020119160767721133
+        fixed_score, fixed_cycle = discrete_wire_score(
+            ipc1, 0.7894564656933903, lambda_wire, 1.3580618602253112,
+            "nearest",
+        )
+        proposed_score, proposed_cycle = discrete_wire_score(
+            ipc1, 0.7906404937722684, lambda_wire, 1.5577477284674477,
+            "nearest",
+        )
+
+        self.assertEqual((fixed_cycle, proposed_cycle), (1, 2))
+        self.assertLess(fixed_score, proposed_score)
+
+    def test_discrete_partition_rejects_invalid_grid_and_disabled_baseline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+            for steps in (2, 4):
+                with self.subTest(steps=steps):
+                    with self.assertRaisesRegex(ValueError, "odd integer"):
+                        optimize(
+                            root / "modules.json", root / "layout.json",
+                            root / "report.json",
+                            wire_objective="discrete-partition",
+                            partition_grid_steps=steps,
+                        )
+            with self.assertRaisesRegex(ValueError, "fixed-bin baseline"):
+                optimize(
+                    root / "modules.json", root / "layout.json",
+                    root / "report.json",
+                    wire_objective="discrete-partition",
+                    partition_grid_steps=3, include_fixed_baseline=False,
+                )
+
+    def test_discrete_partition_is_deterministic_and_reports_integer_partitions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+            reports = []
+            for run in (1, 2):
+                reports.append(optimize(
+                    root / "modules.json", root / f"layout-{run}.json",
+                    root / f"report-{run}.json", allowed_l2_tiers=[1],
+                    require_scipy=False, wire_objective="discrete-partition",
+                    wire_aggregation="mean", partition_grid_steps=5,
+                    include_fixed_baseline=True,
+                ))
+
+            report = reports[0]
+            self.assertEqual(
+                report["parameters"]["wire_objective"], "discrete-partition"
+            )
+            self.assertEqual(report["discrete_search"]["grid_steps"], 5)
+            self.assertTrue(
+                report["discrete_search"]["fixed_baseline_included"]
+            )
+            self.assertIn(
+                report["selected"]["origin"], ("fixed-bin", "partition-grid")
+            )
+            self.assertIsInstance(report["selected"]["r2_wire_cycles"], int)
+            self.assertEqual(
+                report["selected"]["wire_objective_cycles"],
+                report["selected"]["r2_wire_cycles"],
+            )
+            self.assertGreaterEqual(
+                len(report["discrete_search"]["partitions"]), 1
+            )
+            self.assertEqual(reports[0]["selected"], reports[1]["selected"])
+            self.assertEqual(
+                reports[0]["discrete_search"]["partitions"],
+                reports[1]["discrete_search"]["partitions"],
+            )
 
     def test_exact_power_conservation(self):
         gridded = grid_power(baseline_layout(self.model()), 8)
