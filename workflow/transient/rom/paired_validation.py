@@ -1,0 +1,169 @@
+"""Fail-closed evidence helpers for paired transient-ROM validation."""
+
+from __future__ import annotations
+
+import csv
+from io import StringIO
+import math
+from numbers import Integral, Real
+from pathlib import Path
+
+from workflow.common import atomic_write_bytes, write_json
+
+
+def _finite_optional(value: object, label: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{label} must be a finite positive number or None")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized <= 0.0:
+        raise ValueError(f"{label} must be a finite positive number or None")
+    return normalized
+
+
+def _integer(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < 0:
+        raise ValueError(f"{label} must be a non-negative integer wire cycle")
+    return int(value)
+
+
+def require_selected_cycle_identity(
+    selected: dict, vector: dict, wire_aggregation: str,
+) -> int:
+    """Require optimizer, vector component, and layout-delay cycles to agree."""
+    if wire_aggregation not in ("mean", "maximum", "traffic-weighted"):
+        raise ValueError("wire aggregation is invalid")
+    if vector.get("wire_cycle_aggregation_for_r2") != wire_aggregation:
+        raise ValueError("R2 wire aggregation differs from the optimizer")
+    components = vector.get("components_cycles")
+    layout_delays = vector.get("layout_delays")
+    if not isinstance(components, dict) or not isinstance(layout_delays, dict):
+        raise ValueError("R2 vector lacks integer wire cycle evidence")
+    delay_field = {
+        "mean": "wire_cycles",
+        "maximum": "maximum_wire_cycles",
+        "traffic-weighted": "traffic_weighted_wire_cycles",
+    }[wire_aggregation]
+    values = (
+        _integer(selected.get("r2_wire_cycles"), "optimizer integer wire cycle"),
+        _integer(components.get("layout_wire"), "R2 component integer wire cycle"),
+        _integer(layout_delays.get(delay_field), "layout integer wire cycle"),
+    )
+    if len(set(values)) != 1:
+        raise ValueError(
+            "optimizer and R2 integer wire cycle representations differ: "
+            f"optimizer={values[0]}, component={values[1]}, layout={values[2]}"
+        )
+    return values[0]
+
+
+def branch_metrics(ipc2: float | None, f_hotspot_ghz: float | None) -> dict:
+    """Name measured IPC and validated HotSpot frequency without proxy aliases."""
+    ipc = _finite_optional(ipc2, "measured IPC2")
+    frequency = _finite_optional(
+        f_hotspot_ghz, "validated HotSpot sustainable frequency"
+    )
+    return {
+        "validated_f_sus_trans_hotspot_ghz": frequency,
+        "measured_ipc2": ipc,
+        "measured_bips2_trans": (
+            ipc * frequency if ipc is not None and frequency is not None else None
+        ),
+    }
+
+
+def _validated_branch(branch: dict, expected_name: str) -> tuple[float, dict]:
+    if not isinstance(branch, dict) or branch.get("branch") != expected_name:
+        raise ValueError(f"paired comparison requires the {expected_name} branch")
+    bips = _finite_optional(
+        branch.get("measured_bips2_trans"),
+        f"{expected_name} measured BIPS2_trans",
+    )
+    if bips is None:
+        raise ValueError(f"{expected_name} lacks measured BIPS2_trans")
+    controls = branch.get("controls")
+    artifacts = branch.get("artifacts")
+    if not isinstance(controls, dict) or not isinstance(artifacts, dict):
+        raise ValueError(f"{expected_name} lacks controls or artifact identity")
+    return bips, controls
+
+
+def publish_paired_comparison(
+    fixed: dict,
+    clip3d: dict,
+    output_dir: Path,
+    *,
+    r2_requested: bool,
+) -> dict | None:
+    """Publish paired metrics only when both branches have real R2 and HotSpot."""
+    output_dir = Path(output_dir)
+    json_path = output_dir / "paired_comparison.json"
+    csv_path = output_dir / "paired_comparison.csv"
+    if not r2_requested or any(
+        not isinstance(branch, dict)
+        or branch.get("measured_bips2_trans") is None
+        for branch in (fixed, clip3d)
+    ):
+        json_path.unlink(missing_ok=True)
+        csv_path.unlink(missing_ok=True)
+        return None
+
+    fixed_bips, fixed_controls = _validated_branch(fixed, "fixed-bin")
+    clip_bips, clip_controls = _validated_branch(clip3d, "clip3d")
+    if fixed_controls != clip_controls:
+        raise ValueError("paired branches use different optimization controls")
+    lambda_wire = _finite_optional(
+        fixed_controls.get("lambda_wire"), "paired lambda_wire"
+    )
+    if lambda_wire is None:
+        raise ValueError("paired comparison lacks lambda_wire")
+    if fixed_controls.get("wire_aggregation") not in (
+        "mean", "maximum", "traffic-weighted"
+    ):
+        raise ValueError("paired comparison has invalid wire aggregation")
+    if fixed_controls.get("wire_rounding") not in ("nearest", "ceil", "floor"):
+        raise ValueError("paired comparison has invalid wire rounding")
+
+    absolute = clip_bips - fixed_bips
+    percent = absolute / fixed_bips * 100.0
+    report = {
+        "schema_version": 1,
+        "mode": "paired transient ROM real-HotSpot and gem5 R2 comparison",
+        "non_formal": True,
+        "paper_equivalent": False,
+        "controls": fixed_controls,
+        "fixed_bin": fixed,
+        "clip3d": clip3d,
+        "bips2_trans_absolute_difference": absolute,
+        "bips2_trans_improvement_percent": percent,
+        "score_definition": (
+            "measured IPC2 * validated real-HotSpot transient sustainable frequency"
+        ),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(json_path, report)
+
+    stream = StringIO(newline="")
+    fieldnames = (
+        "fixed_bips2_trans",
+        "clip3d_bips2_trans",
+        "absolute_difference",
+        "improvement_percent",
+        "lambda_wire",
+        "wire_aggregation",
+        "wire_rounding",
+    )
+    writer = csv.DictWriter(stream, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerow({
+        "fixed_bips2_trans": fixed_bips,
+        "clip3d_bips2_trans": clip_bips,
+        "absolute_difference": absolute,
+        "improvement_percent": percent,
+        "lambda_wire": lambda_wire,
+        "wire_aggregation": fixed_controls["wire_aggregation"],
+        "wire_rounding": fixed_controls["wire_rounding"],
+    })
+    atomic_write_bytes(csv_path, stream.getvalue().encode("utf-8"))
+    return report

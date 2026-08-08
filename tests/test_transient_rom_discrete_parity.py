@@ -1,9 +1,15 @@
 from pathlib import Path
+import tempfile
 import unittest
 
 from workflow.common import read_json
 from workflow.floorplan.discrete_partition import search_discrete_partitions
 from workflow.run_lifting_pipeline import validate_config
+from workflow.transient.rom.paired_validation import (
+    branch_metrics,
+    publish_paired_comparison,
+    require_selected_cycle_identity,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -166,6 +172,96 @@ class DiscretePartitionEngineTests(unittest.TestCase):
             search_discrete_partitions(
                 self.base_layout(), "L2", [1], 3, False, self.evaluator
             )
+
+
+class PairedValidationUnitTests(unittest.TestCase):
+    """Catch cycle drift and publication of predicted or incomplete BIPS."""
+
+    @staticmethod
+    def vector(cycle=7, aggregation="traffic-weighted"):
+        return {
+            "components_cycles": {"layout_wire": cycle},
+            "wire_cycle_aggregation_for_r2": aggregation,
+            "layout_delays": {"traffic_weighted_wire_cycles": cycle},
+        }
+
+    @staticmethod
+    def branch(name, ipc2, frequency):
+        metrics = branch_metrics(ipc2, frequency)
+        return {
+            "branch": name,
+            **metrics,
+            "controls": {
+                "lambda_wire": 0.0020119160767721133,
+                "wire_aggregation": "traffic-weighted",
+                "wire_rounding": "nearest",
+            },
+            "artifacts": {
+                "hotspot": f"/{name}/hotspot/result.json",
+                "r2_result": f"/{name}/gem5_r2/r2_result.json",
+            },
+        }
+
+    def test_selected_cycle_must_equal_every_r2_representation(self):
+        self.assertEqual(
+            require_selected_cycle_identity(
+                {"r2_wire_cycles": 7}, self.vector(), "traffic-weighted"
+            ),
+            7,
+        )
+        with self.assertRaisesRegex(ValueError, "integer wire cycle"):
+            require_selected_cycle_identity(
+                {"r2_wire_cycles": 7}, self.vector(cycle=6),
+                "traffic-weighted",
+            )
+        with self.assertRaisesRegex(ValueError, "aggregation"):
+            require_selected_cycle_identity(
+                {"r2_wire_cycles": 7}, self.vector(aggregation="mean"),
+                "traffic-weighted",
+            )
+
+    def test_branch_metrics_require_both_real_measurements(self):
+        self.assertEqual(branch_metrics(1.5, 1.8), {
+            "validated_f_sus_trans_hotspot_ghz": 1.8,
+            "measured_ipc2": 1.5,
+            "measured_bips2_trans": 2.7,
+        })
+        self.assertIsNone(branch_metrics(None, 1.8)["measured_bips2_trans"])
+        self.assertIsNone(branch_metrics(1.5, None)["measured_bips2_trans"])
+
+    def test_paired_report_is_published_only_for_two_measured_branches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            fixed = self.branch("fixed-bin", 1.4, 1.8)
+            clip = self.branch("clip3d", None, 1.9)
+
+            self.assertIsNone(
+                publish_paired_comparison(
+                    fixed, clip, output, r2_requested=False
+                )
+            )
+            self.assertFalse((output / "paired_comparison.json").exists())
+            self.assertFalse((output / "paired_comparison.csv").exists())
+            self.assertIsNone(
+                publish_paired_comparison(fixed, clip, output, r2_requested=True)
+            )
+            self.assertFalse((output / "paired_comparison.json").exists())
+            self.assertFalse((output / "paired_comparison.csv").exists())
+
+            clip = self.branch("clip3d", 1.5, 1.9)
+            report = publish_paired_comparison(
+                fixed, clip, output, r2_requested=True
+            )
+            fixed_bips = 1.4 * 1.8
+            clip_bips = 1.5 * 1.9
+            expected = (clip_bips - fixed_bips) / fixed_bips * 100.0
+            self.assertEqual(
+                report["bips2_trans_improvement_percent"], expected
+            )
+            self.assertTrue((output / "paired_comparison.json").is_file())
+            self.assertTrue((output / "paired_comparison.csv").is_file())
+            self.assertTrue(report["non_formal"])
+            self.assertFalse(report["paper_equivalent"])
 
 
 if __name__ == "__main__":
