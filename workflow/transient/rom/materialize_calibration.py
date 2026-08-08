@@ -218,6 +218,12 @@ def _materialize_case(*, kind: str, point: dict, case_dir: Path,
         frequency_scale=frequency_ghz / f0_ghz,
         period_repeats=period_repeats,
     )
+    trace_manifest = read_json(case_dir / "transient_trace_manifest.json")
+    trace_manifest["trace_input_identity"]["config_sha256"] = _sha256(
+        package_dir / "config.json"
+    )
+    trace_manifest["hotspot_sha256"] = _sha256(hotspot)
+    write_json(case_dir / "transient_trace_manifest.json", trace_manifest)
     thermal = run_hotspot_transient(
         case_dir, hotspot=hotspot, initial_temperature="ambient"
     )

@@ -337,6 +337,9 @@ def require_package_calibration_evidence(
         layout_for_point,
         load_calibration_design,
     )
+    from workflow.transient.generate_hotspot_trace import (
+        trace_input_identity, validate_materialized_trace,
+    )
 
     design = load_calibration_design(package_dir)
     design_identity = calibration_design_hash(design)
@@ -534,6 +537,23 @@ def require_package_calibration_evidence(
                     f"reusable ROM holdout case {identifier} "
                     "source power identity differs"
                 )
+            expected_identity = trace_input_identity(
+                resolved_artifacts["modules"], resolved_artifacts["layout"],
+                resolved_artifacts["power_windows"], packaged_config_path,
+                case.get("frequency_scale"),
+            )
+            try:
+                trace_manifest = validate_materialized_trace(
+                    resolved_artifacts["power_trace"].parent, expected_identity, True,
+                )
+            except (OSError, ValueError) as error:
+                label = ("temperature trace period structure" if expected_kind == "holdout"
+                         else "training trace / PRBS power evidence")
+                raise ValueError(
+                    f"reusable ROM {expected_kind} case {identifier} {label} differs"
+                ) from error
+            if trace_manifest.get("hotspot_sha256") != acceptance["identity"]["hotspot_hash"]:
+                raise ValueError(f"reusable ROM {expected_kind} case {identifier} HotSpot trace identity differs")
 
     holdout_power_hashes = {
         artifact_hashes[identifier]["power_windows"]

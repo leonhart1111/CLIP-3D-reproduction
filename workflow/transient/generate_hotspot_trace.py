@@ -48,6 +48,9 @@ def validate_materialized_trace(case_dir: Path, expected_identity: dict,
     grid_count = manifest.get("grid_cell_count")
     if not isinstance(count, int) or count < 1 or not isinstance(grid_count, int) or grid_count < 1:
         raise ValueError("materialized trace manifest shape is invalid")
+    expected_names = manifest.get("grid_unit_names")
+    if not isinstance(expected_names, list) or len(expected_names) != grid_count:
+        raise ValueError("materialized trace grid names are invalid")
     for name in required:
         path = case_dir / name
         if not path.is_file():
@@ -55,8 +58,17 @@ def validate_materialized_trace(case_dir: Path, expected_identity: dict,
         lines = path.read_text(encoding="utf-8").splitlines()
         if len(lines) != count + 1:
             raise ValueError("materialized trace row count differs")
-        if len(lines[0].split()) != grid_count or any(len(row.split()) != grid_count for row in lines[1:]):
+        if lines[0].split() != expected_names:
             raise ValueError("materialized trace grid differs")
+        for row in lines[1:]:
+            cells = row.split()
+            if len(cells) != grid_count:
+                raise ValueError("materialized trace grid differs")
+            try:
+                if not all(math.isfinite(float(value)) for value in cells):
+                    raise ValueError
+            except ValueError as error:
+                raise ValueError("materialized trace has non-finite cells") from error
     return manifest
 RAW_POWER_PROVENANCE = {
     "dynamic": "McPAT Runtime Dynamic",
@@ -263,6 +275,7 @@ def materialize_trace(modules_path: Path, layout_path: Path, power_windows_path:
             "model": "fixed-voltage dynamic-power scaling with fixed leakage",
         },
         "grid_cell_count": len(trace_names),
+        "grid_unit_names": trace_names,
         "actual_gem5_duration_s": actual_duration_s,
         "hotspot_trace_duration_s": hotspot_duration_s,
         "padded_final_duration_s": max(hotspot_duration_s - actual_duration_s, 0.0),

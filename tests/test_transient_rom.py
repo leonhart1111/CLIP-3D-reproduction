@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy
 
 from workflow.common import read_json, write_json
+from workflow.transient.generate_hotspot_trace import trace_input_identity
 from workflow.transient.rom.contracts import (
     parse_settings,
     require_accepted_package,
@@ -172,8 +173,10 @@ def write_synthetic_accepted_package(
         write_json(artifact_paths["layout"], layout)
         write_json(artifact_paths["power_windows"], case_power_windows)
         artifact_paths["power_trace"].write_text(
-            "shared_l2\n" + "1.0\n" * period_rows, encoding="utf-8"
+            "cell0\n" + "1.0\n" * period_rows, encoding="utf-8"
         )
+        for name in ("power_dynamic_transient.ptrace", "power_leakage_transient.ptrace"):
+            (case_dir / name).write_text("cell0\n" + "1.0\n" * period_rows, encoding="utf-8")
         frequency_ghz = (
             f0_ghz if kind == "training" else holdout_frequencies[index]
         )
@@ -197,6 +200,15 @@ def write_synthetic_accepted_package(
             artifact_paths["temperature_trace"].write_text(
                 "cell0\n" + "300.0\n" * period_rows, encoding="utf-8"
             )
+        write_json(case_dir / "transient_trace_manifest.json", {
+            "trace_input_identity": trace_input_identity(
+                package_modules, artifact_paths["layout"], artifact_paths["power_windows"],
+                package_config, frequency_ghz / f0_ghz,
+            ),
+            "hotspot_sha256": identity["hotspot_hash"],
+            "window_count": period_rows, "grid_cell_count": 1,
+            "grid_unit_names": ["cell0"],
+        })
         case = {
             "id": point["id"],
             "kind": kind,
