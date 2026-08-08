@@ -505,7 +505,7 @@ def require_package_calibration_evidence(
             if (not isinstance(expected_rows, int) or expected_rows < 1
                     or len(trace_rows) != expected_rows + 1):
                 raise ValueError(
-                    f"reusable ROM {expected_kind} case {identifier} training trace differs"
+                    f"reusable ROM {expected_kind} case {identifier} {expected_kind} trace differs"
                 )
             expected_layout = layout_for_point(
                 design["base_layout"], expected_points[identifier]

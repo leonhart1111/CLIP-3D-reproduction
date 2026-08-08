@@ -539,6 +539,26 @@ class ROMContractTests(unittest.TestCase):
                 self.package, self.reuse_identity(), self.settings(),
             )
 
+    def test_reuse_rejects_rehashed_same_shaped_power_payload(self):
+        """Catch a finite payload edit that preserves all trace dimensions."""
+        cases = read_json(self.package / "calibration_cases.json")
+        case = cases["training_cases"][0]
+        trace = self.package / case["artifacts"]["power_trace"]
+        lines = trace.read_text(encoding="utf-8").splitlines()
+        cells = lines[1].split()
+        cells[0] = str(float(cells[0]) + 0.125)
+        lines[1] = "\t".join(cells)
+        trace.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        case["artifacts"]["sha256"]["power_trace"] = (
+            "sha256:" + hashlib.sha256(trace.read_bytes()).hexdigest()
+        )
+        write_json(self.package / "calibration_cases.json", cases)
+        write_test_artifact_manifest(self.package)
+        with self.assertRaisesRegex(ValueError, "power trace payload"):
+            require_package_calibration_evidence(
+                self.package, self.reuse_identity(), self.settings(),
+            )
+
     def test_reuse_rejects_contradictory_fit_report_classification(self):
         # Break caught: a rehashed fit report must not reinterpret a transient
         # ROM model as formal steady-state evidence during package reuse.
