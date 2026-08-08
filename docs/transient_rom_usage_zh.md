@@ -24,6 +24,14 @@ R1=runs/architecture_sweep/r1/paper/matmul/l1d_32kB/l2_512kB
 OUT=runs/transient_rom/matmul_32kB_512kB
 ```
 
+若要验证与当前稳态 5 点实验一致的“非零线长权重 + 通信权重 + nearest 整数周期分区”流程，应使用下面这个独立配置，而不是上面的 λ=0 隔离配置：
+
+```text
+configs/experiments/clip3d_transient_rom_lambda0020119_traffic_weighted_discrete_partition_exploratory.json
+```
+
+它固定使用 `lambda_wire=0.0020119160767721133`、`wire_objective=discrete-partition`、`wire_aggregation=traffic-weighted`、`wire_rounding=nearest`、41×41 网格、固定布局基线和 `allowed_l2_tiers=[1]`。该 λ 来自仓库内可追溯但**未通过正式验收**的 FFT 拟合报告：R²、单调性和跨工作负载迁移门并未全部通过。因此该配置只能证明瞬态 ROM、整数分区和双分支实测流程可运行，不能据此宣称参数已被论文或跨负载实验验证。
+
 ## 首次校准与后续复用
 
 首次运行须创建并通过校准包。省略 `--transient-rom-r1-dir` 时，流程会在 `OUT/transient_rom/r1/` 创建 2 ms 周期统计 R1；运行 `--run-r2` 才会得到可报告的最终 `bips2_trans`。
@@ -44,6 +52,31 @@ python -m workflow.run_lifting_pipeline \
   --thermal-mode transient-rom --transient-rom-r1-dir "$PERIODIC_R1" \
   --transient-rom-package-dir "$PACKAGE" --run-r2
 ```
+
+## 复用现有 R1 的非零 λ 配对实验
+
+下面的命令不会重跑 canonical R1，也不会重跑已经完成的 2 ms 周期统计 R1。它会准备一次共享功耗窗口，执行固定的 8+2 ROM 校准，使用 ROM 搜索 L2 布局，然后分别用真实 HotSpot 和各自的 gem5 R2 验证 fixed-bin 与 CLIP-3D。必须使用新的空输出目录；不要覆盖历史证据。
+
+```bash
+cd /home/zyjiang/Agenticflow/CLIP/.worktrees/transient-rom
+source scripts/env.sh
+
+R1=/home/zyjiang/Agenticflow/CLIP/runs/architecture_sweep/r1/paper/matmul/l1d_32kB/l2_512kB
+PERIODIC_R1=/home/zyjiang/Agenticflow/CLIP/runs/transient_validation/matmul_32kB_512kB_lambda0020119_2ms_precision6_20260806_030743/transient/shared_r1
+CFG=configs/experiments/clip3d_transient_rom_lambda0020119_traffic_weighted_discrete_partition_exploratory.json
+OUT=runs/transient_rom/matmul_32kB_512kB_lambda0020119_discrete_$(date +%Y%m%d_%H%M%S)
+
+python -m workflow.run_lifting_pipeline \
+  --r1-dir "$R1" \
+  --output-dir "$OUT" \
+  --config "$CFG" \
+  --thermal-mode transient-rom \
+  --transient-rom-r1-dir "$PERIODIC_R1" \
+  --transient-rom-calibrate \
+  --run-r2
+```
+
+公共入口会在复用稳态预检之前校验离散搜索控制；偶数网格、未包含 fixed-bin、非法 tier 或不受支持的通信聚合会直接拒绝。优化器输出的 `r2_wire_cycles` 还必须与 CLIP 分支 `r2_latency.json` 的 `components_cycles.layout_wire` 及 `layout_delays.traffic_weighted_wire_cycles` 完全相等，否则两次 R2 都不会启动，并在 CLIP 分支留下 `integer_cycle_identity` 失败记录。
 
 接受包会绑定 canonical R1 元数据、窗口功耗、模块与布局几何、配置、HotSpot 二进制、网格、热堆栈、冷却、允许的 L2 tier，以及完整校准设计（8 个锚点、2 个留出点、插值域和 Delaunay simplices）的哈希/identity。复用只读取包内 `anchors.json`，不会用当前代码重新生成设计；`pod_model.npz` 中的 B_L2 anchor ID、拟合 case 顺序、训练输入/温度哈希、转换阈值和设计哈希必须与 `fit_report.json` 完全一致。复用还会重新读取 `calibration_cases.json` 与 `validation_report.json`，校验 8+2 case 的点/布局映射、包内 artifact 哈希、全部留出 gate 和误差阈值，并保留历史留出 RMSE/峰温误差。case artifact 路径只允许相对于包根目录，源 `modules.json` 的原始字节也会复制进包，因此完整包可整体移动后复用；路径逃逸、symlink、证据缺失、清单缺失或清单哈希陈旧都会拒绝复用。不得只复制或修改接受标记。
 
@@ -70,9 +103,21 @@ OUT/
     │   ├── validation_report.json
     │   └── rom_acceptance.json
     ├── optimization/{optimization_report.json,proposed_layout.json}
-    ├── final_hotspot_validation/transient_sustainable_frequency.json
-    ├── r2_latency.json
-    ├── gem5_r2/r2_result.json          # 仅 --run-r2
+    ├── final_hotspot_validation/        # λ=0 continuous 旧单分支模式
+    │   └── transient_sustainable_frequency.json
+    ├── final_validation/                # discrete-partition 新配对模式
+    │   ├── fixed_bin/
+    │   │   ├── transient_sustainable_frequency.json
+    │   │   ├── r2_latency.json
+    │   │   ├── gem5_r2/r2_result.json   # 仅 --run-r2
+    │   │   └── branch_summary.json
+    │   ├── clip3d/
+    │   │   ├── transient_sustainable_frequency.json
+    │   │   ├── r2_latency.json
+    │   │   ├── gem5_r2/r2_result.json   # 仅 --run-r2
+    │   │   └── branch_summary.json
+    │   ├── paired_comparison.json       # 仅两边 HotSpot+R2 均完整时生成
+    │   └── paired_comparison.csv
     └── transient_rom_summary.json
 ```
 
@@ -95,3 +140,11 @@ OUT/
 - `bips2`：只属于独立稳态汇总；ROM 汇总中故意不存在这个含糊字段，不能把稳态 `bips2` 当作 `bips2_trans`。
 
 因此，报告应同时保留预测、留出误差、最终 HotSpot 结果、R2 结果、调用次数和所有 identity。即便所有门通过，结果仍是 non-formal、paper-inequivalent 的探索性扩展，不能提升为正式/论文等价结论。
+
+对于新的离散配对模式，顶层汇总不再把 CLIP 单分支结果伪装成整个实验结果，而是使用三个命名空间：
+
+- `predicted.clip3d`：ROM 的候选选择预测；只解释为什么选中该布局。
+- `validated.fixed_bin` 与 `validated.clip3d`：两个布局各自经过真实瞬态 HotSpot 得到的持续频率及验证分类。
+- `measured.fixed_bin` 与 `measured.clip3d`：两个布局各自真实 gem5 R2 的 IPC2，以及 `BIPS2_trans = IPC2 × f_sus_trans_hotspot`。
+
+首要科学比较文件是 `transient_rom/final_validation/paired_comparison.json`（CSV 同目录）。它只在两边都存在真实 HotSpot 持续频率和真实 R2 IPC2 时生成；其中的提升率为 `(CLIP BIPS2_trans - fixed BIPS2_trans) / fixed BIPS2_trans × 100%`。ROM predicted 值永远不能替代这个 measured 配对结果，也不能在缺失一边时发布提升率。

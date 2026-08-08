@@ -2074,8 +2074,14 @@ class ThermalModeDispatchTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        write_json(self.root / "config.json", {
+            "schema_version": 1,
+            "physical": {"r_convec_k_per_w": 5.0},
+            "layout_optimizer": {"r_convec_k_per_w": 5.0},
+            "delay": {"wire_aggregation": "mean"},
+        })
 
-    def invoke_cli(self, *arguments: str) -> None:
+    def invoke_cli(self, *arguments: str) -> str:
         argv = [
             "run_lifting_pipeline",
             "--r1-dir", str(self.root / "r1"),
@@ -2083,8 +2089,10 @@ class ThermalModeDispatchTests(unittest.TestCase):
             "--config", str(self.root / "config.json"),
             *arguments,
         ]
-        with patch("sys.argv", argv), redirect_stdout(StringIO()):
+        stdout = StringIO()
+        with patch("sys.argv", argv), redirect_stdout(stdout):
             run_lifting_pipeline_main()
+        return stdout.getvalue()
 
     @staticmethod
     def steady_summary() -> dict:
@@ -2157,6 +2165,64 @@ class ThermalModeDispatchTests(unittest.TestCase):
             self.invoke_cli(
                 "--thermal-mode", "transient-rom", "--transient", "true"
             )
+
+    def test_rom_mode_rejects_invalid_discrete_controls_before_dispatch(self):
+        # Break caught: reusing an existing preflight must not bypass the common
+        # discrete-partition gate and start expensive ROM work with no baseline.
+        config = read_json(self.root / "config.json")
+        config["layout_optimizer"].update({
+            "wire_objective": "discrete-partition",
+            "partition_grid_steps": 41,
+            "include_fixed_baseline": False,
+        })
+        write_json(self.root / "config.json", config)
+        write_json(
+            self.root / "output/steady_preflight/pipeline_summary.json", {}
+        )
+
+        with patch(
+            "workflow.run_lifting_pipeline.run_pipeline"
+        ) as steady, patch(
+            "workflow.transient.rom.run_pipeline.run_transient_rom_pipeline",
+            return_value={"f_sus_trans_hotspot_ghz": None},
+        ) as rom, self.assertRaisesRegex(ValueError, "fixed-bin baseline"):
+            self.invoke_cli("--thermal-mode", "transient-rom")
+
+        steady.assert_not_called()
+        rom.assert_not_called()
+
+    def test_rom_mode_renders_paired_clip3d_validated_frequency(self):
+        # Break caught: the discrete paired summary intentionally removes the
+        # legacy flat frequency field; the CLI must read the CLIP branch.
+        config = read_json(self.root / "config.json")
+        config["layout_optimizer"].update({
+            "wire_objective": "discrete-partition",
+            "partition_grid_steps": 41,
+            "include_fixed_baseline": True,
+        })
+        write_json(self.root / "config.json", config)
+        write_json(
+            self.root / "output/steady_preflight/pipeline_summary.json", {}
+        )
+        paired_summary = {
+            "branches": {
+                "clip3d": {
+                    "validated_f_sus_trans_hotspot_ghz": 1.75,
+                }
+            }
+        }
+
+        with patch(
+            "workflow.run_lifting_pipeline.run_pipeline"
+        ) as steady, patch(
+            "workflow.transient.rom.run_pipeline.run_transient_rom_pipeline",
+            return_value=paired_summary,
+        ) as rom:
+            stdout = self.invoke_cli("--thermal-mode", "transient-rom")
+
+        steady.assert_not_called()
+        rom.assert_called_once()
+        self.assertIn("f_sus_hotspot=1.750000 GHz", stdout)
 
     def test_rom_mode_rejects_arbitrary_output_directory_option(self):
         # Break caught: allowing callers to relocate ROM outputs breaks the

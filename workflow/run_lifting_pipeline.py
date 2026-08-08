@@ -896,6 +896,7 @@ def main() -> None:
                 "choose either --transient-rom-calibrate or "
                 "--transient-rom-package-dir"
             )
+        validate_config(read_json(args.config.resolve()), "clip3d")
         steady_preflight_dir = (args.output_dir / "steady_preflight").resolve()
         if not (steady_preflight_dir / "pipeline_summary.json").is_file():
             run_pipeline(
@@ -954,7 +955,12 @@ def main() -> None:
               f"Tmax={format_temperature_c(summary['tmax_c'])} C, "
               f"f_sus={summary['sustainable_frequency_ghz']:.6f} GHz")
     else:
-        frequency = summary["f_sus_trans_hotspot_ghz"]
+        frequency = summary.get("f_sus_trans_hotspot_ghz")
+        branches = summary.get("branches")
+        if isinstance(branches, dict) and isinstance(branches.get("clip3d"), dict):
+            frequency = branches["clip3d"].get(
+                "validated_f_sus_trans_hotspot_ghz"
+            )
         rendered = "none" if frequency is None else f"{frequency:.6f} GHz"
         print(f"Transient ROM pipeline complete: f_sus_hotspot={rendered}")
     if args.transient:
