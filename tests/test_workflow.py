@@ -30,7 +30,11 @@ from workflow.floorplan.layout_metrics import (
     derive_layout_delays,
     select_rounded_wire_cycles,
 )
-from workflow.floorplan.optimize_layout import optimize, proxy_temperature
+from workflow.floorplan.optimize_layout import (
+    discrete_wire_score,
+    optimize,
+    proxy_temperature,
+)
 from workflow.mcpat.parse_mcpat import parse_mcpat_text, subtract
 from workflow.r2.calibrate_lambda_wire import (
     calibrate as calibrate_lambda_wire,
@@ -45,7 +49,7 @@ from workflow.r2.run_wire_sensitivity import (
 )
 from workflow.run_lifting_pipeline import (
     evaluate_comparison_candidates, main as run_lifting_pipeline_main,
-    select_clip3d_candidate, validate_config,
+    optimize_clip3d_layout, select_clip3d_candidate, validate_config,
 )
 from workflow.run_lifting_sweep import (
     completed as lifting_completed,
@@ -71,6 +75,39 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_lifting_cli_accepts_discrete_partition_override(self):
+        process = subprocess.run(
+            [
+                sys.executable, "-m", "workflow.run_lifting_pipeline",
+                "--r1-dir", "/definitely/missing/r1",
+                "--output-dir", "/definitely/missing/output",
+                "--wire-objective", "discrete-partition",
+            ],
+            cwd=Path(__file__).resolve().parents[1], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(process.returncode, 0)
+        self.assertNotIn("invalid choice", process.stderr)
+        self.assertIn("FileNotFoundError", process.stderr)
+
+    def test_floorplanner_cli_accepts_discrete_partition_mode(self):
+        process = subprocess.run(
+            [
+                sys.executable, "-m", "workflow.floorplan.optimize_layout",
+                "--modules", "/definitely/missing/modules.json",
+                "--output-layout", "/definitely/missing/layout.json",
+                "--report", "/definitely/missing/report.json",
+                "--wire-objective", "discrete-partition",
+            ],
+            cwd=Path(__file__).resolve().parents[1], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(process.returncode, 0)
+        self.assertNotIn("invalid choice", process.stderr)
+        self.assertIn("FileNotFoundError", process.stderr)
+
     def test_temperature_text_and_csv_fields_use_six_decimals(self):
         from workflow.common import format_temperature_c, format_temperature_csv_row
 
@@ -815,6 +852,114 @@ class GridTests(unittest.TestCase):
         return {"schema_version": 1, "ipc1": 4.0, "gamma": 0.21,
                 "modules": modules, "totals": {"total_power_w": 4.61,
                 "dynamic_power_w": 3.7, "leakage_power_w": 0.91}}
+
+    def test_discrete_wire_score_blocks_harmful_rounding_boundary(self):
+        ipc1 = 4.31314420772608
+        lambda_wire = 0.0020119160767721133
+        fixed_score, fixed_cycle = discrete_wire_score(
+            ipc1, 0.7894564656933903, lambda_wire, 1.3580618602253112,
+            "nearest",
+        )
+        proposed_score, proposed_cycle = discrete_wire_score(
+            ipc1, 0.7906404937722684, lambda_wire, 1.5577477284674477,
+            "nearest",
+        )
+
+        self.assertEqual((fixed_cycle, proposed_cycle), (1, 2))
+        self.assertLess(fixed_score, proposed_score)
+
+    def test_discrete_partition_rejects_invalid_grid_and_disabled_baseline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+            for steps in (2, 4):
+                with self.subTest(steps=steps):
+                    with self.assertRaisesRegex(ValueError, "odd integer"):
+                        optimize(
+                            root / "modules.json", root / "layout.json",
+                            root / "report.json",
+                            wire_objective="discrete-partition",
+                            partition_grid_steps=steps,
+                        )
+            with self.assertRaisesRegex(ValueError, "fixed-bin baseline"):
+                optimize(
+                    root / "modules.json", root / "layout.json",
+                    root / "report.json",
+                    wire_objective="discrete-partition",
+                    partition_grid_steps=3, include_fixed_baseline=False,
+                )
+
+    def test_discrete_partition_is_deterministic_and_reports_integer_partitions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+            reports = []
+            for run in (1, 2):
+                reports.append(optimize(
+                    root / "modules.json", root / f"layout-{run}.json",
+                    root / f"report-{run}.json", allowed_l2_tiers=[1],
+                    require_scipy=False, wire_objective="discrete-partition",
+                    wire_aggregation="mean", partition_grid_steps=5,
+                    include_fixed_baseline=True,
+                ))
+
+            report = reports[0]
+            self.assertEqual(
+                report["parameters"]["wire_objective"], "discrete-partition"
+            )
+            self.assertEqual(report["discrete_search"]["grid_steps"], 5)
+            self.assertTrue(
+                report["discrete_search"]["fixed_baseline_included"]
+            )
+            self.assertIn(
+                report["selected"]["origin"], ("fixed-bin", "partition-grid")
+            )
+            self.assertIsInstance(report["selected"]["r2_wire_cycles"], int)
+            self.assertEqual(
+                report["selected"]["wire_objective_cycles"],
+                report["selected"]["r2_wire_cycles"],
+            )
+            self.assertGreaterEqual(
+                len(report["discrete_search"]["partitions"]), 1
+            )
+            self.assertEqual(reports[0]["selected"], reports[1]["selected"])
+            self.assertEqual(
+                reports[0]["discrete_search"]["partitions"],
+                reports[1]["discrete_search"]["partitions"],
+            )
+
+    def test_pipeline_forwards_discrete_partition_options_to_optimizer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+            config = {
+                "frequency": {
+                    "ambient_c": 25.0, "f0_ghz": 2.0, "fmin_ghz": 0.4,
+                    "tsafe_c": 95.0,
+                },
+                "physical": {"utilization": 0.70, "r_convec_k_per_w": 5.0},
+                "layout_optimizer": {
+                    "alpha": 0.3, "beta": 0.1, "cross_tier_weight": 0.65,
+                    "lambda_wire": 0.0020119160767721133,
+                    "allowed_l2_tiers": [1], "require_scipy": False,
+                    "wire_objective": "discrete-partition",
+                    "partition_grid_steps": 3,
+                    "include_fixed_baseline": True,
+                },
+                "delay": {
+                    "wire_rounding": "nearest", "wire_aggregation": "mean",
+                },
+            }
+
+            report = optimize_clip3d_layout(
+                root / "modules.json", root / "layout.json",
+                root / "report.json", config,
+            )
+
+            self.assertEqual(report["discrete_search"]["grid_steps"], 3)
+            self.assertTrue(
+                report["discrete_search"]["fixed_baseline_included"]
+            )
 
     def test_exact_power_conservation(self):
         gridded = grid_power(baseline_layout(self.model()), 8)
@@ -1854,6 +1999,27 @@ class FormalGuardTests(unittest.TestCase):
         config["layout_optimizer"]["allowed_l2_tiers"] = [1]
         config["layout_optimizer"]["wire_objective"] = "invented"
         with self.assertRaises(ValueError):
+            validate_config(config, "clip3d")
+
+    def test_discrete_partition_config_requires_valid_grid_and_baseline(self):
+        config = {
+            "schema_version": 1,
+            "physical": {"r_convec_k_per_w": 5.0},
+            "layout_optimizer": {
+                "r_convec_k_per_w": 5.0,
+                "wire_objective": "discrete-partition",
+                "partition_grid_steps": 41,
+                "include_fixed_baseline": True,
+            },
+        }
+        validate_config(config, "clip3d")
+
+        config["layout_optimizer"]["partition_grid_steps"] = 40
+        with self.assertRaisesRegex(ValueError, "odd integer"):
+            validate_config(config, "clip3d")
+        config["layout_optimizer"]["partition_grid_steps"] = 41
+        config["layout_optimizer"]["include_fixed_baseline"] = False
+        with self.assertRaisesRegex(ValueError, "fixed-bin baseline"):
             validate_config(config, "clip3d")
 
     def test_formal_summary_requires_real_r2(self):

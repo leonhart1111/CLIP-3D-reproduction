@@ -232,8 +232,25 @@ def validate_config(config: dict, layout_method: str) -> None:
     wire_objective = config.get("layout_optimizer", {}).get(
         "wire_objective", "continuous"
     )
-    if wire_objective not in ("continuous", "r2-quantized"):
+    if wire_objective not in (
+            "continuous", "r2-quantized", "discrete-partition"):
         raise ValueError("layout_optimizer.wire_objective is invalid")
+    if wire_objective == "discrete-partition":
+        partition_grid_steps = config.get("layout_optimizer", {}).get(
+            "partition_grid_steps", 41
+        )
+        if (not isinstance(partition_grid_steps, int)
+                or isinstance(partition_grid_steps, bool)
+                or partition_grid_steps < 3
+                or partition_grid_steps % 2 == 0):
+            raise ValueError(
+                "layout_optimizer.partition_grid_steps must be an odd integer >= 3"
+            )
+        if config.get("layout_optimizer", {}).get(
+                "include_fixed_baseline", True) is not True:
+            raise ValueError(
+                "discrete-partition requires the fixed-bin baseline"
+            )
 
 
 def refresh_copied_hotspot_paths(hotspot_dir: Path) -> None:
@@ -501,6 +518,31 @@ def evaluate_clip3d_paper_single(modules_path: Path, proposed_layout: Path,
     return hotspot_dir / "layout.json", thermal, selection
 
 
+def optimize_clip3d_layout(modules_path: Path, proposed_layout: Path,
+                           report_path: Path, config: dict) -> dict:
+    """Forward one validated experiment configuration to the floorplanner."""
+    frequency = config["frequency"]
+    physical = config["physical"]
+    optimizer = config["layout_optimizer"]
+    delay = config["delay"]
+    return optimize(
+        modules_path, proposed_layout, report_path,
+        physical["utilization"], frequency["ambient_c"],
+        physical["r_convec_k_per_w"], optimizer["alpha"], optimizer["beta"],
+        optimizer["cross_tier_weight"], frequency["f0_ghz"],
+        frequency["fmin_ghz"], frequency["tsafe_c"],
+        optimizer["lambda_wire"], optimizer.get("require_scipy", False),
+        optimizer.get("allowed_l2_tiers"),
+        optimizer.get("proxy_spatial_model", "center"),
+        int(optimizer.get("proxy_quadrature_order", 2)),
+        optimizer.get("wire_objective", "continuous"),
+        delay.get("wire_rounding", "nearest"),
+        delay.get("wire_aggregation", "mean"),
+        int(optimizer.get("partition_grid_steps", 41)),
+        optimizer.get("include_fixed_baseline", True),
+    )
+
+
 def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
                  layout_method: str = "fixed-bin", execute_r2: bool = False,
                  rerun_r2: bool = False,
@@ -585,19 +627,9 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     if layout_method == "clip3d":
         optimizer = config["layout_optimizer"]
         proposed_layout = output_dir / "optimized_layout.json"
-        optimize(
-            modules_path, proposed_layout, output_dir / "optimizer_report.json",
-            physical["utilization"], frequency["ambient_c"],
-            physical["r_convec_k_per_w"], optimizer["alpha"], optimizer["beta"],
-            optimizer["cross_tier_weight"], frequency["f0_ghz"],
-            frequency["fmin_ghz"], frequency["tsafe_c"], optimizer["lambda_wire"],
-            optimizer.get("require_scipy", False),
-            optimizer.get("allowed_l2_tiers"),
-            optimizer.get("proxy_spatial_model", "center"),
-            int(optimizer.get("proxy_quadrature_order", 2)),
-            optimizer.get("wire_objective", "continuous"),
-            config["delay"].get("wire_rounding", "nearest"),
-            config["delay"].get("wire_aggregation", "mean"),
+        optimize_clip3d_layout(
+            modules_path, proposed_layout,
+            output_dir / "optimizer_report.json", config,
         )
         if optimizer.get("validation_policy", "guarded") == "paper-single":
             layout_path, thermal, selection = evaluate_clip3d_paper_single(
@@ -789,7 +821,8 @@ def main() -> None:
     parser.add_argument("--reuse-r2-dir", type=Path,
                         help="reuse a successful R2 when the generated latency vector is identical")
     parser.add_argument(
-        "--wire-objective", choices=("continuous", "r2-quantized"),
+        "--wire-objective",
+        choices=("continuous", "r2-quantized", "discrete-partition"),
         help="override the layout objective without editing the source config",
     )
     parser.add_argument(

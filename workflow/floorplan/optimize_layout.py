@@ -84,6 +84,17 @@ def collision_area(candidate: dict, others: list[dict]) -> float:
                for m in others if m["tier"] == candidate["tier"])
 
 
+def discrete_wire_score(ipc1: float, frequency_ghz: float,
+                        lambda_wire: float, continuous_wire_cycles: float,
+                        rounding: str) -> tuple[float, int]:
+    """Evaluate equation (15)'s wire term in the integer R2 domain."""
+    rounded = round_wire_cycles(continuous_wire_cycles, rounding)
+    score = -ipc1 * frequency_ghz + lambda_wire * ipc1 * rounded
+    if not math.isfinite(score):
+        raise ValueError("discrete partition score must be finite")
+    return score, rounded
+
+
 def pattern_search(function, start: tuple[float, float],
                    upper: tuple[float, float]) -> tuple[list[float], float, int]:
     point = [min(max(start[index], 0.0), upper[index]) for index in range(2)]
@@ -116,7 +127,9 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
              proxy_quadrature_order: int = 2,
              wire_objective: str = "continuous",
              wire_rounding: str = "nearest",
-             wire_aggregation: str = "mean") -> dict:
+             wire_aggregation: str = "mean",
+             partition_grid_steps: int = 41,
+             include_fixed_baseline: bool = True) -> dict:
     model = read_json(model_path)
     base = baseline_layout(model, utilization)
     side = base["die_width_mm"]
@@ -125,8 +138,24 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
     upper = (side - original["width_mm"], side - original["height_mm"])
     if min(upper) < 0:
         raise ValueError("L2 geometry does not fit inside the die")
-    if wire_objective not in ("continuous", "r2-quantized"):
-        raise ValueError("wire_objective must be continuous or r2-quantized")
+    if wire_objective not in (
+            "continuous", "r2-quantized", "discrete-partition"):
+        raise ValueError(
+            "wire_objective must be continuous, r2-quantized, or "
+            "discrete-partition"
+        )
+    if wire_objective == "discrete-partition":
+        if (not isinstance(partition_grid_steps, int)
+                or isinstance(partition_grid_steps, bool)
+                or partition_grid_steps < 3
+                or partition_grid_steps % 2 == 0):
+            raise ValueError(
+                "partition_grid_steps must be an odd integer >= 3"
+            )
+        if include_fixed_baseline is not True:
+            raise ValueError(
+                "discrete-partition requires the fixed-bin baseline"
+            )
     if wire_aggregation not in ("mean", "traffic-weighted"):
         raise ValueError(
             "optimizer wire_aggregation must be mean or traffic-weighted; "
@@ -135,18 +164,7 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
     communication_weights = communication_weights_from_model(
         model, required=wire_aggregation == "traffic-weighted"
     )
-    starts = ((0.0, 0.0), (upper[0] / 2.0, upper[1] / 2.0), upper)
     candidates = []
-    try:
-        from scipy.optimize import minimize  # type: ignore
-        solver = "scipy-L-BFGS-B"
-    except ImportError:
-        if require_scipy:
-            raise RuntimeError(
-                "SciPy is required for the paper L-BFGS-B solver but is not installed"
-            )
-        minimize = None
-        solver = "dependency-free bounded pattern search"
 
     tiers = tuple(dict.fromkeys(
         int(tier) for tier in (allowed_l2_tiers if allowed_l2_tiers is not None else (0, 1))
@@ -177,69 +195,195 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
         )
         return mean_cycles, selected_cycles
 
-    for tier in tiers:
-        def objective(point):
-            l2 = dict(original, x_mm=float(point[0]), y_mm=float(point[1]), tier=tier)
-            modules = fixed + [l2]
-            collision = collision_area(l2, fixed)
-            proxy = proxy_temperature(modules, side, ambient, r_convec, alpha, beta,
-                                      cross_tier_weight, proxy_spatial_model,
-                                      proxy_quadrature_order)
-            frequency = closed_form_frequency(proxy, model["gamma"], f0_ghz,
-                                               fmin_ghz, tsafe, ambient)[0]
-            _, wire = selected_wire_cycles(modules)
-            objective_wire = (
-                wire if wire_objective == "continuous"
-                else round_wire_cycles(wire, wire_rounding)
-            )
-            # A large dimensional penalty makes illegal overlaps unattractive.
-            return (-model["ipc1"] * frequency
-                    + lambda_wire * model["ipc1"] * objective_wire
-                    + 1e4 * collision)
+    discrete_search = None
+    if wire_objective == "discrete-partition":
+        solver = "deterministic integer-cycle partition grid"
+        floor_scale = model["gamma"] + (
+            1.0 - model["gamma"]
+        ) * (fmin_ghz / f0_ghz)
 
-        for start_name, start in zip(("BL", "CENTER", "TR"), starts):
-            if minimize is not None:
-                result = minimize(objective, start, method="L-BFGS-B",
-                                  bounds=((0.0, upper[0]), (0.0, upper[1])))
-                point, value, evaluations = list(map(float, result.x)), float(result.fun), int(result.nfev)
-            else:
-                point, value, evaluations = pattern_search(objective, start, upper)
-            l2 = dict(original, x_mm=point[0], y_mm=point[1], tier=tier)
+        def evaluate_discrete(tier: int, x_mm: float, y_mm: float,
+                              origin: str, start: str) -> dict:
+            l2 = dict(original, x_mm=float(x_mm), y_mm=float(y_mm), tier=tier)
             modules = fixed + [l2]
             collision = collision_area(l2, fixed)
-            proxy = proxy_temperature(modules, side, ambient, r_convec, alpha, beta,
-                                      cross_tier_weight, proxy_spatial_model,
-                                      proxy_quadrature_order)
+            proxy = proxy_temperature(
+                modules, side, ambient, r_convec, alpha, beta,
+                cross_tier_weight, proxy_spatial_model,
+                proxy_quadrature_order,
+            )
             frequency, frequency_state, raw_frequency = closed_form_frequency(
                 proxy, model["gamma"], f0_ghz, fmin_ghz, tsafe, ambient
             )
-            floor_scale = model["gamma"] + (
-                1.0 - model["gamma"]
-            ) * (fmin_ghz / f0_ghz)
-            tmax_at_floor = ambient + (proxy - ambient) * floor_scale
-            mean_wire, wire = selected_wire_cycles(modules)
-            objective_wire = (
-                wire if wire_objective == "continuous"
-                else round_wire_cycles(wire, wire_rounding)
+            mean_wire, selected_wire = selected_wire_cycles(modules)
+            score, rounded_wire = discrete_wire_score(
+                model["ipc1"], frequency, lambda_wire, selected_wire,
+                wire_rounding,
             )
-            candidate = {"tier": tier, "start": start_name, "x_mm": point[0],
-                         "y_mm": point[1], "loss": value, "evaluations": evaluations,
-                         "collision_mm2": collision, "proxy_tmax_c": proxy,
-                         "proxy_frequency_ghz": frequency,
-                         "proxy_unclamped_frequency_ghz": raw_frequency,
-                         "proxy_frequency_state": frequency_state,
-                         "proxy_tmax_at_fmin_c": tmax_at_floor,
-                         "proxy_thermal_feasible_at_fmin": tmax_at_floor <= tsafe,
-                         "mean_wire_cycles": mean_wire,
-                         "wire_aggregation": wire_aggregation,
-                         "wire_objective_cycles": objective_wire}
+            candidate = {
+                "origin": origin, "tier": tier, "start": start,
+                "x_mm": float(x_mm), "y_mm": float(y_mm),
+                "loss": score + 1e4 * collision, "evaluations": 1,
+                "collision_mm2": collision, "proxy_tmax_c": proxy,
+                "proxy_frequency_ghz": frequency,
+                "proxy_unclamped_frequency_ghz": raw_frequency,
+                "proxy_frequency_state": frequency_state,
+                "proxy_tmax_at_fmin_c": (
+                    ambient + (proxy - ambient) * floor_scale
+                ),
+                "proxy_thermal_feasible_at_fmin": (
+                    ambient + (proxy - ambient) * floor_scale <= tsafe
+                ),
+                "mean_wire_cycles": mean_wire,
+                "wire_aggregation": wire_aggregation,
+                "wire_objective_cycles": rounded_wire,
+                "r2_wire_cycles": rounded_wire,
+                "continuous_selected_wire_cycles": selected_wire,
+            }
             if wire_aggregation == "traffic-weighted":
-                candidate["traffic_weighted_wire_cycles"] = wire
-            candidates.append(candidate)
-    legal = [candidate for candidate in candidates if candidate["collision_mm2"] <= 1e-8]
-    if not legal:
-        raise RuntimeError("layout optimizer found no non-overlapping L2 placement")
-    best = min(legal, key=lambda item: item["loss"])
+                candidate["traffic_weighted_wire_cycles"] = selected_wire
+            return candidate
+
+        def discrete_key(candidate: dict) -> tuple[float, float, int, float, float]:
+            return (
+                candidate["loss"],
+                candidate["continuous_selected_wire_cycles"],
+                candidate["tier"], candidate["y_mm"], candidate["x_mm"],
+            )
+
+        fixed_candidate = evaluate_discrete(
+            int(original["tier"]), float(original["x_mm"]),
+            float(original["y_mm"]), "fixed-bin", "FIXED",
+        )
+        if fixed_candidate["collision_mm2"] > 1e-8:
+            raise RuntimeError("fixed-bin baseline contains an L2 overlap")
+
+        xs = [
+            upper[0] * index / (partition_grid_steps - 1)
+            for index in range(partition_grid_steps)
+        ]
+        ys = [
+            upper[1] * index / (partition_grid_steps - 1)
+            for index in range(partition_grid_steps)
+        ]
+        partition_best: dict[int, dict] = {}
+        legal_count = 0
+        rejected_count = 0
+        for tier in tiers:
+            for y_index, y_mm in enumerate(ys):
+                for x_index, x_mm in enumerate(xs):
+                    candidate = evaluate_discrete(
+                        tier, x_mm, y_mm, "partition-grid",
+                        f"GRID-{y_index}-{x_index}",
+                    )
+                    if candidate["collision_mm2"] > 1e-8:
+                        rejected_count += 1
+                        continue
+                    legal_count += 1
+                    cycle = candidate["r2_wire_cycles"]
+                    incumbent = partition_best.get(cycle)
+                    if (incumbent is None
+                            or discrete_key(candidate) < discrete_key(incumbent)):
+                        partition_best[cycle] = candidate
+        if legal_count == 0:
+            raise RuntimeError(
+                "layout optimizer found no non-overlapping L2 grid placement"
+            )
+        partition_records = [
+            partition_best[cycle] for cycle in sorted(partition_best)
+        ]
+        candidates = [fixed_candidate, *partition_records]
+        best = min(candidates, key=discrete_key)
+        discrete_search = {
+            "grid_steps": partition_grid_steps,
+            "total_grid_candidates": (
+                len(tiers) * partition_grid_steps * partition_grid_steps
+            ),
+            "legal_grid_candidates": legal_count,
+            "rejected_grid_candidates": rejected_count,
+            "fixed_baseline_included": True,
+            "fixed_baseline": fixed_candidate,
+            "partitions": partition_records,
+        }
+    else:
+        starts = ((0.0, 0.0), (upper[0] / 2.0, upper[1] / 2.0), upper)
+        try:
+            from scipy.optimize import minimize  # type: ignore
+            solver = "scipy-L-BFGS-B"
+        except ImportError:
+            if require_scipy:
+                raise RuntimeError(
+                    "SciPy is required for the paper L-BFGS-B solver but is not installed"
+                )
+            minimize = None
+            solver = "dependency-free bounded pattern search"
+
+        for tier in tiers:
+            def objective(point):
+                l2 = dict(original, x_mm=float(point[0]), y_mm=float(point[1]), tier=tier)
+                modules = fixed + [l2]
+                collision = collision_area(l2, fixed)
+                proxy = proxy_temperature(modules, side, ambient, r_convec, alpha, beta,
+                                          cross_tier_weight, proxy_spatial_model,
+                                          proxy_quadrature_order)
+                frequency = closed_form_frequency(proxy, model["gamma"], f0_ghz,
+                                                   fmin_ghz, tsafe, ambient)[0]
+                _, wire = selected_wire_cycles(modules)
+                objective_wire = (
+                    wire if wire_objective == "continuous"
+                    else round_wire_cycles(wire, wire_rounding)
+                )
+                # A large dimensional penalty makes illegal overlaps unattractive.
+                return (-model["ipc1"] * frequency
+                        + lambda_wire * model["ipc1"] * objective_wire
+                        + 1e4 * collision)
+
+            for start_name, start in zip(("BL", "CENTER", "TR"), starts):
+                if minimize is not None:
+                    result = minimize(objective, start, method="L-BFGS-B",
+                                      bounds=((0.0, upper[0]), (0.0, upper[1])))
+                    point, value, evaluations = list(map(float, result.x)), float(result.fun), int(result.nfev)
+                else:
+                    point, value, evaluations = pattern_search(objective, start, upper)
+                l2 = dict(original, x_mm=point[0], y_mm=point[1], tier=tier)
+                modules = fixed + [l2]
+                collision = collision_area(l2, fixed)
+                proxy = proxy_temperature(modules, side, ambient, r_convec, alpha, beta,
+                                          cross_tier_weight, proxy_spatial_model,
+                                          proxy_quadrature_order)
+                frequency, frequency_state, raw_frequency = closed_form_frequency(
+                    proxy, model["gamma"], f0_ghz, fmin_ghz, tsafe, ambient
+                )
+                floor_scale = model["gamma"] + (
+                    1.0 - model["gamma"]
+                ) * (fmin_ghz / f0_ghz)
+                tmax_at_floor = ambient + (proxy - ambient) * floor_scale
+                mean_wire, wire = selected_wire_cycles(modules)
+                objective_wire = (
+                    wire if wire_objective == "continuous"
+                    else round_wire_cycles(wire, wire_rounding)
+                )
+                candidate = {"tier": tier, "start": start_name, "x_mm": point[0],
+                             "y_mm": point[1], "loss": value, "evaluations": evaluations,
+                             "collision_mm2": collision, "proxy_tmax_c": proxy,
+                             "proxy_frequency_ghz": frequency,
+                             "proxy_unclamped_frequency_ghz": raw_frequency,
+                             "proxy_frequency_state": frequency_state,
+                             "proxy_tmax_at_fmin_c": tmax_at_floor,
+                             "proxy_thermal_feasible_at_fmin": tmax_at_floor <= tsafe,
+                             "mean_wire_cycles": mean_wire,
+                             "wire_aggregation": wire_aggregation,
+                             "wire_objective_cycles": objective_wire}
+                if wire_aggregation == "traffic-weighted":
+                    candidate["traffic_weighted_wire_cycles"] = wire
+                candidates.append(candidate)
+        legal = [candidate for candidate in candidates
+                 if candidate["collision_mm2"] <= 1e-8]
+        if not legal:
+            raise RuntimeError(
+                "layout optimizer found no non-overlapping L2 placement"
+            )
+        best = min(legal, key=lambda item: item["loss"])
     optimized = dict(base)
     optimized["policy"] = "CLIP-3D equation (15) optimized"
     optimized["modules"] = fixed + [dict(original, tier=best["tier"],
@@ -263,6 +407,12 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
         "traffic_weighted_wire_cycles"
         if wire_aggregation == "traffic-weighted" else "wire_cycles"
     )
+    if (wire_objective == "discrete-partition"
+            and optimized_delays[selected_cycle_field]
+            != best["r2_wire_cycles"]):
+        raise RuntimeError(
+            "discrete partition cycle differs from the standard R2 mapping"
+        )
     selected_cycle_changed = (
         baseline_delays[selected_cycle_field] != optimized_delays[selected_cycle_field]
     )
@@ -296,6 +446,8 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                        "wire_objective": wire_objective,
                        "wire_aggregation": wire_aggregation,
                        "wire_rounding": wire_rounding,
+                       "partition_grid_steps": partition_grid_steps,
+                       "include_fixed_baseline": include_fixed_baseline,
                        "wire_r_ohm_per_mm": 50.0, "wire_c_f_per_mm": 200e-15},
         "baseline": {
             "policy": base.get("policy", "fixed-bin"),
@@ -330,6 +482,8 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
         },
         "warning": "proxy_tmax_c guides search only; run HotSpot on output_layout for reportable Tmax.",
     }
+    if discrete_search is not None:
+        report["discrete_search"] = discrete_search
     if wire_aggregation == "traffic-weighted":
         report["predicted_deltas"].update({
             "traffic_weighted_wire_cycles_unrounded": (
@@ -368,7 +522,8 @@ def main() -> None:
     )
     parser.add_argument("--proxy-quadrature-order", type=int, choices=(1, 2, 3), default=2)
     parser.add_argument(
-        "--wire-objective", choices=("continuous", "r2-quantized"),
+        "--wire-objective",
+        choices=("continuous", "r2-quantized", "discrete-partition"),
         default="continuous",
     )
     parser.add_argument("--wire-rounding", choices=("nearest", "ceil", "floor"), default="nearest")
