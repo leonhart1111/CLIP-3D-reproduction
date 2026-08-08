@@ -15,6 +15,7 @@ from workflow.common import read_json, write_json
 from workflow.transient.rom.contracts import (
     parse_settings,
     require_accepted_package,
+    require_package_calibration_evidence,
     rom_input_identity,
 )
 from workflow.transient.rom.calibration_design import (
@@ -26,6 +27,7 @@ from workflow.transient.rom.calibration_design import (
     layout_for_point,
     make_prbs_input,
 )
+from workflow.transient.rom.evidence import ROM_CLASSIFICATION
 from workflow.transient.rom.calibrate_rom import validate_calibration_holdouts
 from workflow.transient.rom.materialize_calibration import (
     build_prbs_power_windows,
@@ -240,6 +242,7 @@ def write_synthetic_accepted_package(
     ]
     write_json(package / "calibration_cases.json", {
         "schema_version": 1,
+        **classification,
         "training_hotspot_calls": 8,
         "holdout_hotspot_calls": 2,
         "training_cases": training,
@@ -301,8 +304,91 @@ class ROMContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.package = Path(self.temporary.name) / "accepted-rom"
-        self.package.mkdir()
+        self.root = Path(self.temporary.name)
+        self.package = self.root / "accepted-rom"
+        self.modules = self.root / "modules.json"
+        self.power_windows = self.root / "power_windows.json"
+        self.config_path = self.root / "config.json"
+        self.hotspot = self.root / "hotspot"
+
+        modules = CalibrationDesignTests.model()
+        modules["ipc1"] = 2.0
+        write_json(self.modules, modules)
+        source_power = ROMCalibrationCaseTests.raw_windows()
+        write_json(self.power_windows, source_power)
+        self.hotspot.write_text("mock executable", encoding="utf-8")
+        write_json(self.config_path, self.config())
+        settings = self.settings()
+        design = build_design(modules, [1], settings)
+        fixed_names = tuple(
+            module["name"] for module in modules["modules"]
+            if module["kind"] != "l2"
+        )
+        model = StateSpaceModel(
+            temperature_basis=numpy.ones((1, 1)),
+            a_continuous=numpy.array([[-1.0]]),
+            b_fixed=numpy.zeros((1, len(fixed_names))),
+            b_l2_anchors={
+                point["id"]: numpy.ones((1, 1))
+                for point in design["training"]
+            },
+            module_names=fixed_names,
+            grid_unit_names=("cell0",),
+        )
+        physical = self.config()["physical"]
+        self._identity = rom_input_identity(
+            canonical_r1_metadata_hash="sha256:r1",
+            power_trace=power_trace_identity(source_power),
+            modules_geometry_hash="sha256:" + hashlib.sha256(
+                self.modules.read_bytes()
+            ).hexdigest(),
+            layout_geometry_hash=canonical_json_sha256(design["base_layout"]),
+            configuration_hash="sha256:" + hashlib.sha256(
+                self.config_path.read_bytes()
+            ).hexdigest(),
+            hotspot_hash="sha256:" + hashlib.sha256(
+                self.hotspot.read_bytes()
+            ).hexdigest(),
+            grid={"rows": physical["grid_size"], "columns": physical["grid_size"]},
+            stack=physical["thermal_stack"],
+            cooling={
+                "ambient_c": self.config()["frequency"]["ambient_c"],
+                "r_convec_k_per_w": physical["r_convec_k_per_w"],
+            },
+            allowed_l2_tiers=[1],
+            calibration_design_hash=canonical_json_sha256(design),
+        )
+        write_synthetic_accepted_package(
+            self.package, design, self._identity, settings, model,
+            self.modules, self.config_path, source_power,
+        )
+
+    @staticmethod
+    def config() -> dict:
+        return {
+            "frequency": {
+                "ambient_c": 25.0,
+                "f0_ghz": 2.0,
+                "fmin_ghz": 1.0,
+                "tsafe_c": 50.0,
+            },
+            "physical": {
+                "utilization": 0.70,
+                "grid_size": 1,
+                "r_convec_k_per_w": 0.1,
+                "thermal_stack": {"layers": ["silicon", "tim"]},
+            },
+            "layout_optimizer": {
+                "lambda_wire": 0.25,
+                "wire_objective": "continuous",
+                "allowed_l2_tiers": [1],
+            },
+            "delay": {"wire_aggregation": "mean", "wire_rounding": "nearest"},
+        }
+
+    @staticmethod
+    def settings():
+        return parse_settings({})
 
     @staticmethod
     def identity() -> dict:
@@ -319,6 +405,24 @@ class ROMContractTests(unittest.TestCase):
             allowed_l2_tiers=[1],
             calibration_design_hash="sha256:design",
         )
+
+    def reuse_identity(self) -> dict:
+        return self._identity
+
+    def rewrite_and_rehash(self, path: Path, **changes: object) -> None:
+        value = read_json(path)
+        value.update(changes)
+        write_json(path, value)
+        write_test_artifact_manifest(self.package)
+
+    def replace_case_directory_with_symlink(self, case_name: str) -> None:
+        case_dir = self.package / case_name
+        outside = self.root / "outside-case"
+        case_dir.rename(outside)
+        case_dir.symlink_to(outside, target_is_directory=True)
+
+    def remove_packaged_source(self, name: str) -> None:
+        (self.package / name).unlink()
 
     def test_parse_settings_uses_strict_rom_defaults(self):
         settings = parse_settings({})
@@ -365,65 +469,98 @@ class ROMContractTests(unittest.TestCase):
             parse_settings({"transient_rom": {"prbs_fraction": 1.0}})
 
     def test_rom_input_identity_records_all_scientific_provenance(self):
-        identity = self.identity()
+        identity = self.reuse_identity()
 
         self.assertEqual(identity["canonical_r1_metadata_hash"], "sha256:r1")
-        self.assertEqual(identity["power_trace"], "sha256:power")
-        self.assertEqual(identity["modules_geometry_hash"], "sha256:modules")
-        self.assertEqual(identity["layout_geometry_hash"], "sha256:layout")
-        self.assertEqual(identity["configuration_hash"], "sha256:config")
-        self.assertEqual(identity["hotspot_hash"], "sha256:hotspot")
-        self.assertEqual(identity["grid"], {"rows": 64, "columns": 64})
+        self.assertTrue(identity["power_trace"].startswith("sha256:"))
+        self.assertTrue(identity["modules_geometry_hash"].startswith("sha256:"))
+        self.assertTrue(identity["layout_geometry_hash"].startswith("sha256:"))
+        self.assertTrue(identity["configuration_hash"].startswith("sha256:"))
+        self.assertTrue(identity["hotspot_hash"].startswith("sha256:"))
+        self.assertEqual(identity["grid"], {"rows": 1, "columns": 1})
         self.assertEqual(identity["stack"], {"layers": ["silicon", "tim"]})
-        self.assertEqual(identity["cooling"], {"ambient_c": 25.0})
+        self.assertEqual(
+            identity["cooling"], {"ambient_c": 25.0, "r_convec_k_per_w": 0.1}
+        )
         self.assertEqual(identity["allowed_l2_tiers"], [1])
-        self.assertEqual(identity["calibration_design_hash"], "sha256:design")
+        self.assertTrue(identity["calibration_design_hash"].startswith("sha256:"))
+
+    def test_reuse_rejects_contradictory_classification_and_symlink_tree(self):
+        original = read_json(self.package / "rom_acceptance.json")
+        self.rewrite_and_rehash(
+            self.package / "rom_acceptance.json",
+            thermal_mode="steady", non_formal=False,
+        )
+        with self.assertRaisesRegex(ValueError, "classification"):
+            require_accepted_package(self.package, self.reuse_identity())
+        write_json(self.package / "rom_acceptance.json", original)
+        write_test_artifact_manifest(self.package)
+
+        case_id = read_json(self.package / "anchors.json")["training"][0]["id"]
+        self.replace_case_directory_with_symlink(f"training_{case_id}")
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            require_package_calibration_evidence(
+                self.package, self.reuse_identity(), self.settings(),
+            )
+
+    def test_reuse_rejects_missing_packaged_source_power(self):
+        self.remove_packaged_source("source_power_windows.json")
+        with self.assertRaisesRegex(ValueError, "source power"):
+            require_package_calibration_evidence(
+                self.package, self.reuse_identity(), self.settings(),
+            )
 
     def test_rejects_accepted_package_with_changed_calibration_design(self):
         # Break caught: matching physics with changed anchors, holdouts, or
         # simplices must not reinterpret stored B_L2 columns as a new design.
         write_json(self.package / "rom_acceptance.json", {
+            **ROM_CLASSIFICATION,
             "accepted": True,
-            "identity": self.identity(),
+            "identity": self.reuse_identity(),
         })
 
         with self.assertRaisesRegex(ValueError, "calibration design hash identity"):
             require_accepted_package(
                 self.package,
-                {**self.identity(), "calibration_design_hash": "sha256:changed"},
+                {**self.reuse_identity(), "calibration_design_hash": "sha256:changed"},
             )
 
     def test_rejects_accepted_package_with_changed_power_identity(self):
         write_json(self.package / "rom_acceptance.json", {
+            **ROM_CLASSIFICATION,
             "accepted": True,
-            "identity": self.identity(),
+            "identity": self.reuse_identity(),
         })
 
         with self.assertRaisesRegex(ValueError, "power trace identity"):
             require_accepted_package(
-                self.package, {**self.identity(), "power_trace": "changed"}
+                self.package, {**self.reuse_identity(), "power_trace": "changed"}
             )
 
     def test_require_accepted_package_rejects_partial_matching_identity(self):
         write_json(self.package / "rom_acceptance.json", {
+            **ROM_CLASSIFICATION,
             "accepted": True,
-            "identity": self.identity(),
+            "identity": self.reuse_identity(),
         })
 
         with self.assertRaisesRegex(ValueError, "canonical R1 metadata hash identity"):
             require_accepted_package(self.package, {"power_trace": "sha256:power"})
 
     def test_require_accepted_package_rejects_unaccepted_or_incomplete_identity(self):
-        write_json(self.package / "rom_acceptance.json", {"accepted": False})
+        write_json(self.package / "rom_acceptance.json", {
+            **ROM_CLASSIFICATION, "accepted": False,
+        })
         with self.assertRaisesRegex(ValueError, "ROM package is not accepted"):
-            require_accepted_package(self.package, self.identity())
+            require_accepted_package(self.package, self.reuse_identity())
 
         write_json(self.package / "rom_acceptance.json", {
+            **ROM_CLASSIFICATION,
             "accepted": True,
             "identity": {"power_trace": "sha256:power"},
         })
         with self.assertRaisesRegex(ValueError, "canonical R1 metadata hash identity"):
-            require_accepted_package(self.package, self.identity())
+            require_accepted_package(self.package, self.reuse_identity())
 
 
 class CalibrationDesignTests(unittest.TestCase):

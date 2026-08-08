@@ -14,13 +14,18 @@ import math
 from pathlib import Path
 import shutil
 
-from workflow.common import read_json, sha256_file, write_json
+from workflow.common import read_json, write_json
 from workflow.transient.generate_hotspot_trace import materialize_trace
 from workflow.transient.rom.calibration_design import (
     calibration_design_hash,
     layout_for_point,
 )
 from workflow.transient.rom.contracts import ROMSettings
+from workflow.transient.rom.evidence import (
+    ROM_CLASSIFICATION,
+    require_new_output_root,
+    sha256_identity,
+)
 from workflow.transient.run_hotspot_transient import (
     DEFAULT_HOTSPOT,
     parse_ttrace_grid,
@@ -38,7 +43,7 @@ POWER_FIELDS = ("dynamic_power_w", "leakage_power_w", "total_power_w")
 
 
 def _sha256(path: Path) -> str:
-    return "sha256:" + sha256_file(path)
+    return sha256_identity(path)
 
 
 def _positive_multiplier(value: object, name: str, index: int) -> float:
@@ -136,7 +141,7 @@ def _require_case_inputs(modules_path: Path, source_power_windows_path: Path,
                          config_path: Path, hotspot: Path, design: dict,
                          settings: ROMSettings) -> tuple[dict, dict, dict]:
     for path in (modules_path, source_power_windows_path, config_path, hotspot):
-        if not path.is_file():
+        if not path.is_file() or path.is_symlink():
             raise FileNotFoundError(path)
     if not isinstance(settings, ROMSettings):
         raise ValueError("settings must be ROMSettings")
@@ -264,8 +269,10 @@ def execute_calibration_cases(modules_path: Path, source_power_windows_path: Pat
     """
     modules_path = Path(modules_path).resolve()
     source_power_windows_path = Path(source_power_windows_path).resolve()
-    config_path, output_dir, hotspot = (
-        Path(config_path).resolve(), Path(output_dir).resolve(), Path(hotspot).resolve()
+    config_path, hotspot = Path(config_path).resolve(), Path(hotspot).resolve()
+    output_dir = require_new_output_root(
+        Path(output_dir),
+        [modules_path, source_power_windows_path, config_path, hotspot],
     )
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"calibration output directory is not empty: {output_dir}")
@@ -290,9 +297,7 @@ def execute_calibration_cases(modules_path: Path, source_power_windows_path: Pat
     write_json(output_dir / "calibration_manifest.json", {
         "schema_version": 1,
         "mode": "transient ROM calibration",
-        "thermal_mode": "transient-rom",
-        "non_formal": True,
-        "paper_equivalent": False,
+        **ROM_CLASSIFICATION,
         "calibration_runs": 8,
         "validation_runs": 2,
         "calibration_design_hash": design_identity,
@@ -310,7 +315,6 @@ def execute_calibration_cases(modules_path: Path, source_power_windows_path: Pat
             "power_trace_identity": power_trace_identity(source_power_windows),
             "config": "config.json",
             "config_sha256": _sha256(package_config_path),
-            "hotspot": str(hotspot),
             "hotspot_sha256": _sha256(hotspot),
         },
         "training_ids": [point["id"] for point in design["training"]],
@@ -347,8 +351,9 @@ def execute_calibration_cases(modules_path: Path, source_power_windows_path: Pat
     report = {
         "schema_version": 1,
         "mode": "transient ROM calibration materialization",
-        "source_modules": str(modules_path),
-        "source_power_windows": str(source_power_windows_path),
+        **ROM_CLASSIFICATION,
+        "source_modules": "modules.json",
+        "source_power_windows": "source_power_windows.json",
         "source_power_trace_identity": power_trace_identity(source_power_windows),
         "settings": {
             "calibration_windows": settings.calibration_windows,

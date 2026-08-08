@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from workflow.common import read_json, sha256_file, write_json
+from workflow.transient.rom.evidence import (
+    ROM_CLASSIFICATION,
+    require_regular_descendant,
+    require_rom_classification,
+    sha256_identity,
+)
 
 
 @dataclass(frozen=True)
@@ -80,17 +86,17 @@ _IDENTITY_LABELS = {
     "allowed_l2_tiers": "allowed tiers identity",
     "calibration_design_hash": "calibration design hash identity",
 }
-_CLASSIFICATION = {
-    "thermal_mode": "transient-rom",
-    "non_formal": True,
-    "paper_equivalent": False,
-}
+_CLASSIFICATION = ROM_CLASSIFICATION
+
+
 def write_rom_artifact_manifest(output_dir: Path) -> dict:
     """Bind every ROM-owned file to its bytes and non-formal classification."""
     output_dir = Path(output_dir).resolve()
     manifest_path = output_dir / "rom_artifact_manifest.json"
     artifacts = []
     for path in sorted(output_dir.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("ROM artifact manifest cannot bind symlinks")
         if not path.is_file() or path == manifest_path:
             continue
         artifacts.append({
@@ -111,14 +117,14 @@ def write_rom_artifact_manifest(output_dir: Path) -> dict:
 def require_rom_artifact_manifest(package_dir: Path) -> dict:
     """Require a complete, current, symlink-free ROM artifact inventory."""
     package_dir = Path(package_dir).resolve()
-    manifest_path = package_dir / "rom_artifact_manifest.json"
-    if not manifest_path.is_file():
+    try:
+        manifest_path = require_regular_descendant(
+            package_dir, "rom_artifact_manifest.json", "reusable ROM package manifest"
+        )
+    except ValueError as error:
         raise ValueError("reusable ROM package lacks rom_artifact_manifest.json")
     manifest = read_json(manifest_path)
-    if not isinstance(manifest, dict) or any(
-        manifest.get(field) != value for field, value in _CLASSIFICATION.items()
-    ):
-        raise ValueError("reusable ROM package manifest classification is invalid")
+    require_rom_classification(manifest, "reusable ROM package manifest")
     records = manifest.get("artifacts")
     if not isinstance(records, list):
         raise ValueError("reusable ROM package manifest artifacts must be a list")
@@ -139,10 +145,10 @@ def require_rom_artifact_manifest(package_dir: Path) -> dict:
 
     actual: dict[str, Path] = {}
     for path in sorted(package_dir.rglob("*")):
-        if path == manifest_path or not path.is_file():
-            continue
         if path.is_symlink():
             raise ValueError("reusable ROM package manifest cannot bind symlinks")
+        if path == manifest_path or not path.is_file():
+            continue
         actual[path.relative_to(package_dir).as_posix()] = path
     if set(recorded) != set(actual):
         raise ValueError(
@@ -298,13 +304,17 @@ def rom_input_identity(
 
 def require_accepted_package(package_dir: Path, identity: dict) -> dict:
     """Load a ROM acceptance record only when every provenance field matches."""
-    path = Path(package_dir) / "rom_acceptance.json"
+    package_dir = Path(package_dir)
     try:
+        path = require_regular_descendant(
+            package_dir, "rom_acceptance.json", "ROM package acceptance"
+        )
         acceptance = read_json(path)
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, json.JSONDecodeError, ValueError) as error:
         raise ValueError("ROM package is not accepted: missing valid rom_acceptance.json") from error
     if not isinstance(acceptance, dict) or acceptance.get("accepted") is not True:
         raise ValueError("ROM package is not accepted")
+    require_rom_classification(acceptance, "ROM package acceptance")
     package_identity = acceptance.get("identity")
     package_identity = _normalized_identity(package_identity, "ROM package")
     identity = _normalized_identity(identity, "requested ROM")
@@ -335,9 +345,12 @@ def require_package_calibration_evidence(
         "calibration_manifest.json", "calibration_cases.json",
         "fit_report.json", "validation_report.json",
     ):
-        path = package_dir / name
-        if not path.is_file():
-            raise ValueError(f"reusable ROM package lacks {name}")
+        try:
+            path = require_regular_descendant(
+                package_dir, name, f"reusable ROM package {name}"
+            )
+        except ValueError as error:
+            raise ValueError(f"reusable ROM package lacks {name}") from error
         value = read_json(path)
         if not isinstance(value, dict):
             raise ValueError(f"reusable ROM package has invalid {name}")
@@ -354,8 +367,11 @@ def require_package_calibration_evidence(
     }
     if manifest.get("settings") != expected_settings:
         raise ValueError("reusable ROM calibration manifest resolved settings differ")
-    if any(manifest.get(field) != value for field, value in _CLASSIFICATION.items()):
-        raise ValueError("reusable ROM calibration manifest classification differs")
+    try:
+        require_rom_classification(manifest, "reusable ROM calibration manifest")
+    except ValueError as error:
+        raise ValueError("reusable ROM calibration manifest classification differs") from error
+    require_rom_classification(cases, "reusable ROM calibration cases report")
     if (manifest.get("identity") != acceptance["identity"]
             or manifest.get("calibration_design_hash") != design_identity
             or manifest.get("calibration_runs") != 8
@@ -373,17 +389,37 @@ def require_package_calibration_evidence(
         for field, value in expected_source_identities.items()
     )):
         raise ValueError("reusable ROM calibration manifest source identities differ")
-    config_value = sources.get("config") if isinstance(sources, dict) else None
-    if not isinstance(config_value, str):
-        raise ValueError("reusable ROM calibration manifest lacks packaged config")
-    config_relative = Path(config_value)
-    if config_relative.is_absolute() or ".." in config_relative.parts:
-        raise ValueError("reusable ROM calibration config path must be package-relative")
-    packaged_config_path = (package_dir / config_relative).resolve()
-    if (package_dir not in packaged_config_path.parents
-            or not packaged_config_path.is_file()
-            or sources["config_sha256"]
-            != "sha256:" + sha256_file(packaged_config_path)):
+    from workflow.transient.validation import power_trace_identity
+
+    packaged_sources: dict[str, Path] = {}
+    for field, context in (
+        ("modules", "modules"),
+        ("power_windows", "source power"),
+        ("config", "config"),
+    ):
+        relative = sources.get(field) if isinstance(sources, dict) else None
+        if not isinstance(relative, str):
+            raise ValueError(
+                f"reusable ROM calibration manifest lacks packaged {context}"
+            )
+        try:
+            packaged_sources[field] = require_regular_descendant(
+                package_dir, relative, f"reusable ROM calibration {context}"
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"reusable ROM calibration {context} evidence differs"
+            ) from error
+    if sha256_identity(packaged_sources["modules"]) != expected_source_identities["modules_sha256"]:
+        raise ValueError("reusable ROM calibration modules evidence differs")
+    packaged_source_power = read_json(packaged_sources["power_windows"])
+    if (sha256_identity(packaged_sources["power_windows"])
+            != sources["power_windows_sha256"]
+            or power_trace_identity(packaged_source_power)
+            != expected_source_identities["power_trace_identity"]):
+        raise ValueError("reusable ROM calibration source power evidence differs")
+    packaged_config_path = packaged_sources["config"]
+    if sources["config_sha256"] != sha256_identity(packaged_config_path):
         raise ValueError("reusable ROM calibration config evidence differs")
     packaged_config = read_json(packaged_config_path)
     if not isinstance(packaged_config, dict):
@@ -409,8 +445,6 @@ def require_package_calibration_evidence(
     expected_points = {
         point["id"]: point for point in [*design["training"], *design["holdout"]]
     }
-    from workflow.transient.validation import power_trace_identity
-
     artifact_hashes: dict[str, dict[str, str]] = {}
     case_power_windows: dict[str, dict] = {}
     for expected_kind, case_set in (("training", training), ("holdout", holdouts)):
@@ -438,19 +472,17 @@ def require_package_calibration_evidence(
                         f"reusable ROM {expected_kind} case {identifier} "
                         f"lacks {artifact} hash"
                     )
-                relative = Path(value)
-                if (relative.is_absolute() or ".." in relative.parts):
+                try:
+                    path = require_regular_descendant(
+                        package_dir, value,
+                        f"reusable ROM {expected_kind} case {identifier} {artifact}",
+                    )
+                except ValueError as error:
                     raise ValueError(
                         f"reusable ROM {expected_kind} case {identifier} "
-                        f"{artifact} path must be package-relative"
-                    )
-                path = (package_dir / relative).resolve()
-                if package_dir not in path.parents:
-                    raise ValueError(
-                        f"reusable ROM {expected_kind} case {identifier} "
-                        f"{artifact} path escapes package"
-                    )
-                if not path.is_file() or recorded != "sha256:" + sha256_file(path):
+                        f"{artifact} evidence differs: {error}"
+                    ) from error
+                if recorded != sha256_identity(path):
                     raise ValueError(
                         f"reusable ROM {expected_kind} case {identifier} "
                         f"{artifact} hash differs"
