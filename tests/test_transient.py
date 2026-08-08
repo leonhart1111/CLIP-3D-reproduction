@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from workflow.common import read_json, write_json
+from workflow.floorplan.generate_hotspot_inputs import grid_power
 from workflow.run_lifting_pipeline import boolean_text
 from workflow.transient.compare_layouts import compare_layout_results
 from workflow.transient.generate_hotspot_trace import materialize_trace
@@ -391,21 +392,33 @@ class TransientTraceTests(unittest.TestCase):
             self.assertEqual(result["windows_per_period"], 2)
 
     def test_emitted_trace_scales_dynamic_only(self):
-        """Catch a frequency transform that also scales leakage evidence."""
+        """Catch scaling leakage or omitting dynamic scaling in repeated rows."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             model = self.model()
             write_json(root / "modules.json", model)
             from workflow.floorplan.generate_hotspot_inputs import baseline_layout
-            write_json(root / "layout.json", baseline_layout(model))
+            layout = baseline_layout(model)
+            write_json(root / "layout.json", layout)
             windows = []
-            for index in range(2):
+            for index, (dynamic_scale, leakage_scale) in enumerate(
+                ((1.0, 1.0), (2.0, 3.0))
+            ):
+                modules = []
+                for source in model["modules"]:
+                    module = dict(source)
+                    module["dynamic_power_w"] *= dynamic_scale
+                    module["leakage_power_w"] *= leakage_scale
+                    module["total_power_w"] = (
+                        module["dynamic_power_w"] + module["leakage_power_w"]
+                    )
+                    modules.append(module)
                 windows.append({
                     "index": index, "start_tick": index * 10,
                     "end_tick": (index + 1) * 10, "duration_s": 0.01,
                     "duration_ticks": 10, "source_stats_sha256": f"sha256:{index}",
-                    "modules": [dict(module) for module in model["modules"]],
-                    "totals": {field: sum(module[field] for module in model["modules"])
+                    "modules": modules,
+                    "totals": {field: sum(module[field] for module in modules)
                                for field in ("dynamic_power_w", "leakage_power_w", "total_power_w")},
                 })
             write_json(root / "power_windows.json", {
@@ -417,8 +430,51 @@ class TransientTraceTests(unittest.TestCase):
             })
             config = {"frequency": {"ambient_c": 25.0}, "physical": {"grid_size": 4, "utilization": .7, "r_convec_k_per_w": 5.0}}
             materialize_trace(root / "modules.json", root / "layout.json", root / "power_windows.json", root / "out", config, frequency_scale=.5, period_repeats=2)
-            manifest = read_json(root / "out/transient_trace_manifest.json")
-            self.assertEqual(manifest["trace_input_identity"]["frequency_scale"], 0.5)
+
+            source_dynamic_rows = []
+            source_leakage_rows = []
+            for window in windows:
+                by_name = {module["name"]: module for module in window["modules"]}
+                window_layout = {**layout, "modules": []}
+                for placed in layout["modules"]:
+                    module = dict(placed)
+                    for field in ("dynamic_power_w", "leakage_power_w", "total_power_w"):
+                        module[field] = by_name[module["name"]][field]
+                    window_layout["modules"].append(module)
+                gridded = grid_power(window_layout, 4)
+                cells = [
+                    cell for tier in gridded["tiers"] for cell in tier["cells"]
+                ]
+                source_dynamic_rows.append(
+                    [cell["dynamic_power_w"] for cell in cells]
+                )
+                source_leakage_rows.append(
+                    [cell["leakage_power_w"] for cell in cells]
+                )
+
+            def emitted_rows(name: str) -> list[list[float]]:
+                lines = (root / "out" / name).read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                return [[float(value) for value in line.split()] for line in lines[1:]]
+
+            expected_dynamic = [
+                [power * 0.5 for power in row]
+                for _ in range(2) for row in source_dynamic_rows
+            ]
+            expected_leakage = [
+                list(row) for _ in range(2) for row in source_leakage_rows
+            ]
+            actual_dynamic = emitted_rows("power_dynamic_transient.ptrace")
+            actual_leakage = emitted_rows("power_leakage_transient.ptrace")
+            self.assertEqual(len(actual_dynamic), 4)
+            self.assertEqual(len(actual_leakage), 4)
+            for actual, expected in zip(actual_dynamic, expected_dynamic):
+                for actual_cell, expected_cell in zip(actual, expected):
+                    self.assertAlmostEqual(actual_cell, expected_cell, places=14)
+            for actual, expected in zip(actual_leakage, expected_leakage):
+                for actual_cell, expected_cell in zip(actual, expected):
+                    self.assertAlmostEqual(actual_cell, expected_cell, places=14)
 
     @staticmethod
     def windowed_mcpat_fixture(root: Path) -> tuple[Path, Path, dict, Path, dict]:

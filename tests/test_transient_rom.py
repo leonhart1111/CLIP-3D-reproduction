@@ -1664,18 +1664,29 @@ class ROMOptimizerTests(unittest.TestCase):
         self.accepted_package.mkdir()
         self.rejected_package.mkdir()
 
-        model = CalibrationDesignTests.model()
-        model["ipc1"] = 2.0
-        write_json(self.modules, model)
+        self.model_data = CalibrationDesignTests.model()
+        self.model_data["ipc1"] = 2.0
+        write_json(self.modules, self.model_data)
         self.canonical_r1.mkdir()
         write_json(self.canonical_r1 / "r1_metadata.json", {"source": "synthetic-r1"})
         self.hotspot.write_text("mock executable", encoding="utf-8")
         write_json(self.config_path, self.config())
         settings = parse_settings({})
-        design = build_design(model, [1], settings)
+        design = build_design(self.model_data, [1], settings)
         self.design = design
+        write_json(self.rejected_package / "anchors.json", design)
+        self.source_power_windows = ROMCalibrationCaseTests.raw_windows()
+        self.source_power_windows["canonical_source_r1"] = str(self.canonical_r1)
+        write_json(self.power_windows, self.source_power_windows)
+        self._write_self_consistent_package(self.accepted_package, design)
+        write_json(self.rejected_package / "rom_acceptance.json", {
+            "accepted": False,
+        })
+
+    def _write_self_consistent_package(self, package: Path, design: dict) -> None:
+        settings = parse_settings({})
         fixed_names = tuple(
-            module["name"] for module in model["modules"]
+            module["name"] for module in self.model_data["modules"]
             if module["kind"] != "l2"
         )
         rom = StateSpaceModel(
@@ -1689,17 +1700,13 @@ class ROMOptimizerTests(unittest.TestCase):
             module_names=fixed_names,
             grid_unit_names=("cell0",),
         )
-        write_json(self.rejected_package / "anchors.json", design)
-        power_windows = ROMCalibrationCaseTests.raw_windows()
-        power_windows["canonical_source_r1"] = str(self.canonical_r1)
-        write_json(self.power_windows, power_windows)
         config = read_json(self.config_path)
         physical = config["physical"]
         identity = rom_input_identity(
             canonical_r1_metadata_hash="sha256:" + hashlib.sha256(
                 (self.canonical_r1 / "r1_metadata.json").read_bytes()
             ).hexdigest(),
-            power_trace=power_trace_identity(power_windows),
+            power_trace=power_trace_identity(self.source_power_windows),
             modules_geometry_hash="sha256:" + hashlib.sha256(
                 self.modules.read_bytes()
             ).hexdigest(),
@@ -1723,12 +1730,41 @@ class ROMOptimizerTests(unittest.TestCase):
             calibration_design_hash=canonical_json_sha256(design),
         )
         write_synthetic_accepted_package(
-            self.accepted_package, design, identity, settings, rom,
-            self.modules, self.config_path, power_windows,
+            package, design, identity, settings, rom,
+            self.modules, self.config_path, self.source_power_windows,
         )
-        write_json(self.rejected_package / "rom_acceptance.json", {
-            "accepted": False,
-        })
+
+    def _refresh_package_design(
+        self, package: Path, design: dict, *, recompute_validation: bool = True,
+    ) -> None:
+        """Rehash every persisted design binding after a semantic mutation."""
+        design_hash = canonical_json_sha256(design)
+        write_json(package / "anchors.json", design)
+        manifest_path = package / "calibration_manifest.json"
+        manifest = read_json(manifest_path)
+        manifest["calibration_design_hash"] = design_hash
+        manifest["identity"]["calibration_design_hash"] = design_hash
+        write_json(manifest_path, manifest)
+        fit_path = package / "fit_report.json"
+        fit_report = read_json(fit_path)
+        fit_report["calibration_design_hash"] = design_hash
+        write_json(fit_path, fit_report)
+        model, _ = load_model(package / "pod_model.npz")
+        save_model(package / "pod_model.npz", model, fit_report)
+        if recompute_validation:
+            cases = read_json(package / "calibration_cases.json")
+            validation = validate_calibration_holdouts(
+                model, design, cases["holdout_cases"], parse_settings({}),
+                read_json(self.config_path), output_dir=package, identity=None,
+                publish=False,
+            )
+            self.assertTrue(validation["accepted"])
+            write_json(package / "validation_report.json", validation)
+        acceptance_path = package / "rom_acceptance.json"
+        acceptance = read_json(acceptance_path)
+        acceptance["identity"]["calibration_design_hash"] = design_hash
+        write_json(acceptance_path, acceptance)
+        write_test_artifact_manifest(package)
 
     @staticmethod
     def config() -> dict:
@@ -1827,6 +1863,74 @@ class ROMOptimizerTests(unittest.TestCase):
         self.assertEqual(
             report["calibration_design_hash"], canonical_json_sha256(self.design)
         )
+
+    def test_optimizer_rejects_rehashed_shifted_fixed_module_before_search(self):
+        # Break caught: self-consistent package hashes must not let calibration
+        # geometry for a fixed non-L2 module differ from the current modules.
+        design = build_design(self.model_data, [1], parse_settings({}))
+        fixed = next(
+            module for module in design["base_layout"]["modules"]
+            if module["kind"] != "l2"
+        )
+        fixed["x_mm"] += 0.001
+        package = self.root / "shifted-fixed-package"
+        self._write_self_consistent_package(package, design)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "base layout fixed module geometry"):
+            optimize_transient_layout(
+                self.modules, package, self.output, self.config_path,
+                self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_rehashed_bilinear_corner_before_search(self):
+        # Break caught: a rehashed bilinear corner cannot silently change which
+        # named anchor supplies an interpolation column.
+        config = self.config()
+        config["layout_optimizer"]["allowed_l2_tiers"] = [0, 1]
+        write_json(self.config_path, config)
+        design = build_design(self.model_data, [0, 1], parse_settings({}))
+        package = self.root / "shifted-bilinear-package"
+        self._write_self_consistent_package(package, design)
+        design["domains"]["0"]["corners"][0][0] += 1e-6
+        self._refresh_package_design(
+            package, design, recompute_validation=False,
+        )
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "domain anchor coordinate"):
+            optimize_transient_layout(
+                self.modules, package, self.output, self.config_path,
+                self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
+
+    def test_optimizer_rejects_rehashed_delaunay_point_before_search(self):
+        # Break caught: a rehashed Delaunay point cannot silently change which
+        # named anchor supplies an interpolation column.
+        design = build_design(self.model_data, [1], parse_settings({}))
+        package = self.root / "shifted-delaunay-package"
+        self._write_self_consistent_package(package, design)
+        design["domains"]["1"]["points"][0][0] += 1e-6
+        self._refresh_package_design(package, design)
+
+        with patch(
+            "workflow.transient.rom.optimize_layout.find_rom_sustainable_frequency",
+            side_effect=self._search_must_not_run,
+        ), self.assertRaisesRegex(ValueError, "domain anchor coordinate"):
+            optimize_transient_layout(
+                self.modules, package, self.output, self.config_path,
+                self.power_windows, hotspot=self.hotspot,
+            )
+
+        self.assertFalse(self.output.exists())
 
     def test_optimizer_reuses_a_relocated_self_contained_package(self):
         # Break caught: absolute case-artifact paths either read the old package
