@@ -20,6 +20,7 @@ from workflow.transient.run_hotspot_transient import (
     summarize_period_end_convergence,
     summarize_temperature_samples,
 )
+from workflow.transient.run_hotspot_steady import run_hotspot_steady
 from workflow.transient.verify_sustainable_frequency import (
     last_period_peak,
     search_layout_frequency,
@@ -1073,6 +1074,70 @@ class TransientTraceTests(unittest.TestCase):
         self.assertFalse(boolean_text("false"))
         with self.assertRaises(Exception):
             boolean_text("maybe")
+
+
+class HotSpotSteadyInitializationTests(unittest.TestCase):
+    def test_steady_only_run_binds_exact_inputs_and_outputs(self):
+        # Break caught: adding -o would perform a transient integration, while
+        # omitting an input/output hash would allow mismatched preconditioning.
+        with tempfile.TemporaryDirectory() as temporary:
+            case = Path(temporary) / "case"
+            case.mkdir()
+            for name, payload in (
+                ("hotspot.config", "-sampling_intvl 0.002\n"),
+                ("power_transient.ptrace", "unit\n1.0\n2.0\n"),
+                ("stack.lcf", "stack\n"),
+                ("materials.txt", "material\n"),
+            ):
+                (case / name).write_text(payload, encoding="utf-8")
+            hotspot = Path(temporary) / "hotspot"
+            hotspot.write_text("synthetic executable\n", encoding="utf-8")
+
+            def fake_hotspot(command, **kwargs):
+                cwd = Path(kwargs["cwd"])
+                self.assertNotIn("-o", command)
+                (cwd / "initialization.steady.txt").write_text(
+                    "unit 390.125000\n", encoding="utf-8"
+                )
+                (cwd / "initialization.grid.steady.txt").write_text(
+                    "t0_r00_c00 390.125000\n", encoding="utf-8"
+                )
+                return type("Process", (), {"returncode": 0, "stdout": "ok"})()
+
+            with patch(
+                "workflow.transient.run_hotspot_steady.subprocess.run",
+                side_effect=fake_hotspot,
+            ):
+                result = run_hotspot_steady(case, hotspot)
+
+            self.assertNotIn("-o", result["command"])
+            self.assertEqual(result["return_code"], 0)
+            self.assertEqual(result["initial_peak"]["peak_unit"], "unit")
+            self.assertAlmostEqual(result["initial_peak"]["tmax_k"], 390.125)
+            self.assertTrue((case / "initialization.steady.txt").is_file())
+            self.assertTrue((case / "initialization.grid.steady.txt").is_file())
+            self.assertEqual(
+                read_json(case / "steady_initialization.json")["input_sha256"],
+                result["input_sha256"],
+            )
+            self.assertEqual(
+                set(result["input_sha256"]),
+                {
+                    "hotspot.config", "power_transient.ptrace", "stack.lcf",
+                    "materials.txt", "hotspot_binary",
+                },
+            )
+            self.assertEqual(
+                set(result["output_sha256"]),
+                {"initialization.steady.txt", "initialization.grid.steady.txt"},
+            )
+            self.assertTrue(all(
+                value.startswith("sha256:")
+                for value in [
+                    *result["input_sha256"].values(),
+                    *result["output_sha256"].values(),
+                ]
+            ))
 
 
 class TransientComparisonTests(unittest.TestCase):
