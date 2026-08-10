@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
+from io import StringIO
 import math
 from numbers import Real
 from pathlib import Path
@@ -11,7 +13,14 @@ import subprocess
 import sys
 from typing import Callable
 
-from workflow.common import read_json, sha256_file, write_json
+from workflow.common import (
+    PROJECT_ROOT,
+    atomic_write_bytes,
+    format_temperature_c,
+    read_json,
+    sha256_file,
+    write_json,
+)
 from workflow.run_lifting_pipeline import validate_config
 from workflow.transient.run_transient_r1 import completed as transient_r1_completed
 
@@ -22,6 +31,37 @@ EXPECTED_POINTS = (
 )
 SAMPLE_INTERVAL_MS = 2.0
 Invoke = Callable[[list[str], Path, Path], int]
+DEFAULT_SELECTION = (
+    PROJECT_ROOT / "configs/experiments/transient_rom_balanced2_selection.json"
+)
+DEFAULT_CONFIG = (
+    PROJECT_ROOT / "configs/experiments/"
+    "clip3d_transient_rom_lambda0020119_traffic_weighted_"
+    "discrete_partition_exploratory.json"
+)
+DEFAULT_CANONICAL_R1_ROOT = PROJECT_ROOT / "runs/architecture_sweep/r1/paper"
+DEFAULT_PERIODIC_R1_ROOT = (
+    PROJECT_ROOT / "runs/transient_r1/balanced2_2ms_20260811"
+)
+DEFAULT_STEADY_BASELINE = (
+    PROJECT_ROOT
+    / "runs/discrete_partition_validation/balanced5_midcache_20260809/summary.csv"
+)
+CSV_FIELDS = (
+    "workload", "l1d_size", "l2_size", "state",
+    "steady_fixed_tmax_c", "steady_clip3d_tmax_c",
+    "steady_fixed_frequency_ghz", "steady_clip3d_frequency_ghz",
+    "steady_fixed_ipc2", "steady_clip3d_ipc2",
+    "steady_fixed_bips2", "steady_clip3d_bips2",
+    "steady_bips2_improvement_percent",
+    "transient_fixed_frequency_ghz", "transient_clip3d_frequency_ghz",
+    "transient_fixed_ipc2", "transient_clip3d_ipc2",
+    "transient_fixed_bips2", "transient_clip3d_bips2",
+    "transient_bips2_improvement_percent",
+    "improvement_shift_percentage_points",
+    "calibration_hotspot_calls", "final_validation_hotspot_calls",
+    "thermal_summary", "r2_summary",
+)
 
 
 def _point_key(point: dict) -> str:
@@ -528,3 +568,220 @@ def run_validation_set(
     output_root.mkdir(parents=True, exist_ok=True)
     write_json(output_root / "status.json", result)
     return result
+
+
+def _steady_metrics(row: dict[str, str], point: dict) -> dict:
+    def positive(field: str) -> float:
+        try:
+            value: object = float(row[field])
+        except (KeyError, TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                f"steady baseline {field} is invalid for {_point_key(point)}"
+            ) from error
+        return _finite_positive(value, f"steady baseline {field}")
+
+    fixed_bips = positive("fixed_bips2")
+    clip_bips = positive("clip3d_bips2")
+    improvement = (clip_bips / fixed_bips - 1.0) * 100.0
+    try:
+        claimed: object = float(row["bips2_improvement_percent"])
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"steady baseline improvement is invalid for {_point_key(point)}"
+        ) from error
+    if not math.isclose(
+        _finite_number(claimed, "steady baseline improvement"),
+        improvement,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(f"steady baseline improvement differs for {_point_key(point)}")
+    return {
+        "steady_fixed_tmax_c": positive("fixed_tmax_c"),
+        "steady_clip3d_tmax_c": positive("clip3d_tmax_c"),
+        "steady_fixed_frequency_ghz": positive("fixed_frequency_ghz"),
+        "steady_clip3d_frequency_ghz": positive("clip3d_frequency_ghz"),
+        "steady_fixed_ipc2": positive("fixed_ipc2"),
+        "steady_clip3d_ipc2": positive("clip3d_ipc2"),
+        "steady_fixed_bips2": fixed_bips,
+        "steady_clip3d_bips2": clip_bips,
+        "steady_bips2_improvement_percent": improvement,
+    }
+
+
+def _csv_value(field: str, value: object) -> object:
+    if value is None:
+        return ""
+    if field.endswith("_tmax_c"):
+        return format_temperature_c(float(value))
+    return value
+
+
+def summarize_validation_set(
+    inputs: dict,
+    output_root: Path,
+    require_r2: bool,
+) -> dict:
+    """Publish a deterministic steady/transient report from validated facts."""
+    if (
+        not isinstance(inputs, dict)
+        or inputs.get("non_formal") is not True
+        or inputs.get("paper_equivalent") is not False
+        or not isinstance(inputs.get("points"), list)
+        or len(inputs["points"]) != len(EXPECTED_POINTS)
+    ):
+        raise ValueError("Balanced-2 summarized inputs are invalid")
+    output_root = Path(output_root).resolve()
+    rows = []
+    transient_gains: list[float] = []
+    for point in inputs["points"]:
+        slug = _point_slug(point)
+        thermal = validate_thermal_checkpoint(
+            output_root / "thermal" / slug, point,
+        )
+        checkpoint = (
+            validate_r2_checkpoint(output_root / "r2" / slug, point)
+            if require_r2 else thermal
+        )
+        summary = checkpoint["summary"]
+        fixed = summary["branches"]["fixed_bin"]
+        clip = summary["branches"]["clip3d"]
+        steady = _steady_metrics(point["steady_baseline"], point)
+        transient_fixed_ipc = fixed.get("measured_ipc2") if require_r2 else None
+        transient_clip_ipc = clip.get("measured_ipc2") if require_r2 else None
+        transient_fixed_bips = (
+            fixed.get("measured_bips2_trans") if require_r2 else None
+        )
+        transient_clip_bips = (
+            clip.get("measured_bips2_trans") if require_r2 else None
+        )
+        transient_gain = None
+        gain_shift = None
+        if require_r2:
+            transient_fixed_bips = _finite_positive(
+                transient_fixed_bips, "transient fixed BIPS2"
+            )
+            transient_clip_bips = _finite_positive(
+                transient_clip_bips, "transient CLIP-3D BIPS2"
+            )
+            transient_gain = (
+                transient_clip_bips / transient_fixed_bips - 1.0
+            ) * 100.0
+            paired_claim = checkpoint["paired"].get(
+                "bips2_trans_improvement_percent"
+            )
+            if not math.isclose(
+                _finite_number(paired_claim, "paired transient improvement"),
+                transient_gain,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(f"paired improvement differs for {_point_key(point)}")
+            gain_shift = transient_gain - steady["steady_bips2_improvement_percent"]
+            transient_gains.append(transient_gain)
+        rows.append({
+            "workload": point["workload"],
+            "l1d_size": point["l1d_size"],
+            "l2_size": point["l2_size"],
+            "state": "r2_validated" if require_r2 else "thermal_validated",
+            **steady,
+            "transient_fixed_frequency_ghz": _finite_positive(
+                fixed.get("validated_f_sus_trans_hotspot_ghz"),
+                "transient fixed validated frequency",
+            ),
+            "transient_clip3d_frequency_ghz": _finite_positive(
+                clip.get("validated_f_sus_trans_hotspot_ghz"),
+                "transient CLIP-3D validated frequency",
+            ),
+            "transient_fixed_ipc2": transient_fixed_ipc,
+            "transient_clip3d_ipc2": transient_clip_ipc,
+            "transient_fixed_bips2": transient_fixed_bips,
+            "transient_clip3d_bips2": transient_clip_bips,
+            "transient_bips2_improvement_percent": transient_gain,
+            "improvement_shift_percentage_points": gain_shift,
+            "calibration_hotspot_calls": summary["calibration_hotspot_calls"],
+            "final_validation_hotspot_calls": summary[
+                "final_validation_hotspot_calls"
+            ],
+            "thermal_summary": thermal["summary_path"],
+            "r2_summary": checkpoint["summary_path"] if require_r2 else None,
+            "artifact_sha256": {
+                "thermal_summary": thermal["summary_sha256"],
+                "r2_summary": checkpoint["summary_sha256"] if require_r2 else None,
+                "paired_comparison": checkpoint.get("paired_sha256"),
+            },
+        })
+
+    statistics = None
+    if require_r2:
+        statistics = {
+            "wins": sum(value > 0.0 for value in transient_gains),
+            "ties": sum(value == 0.0 for value in transient_gains),
+            "losses": sum(value < 0.0 for value in transient_gains),
+            "mean_bips2_improvement_percent": (
+                sum(transient_gains) / len(transient_gains)
+            ),
+        }
+    report = {
+        "schema_version": 1,
+        "name": "transient_rom_balanced2",
+        "state": "r2_validated" if require_r2 else "thermal_validated",
+        "non_formal": True,
+        "paper_equivalent": False,
+        "point_count": len(rows),
+        "sample_interval_ms": inputs["sample_interval_ms"],
+        "input_sha256": inputs["input_sha256"],
+        "transient_statistics": statistics,
+        "points": rows,
+    }
+    output_root.mkdir(parents=True, exist_ok=True)
+    write_json(output_root / "summary.json", report)
+    stream = StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({field: _csv_value(field, row.get(field)) for field in CSV_FIELDS})
+    atomic_write_bytes(
+        output_root / "summary.csv", stream.getvalue().encode("utf-8")
+    )
+    return report
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--selection", type=Path, default=DEFAULT_SELECTION)
+    parser.add_argument(
+        "--canonical-r1-root", type=Path, default=DEFAULT_CANONICAL_R1_ROOT,
+    )
+    parser.add_argument(
+        "--periodic-r1-root", type=Path, default=DEFAULT_PERIODIC_R1_ROOT,
+    )
+    parser.add_argument(
+        "--steady-baseline-csv", type=Path, default=DEFAULT_STEADY_BASELINE,
+    )
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--run-r2", action="store_true")
+    parser.add_argument("--summarize-only", action="store_true")
+    args = parser.parse_args()
+    inputs = preflight_inputs(
+        args.selection, args.canonical_r1_root, args.periodic_r1_root,
+        args.steady_baseline_csv, args.config,
+    )
+    if not args.summarize_only:
+        run_validation_set(
+            args.selection, args.canonical_r1_root, args.periodic_r1_root,
+            args.steady_baseline_csv, args.config, args.output_root,
+            execute_r2=args.run_r2,
+        )
+    report = summarize_validation_set(
+        inputs, args.output_root, require_r2=args.run_r2,
+    )
+    print(
+        f"Balanced-2 {report['state']}: {report['point_count']} points; "
+        f"summary={args.output_root.resolve() / 'summary.csv'}"
+    )
+
+
+if __name__ == "__main__":
+    main()

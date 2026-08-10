@@ -14,6 +14,7 @@ from workflow.common import PROJECT_ROOT, read_json, write_json
 from workflow.experiments.transient_rom_balanced2 import (
     preflight_inputs,
     run_validation_set,
+    summarize_validation_set,
 )
 
 
@@ -332,6 +333,68 @@ class Balanced2RunnerTests(Balanced2PreflightTests):
         self.assertTrue(all("--run-r2" in call for call in self.calls))
         self.assertTrue(all("--transient-rom-calibrate" not in call for call in self.calls))
         self.assertTrue(all("--transient-rom-package-dir" in call for call in self.calls))
+
+
+class Balanced2ReportTests(Balanced2RunnerTests):
+    def inputs(self) -> dict:
+        return self.invoke()
+
+    def test_thermal_report_keeps_measured_fields_empty(self) -> None:
+        self.run_set()
+        report = summarize_validation_set(
+            self.inputs(), self.output, require_r2=False,
+        )
+        self.assertEqual(report["state"], "thermal_validated")
+        self.assertEqual(report["point_count"], 2)
+        for row in report["points"]:
+            self.assertIsNotNone(row["transient_fixed_frequency_ghz"])
+            self.assertIsNotNone(row["transient_clip3d_frequency_ghz"])
+            self.assertIsNone(row["transient_fixed_ipc2"])
+            self.assertIsNone(row["transient_clip3d_bips2"])
+            self.assertIsNone(row["transient_bips2_improvement_percent"])
+        self.assertTrue((self.output / "summary.json").is_file())
+        self.assertTrue((self.output / "summary.csv").is_file())
+
+    def test_r2_report_recomputes_signed_gains_and_statistics(self) -> None:
+        self.run_set()
+        self.run_set(execute_r2=True)
+        report = summarize_validation_set(
+            self.inputs(), self.output, require_r2=True,
+        )
+        self.assertEqual(report["state"], "r2_validated")
+        self.assertEqual(report["transient_statistics"]["wins"], 1)
+        self.assertEqual(report["transient_statistics"]["ties"], 0)
+        self.assertEqual(report["transient_statistics"]["losses"], 1)
+        matmul, stencil = report["points"]
+        self.assertAlmostEqual(
+            matmul["steady_bips2_improvement_percent"], 15.5,
+        )
+        self.assertGreater(matmul["transient_bips2_improvement_percent"], 0.0)
+        self.assertLess(stencil["transient_bips2_improvement_percent"], 0.0)
+        self.assertAlmostEqual(
+            matmul["improvement_shift_percentage_points"],
+            matmul["transient_bips2_improvement_percent"] - 15.5,
+        )
+        persisted = read_json(self.output / "summary.json")
+        self.assertEqual(persisted, report)
+
+    def test_csv_has_deterministic_header_and_six_decimal_temperatures(self) -> None:
+        self.run_set()
+        summarize_validation_set(self.inputs(), self.output, require_r2=False)
+        with (self.output / "summary.csv").open(encoding="utf-8") as stream:
+            rows = list(csv.DictReader(stream))
+            header = stream.seek(0) or stream.readline().strip()
+        self.assertEqual(header.split(",")[:6], [
+            "workload", "l1d_size", "l2_size", "state",
+            "steady_fixed_tmax_c", "steady_clip3d_tmax_c",
+        ])
+        self.assertEqual(rows[0]["steady_fixed_tmax_c"], "100.000000")
+        self.assertEqual(rows[0]["steady_clip3d_tmax_c"], "99.500000")
+
+    def test_r2_report_rejects_thermal_only_predictions(self) -> None:
+        self.run_set()
+        with self.assertRaisesRegex(ValueError, "R2 checkpoint"):
+            summarize_validation_set(self.inputs(), self.output, require_r2=True)
 
 
 if __name__ == "__main__":

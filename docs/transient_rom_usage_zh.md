@@ -157,3 +157,56 @@ OUT/
 - `measured.fixed_bin` 与 `measured.clip3d`：两个布局各自真实 gem5 R2 的 IPC2，以及 `BIPS2_trans = IPC2 × f_sus_trans_hotspot`。
 
 首要科学比较文件是 `transient_rom/final_validation/paired_comparison.json`（CSV 同目录）。它只在两边都存在真实 HotSpot 持续频率和真实 R2 IPC2 时生成；其中的提升率为 `(CLIP BIPS2_trans - fixed BIPS2_trans) / fixed BIPS2_trans × 100%`。ROM predicted 值永远不能替代这个 measured 配对结果，也不能在缺失一边时发布提升率。
+
+## MATMUL/STENCIL 双点验证入口
+
+双点验证固定选择稳态 5 点结果中的 MATMUL 和 STENCIL `64kB/512kB`：前者是正提升点，后者是负提升点。该选择能检查瞬态模型是否会改变稳态排序，而不是只挑选有利样本。它仍使用非零 `lambda_wire`、通信权重和 nearest 整数周期分区，分类始终是探索性、非论文等价。
+
+先生成两个互相独立、不会覆盖 canonical R1 的 2 ms 周期统计 R1：
+
+```bash
+cd /home/zyjiang/Agenticflow/CLIP
+source scripts/env.sh
+
+time python -m workflow.transient.run_transient_r1 \
+  --source-r1-dir runs/architecture_sweep/r1/paper/matmul/l1d_64kB/l2_512kB \
+  --output-dir runs/transient_r1/balanced2_2ms_20260811/matmul_64kB_512kB \
+  --sample-ms 2
+
+time python -m workflow.transient.run_transient_r1 \
+  --source-r1-dir runs/architecture_sweep/r1/paper/stencil/l1d_64kB/l2_512kB \
+  --output-dir runs/transient_r1/balanced2_2ms_20260811/stencil_64kB_512kB \
+  --sample-ms 2
+```
+
+两个 `status.json` 均为 `success` 后，先只运行 ROM 校准、布局搜索和真实 HotSpot 热验收，不启动 R2：
+
+```bash
+python -m workflow.experiments.transient_rom_balanced2 \
+  --output-root runs/transient_rom_balanced2/validation_20260811
+```
+
+只有根目录 `summary.json` 的状态为 `thermal_validated`，才运行第二阶段：
+
+```bash
+python -m workflow.experiments.transient_rom_balanced2 \
+  --output-root runs/transient_rom_balanced2/validation_20260811 \
+  --run-r2
+```
+
+第二条命令会先重新校验两个热 checkpoint，然后在新的 `r2/` 子目录中复用各自的 12-call ROM 包，分别执行 fixed-bin 和 CLIP-3D 的真实 HotSpot/R2。已完成且通过哈希和内容校验的 checkpoint 会复用；非空但不完整的目录不会被覆盖，必须换新的输出根目录。
+
+主要产物为：
+
+```text
+validation_20260811/
+├── thermal/{matmul,stencil}_64kB_512kB/   # 不含 R2 的热验收
+├── r2/{matmul,stencil}_64kB_512kB/        # 仅 --run-r2 后存在
+├── status/                                 # 每点、每阶段状态
+├── logs/                                   # 公共入口 stdout/stderr
+├── status.json                             # 根阶段状态
+├── summary.json                            # 全精度、带哈希的权威汇总
+└── summary.csv                             # 便于汇报的确定性表格
+```
+
+热阶段的表格只包含两个布局的真实瞬态持续频率，IPC/BIPS 和提升率保持为空。R2 阶段完成后才计算 `BIPS2_trans = IPC2 × f_sus_trans_hotspot`，并同时列出稳态提升、瞬态提升及二者的百分点变化。周期 R1 通常每点需要数小时；R2 还需对每点两个布局分别运行 gem5，因此完整双点测试仍可能需要十几小时以上，入口默认串行以避免争用节点 CPU 和混淆日志。
