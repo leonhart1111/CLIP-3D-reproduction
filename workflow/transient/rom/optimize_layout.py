@@ -27,6 +27,7 @@ from workflow.transient.rom.calibration_design import (
 from workflow.transient.rom.contracts import (
     parse_settings,
     require_package_calibration_evidence,
+    r1_input_hash_identity,
     rom_input_identity,
 )
 from workflow.transient.rom.layout_rom import (
@@ -77,6 +78,9 @@ def _requested_identity(modules_path: Path, config_path: Path, hotspot: Path,
     canonical_metadata = Path(canonical_source) / "r1_metadata.json"
     if not canonical_metadata.is_file():
         raise FileNotFoundError(canonical_metadata)
+    periodic_source = power_windows.get("transient_r1")
+    if not isinstance(periodic_source, str) or not periodic_source:
+        raise ValueError("power windows lack transient_r1 provenance")
     physical = config.get("physical")
     frequency = config.get("frequency")
     optimizer = config.get("layout_optimizer")
@@ -105,6 +109,9 @@ def _requested_identity(modules_path: Path, config_path: Path, hotspot: Path,
         },
         allowed_l2_tiers=tiers,
         calibration_design_hash=calibration_design_hash(design),
+        r1_input_hashes=r1_input_hash_identity(
+            Path(canonical_source), Path(periodic_source)
+        ),
     )
 
 

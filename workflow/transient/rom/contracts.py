@@ -17,6 +17,10 @@ from workflow.transient.rom.evidence import (
     require_rom_classification,
     sha256_identity,
 )
+from workflow.transient.run_hotspot_steady import canonical_hotspot_steady_command
+from workflow.transient.run_hotspot_transient import (
+    canonical_hotspot_transient_command,
+)
 
 
 @dataclass(frozen=True)
@@ -74,6 +78,14 @@ _REQUIRED_IDENTITY_FIELDS = (
     "allowed_l2_tiers",
     "calibration_design_hash",
 )
+_R1_INPUT_HASH_FIELDS = (
+    "canonical_status",
+    "canonical_metadata",
+    "canonical_stats",
+    "periodic_status",
+    "periodic_metadata",
+    "periodic_stats",
+)
 _IDENTITY_LABELS = {
     "canonical_r1_metadata_hash": "canonical R1 metadata hash identity",
     "power_trace": "power trace identity",
@@ -86,6 +98,7 @@ _IDENTITY_LABELS = {
     "cooling": "cooling identity",
     "allowed_l2_tiers": "allowed tiers identity",
     "calibration_design_hash": "calibration design hash identity",
+    "r1_input_hashes": "R1 input hash identity",
 }
 _CLASSIFICATION = ROM_CLASSIFICATION
 
@@ -273,6 +286,7 @@ def rom_input_identity(
     cooling: Any,
     allowed_l2_tiers: list[int] | tuple[int, ...],
     calibration_design_hash: str,
+    r1_input_hashes: dict[str, str] | None = None,
 ) -> dict:
     """Return the complete scientific provenance required to reuse a ROM."""
     hashes = {
@@ -294,13 +308,38 @@ def rom_input_identity(
         raise ValueError("allowed_l2_tiers must contain non-negative integer tiers")
     if len(set(tiers)) != len(tiers):
         raise ValueError("allowed_l2_tiers must not contain duplicates")
-    return {
+    identity = {
         **hashes,
         "grid": _json_value(grid, "grid"),
         "stack": _json_value(stack, "stack"),
         "cooling": _json_value(cooling, "cooling"),
         "allowed_l2_tiers": tiers,
     }
+    if r1_input_hashes is not None:
+        identity["r1_input_hashes"] = _normalize_r1_input_hashes(
+            r1_input_hashes, "ROM"
+        )
+    return identity
+
+
+def r1_input_hash_identity(canonical_r1: Path, periodic_r1: Path) -> dict[str, str]:
+    """Hash every raw R1 artifact that may affect ROM or measured R2 reuse."""
+    roots = {
+        "canonical": Path(canonical_r1).resolve(),
+        "periodic": Path(periodic_r1).resolve(),
+    }
+    result = {}
+    for prefix, root in roots.items():
+        for suffix, filename in (
+            ("status", "status.json"),
+            ("metadata", "r1_metadata.json"),
+            ("stats", "stats.txt"),
+        ):
+            path = root / filename
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            result[f"{prefix}_{suffix}"] = "sha256:" + sha256_file(path)
+    return result
 
 
 def require_accepted_package(package_dir: Path, identity: dict) -> dict:
@@ -323,6 +362,15 @@ def require_accepted_package(package_dir: Path, identity: dict) -> dict:
         for name in _REQUIRED_IDENTITY_FIELDS:
             if package_identity[name] != identity[name]:
                 raise ValueError(_IDENTITY_LABELS[name])
+        package_r1 = package_identity.get("r1_input_hashes")
+        requested_r1 = identity.get("r1_input_hashes")
+        if package_r1 is not None and package_r1 != requested_r1:
+            raise ValueError(_IDENTITY_LABELS["r1_input_hashes"])
+        # A legacy accepted 12-call package has no raw-R1 binding. It remains
+        # readable by the generic ROM verifier, but strict experiment entries
+        # must independently require the new field before checkpoint reuse.
+        if package_r1 is None and requested_r1 is not None:
+            return acceptance
         raise ValueError("ROM package identity differs")
     return acceptance
 
@@ -368,6 +416,8 @@ def require_package_calibration_evidence(
         **asdict(settings),
         "calibration_runs": 8,
         "validation_runs": 2,
+        "initialization_runs": 2,
+        "calibration_hotspot_calls": 12,
     }
     if manifest.get("settings") != expected_settings:
         raise ValueError("reusable ROM calibration manifest resolved settings differ")
@@ -380,7 +430,9 @@ def require_package_calibration_evidence(
     if (manifest.get("identity") != acceptance["identity"]
             or manifest.get("calibration_design_hash") != design_identity
             or manifest.get("calibration_runs") != 8
-            or manifest.get("validation_runs") != 2):
+            or manifest.get("validation_runs") != 2
+            or manifest.get("initialization_runs") != 2
+            or manifest.get("calibration_hotspot_calls") != 12):
         raise ValueError("reusable ROM calibration manifest evidence differs")
     sources = manifest.get("sources")
     expected_source_identities = {
@@ -437,12 +489,16 @@ def require_package_calibration_evidence(
     expected_training = [point["id"] for point in design["training"]]
     expected_holdouts = [point["id"] for point in design["holdout"]]
     if (cases.get("training_hotspot_calls") != 8
-            or cases.get("holdout_hotspot_calls") != 2
+            or cases.get("holdout_initialization_hotspot_calls") != 2
+            or cases.get("holdout_transient_hotspot_calls") != 2
+            or cases.get("calibration_hotspot_calls") != 12
             or not isinstance(training, list) or len(training) != 8
             or not isinstance(holdouts, list) or len(holdouts) != 2
             or [case.get("id") for case in training] != expected_training
             or [case.get("id") for case in holdouts] != expected_holdouts):
-        raise ValueError("reusable ROM calibration case evidence must contain exact 8+2")
+        raise ValueError(
+            "reusable ROM calibration case evidence must contain exact 8+2+2"
+        )
     if (manifest.get("training_ids") != expected_training
             or manifest.get("holdout_ids") != expected_holdouts):
         raise ValueError("reusable ROM calibration manifest case ids differ")
@@ -455,9 +511,14 @@ def require_package_calibration_evidence(
     for expected_kind, case_set in (("training", training), ("holdout", holdouts)):
         for case in case_set:
             identifier = case["id"]
+            expected_initial_temperature = (
+                "ambient" if expected_kind == "training"
+                else "average_power_steady"
+            )
             if (case.get("kind") != expected_kind
                     or case.get("point") != expected_points[identifier]
-                    or case.get("initial_temperature") != "ambient"
+                    or case.get("initial_temperature")
+                    != expected_initial_temperature
                     or not isinstance(case.get("hotspot"), dict)):
                 raise ValueError(
                     f"reusable ROM {expected_kind} case {identifier} evidence differs"
@@ -466,10 +527,26 @@ def require_package_calibration_evidence(
             hashes = artifacts.get("sha256") if isinstance(artifacts, dict) else None
             artifact_hashes[identifier] = {}
             resolved_artifacts: dict[str, Path] = {}
-            for artifact in (
+            required_artifacts = [
                 "modules", "layout", "power_windows", "power_trace",
                 "temperature_trace",
-            ):
+            ]
+            initialization_artifacts = (
+                "steady_initialization", "initialization_steady",
+                "initialization_grid_steady",
+            )
+            if expected_kind == "holdout":
+                required_artifacts.extend(initialization_artifacts)
+            elif any(
+                (isinstance(artifacts, dict) and name in artifacts)
+                or (isinstance(hashes, dict) and name in hashes)
+                for name in (*initialization_artifacts, "initial_steady")
+            ) or "steady_initialization" in case:
+                raise ValueError(
+                    f"reusable ROM training case {identifier} unexpectedly "
+                    "contains steady initialization evidence"
+                )
+            for artifact in required_artifacts:
                 value = artifacts.get(artifact) if isinstance(artifacts, dict) else None
                 recorded = hashes.get(artifact) if isinstance(hashes, dict) else None
                 if not isinstance(value, str) or not isinstance(recorded, str):
@@ -494,6 +571,173 @@ def require_package_calibration_evidence(
                     )
                 artifact_hashes[identifier][artifact] = recorded
                 resolved_artifacts[artifact] = path
+            case_directory = resolved_artifacts["power_trace"].parent
+
+            def bind_optional_or_legacy(name: str, filename: str) -> None:
+                value = artifacts.get(name) if isinstance(artifacts, dict) else None
+                recorded = hashes.get(name) if isinstance(hashes, dict) else None
+                if (value is None) != (recorded is None):
+                    raise ValueError(
+                        f"reusable ROM {expected_kind} case {identifier} "
+                        f"has partial {name} evidence"
+                    )
+                if value is None:
+                    legacy_path = case_directory / filename
+                    try:
+                        path = require_regular_descendant(
+                            package_dir,
+                            legacy_path.relative_to(package_dir).as_posix(),
+                            f"reusable ROM {expected_kind} case {identifier} {name}",
+                        )
+                    except (ValueError, OSError) as error:
+                        raise ValueError(
+                            f"reusable ROM {expected_kind} case {identifier} "
+                            f"lacks legacy {name} evidence"
+                        ) from error
+                    recorded = sha256_identity(path)
+                else:
+                    try:
+                        path = require_regular_descendant(
+                            package_dir, value,
+                            f"reusable ROM {expected_kind} case {identifier} {name}",
+                        )
+                    except ValueError as error:
+                        raise ValueError(
+                            f"reusable ROM {expected_kind} case {identifier} "
+                            f"{name} evidence differs"
+                        ) from error
+                    if recorded != sha256_identity(path):
+                        raise ValueError(
+                            f"reusable ROM {expected_kind} case {identifier} "
+                            f"{name} hash differs"
+                        )
+                artifact_hashes[identifier][name] = recorded
+                resolved_artifacts[name] = path
+
+            bind_optional_or_legacy("transient_result", "transient_result.json")
+            if expected_kind == "holdout":
+                bind_optional_or_legacy("initial_steady", "initial.steady.txt")
+            transient_command = case["hotspot"].get("command")
+            if not isinstance(transient_command, list) or not transient_command:
+                raise ValueError(
+                    f"reusable ROM {expected_kind} case {identifier} "
+                    "transient command differs"
+                )
+            expected_transient_command = canonical_hotspot_transient_command(
+                transient_command[0],
+                steady_initialization=expected_kind == "holdout",
+            )
+            if transient_command != expected_transient_command:
+                raise ValueError(
+                    f"reusable ROM {expected_kind} case {identifier} "
+                    "transient command differs"
+                )
+            transient_result = read_json(resolved_artifacts["transient_result"])
+            expected_runner_initial = (
+                "ambient" if expected_kind == "training" else "steady"
+            )
+            if (
+                not isinstance(transient_result, dict)
+                or transient_result.get("schema_version") != 1
+                or any(
+                    transient_result.get(field) != value
+                    for field, value in ROM_CLASSIFICATION.items()
+                )
+                or transient_result.get("command") != transient_command
+                or transient_result.get("return_code") != 0
+                or transient_result.get("initial_temperature")
+                != expected_runner_initial
+                or case["hotspot"] != {
+                    "command": transient_result.get("command"),
+                    "elapsed_seconds": transient_result.get("elapsed_seconds"),
+                }
+            ):
+                raise ValueError(
+                    f"reusable ROM {expected_kind} case {identifier} "
+                    "transient runner record differs"
+                )
+            if expected_kind == "holdout":
+                initialization = read_json(
+                    resolved_artifacts["steady_initialization"]
+                )
+                recorded_initialization = case.get("steady_initialization")
+                if not isinstance(initialization, dict) or not isinstance(
+                    recorded_initialization, dict
+                ):
+                    raise ValueError(
+                        f"reusable ROM holdout case {identifier} lacks "
+                        "steady initialization record"
+                    )
+                for field in (
+                    "command", "return_code", "elapsed_seconds",
+                    "input_sha256", "output_sha256",
+                ):
+                    if recorded_initialization.get(field) != initialization.get(field):
+                        raise ValueError(
+                            f"reusable ROM holdout case {identifier} steady "
+                            f"initialization {field} differs"
+                        )
+                if initialization.get("return_code") != 0:
+                    raise ValueError(
+                        f"reusable ROM holdout case {identifier} steady "
+                        "initialization tool result differs"
+                    )
+                initialization_command = initialization.get("command")
+                if (
+                    not isinstance(initialization_command, list)
+                    or not initialization_command
+                    or initialization_command
+                    != canonical_hotspot_steady_command(initialization_command[0])
+                    or initialization_command[0] != transient_command[0]
+                ):
+                    raise ValueError(
+                        f"reusable ROM holdout case {identifier} steady "
+                        "initialization command differs"
+                    )
+                input_hashes = initialization.get("input_sha256")
+                output_hashes = initialization.get("output_sha256")
+                expected_initialization_inputs = {
+                    "hotspot.config": sha256_identity(
+                        resolved_artifacts["power_trace"].parent
+                        / "hotspot.config"
+                    ),
+                    "power_transient.ptrace": artifact_hashes[identifier][
+                        "power_trace"
+                    ],
+                    "stack.lcf": sha256_identity(
+                        resolved_artifacts["power_trace"].parent / "stack.lcf"
+                    ),
+                    "materials.txt": sha256_identity(
+                        resolved_artifacts["power_trace"].parent / "materials.txt"
+                    ),
+                    "hotspot_binary": acceptance["identity"]["hotspot_hash"],
+                }
+                expected_initialization_outputs = {
+                    "initialization.steady.txt": artifact_hashes[identifier][
+                        "initialization_steady"
+                    ],
+                    "initialization.grid.steady.txt": artifact_hashes[identifier][
+                        "initialization_grid_steady"
+                    ],
+                }
+                if input_hashes != expected_initialization_inputs:
+                    raise ValueError(
+                        f"reusable ROM holdout case {identifier} steady "
+                        "initialization input hashes differ"
+                    )
+                if output_hashes != expected_initialization_outputs:
+                    raise ValueError(
+                        f"reusable ROM holdout case {identifier} steady "
+                        "initialization output hashes differ"
+                    )
+                if (
+                    artifact_hashes[identifier]["initial_steady"]
+                    != artifact_hashes[identifier]["initialization_steady"]
+                ):
+                    raise ValueError(
+                        f"reusable ROM holdout case {identifier} copied initial "
+                        "steady differs from steady output"
+                    )
             if artifact_hashes[identifier]["modules"] != expected_modules_hash:
                 raise ValueError(
                     f"reusable ROM {expected_kind} case {identifier} "
@@ -683,6 +927,19 @@ def require_package_calibration_evidence(
     }
 
 
+def _normalize_r1_input_hashes(value: Any, context: str) -> dict[str, str]:
+    normalized = _json_value(value, f"{context} R1 input hashes")
+    if not isinstance(normalized, dict) or set(normalized) != set(
+        _R1_INPUT_HASH_FIELDS
+    ):
+        raise ValueError("R1 input hash identity")
+    for field in _R1_INPUT_HASH_FIELDS:
+        digest = normalized[field]
+        if not isinstance(digest, str) or not digest.startswith("sha256:"):
+            raise ValueError("R1 input hash identity")
+    return normalized
+
+
 def _normalized_identity(value: Any, context: str) -> dict:
     """Require a JSON-normalized identity with exactly the scientific fields."""
     normalized = _json_value(value, f"{context} identity")
@@ -691,7 +948,11 @@ def _normalized_identity(value: Any, context: str) -> dict:
     for name in _REQUIRED_IDENTITY_FIELDS:
         if name not in normalized:
             raise ValueError(_IDENTITY_LABELS[name])
-    extras = set(normalized) - set(_REQUIRED_IDENTITY_FIELDS)
+    extras = set(normalized) - set(_REQUIRED_IDENTITY_FIELDS) - {"r1_input_hashes"}
     if extras:
         raise ValueError(f"{context} identity contains unsupported fields")
+    if "r1_input_hashes" in normalized:
+        normalized["r1_input_hashes"] = _normalize_r1_input_hashes(
+            normalized["r1_input_hashes"], context
+        )
     return normalized

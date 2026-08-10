@@ -23,6 +23,27 @@ from workflow.common import (
 DEFAULT_HOTSPOT = PROJECT_ROOT / "tools/src/hotspot/hotspot"
 
 
+def canonical_hotspot_transient_command(
+    hotspot: Path | str, *, steady_initialization: bool,
+) -> list[str]:
+    """Return the canonical detailed-3D transient HotSpot invocation."""
+    command = [
+        str(hotspot),
+        "-c", "hotspot.config",
+        "-p", "power_transient.ptrace",
+        "-grid_layer_file", "stack.lcf",
+        "-materials_file", "materials.txt",
+        "-model_type", "grid",
+        "-detailed_3D", "on",
+        "-o", "transient.ttrace",
+        "-steady_file", "average_power.steady.txt",
+        "-grid_steady_file", "average_power.grid.steady.txt",
+    ]
+    if steady_initialization:
+        command.extend(("-init_file", "initial.steady.txt"))
+    return command
+
+
 def read_named_temperatures(path: Path) -> list[tuple[str, float]]:
     values = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -160,20 +181,9 @@ def run_hotspot_transient(case_dir: Path, hotspot: Path = DEFAULT_HOTSPOT,
         shutil.copy2(steady_source, initial_file)
 
     ttrace = case_dir / "transient.ttrace"
-    command = [
-        str(hotspot.resolve()),
-        "-c", "hotspot.config",
-        "-p", "power_transient.ptrace",
-        "-grid_layer_file", "stack.lcf",
-        "-materials_file", "materials.txt",
-        "-model_type", "grid",
-        "-detailed_3D", "on",
-        "-o", ttrace.name,
-        "-steady_file", "average_power.steady.txt",
-        "-grid_steady_file", "average_power.grid.steady.txt",
-    ]
-    if initial_file is not None:
-        command.extend(("-init_file", initial_file.name))
+    command = canonical_hotspot_transient_command(
+        hotspot.resolve(), steady_initialization=initial_file is not None,
+    )
     started = time.perf_counter()
     process = subprocess.run(
         command, cwd=case_dir, text=True,
