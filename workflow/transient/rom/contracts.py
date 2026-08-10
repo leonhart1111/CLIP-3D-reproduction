@@ -368,6 +368,8 @@ def require_package_calibration_evidence(
         **asdict(settings),
         "calibration_runs": 8,
         "validation_runs": 2,
+        "initialization_runs": 2,
+        "calibration_hotspot_calls": 12,
     }
     if manifest.get("settings") != expected_settings:
         raise ValueError("reusable ROM calibration manifest resolved settings differ")
@@ -380,7 +382,9 @@ def require_package_calibration_evidence(
     if (manifest.get("identity") != acceptance["identity"]
             or manifest.get("calibration_design_hash") != design_identity
             or manifest.get("calibration_runs") != 8
-            or manifest.get("validation_runs") != 2):
+            or manifest.get("validation_runs") != 2
+            or manifest.get("initialization_runs") != 2
+            or manifest.get("calibration_hotspot_calls") != 12):
         raise ValueError("reusable ROM calibration manifest evidence differs")
     sources = manifest.get("sources")
     expected_source_identities = {
@@ -437,12 +441,16 @@ def require_package_calibration_evidence(
     expected_training = [point["id"] for point in design["training"]]
     expected_holdouts = [point["id"] for point in design["holdout"]]
     if (cases.get("training_hotspot_calls") != 8
-            or cases.get("holdout_hotspot_calls") != 2
+            or cases.get("holdout_initialization_hotspot_calls") != 2
+            or cases.get("holdout_transient_hotspot_calls") != 2
+            or cases.get("calibration_hotspot_calls") != 12
             or not isinstance(training, list) or len(training) != 8
             or not isinstance(holdouts, list) or len(holdouts) != 2
             or [case.get("id") for case in training] != expected_training
             or [case.get("id") for case in holdouts] != expected_holdouts):
-        raise ValueError("reusable ROM calibration case evidence must contain exact 8+2")
+        raise ValueError(
+            "reusable ROM calibration case evidence must contain exact 8+2+2"
+        )
     if (manifest.get("training_ids") != expected_training
             or manifest.get("holdout_ids") != expected_holdouts):
         raise ValueError("reusable ROM calibration manifest case ids differ")
@@ -455,9 +463,14 @@ def require_package_calibration_evidence(
     for expected_kind, case_set in (("training", training), ("holdout", holdouts)):
         for case in case_set:
             identifier = case["id"]
+            expected_initial_temperature = (
+                "ambient" if expected_kind == "training"
+                else "average_power_steady"
+            )
             if (case.get("kind") != expected_kind
                     or case.get("point") != expected_points[identifier]
-                    or case.get("initial_temperature") != "ambient"
+                    or case.get("initial_temperature")
+                    != expected_initial_temperature
                     or not isinstance(case.get("hotspot"), dict)):
                 raise ValueError(
                     f"reusable ROM {expected_kind} case {identifier} evidence differs"
@@ -466,10 +479,26 @@ def require_package_calibration_evidence(
             hashes = artifacts.get("sha256") if isinstance(artifacts, dict) else None
             artifact_hashes[identifier] = {}
             resolved_artifacts: dict[str, Path] = {}
-            for artifact in (
+            required_artifacts = [
                 "modules", "layout", "power_windows", "power_trace",
                 "temperature_trace",
-            ):
+            ]
+            initialization_artifacts = (
+                "steady_initialization", "initialization_steady",
+                "initialization_grid_steady",
+            )
+            if expected_kind == "holdout":
+                required_artifacts.extend(initialization_artifacts)
+            elif any(
+                (isinstance(artifacts, dict) and name in artifacts)
+                or (isinstance(hashes, dict) and name in hashes)
+                for name in initialization_artifacts
+            ) or "steady_initialization" in case:
+                raise ValueError(
+                    f"reusable ROM training case {identifier} unexpectedly "
+                    "contains steady initialization evidence"
+                )
+            for artifact in required_artifacts:
                 value = artifacts.get(artifact) if isinstance(artifacts, dict) else None
                 recorded = hashes.get(artifact) if isinstance(hashes, dict) else None
                 if not isinstance(value, str) or not isinstance(recorded, str):
@@ -494,6 +523,74 @@ def require_package_calibration_evidence(
                     )
                 artifact_hashes[identifier][artifact] = recorded
                 resolved_artifacts[artifact] = path
+            if expected_kind == "holdout":
+                initialization = read_json(
+                    resolved_artifacts["steady_initialization"]
+                )
+                recorded_initialization = case.get("steady_initialization")
+                if not isinstance(initialization, dict) or not isinstance(
+                    recorded_initialization, dict
+                ):
+                    raise ValueError(
+                        f"reusable ROM holdout case {identifier} lacks "
+                        "steady initialization record"
+                    )
+                for field in (
+                    "command", "return_code", "elapsed_seconds",
+                    "input_sha256", "output_sha256",
+                ):
+                    if recorded_initialization.get(field) != initialization.get(field):
+                        raise ValueError(
+                            f"reusable ROM holdout case {identifier} steady "
+                            f"initialization {field} differs"
+                        )
+                if initialization.get("return_code") != 0:
+                    raise ValueError(
+                        f"reusable ROM holdout case {identifier} steady "
+                        "initialization tool result differs"
+                    )
+                command = case["hotspot"].get("command")
+                if not isinstance(command, list) or "-init_file" not in command:
+                    raise ValueError(
+                        f"reusable ROM holdout case {identifier} transient "
+                        "command lacks matched initialization"
+                    )
+                input_hashes = initialization.get("input_sha256")
+                output_hashes = initialization.get("output_sha256")
+                expected_initialization_inputs = {
+                    "hotspot.config": sha256_identity(
+                        resolved_artifacts["power_trace"].parent
+                        / "hotspot.config"
+                    ),
+                    "power_transient.ptrace": artifact_hashes[identifier][
+                        "power_trace"
+                    ],
+                    "stack.lcf": sha256_identity(
+                        resolved_artifacts["power_trace"].parent / "stack.lcf"
+                    ),
+                    "materials.txt": sha256_identity(
+                        resolved_artifacts["power_trace"].parent / "materials.txt"
+                    ),
+                    "hotspot_binary": acceptance["identity"]["hotspot_hash"],
+                }
+                expected_initialization_outputs = {
+                    "initialization.steady.txt": artifact_hashes[identifier][
+                        "initialization_steady"
+                    ],
+                    "initialization.grid.steady.txt": artifact_hashes[identifier][
+                        "initialization_grid_steady"
+                    ],
+                }
+                if input_hashes != expected_initialization_inputs:
+                    raise ValueError(
+                        f"reusable ROM holdout case {identifier} steady "
+                        "initialization input hashes differ"
+                    )
+                if output_hashes != expected_initialization_outputs:
+                    raise ValueError(
+                        f"reusable ROM holdout case {identifier} steady "
+                        "initialization output hashes differ"
+                    )
             if artifact_hashes[identifier]["modules"] != expected_modules_hash:
                 raise ValueError(
                     f"reusable ROM {expected_kind} case {identifier} "

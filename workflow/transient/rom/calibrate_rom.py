@@ -307,7 +307,9 @@ def main() -> None:
     print(
         "Transient ROM cases: "
         f"{report['training_hotspot_calls']} training, "
-        f"{report['holdout_hotspot_calls']} holdout; "
+        f"{report['holdout_initialization_hotspot_calls']} holdout initialization, "
+        f"{report['holdout_transient_hotspot_calls']} holdout transient "
+        f"({report['calibration_hotspot_calls']} HotSpot calls total); "
         f"POD rank {fit_report['pod']['rank']}"
     )
 

@@ -134,12 +134,16 @@ def write_synthetic_accepted_package(
         **classification,
         "calibration_runs": 8,
         "validation_runs": 2,
+        "initialization_runs": 2,
+        "calibration_hotspot_calls": 12,
         "calibration_design_hash": canonical_json_sha256(design),
         "identity": identity,
         "settings": {
             **vars(settings),
             "calibration_runs": 8,
             "validation_runs": 2,
+            "initialization_runs": 2,
+            "calibration_hotspot_calls": 12,
         },
         "sources": {
             "modules": "modules.json",
@@ -165,6 +169,14 @@ def write_synthetic_accepted_package(
             "power_trace": case_dir / "power_transient.ptrace",
             "temperature_trace": case_dir / "transient.ttrace",
         }
+        if kind == "holdout":
+            artifact_paths.update({
+                "steady_initialization": case_dir / "steady_initialization.json",
+                "initialization_steady": case_dir / "initialization.steady.txt",
+                "initialization_grid_steady": (
+                    case_dir / "initialization.grid.steady.txt"
+                ),
+            })
         layout = layout_for_point(design["base_layout"], point)
         case_power_windows = (
             prbs_power_windows if kind == "training" else source_power_windows
@@ -183,6 +195,40 @@ def write_synthetic_accepted_package(
                           frequency_scale=frequency_ghz / f0_ghz,
                           period_repeats=period_rows // len(case_power_windows["windows"]))
         if kind == "holdout":
+            artifact_paths["initialization_steady"].write_text(
+                "shared_l2 300.0\n", encoding="utf-8"
+            )
+            artifact_paths["initialization_grid_steady"].write_text(
+                "cell0 300.0\n", encoding="utf-8"
+            )
+            write_json(artifact_paths["steady_initialization"], {
+                "command": ["hotspot", "-steady_file", "initialization.steady.txt"],
+                "return_code": 0,
+                "elapsed_seconds": 0.1,
+                "input_sha256": {
+                    "hotspot.config": "sha256:" + hashlib.sha256(
+                        (case_dir / "hotspot.config").read_bytes()
+                    ).hexdigest(),
+                    "power_transient.ptrace": "sha256:" + hashlib.sha256(
+                        artifact_paths["power_trace"].read_bytes()
+                    ).hexdigest(),
+                    "stack.lcf": "sha256:" + hashlib.sha256(
+                        (case_dir / "stack.lcf").read_bytes()
+                    ).hexdigest(),
+                    "materials.txt": "sha256:" + hashlib.sha256(
+                        (case_dir / "materials.txt").read_bytes()
+                    ).hexdigest(),
+                    "hotspot_binary": identity["hotspot_hash"],
+                },
+                "output_sha256": {
+                    "initialization.steady.txt": "sha256:" + hashlib.sha256(
+                        artifact_paths["initialization_steady"].read_bytes()
+                    ).hexdigest(),
+                    "initialization.grid.steady.txt": "sha256:" + hashlib.sha256(
+                        artifact_paths["initialization_grid_steady"].read_bytes()
+                    ).hexdigest(),
+                },
+            })
             rom = evaluate_layout_rom(
                 model, design, case_power_windows, layout, frequency_ghz,
                 settings, config,
@@ -217,11 +263,19 @@ def write_synthetic_accepted_package(
             "id": point["id"],
             "kind": kind,
             "point": point,
-            "initial_temperature": "ambient",
+            "initial_temperature": (
+                "ambient" if kind == "training" else "average_power_steady"
+            ),
             "frequency_ghz": frequency_ghz,
             "frequency_scale": frequency_ghz / f0_ghz,
             "window_count": period_rows,
-            "hotspot": {"command": ["hotspot"], "elapsed_seconds": 0.1},
+            "hotspot": {
+                "command": (
+                    ["hotspot"] if kind == "training"
+                    else ["hotspot", "-init_file", "initial.steady.txt"]
+                ),
+                "elapsed_seconds": 0.1,
+            },
             "artifacts": {
                 **{
                     name: path.relative_to(package).as_posix()
@@ -234,6 +288,9 @@ def write_synthetic_accepted_package(
             },
         }
         if kind == "holdout":
+            case["steady_initialization"] = read_json(
+                artifact_paths["steady_initialization"]
+            )
             names, rows = parse_ttrace_grid(artifact_paths["temperature_trace"])
             windows_per_period = len(source_power_windows["windows"])
             convergence = summarize_period_end_convergence(
@@ -260,7 +317,9 @@ def write_synthetic_accepted_package(
         "schema_version": 1,
         **classification,
         "training_hotspot_calls": 8,
-        "holdout_hotspot_calls": 2,
+        "holdout_initialization_hotspot_calls": 2,
+        "holdout_transient_hotspot_calls": 2,
+        "calibration_hotspot_calls": 12,
         "training_cases": training,
         "holdout_cases": holdouts,
     })
@@ -523,6 +582,51 @@ class ROMContractTests(unittest.TestCase):
     def test_reuse_rejects_missing_packaged_source_power(self):
         self.remove_packaged_source("source_power_windows.json")
         with self.assertRaisesRegex(ValueError, "source power"):
+            require_package_calibration_evidence(
+                self.package, self.reuse_identity(), self.settings(),
+            )
+
+    def test_reuse_accepts_exact_eight_plus_two_plus_two_call_evidence(self):
+        # Break caught: continuing to require the legacy ten-call ambient
+        # package rejects scientifically matched holdout preconditioning.
+        evidence = require_package_calibration_evidence(
+            self.package, self.reuse_identity(), self.settings(),
+        )
+
+        self.assertEqual(evidence["cases"]["training_hotspot_calls"], 8)
+        self.assertEqual(
+            evidence["cases"]["holdout_initialization_hotspot_calls"], 2
+        )
+        self.assertEqual(evidence["cases"]["holdout_transient_hotspot_calls"], 2)
+        self.assertEqual(evidence["cases"]["calibration_hotspot_calls"], 12)
+
+    def test_reuse_rejects_legacy_ten_call_package(self):
+        # Break caught: silently accepting old ambient-start holdouts would
+        # preserve the exact PSS failure this change is intended to remove.
+        cases_path = self.package / "calibration_cases.json"
+        cases = read_json(cases_path)
+        cases.pop("holdout_initialization_hotspot_calls")
+        cases.pop("holdout_transient_hotspot_calls")
+        cases.pop("calibration_hotspot_calls")
+        cases["holdout_hotspot_calls"] = 2
+        write_json(cases_path, cases)
+        write_test_artifact_manifest(self.package)
+
+        with self.assertRaisesRegex(ValueError, r"exact 8\+2\+2"):
+            require_package_calibration_evidence(
+                self.package, self.reuse_identity(), self.settings(),
+            )
+
+    def test_reuse_rejects_changed_holdout_initialization_hash(self):
+        # Break caught: a rehashed package inventory must not hide a steady
+        # state that differs from the one bound by its holdout case evidence.
+        cases = read_json(self.package / "calibration_cases.json")
+        holdout = cases["holdout_cases"][0]
+        path = self.package / holdout["artifacts"]["initialization_steady"]
+        path.write_text("shared_l2 450.0\n", encoding="utf-8")
+        write_test_artifact_manifest(self.package)
+
+        with self.assertRaisesRegex(ValueError, "initialization_steady hash differs"):
             require_package_calibration_evidence(
                 self.package, self.reuse_identity(), self.settings(),
             )
@@ -819,7 +923,29 @@ class ROMCalibrationCaseTests(unittest.TestCase):
         return self.design["prbs"]["multipliers"]
 
     @staticmethod
-    def _mock_hotspot(case_dir: Path, hotspot: Path, initial_temperature: str) -> dict:
+    def _mock_steady(case_dir: Path, hotspot: Path) -> dict:
+        steady = case_dir / "initialization.steady.txt"
+        grid = case_dir / "initialization.grid.steady.txt"
+        steady.write_text("shared_l2 390.000000\n", encoding="utf-8")
+        grid.write_text("t0_r00_c00 390.000000\n", encoding="utf-8")
+        record = {
+            "command": [str(hotspot), "-steady_file", steady.name],
+            "return_code": 0,
+            "elapsed_seconds": 0.0625,
+            "input_sha256": {"power_transient.ptrace": "sha256:power"},
+            "output_sha256": {
+                steady.name: "sha256:" + hashlib.sha256(
+                    steady.read_bytes()
+                ).hexdigest(),
+                grid.name: "sha256:" + hashlib.sha256(grid.read_bytes()).hexdigest(),
+            },
+        }
+        write_json(case_dir / "steady_initialization.json", record)
+        return record
+
+    @staticmethod
+    def _mock_hotspot(case_dir: Path, hotspot: Path, initial_temperature: str,
+                      steady_source: Path | None = None) -> dict:
         manifest = __import__("json").loads(
             (case_dir / "transient_trace_manifest.json").read_text(encoding="utf-8")
         )
@@ -832,8 +958,13 @@ class ROMCalibrationCaseTests(unittest.TestCase):
         (case_dir / "transient.ttrace").write_text(
             "\n".join(rows) + "\n", encoding="utf-8"
         )
+        command = [str(hotspot), "-c", "hotspot.config"]
+        if initial_temperature == "steady":
+            if steady_source != case_dir / "initialization.steady.txt":
+                raise AssertionError("holdout did not use its matched steady state")
+            command.extend(["-init_file", "initial.steady.txt"])
         return {
-            "command": [str(hotspot), "-c", "hotspot.config"],
+            "command": command,
             "elapsed_seconds": 0.125,
             "initial_temperature": initial_temperature,
         }
@@ -842,6 +973,9 @@ class ROMCalibrationCaseTests(unittest.TestCase):
         # Break caught: omitting an anchor/holdout or routing either through a
         # non-ambient HotSpot invocation changes the case-artifact contract.
         with patch(
+            "workflow.transient.rom.materialize_calibration.run_hotspot_steady",
+            side_effect=self._mock_steady,
+        ) as steady_run, patch(
             "workflow.transient.rom.materialize_calibration.run_hotspot_transient",
             side_effect=self._mock_hotspot,
         ) as hotspot_run:
@@ -856,13 +990,20 @@ class ROMCalibrationCaseTests(unittest.TestCase):
             )
 
         self.assertEqual(report["training_hotspot_calls"], 8)
-        self.assertEqual(report["holdout_hotspot_calls"], 2)
+        self.assertEqual(report["holdout_initialization_hotspot_calls"], 2)
+        self.assertEqual(report["holdout_transient_hotspot_calls"], 2)
+        self.assertEqual(report["calibration_hotspot_calls"], 12)
+        self.assertEqual(steady_run.call_count, 2)
         self.assertEqual(hotspot_run.call_count, 10)
         self.assertEqual(len(report["training_cases"]), 8)
         self.assertEqual(len(report["holdout_cases"]), 2)
         self.assertTrue(all(
             case["initial_temperature"] == "ambient"
-            for case in report["training_cases"] + report["holdout_cases"]
+            for case in report["training_cases"]
+        ))
+        self.assertTrue(all(
+            case["initial_temperature"] == "average_power_steady"
+            for case in report["holdout_cases"]
         ))
         self.assertTrue(all(
             case["artifacts"]["sha256"]["modules"].startswith("sha256:")
@@ -877,13 +1018,27 @@ class ROMCalibrationCaseTests(unittest.TestCase):
                 "command": [str(self.hotspot.resolve()), "-c", "hotspot.config"],
                 "elapsed_seconds": 0.125,
             }
-            for case in report["training_cases"] + report["holdout_cases"]
+            for case in report["training_cases"]
+        ))
+        self.assertTrue(all(
+            case["hotspot"]["command"][-2:] == [
+                "-init_file", "initial.steady.txt"
+            ]
+            and case["steady_initialization"]["return_code"] == 0
+            for case in report["holdout_cases"]
         ))
         self.assertEqual(
             [case["frequency_ghz"] for case in report["holdout_cases"]],
             [2.0, 1.6],
         )
         for case in report["holdout_cases"]:
+            for name in (
+                "steady_initialization", "initialization_steady",
+                "initialization_grid_steady",
+            ):
+                self.assertTrue(case["artifacts"]["sha256"][name].startswith(
+                    "sha256:"
+                ))
             pss = case["periodic_steady_state"]
             self.assertEqual(pss["period_repeats"], 20)
             self.assertEqual(pss["grid_unit_names"], ["t0_r00_c00", "t1_r00_c00"])
@@ -901,6 +1056,8 @@ class ROMCalibrationCaseTests(unittest.TestCase):
         self.assertEqual(manifest["settings"]["calibration_windows"], 64)
         self.assertEqual(manifest["settings"]["calibration_runs"], 8)
         self.assertEqual(manifest["settings"]["validation_runs"], 2)
+        self.assertEqual(manifest["settings"]["initialization_runs"], 2)
+        self.assertEqual(manifest["settings"]["calibration_hotspot_calls"], 12)
         self.assertEqual(
             manifest["identity"]["calibration_design_hash"],
             canonical_json_sha256(self.design),
@@ -917,6 +1074,12 @@ class ROMCalibrationCaseTests(unittest.TestCase):
                 self.assertFalse(relative.is_absolute())
                 self.assertNotIn("..", relative.parts)
                 self.assertTrue((package / relative).is_file())
+        for case in report["holdout_cases"]:
+            for name in (
+                "steady_initialization", "initialization_steady",
+                "initialization_grid_steady",
+            ):
+                self.assertTrue((package / case["artifacts"][name]).is_file())
 
     def test_prbs_windows_preserve_power_triplets(self):
         # Break caught: scaling only one power component or retaining a stale
@@ -990,7 +1153,9 @@ class ROMCalibrationCaseTests(unittest.TestCase):
             write_json(output / "calibration_cases.json", {"synthetic": True})
             return {
                 "training_hotspot_calls": 8,
-                "holdout_hotspot_calls": 2,
+                "holdout_initialization_hotspot_calls": 2,
+                "holdout_transient_hotspot_calls": 2,
+                "calibration_hotspot_calls": 12,
                 "training_cases": [],
                 "holdout_cases": [],
             }

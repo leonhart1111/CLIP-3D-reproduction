@@ -33,6 +33,7 @@ from workflow.transient.run_hotspot_transient import (
     run_hotspot_transient,
     summarize_period_end_convergence,
 )
+from workflow.transient.run_hotspot_steady import run_hotspot_steady
 from workflow.transient.validation import (
     power_trace_identity,
     validate_power_triplet,
@@ -176,7 +177,8 @@ def _require_case_inputs(modules_path: Path, source_power_windows_path: Path,
 
 
 def _case_artifacts(case_dir: Path, package_dir: Path, modules_path: Path,
-                    layout_path: Path, power_path: Path) -> dict:
+                    layout_path: Path, power_path: Path, *,
+                    include_initialization: bool = False) -> dict:
     package_dir = package_dir.resolve()
     paths = {
         "modules": modules_path.resolve(),
@@ -185,6 +187,18 @@ def _case_artifacts(case_dir: Path, package_dir: Path, modules_path: Path,
         "power_trace": (case_dir / "power_transient.ptrace").resolve(),
         "temperature_trace": (case_dir / "transient.ttrace").resolve(),
     }
+    if include_initialization:
+        paths.update({
+            "steady_initialization": (
+                case_dir / "steady_initialization.json"
+            ).resolve(),
+            "initialization_steady": (
+                case_dir / "initialization.steady.txt"
+            ).resolve(),
+            "initialization_grid_steady": (
+                case_dir / "initialization.grid.steady.txt"
+            ).resolve(),
+        })
     if any(not path.is_file() for path in paths.values()):
         missing = [str(path) for path in paths.values() if not path.is_file()]
         raise ValueError(f"calibration case lacks required artifacts: {missing}")
@@ -224,9 +238,23 @@ def _materialize_case(*, kind: str, point: dict, case_dir: Path,
     )
     trace_manifest["hotspot_sha256"] = _sha256(hotspot)
     write_json(case_dir / "transient_trace_manifest.json", trace_manifest)
-    thermal = run_hotspot_transient(
-        case_dir, hotspot=hotspot, initial_temperature="ambient"
-    )
+    initialization = None
+    if kind == "training":
+        initial_temperature = "ambient"
+        thermal = run_hotspot_transient(
+            case_dir, hotspot=hotspot, initial_temperature="ambient"
+        )
+    elif kind == "holdout":
+        initial_temperature = "average_power_steady"
+        initialization = run_hotspot_steady(case_dir, hotspot=hotspot)
+        thermal = run_hotspot_transient(
+            case_dir,
+            hotspot=hotspot,
+            initial_temperature="steady",
+            steady_source=case_dir / "initialization.steady.txt",
+        )
+    else:
+        raise ValueError(f"unsupported calibration case kind: {kind!r}")
     trace_manifest = read_json(case_dir / "transient_trace_manifest.json")
     temperature_names, _ = parse_ttrace_grid(case_dir / "transient.ttrace")
     trace_manifest["temperature_grid_unit_names"] = temperature_names
@@ -235,7 +263,7 @@ def _materialize_case(*, kind: str, point: dict, case_dir: Path,
         "id": point["id"],
         "kind": kind,
         "point": deepcopy(point),
-        "initial_temperature": "ambient",
+        "initial_temperature": initial_temperature,
         "frequency_ghz": frequency_ghz,
         "frequency_scale": frequency_ghz / f0_ghz,
         "window_count": int(trace["window_count"]),
@@ -245,8 +273,17 @@ def _materialize_case(*, kind: str, point: dict, case_dir: Path,
         },
         "artifacts": _case_artifacts(
             case_dir, package_dir, modules_path, layout_path, power_path,
+            include_initialization=initialization is not None,
         ),
     }
+    if initialization is not None:
+        result["steady_initialization"] = {
+            "command": initialization.get("command"),
+            "return_code": initialization.get("return_code"),
+            "elapsed_seconds": initialization.get("elapsed_seconds"),
+            "input_sha256": initialization.get("input_sha256"),
+            "output_sha256": initialization.get("output_sha256"),
+        }
     if kind == "holdout":
         names, rows = parse_ttrace_grid(case_dir / "transient.ttrace")
         convergence = summarize_period_end_convergence(
@@ -273,7 +310,7 @@ def execute_calibration_cases(modules_path: Path, source_power_windows_path: Pat
                               settings: ROMSettings, *,
                               hotspot: Path = DEFAULT_HOTSPOT,
                               identity: dict) -> dict:
-    """Materialize exactly eight PRBS anchors and two real-workload holdouts.
+    """Materialize eight PRBS anchors and two preconditioned holdouts.
 
     This is intentionally a caller-controlled real-HotSpot boundary.  Unit
     tests mock ``run_hotspot_transient``; this function never launches R1, R2,
@@ -312,12 +349,16 @@ def execute_calibration_cases(modules_path: Path, source_power_windows_path: Pat
         **ROM_CLASSIFICATION,
         "calibration_runs": 8,
         "validation_runs": 2,
+        "initialization_runs": 2,
+        "calibration_hotspot_calls": 12,
         "calibration_design_hash": design_identity,
         "identity": deepcopy(identity),
         "settings": {
             **asdict(settings),
             "calibration_runs": 8,
             "validation_runs": 2,
+            "initialization_runs": 2,
+            "calibration_hotspot_calls": 12,
         },
         "sources": {
             "modules": "modules.json",
@@ -373,7 +414,9 @@ def execute_calibration_cases(modules_path: Path, source_power_windows_path: Pat
             "pss_tolerance_c": settings.pss_tolerance_c,
         },
         "training_hotspot_calls": len(training),
-        "holdout_hotspot_calls": len(holdout),
+        "holdout_initialization_hotspot_calls": len(holdout),
+        "holdout_transient_hotspot_calls": len(holdout),
+        "calibration_hotspot_calls": len(training) + 2 * len(holdout),
         "training_cases": training,
         "holdout_cases": holdout,
     }
