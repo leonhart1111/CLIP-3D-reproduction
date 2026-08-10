@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "name": "transient_rom_balanced2",
+  "experiment_classification": {
+    "mode": "operational-exploratory-transient-rom-balanced2",
+    "non_formal": true,
+    "paper_equivalent": false
+  },
+  "sample_interval_ms": 2.0,
+  "points": [
+    {
+      "workload": "matmul",
+      "l1d_size": "64kB",
+      "l2_size": "512kB"
+    },
+    {
+      "workload": "stencil",
+      "l1d_size": "64kB",
+      "l2_size": "512kB"
+    }
+  ]
+}
