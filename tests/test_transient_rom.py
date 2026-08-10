@@ -35,6 +35,7 @@ from workflow.transient.rom.materialize_calibration import (
     execute_calibration_cases,
 )
 from workflow.transient.rom.layout_rom import (
+    _average_power_steady_state,
     evaluate_layout_rom,
     find_rom_sustainable_frequency,
     interpolate_l2_input,
@@ -1535,6 +1536,71 @@ class ROMEvaluationTests(unittest.TestCase):
             "transient_rom": {"frequencies_ghz": values},
         }
 
+    def test_average_power_equilibrium_matches_first_order_rc(self):
+        # Break caught: keeping the ROM at ambient while real HotSpot starts
+        # from average-power steady state compares different thermal problems.
+        model = StateSpaceTests.first_order_model(a=-2.0, b=3.0)
+
+        state, audit = _average_power_steady_state(
+            model,
+            model.b_l2_anchors["a0"],
+            [(0.25, numpy.array([4.0])), (0.75, numpy.array([4.0]))],
+            max_condition_number=1.0e10,
+        )
+
+        self.assertAlmostEqual(state[0], 6.0, places=12)
+        self.assertEqual(audit["method"], "average_power_continuous_equilibrium")
+        self.assertLessEqual(audit["normalized_residual"], 1.0e-10)
+
+    def test_average_power_equilibrium_weights_unequal_durations(self):
+        # Break caught: an unweighted row mean disagrees with the physical
+        # energy average when trace windows have unequal durations.
+        model = StateSpaceTests.first_order_model(a=-2.0, b=3.0)
+
+        state, audit = _average_power_steady_state(
+            model,
+            model.b_l2_anchors["a0"],
+            [(0.25, numpy.array([2.0])), (0.75, numpy.array([6.0]))],
+            max_condition_number=1.0e10,
+        )
+
+        self.assertAlmostEqual(audit["mean_power_w"][0], 5.0, places=12)
+        self.assertAlmostEqual(state[0], 7.5, places=12)
+
+    def test_average_power_equilibrium_rejects_ill_conditioned_state_matrix(self):
+        # Break caught: solving a nearly singular A can create an arbitrarily
+        # large initialization that nevertheless contains finite numbers.
+        model = StateSpaceModel(
+            temperature_basis=numpy.eye(2),
+            a_continuous=numpy.diag([-1.0, -1.0e-12]),
+            b_fixed=numpy.empty((2, 0)),
+            b_l2_anchors={"a0": numpy.ones((2, 1))},
+            module_names=(),
+            grid_unit_names=("cell0", "cell1"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "condition number"):
+            _average_power_steady_state(
+                model, model.b_l2_anchors["a0"],
+                [(1.0, numpy.array([1.0]))],
+                max_condition_number=1.0e10,
+            )
+
+    def test_average_power_equilibrium_rejects_large_solve_residual(self):
+        # Break caught: a successful solver return is not sufficient evidence
+        # that the returned state satisfies the thermal equilibrium equation.
+        model = StateSpaceTests.first_order_model(a=-2.0, b=3.0)
+
+        with patch(
+            "workflow.transient.rom.layout_rom.numpy.linalg.solve",
+            return_value=numpy.array([0.0]),
+        ), self.assertRaisesRegex(ValueError, "normalized residual"):
+            _average_power_steady_state(
+                model, model.b_l2_anchors["a0"],
+                [(1.0, numpy.array([4.0]))],
+                max_condition_number=1.0e10,
+            )
+
     def test_anchor_interpolation_is_exact_and_extrapolation_fails(self):
         # Break caught: blending tiers/anchors or silently extrapolating can
         # manufacture an input matrix unsupported by calibration evidence.
@@ -1576,7 +1642,7 @@ class ROMEvaluationTests(unittest.TestCase):
                            "tsafe_c": 100.0}},
         )
 
-        expected_rise = 10.0 * (1.0 - math.exp(-1.0))
+        expected_rise = 10.0
         self.assertAlmostEqual(result["frequency_scale"], 2.0)
         self.assertEqual(result["module_order"], ["core0", "shared_l2"])
         self.assertAlmostEqual(result["final_period_grid_c"][-1][0],
@@ -1585,21 +1651,37 @@ class ROMEvaluationTests(unittest.TestCase):
                                25.0 + expected_rise, places=12)
         self.assertTrue(result["last_period_peak"]["includes_period_initial_state"])
         self.assertTrue(result["converged"])
+        self.assertEqual(
+            result["thermal_initialization"]["method"],
+            "average_power_continuous_equilibrium",
+        )
 
-    def test_rom_does_not_accept_an_early_tolerance_dip(self):
-        # Break caught: stopping at any early small endpoint delta can certify
-        # a non-normal ROM response whose final fixed-horizon delta is unsafe.
+    def test_rom_evaluates_fixed_horizon_after_early_tolerance_hit(self):
+        # Break caught: stopping when an intermediate endpoint delta first
+        # enters tolerance would make ROM evidence use fewer configured periods.
         settings = replace(
             self.settings(), pss_period_repeats=3, pss_tolerance_c=0.11,
         )
+        power_windows = self.power_windows()
+        second = {
+            **power_windows["windows"][0],
+            "modules": [
+                dict(module) for module in power_windows["windows"][0]["modules"]
+            ],
+        }
+        second["modules"][0].update(
+            dynamic_power_w=4.0, total_power_w=4.5,
+        )
+        power_windows["windows"].append(second)
 
         result = evaluate_layout_rom(
-            self.non_normal_model(), self.design(), self.power_windows(),
+            self.non_normal_model(), self.design(), power_windows,
             self.layout(), 2.0, settings, self.config(),
         )
 
         self.assertEqual(result["periods_evaluated"], settings.pss_period_repeats)
-        self.assertFalse(result["converged"])
+        self.assertEqual(len(result["period_end_deltas_max_c"]), 2)
+        self.assertTrue(result["converged"])
 
     def test_partial_final_window_uses_full_hotspot_sampling_interval(self):
         # Break caught: integrating the final partial ROI duration makes the
@@ -1620,9 +1702,13 @@ class ROMEvaluationTests(unittest.TestCase):
                            "tsafe_c": 100.0}},
         )
 
-        expected_rise = 10.0 * (1.0 - math.exp(-2.0))
+        expected_rise = 10.0
         self.assertAlmostEqual(
             result["final_period_grid_c"][-1][0], 25.0 + expected_rise,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            result["thermal_initialization"]["period_duration_s"], 1.0,
             places=12,
         )
 

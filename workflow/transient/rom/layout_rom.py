@@ -19,6 +19,7 @@ from workflow.transient.verify_sustainable_frequency import find_sustainable_fre
 
 _NEGATIVE_WEIGHT_TOLERANCE = -1e-12
 _DEGENERATE_RELATIVE_TOLERANCE = 1e-14
+_STEADY_SOLVE_RESIDUAL_LIMIT = 1e-10
 
 
 def _finite(value: Any, name: str) -> float:
@@ -272,10 +273,93 @@ def _temperature(model: StateSpaceModel, state: numpy.ndarray,
     return grid + ambient_c
 
 
+def _average_power_steady_state(
+    model: StateSpaceModel,
+    b_l2: numpy.ndarray,
+    period_inputs: list[tuple[float, numpy.ndarray]],
+    max_condition_number: float,
+) -> tuple[numpy.ndarray, dict]:
+    """Solve ``A x + B(l) mean(u) = 0`` with fail-closed diagnostics."""
+    if not isinstance(model, StateSpaceModel):
+        raise ValueError("model must be a StateSpaceModel")
+    a_continuous = numpy.asarray(model.a_continuous, dtype=float)
+    b_fixed = numpy.asarray(model.b_fixed, dtype=float)
+    b_l2 = numpy.asarray(b_l2, dtype=float)
+    rank = numpy.asarray(model.temperature_basis, dtype=float).shape[1]
+    if (a_continuous.shape != (rank, rank)
+            or b_fixed.shape != (rank, len(model.module_names))
+            or b_l2.shape != (rank, 1)
+            or not numpy.all(numpy.isfinite(a_continuous))
+            or not numpy.all(numpy.isfinite(b_fixed))
+            or not numpy.all(numpy.isfinite(b_l2))):
+        raise ValueError("ROM steady initialization matrices are malformed")
+    limit = _positive(max_condition_number, "max_condition_number")
+    condition_number = float(numpy.linalg.cond(a_continuous))
+    if (not math.isfinite(condition_number)
+            or condition_number > limit):
+        raise ValueError(
+            "ROM steady initialization state matrix condition number "
+            f"{condition_number} exceeds {limit}"
+        )
+    if not isinstance(period_inputs, list) or not period_inputs:
+        raise ValueError("ROM steady initialization requires period inputs")
+    input_count = len(model.module_names) + 1
+    weighted_power = numpy.zeros(input_count, dtype=float)
+    total_duration = 0.0
+    for index, item in enumerate(period_inputs):
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise ValueError(
+                f"ROM steady initialization period input {index} is malformed"
+            )
+        duration = _positive(item[0], f"period input {index} duration")
+        powers = numpy.asarray(item[1], dtype=float)
+        if (powers.shape != (input_count,)
+                or not numpy.all(numpy.isfinite(powers))
+                or numpy.any(powers < 0.0)):
+            raise ValueError(
+                f"ROM steady initialization period input {index} power is malformed"
+            )
+        weighted_power += duration * powers
+        total_duration += duration
+    mean_power = weighted_power / total_duration
+    b_layout = numpy.concatenate((b_fixed, b_l2), axis=1)
+    forcing = b_layout @ mean_power
+    try:
+        state = numpy.linalg.solve(a_continuous, -forcing)
+    except numpy.linalg.LinAlgError as error:
+        raise ValueError(
+            "ROM steady initialization state matrix solve failed"
+        ) from error
+    if state.shape != (rank,) or not numpy.all(numpy.isfinite(state)):
+        raise ValueError("ROM steady initialization produced a malformed state")
+    residual = a_continuous @ state + forcing
+    denominator = max(
+        1.0,
+        float(numpy.linalg.norm(a_continuous) * numpy.linalg.norm(state)
+              + numpy.linalg.norm(forcing)),
+    )
+    normalized_residual = float(numpy.linalg.norm(residual) / denominator)
+    if (not math.isfinite(normalized_residual)
+            or normalized_residual > _STEADY_SOLVE_RESIDUAL_LIMIT):
+        raise ValueError(
+            "ROM steady initialization normalized residual "
+            f"{normalized_residual} exceeds {_STEADY_SOLVE_RESIDUAL_LIMIT}"
+        )
+    return state, {
+        "method": "average_power_continuous_equilibrium",
+        "condition_number": condition_number,
+        "max_condition_number": limit,
+        "normalized_residual": normalized_residual,
+        "max_normalized_residual": _STEADY_SOLVE_RESIDUAL_LIMIT,
+        "mean_power_w": mean_power.tolist(),
+        "period_duration_s": total_duration,
+    }
+
+
 def evaluate_layout_rom(model: StateSpaceModel, design: dict, power_windows: dict,
                         layout: dict, frequency_ghz: float, settings: ROMSettings,
                         config: dict) -> dict:
-    """Evaluate one layout/frequency from ambient through full-grid PSS."""
+    """Evaluate a layout/frequency from matched average-power steady state."""
     if not isinstance(settings, ROMSettings):
         raise ValueError("settings must be ROMSettings")
     if settings.pss_period_repeats < 2:
@@ -297,8 +381,9 @@ def evaluate_layout_rom(model: StateSpaceModel, design: dict, power_windows: dic
         (*discretize(model, duration, b_l2), powers)
         for duration, powers in period_inputs
     ]
-    rank = numpy.asarray(model.temperature_basis).shape[1]
-    state = numpy.zeros(rank, dtype=float)
+    state, initialization = _average_power_steady_state(
+        model, b_l2, period_inputs, settings.max_condition_number,
+    )
     previous_end = _temperature(model, state, ambient)
     period_end_deltas = []
     converged = False
@@ -337,6 +422,7 @@ def evaluate_layout_rom(model: StateSpaceModel, design: dict, power_windows: dic
             "tier": l2["tier"], "x_mm": float(l2["x_mm"]),
             "y_mm": float(l2["y_mm"]),
         },
+        "thermal_initialization": initialization,
         "periods_evaluated": periods,
         "period_end_deltas_max_c": period_end_deltas,
         "pss_tolerance_c": settings.pss_tolerance_c,
