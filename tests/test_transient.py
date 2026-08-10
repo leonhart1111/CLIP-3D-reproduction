@@ -20,8 +20,12 @@ from workflow.transient.run_hotspot_transient import (
     summarize_period_end_convergence,
     summarize_temperature_samples,
 )
-from workflow.transient.run_hotspot_steady import run_hotspot_steady
+from workflow.transient.run_hotspot_steady import (
+    run_hotspot_steady,
+    validate_hotspot_steady_record,
+)
 from workflow.transient.verify_sustainable_frequency import (
+    TransientThermalEvaluationError,
     last_period_peak,
     search_layout_frequency,
 )
@@ -947,9 +951,11 @@ class TransientTraceTests(unittest.TestCase):
             hotspot = root / "hotspot"
             hotspot.write_text("synthetic executable", encoding="utf-8")
             rows_by_case = {}
+            events = []
 
             def fake_materialize(_modules, _layout, _windows, output, _config,
                                  frequency_scale, _repeats):
+                Path(output).mkdir(parents=True)
                 rows_by_case[str(output)] = frequency_scale * 2.0
                 return {"windows_per_period": 2}
 
@@ -964,14 +970,38 @@ class TransientTraceTests(unittest.TestCase):
                 return ["a", "b"], [[300.0, 300.0], [300.0, 300.0],
                                         [300.0, 300.0], [300.0, 300.0]]
 
+            def fake_steady(case, hotspot):
+                events.append(("steady", Path(case)))
+                steady = Path(case) / "initialization.steady.txt"
+                steady.write_text("a 300.0\nb 300.0\n", encoding="utf-8")
+                return {
+                    "command": [str(hotspot), "-steady_file", steady.name],
+                    "return_code": 0,
+                    "elapsed_seconds": 0.1,
+                }
+
+            def fake_transient(case, hotspot, initial_temperature, steady_source):
+                events.append(("transient", Path(case)))
+                self.assertEqual(initial_temperature, "steady")
+                self.assertEqual(
+                    steady_source, Path(case) / "initialization.steady.txt"
+                )
+                return {
+                    "command": [str(hotspot), "-init_file", "initial.steady.txt"],
+                    "trace_peak": {"tmax_c": 0.0},
+                }
+
             with patch(
                 "workflow.transient.verify_sustainable_frequency.validate_power_windows"
             ), patch(
                 "workflow.transient.verify_sustainable_frequency.materialize_trace",
                 side_effect=fake_materialize,
             ), patch(
+                "workflow.transient.verify_sustainable_frequency.run_hotspot_steady",
+                side_effect=fake_steady,
+            ), patch(
                 "workflow.transient.verify_sustainable_frequency.run_hotspot_transient",
-                return_value={"trace_peak": {"tmax_c": 0.0}},
+                side_effect=fake_transient,
             ), patch(
                 "workflow.transient.verify_sustainable_frequency.parse_ttrace_grid",
                 side_effect=fake_grid,
@@ -995,6 +1025,57 @@ class TransientTraceTests(unittest.TestCase):
             self.assertEqual(len(result["search"]["safe_unsafe_brackets"]), 2)
             self.assertGreater(result["f_sus_trans_ghz"], 1.5)
             self.assertLess(result["f_sus_trans_ghz"], 2.0)
+            self.assertTrue(all(
+                evaluation["initialization_hotspot_calls"] == 1
+                and evaluation["transient_hotspot_calls"] == 1
+                and evaluation["hotspot_calls"] == 2
+                for evaluation in evaluations.values()
+            ))
+            self.assertEqual(len(events) % 2, 0)
+            self.assertTrue(all(
+                events[index][0] == "steady"
+                and events[index + 1] == ("transient", events[index][1])
+                for index in range(0, len(events), 2)
+            ))
+
+    def test_frequency_search_classifies_steady_initialization_failure(self):
+        # Break caught: reporting a failed preconditioner as PSS
+        # nonconvergence would misdiagnose a tool failure as thermal behavior.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("modules.json", "layout.json", "windows.json"):
+                write_json(root / name, {"modules": []})
+            write_json(root / "config.json", {
+                "frequency": {"f0_ghz": 2.0, "tsafe_c": 50.0},
+            })
+            hotspot = root / "hotspot"
+            hotspot.write_text("synthetic executable", encoding="utf-8")
+
+            def fake_materialize(*args):
+                Path(args[3]).mkdir(parents=True)
+                return {"windows_per_period": 1}
+
+            with patch(
+                "workflow.transient.verify_sustainable_frequency.validate_power_windows"
+            ), patch(
+                "workflow.transient.verify_sustainable_frequency.materialize_trace",
+                side_effect=fake_materialize,
+            ), patch(
+                "workflow.transient.verify_sustainable_frequency.run_hotspot_steady",
+                side_effect=RuntimeError("steady HotSpot rc=9"),
+            ), self.assertRaises(TransientThermalEvaluationError) as raised:
+                search_layout_frequency(
+                    root / "modules.json", root / "layout.json",
+                    root / "windows.json", root / "output",
+                    root / "config.json", frequencies_ghz=[1.0, 2.0],
+                    period_repeats=2, pss_tolerance_c=0.01,
+                    frequency_tolerance_ghz=0.01, hotspot=hotspot,
+                )
+
+            self.assertEqual(
+                raised.exception.category,
+                "steady_initialization_tool_failure",
+            )
 
     def test_last_period_peak_rejects_boolean_period_length(self):
         """Catch bool values being accepted as integer period lengths."""
@@ -1138,6 +1219,62 @@ class HotSpotSteadyInitializationTests(unittest.TestCase):
                     *result["output_sha256"].values(),
                 ]
             ))
+
+    def test_steady_record_rejects_changed_initialization_output(self):
+        # Break caught: reusing a changed initialization file after its solve
+        # would make the transient command scientifically unbound.
+        with tempfile.TemporaryDirectory() as temporary:
+            case = Path(temporary) / "case"
+            case.mkdir()
+            hotspot = Path(temporary) / "hotspot"
+            hotspot.write_text("synthetic executable\n", encoding="utf-8")
+            for name, payload in (
+                ("hotspot.config", "config\n"),
+                ("power_transient.ptrace", "unit\n1.0\n"),
+                ("stack.lcf", "stack\n"),
+                ("materials.txt", "material\n"),
+                ("initialization.steady.txt", "unit 390.0\n"),
+                ("initialization.grid.steady.txt", "cell0 390.0\n"),
+            ):
+                (case / name).write_text(payload, encoding="utf-8")
+            record = {
+                "command": [
+                    str(hotspot),
+                    "-steady_file", "initialization.steady.txt",
+                    "-grid_steady_file", "initialization.grid.steady.txt",
+                ],
+                "return_code": 0,
+                "input_sha256": {
+                    **{
+                        name: "sha256:" + hashlib.sha256(
+                            (case / name).read_bytes()
+                        ).hexdigest()
+                        for name in (
+                            "hotspot.config", "power_transient.ptrace",
+                            "stack.lcf", "materials.txt",
+                        )
+                    },
+                    "hotspot_binary": "sha256:" + hashlib.sha256(
+                        hotspot.read_bytes()
+                    ).hexdigest(),
+                },
+                "output_sha256": {
+                    name: "sha256:" + hashlib.sha256(
+                        (case / name).read_bytes()
+                    ).hexdigest()
+                    for name in (
+                        "initialization.steady.txt",
+                        "initialization.grid.steady.txt",
+                    )
+                },
+            }
+            write_json(case / "steady_initialization.json", record)
+            (case / "initialization.steady.txt").write_text(
+                "unit 450.0\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ValueError, "output hashes differ"):
+                validate_hotspot_steady_record(case, hotspot)
 
 
 class TransientComparisonTests(unittest.TestCase):

@@ -2686,7 +2686,8 @@ class ROMOptimizerTests(unittest.TestCase):
     def test_optimizer_recomputes_and_rejects_forged_peak_error(self):
         self.assert_persisted_holdout_forgery_rejected(
             lambda holdout: holdout.__setitem__(
-                "peak_temperature_error_c", 0.0
+                "peak_temperature_error_c",
+                float(holdout["peak_temperature_error_c"]) + 0.5,
             )
         )
 
@@ -2891,12 +2892,55 @@ class ROMPipelineTests(unittest.TestCase):
         self, output_dir: Path, frequency_ghz: float, profile: str,
         *, modules_path: Path | None = None, layout_path: Path | None = None,
         power_windows_path: Path | None = None,
-        config_path: Path | None = None,
-    ) -> None:
+        config_path: Path | None = None, hotspot_path: Path | None = None,
+    ) -> dict:
         """Write trace facts without consulting any mocked search evaluation."""
         rows_c = self.final_validation_trace_rows(frequency_ghz, profile)
         case_dir = output_dir / f"frequency_{frequency_ghz.hex()}_ghz"
         case_dir.mkdir(parents=True, exist_ok=True)
+        for name, payload in (
+            ("hotspot.config", "-sampling_intvl 0.002\n"),
+            ("power_transient.ptrace", "cell0\n1.0\n"),
+            ("stack.lcf", "stack\n"),
+            ("materials.txt", "material\n"),
+            ("initialization.steady.txt", "shared_l2 300.0\n"),
+            ("initialization.grid.steady.txt", "cell0 300.0\n"),
+        ):
+            (case_dir / name).write_text(payload, encoding="utf-8")
+        selected_hotspot = self.hotspot if hotspot_path is None else Path(hotspot_path)
+        steady_record = {
+            "command": [
+                str(selected_hotspot.resolve()),
+                "-steady_file", "initialization.steady.txt",
+                "-grid_steady_file", "initialization.grid.steady.txt",
+            ],
+            "return_code": 0,
+            "elapsed_seconds": 0.1,
+            "input_sha256": {
+                **{
+                    name: "sha256:" + hashlib.sha256(
+                        (case_dir / name).read_bytes()
+                    ).hexdigest()
+                    for name in (
+                        "hotspot.config", "power_transient.ptrace",
+                        "stack.lcf", "materials.txt",
+                    )
+                },
+                "hotspot_binary": "sha256:" + hashlib.sha256(
+                    selected_hotspot.read_bytes()
+                ).hexdigest(),
+            },
+            "output_sha256": {
+                name: "sha256:" + hashlib.sha256(
+                    (case_dir / name).read_bytes()
+                ).hexdigest()
+                for name in (
+                    "initialization.steady.txt",
+                    "initialization.grid.steady.txt",
+                )
+            },
+        }
+        write_json(case_dir / "steady_initialization.json", steady_record)
         manifest = {
             "window_count": len(rows_c),
             "windows_per_period": 2,
@@ -2931,6 +2975,7 @@ class ROMPipelineTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        return steady_record
 
     def final_validation(
         self, profile: str = "baseline", output_dir: Path | None = None,
@@ -2947,11 +2992,12 @@ class ROMPipelineTests(unittest.TestCase):
         artifact_root.mkdir(parents=True, exist_ok=True)
 
         def evaluate(frequency_ghz: float) -> dict:
-            self.write_final_validation_trace(
+            steady_initialization = self.write_final_validation_trace(
                 artifact_root, frequency_ghz, profile,
                 modules_path=modules_path, layout_path=layout_path,
                 power_windows_path=power_windows_path,
                 config_path=config_path,
+                hotspot_path=hotspot_path,
             )
             case_dir = artifact_root / f"frequency_{frequency_ghz.hex()}_ghz"
             names, rows_k = parse_ttrace_grid(case_dir / "transient.ttrace")
@@ -2969,6 +3015,11 @@ class ROMPipelineTests(unittest.TestCase):
                 "trace_peak_c": max(
                     temperature for row in rows_k for temperature in row
                 ) - 273.15,
+                "initial_temperature": "average_power_steady",
+                "steady_initialization": steady_initialization,
+                "initialization_hotspot_calls": 1,
+                "transient_hotspot_calls": 1,
+                "hotspot_calls": 2,
             }
 
         search = find_sustainable_frequency(evaluate, grid, 50.0, 0.01)
@@ -3473,6 +3524,7 @@ class ROMPipelineTests(unittest.TestCase):
         def fail_after_launch(*args, **kwargs):
             case = Path(args[3]) / "frequency_0x1.0000000000000p+0_ghz"
             case.mkdir(parents=True)
+            write_json(case / "steady_initialization.json", {"return_code": 0})
             (case / "hotspot_transient.log").write_text(
                 "HotSpot failed\n", encoding="utf-8"
             )
@@ -3515,7 +3567,9 @@ class ROMPipelineTests(unittest.TestCase):
         self.assertIn("rc=9", result["final_validation_failure"]["message"])
         self.assertEqual(result["f_sus_trans_rom_pred_ghz"], 1.9)
         self.assertEqual(result["bips1_trans_rom_pred"], 3.8)
-        self.assertEqual(result["final_validation_hotspot_calls"], 1)
+        self.assertEqual(result["final_initialization_hotspot_calls"], 1)
+        self.assertEqual(result["final_transient_hotspot_calls"], 1)
+        self.assertEqual(result["final_validation_hotspot_calls"], 2)
         self.assertIsNone(result["bips2_trans"])
         self.assertTrue((self.output / "transient_rom_summary.json").is_file())
 
@@ -3599,6 +3653,28 @@ class ROMPipelineTests(unittest.TestCase):
         returned["search"]["evaluations"] = {"not": "a list"}
 
         self.assert_final_validation_contract_failure(returned)
+
+    def test_final_missing_matched_initialization_is_contract_failure(self):
+        # Break caught: accepting an evaluation without paired steady/transient
+        # call evidence can silently restore the old ambient-start behavior.
+        self.prepared()
+        self.optimization()
+        returned = self.final_validation(
+            modules_path=self.modules,
+            layout_path=self.proposed_layout,
+            power_windows_path=self.power_windows,
+            config_path=self.config_path,
+            hotspot_path=self.hotspot,
+        )
+        evaluation = returned["search"]["evaluations"][0]
+        evaluation.pop("initial_temperature")
+        evaluation.pop("initialization_hotspot_calls")
+
+        result = self.assert_final_validation_contract_failure(returned)
+        self.assertIn(
+            "matched average-power initialization",
+            result["final_validation_failure"]["message"],
+        )
 
     def test_final_missing_sustainable_frequency_is_contract_failure(self):
         returned = self.final_validation()
@@ -3740,7 +3816,9 @@ class ROMPipelineTests(unittest.TestCase):
         model = object()
         cases = {
             "training_hotspot_calls": 8,
-            "holdout_hotspot_calls": 2,
+            "holdout_initialization_hotspot_calls": 2,
+            "holdout_transient_hotspot_calls": 2,
+            "calibration_hotspot_calls": 12,
             "training_cases": [{"id": str(i)} for i in range(8)],
             "holdout_cases": [{"id": "h0"}, {"id": "h1"}],
         }
@@ -3802,7 +3880,7 @@ class ROMPipelineTests(unittest.TestCase):
             )
 
         self.assertEqual(events, ["accepted", "optimize"])
-        self.assertEqual(result["calibration_hotspot_calls"], 10)
+        self.assertEqual(result["calibration_hotspot_calls"], 12)
         self.assertEqual(result["rom_package_status"], "calibrated")
         self.assertEqual(
             result["rom_acceptance"]["identity"]["power_trace"],
@@ -3877,10 +3955,16 @@ class ROMPipelineTests(unittest.TestCase):
         self.assertEqual(result["rom_package"], str(package.resolve()))
         self.assertEqual(result["rom_package_status"], "reused")
         self.assertEqual(result["training_hotspot_calls"], 8)
-        self.assertEqual(result["holdout_hotspot_calls"], 2)
-        self.assertEqual(result["calibration_hotspot_calls"], 10)
+        self.assertEqual(result["holdout_initialization_hotspot_calls"], 2)
+        self.assertEqual(result["holdout_transient_hotspot_calls"], 2)
+        self.assertEqual(result["calibration_hotspot_calls"], 12)
         self.assertEqual(result["training_hotspot_calls_this_invocation"], 0)
-        self.assertEqual(result["holdout_hotspot_calls_this_invocation"], 0)
+        self.assertEqual(
+            result["holdout_initialization_hotspot_calls_this_invocation"], 0
+        )
+        self.assertEqual(
+            result["holdout_transient_hotspot_calls_this_invocation"], 0
+        )
         self.assertEqual(result["calibration_hotspot_calls_this_invocation"], 0)
         self.assertEqual(result["rom_holdout_validation"], persisted_validation)
 

@@ -45,6 +45,7 @@ from workflow.transient.run_hotspot_transient import (
     parse_ttrace_grid,
     summarize_period_end_convergence,
 )
+from workflow.transient.run_hotspot_steady import validate_hotspot_steady_record
 from workflow.transient.generate_hotspot_trace import trace_input_identity
 from workflow.transient.run_transient_pipeline import (
     prepare_power_windows,
@@ -206,6 +207,15 @@ def _validate_final_search_result(
             raise ValueError(
                 f"final HotSpot evaluation {index} must be a dictionary"
             )
+        if (evaluation.get("initial_temperature")
+                != "average_power_steady"
+                or evaluation.get("initialization_hotspot_calls") != 1
+                or evaluation.get("transient_hotspot_calls") != 1
+                or evaluation.get("hotspot_calls") != 2):
+            raise ValueError(
+                f"final HotSpot evaluation {index} matched average-power "
+                "initialization evidence differs"
+            )
         item_frequency = finite_number(
             evaluation.get("frequency_ghz"),
             f"final HotSpot evaluation {index} frequency", positive=True,
@@ -230,6 +240,11 @@ def _validate_final_search_result(
         convergence_delta(recorded_convergence, index)
         case_dir = artifact_root / f"frequency_{item_frequency.hex()}_ghz"
         try:
+            validate_hotspot_steady_record(
+                case_dir,
+                hotspot,
+                evaluation.get("steady_initialization"),
+            )
             manifest = read_json(case_dir / "transient_trace_manifest.json")
             if not isinstance(manifest, dict):
                 raise ValueError("trace manifest must be a dictionary")
@@ -411,6 +426,67 @@ def _contains_key(value: object, key: str) -> bool:
     if isinstance(value, list):
         return any(_contains_key(nested, key) for nested in value)
     return False
+
+
+def _calibration_call_accounting(cases: dict | None,
+                                 package_status: str) -> dict:
+    values = cases if isinstance(cases, dict) else {}
+    training = int(values.get("training_hotspot_calls", 0))
+    holdout_initialization = int(
+        values.get("holdout_initialization_hotspot_calls", 0)
+    )
+    holdout_transient = int(values.get("holdout_transient_hotspot_calls", 0))
+    total = int(values.get("calibration_hotspot_calls", 0))
+    if total != training + holdout_initialization + holdout_transient:
+        raise ValueError("transient ROM calibration HotSpot call accounting differs")
+    fresh = package_status == "calibrated"
+    return {
+        "training_hotspot_calls": training,
+        "holdout_initialization_hotspot_calls": holdout_initialization,
+        "holdout_transient_hotspot_calls": holdout_transient,
+        "calibration_hotspot_calls": total,
+        "training_hotspot_calls_this_invocation": training if fresh else 0,
+        "holdout_initialization_hotspot_calls_this_invocation": (
+            holdout_initialization if fresh else 0
+        ),
+        "holdout_transient_hotspot_calls_this_invocation": (
+            holdout_transient if fresh else 0
+        ),
+        "calibration_hotspot_calls_this_invocation": total if fresh else 0,
+    }
+
+
+def _final_hotspot_call_accounting(output_dir: Path,
+                                   evaluations: list[dict]) -> dict:
+    initialization_from_evaluations = sum(
+        int(value.get("initialization_hotspot_calls", 0))
+        for value in evaluations if isinstance(value, dict)
+    )
+    transient_from_evaluations = sum(
+        int(value.get("transient_hotspot_calls", 0))
+        for value in evaluations if isinstance(value, dict)
+    )
+    initialization_artifacts = 0
+    transient_artifacts = 0
+    if Path(output_dir).is_dir():
+        for case in Path(output_dir).iterdir():
+            if not case.is_dir() or not case.name.startswith("frequency_"):
+                continue
+            if ((case / "steady_initialization.json").is_file()
+                    or (case / "hotspot_steady.log").is_file()):
+                initialization_artifacts += 1
+            if ((case / "transient_result.json").is_file()
+                    or (case / "hotspot_transient.log").is_file()):
+                transient_artifacts += 1
+    initialization = max(
+        initialization_from_evaluations, initialization_artifacts
+    )
+    transient = max(transient_from_evaluations, transient_artifacts)
+    return {
+        "final_initialization_hotspot_calls": initialization,
+        "final_transient_hotspot_calls": transient,
+        "final_validation_hotspot_calls": initialization + transient,
+    }
 
 
 _CLASSIFICATION = ROM_CLASSIFICATION
@@ -640,9 +716,11 @@ def _run_final_branch(
     except (OSError, RuntimeError, ValueError) as error:
         output_dir.mkdir(parents=True, exist_ok=True)
         failure = {
-            "category": (
+            "category": getattr(
+                error,
+                "category",
                 "validation_contract_error"
-                if isinstance(error, ValueError) else "tool_error"
+                if isinstance(error, ValueError) else "tool_error",
             ),
             "error_type": type(error).__name__,
             "message": str(error),
@@ -660,14 +738,9 @@ def _run_final_branch(
     evaluations = search.get("evaluations") if isinstance(search, dict) else None
     if not isinstance(evaluations, list):
         evaluations = []
-    materialized = (
-        sum(
-            1 for path in output_dir.iterdir()
-            if path.is_dir() and path.name.startswith("frequency_")
-        )
-        if output_dir.is_dir() else 0
+    hotspot_call_accounting = _final_hotspot_call_accounting(
+        output_dir, evaluations,
     )
-    hotspot_calls = max(len(evaluations), materialized)
     f_hotspot = validation.get("f_sus_trans_ghz")
     if failure is None:
         nonconverged = [
@@ -747,7 +820,8 @@ def _run_final_branch(
             if branch == "clip3d" else None
         ),
         **branch_metrics(None, f_hotspot),
-        "hotspot_evaluations": hotspot_calls,
+        "hotspot_evaluations": len(evaluations),
+        **hotspot_call_accounting,
         "r2_requested": execute_r2,
         "r2_executed": False,
         "r2_critical_path_cycles": (
@@ -1073,14 +1147,8 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
             r2_requested=execute_r2,
         )
 
-        cases = calibration_cases or {}
-        historical_training_calls = int(cases.get("training_hotspot_calls", 0))
-        historical_holdout_calls = int(cases.get("holdout_hotspot_calls", 0))
-        invocation_training_calls = (
-            historical_training_calls if package_status == "calibrated" else 0
-        )
-        invocation_holdout_calls = (
-            historical_holdout_calls if package_status == "calibrated" else 0
+        calibration_call_accounting = _calibration_call_accounting(
+            calibration_cases, package_status,
         )
         branches = {"fixed_bin": fixed_branch, "clip3d": clip_branch}
         if any(branch.get("failure") is not None for branch in branches.values()):
@@ -1117,22 +1185,21 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
             "rom_package_status": package_status,
             "rom_acceptance": package_acceptance,
             "rom_holdout_validation": calibration_acceptance,
-            "training_hotspot_calls": historical_training_calls,
-            "holdout_hotspot_calls": historical_holdout_calls,
-            "calibration_hotspot_calls": (
-                historical_training_calls + historical_holdout_calls
-            ),
-            "training_hotspot_calls_this_invocation": invocation_training_calls,
-            "holdout_hotspot_calls_this_invocation": invocation_holdout_calls,
-            "calibration_hotspot_calls_this_invocation": (
-                invocation_training_calls + invocation_holdout_calls
-            ),
+            **calibration_call_accounting,
             "optimizer_hotspot_calls": optimization.get(
                 "hotspot_calls_inside_optimizer"
             ),
             "optimization_reused": optimization_reused,
+            "final_initialization_hotspot_calls": sum(
+                int(branch["final_initialization_hotspot_calls"])
+                for branch in branches.values()
+            ),
+            "final_transient_hotspot_calls": sum(
+                int(branch["final_transient_hotspot_calls"])
+                for branch in branches.values()
+            ),
             "final_validation_hotspot_calls": sum(
-                int(branch["hotspot_evaluations"])
+                int(branch["final_validation_hotspot_calls"])
                 for branch in branches.values()
             ),
             "r2_requested": execute_r2,
@@ -1211,9 +1278,11 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
     except (OSError, RuntimeError, ValueError) as error:
         final_validation_dir.mkdir(parents=True, exist_ok=True)
         final_validation_failure = {
-            "category": (
+            "category": getattr(
+                error,
+                "category",
                 "validation_contract_error"
-                if isinstance(error, ValueError) else "tool_error"
+                if isinstance(error, ValueError) else "tool_error",
             ),
             "error_type": type(error).__name__,
             "message": str(error),
@@ -1235,14 +1304,9 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
     evaluations = search.get("evaluations") if isinstance(search, dict) else None
     if not isinstance(evaluations, list):
         evaluations = []
-    materialized_final_cases = (
-        sum(
-            1 for path in final_validation_dir.iterdir()
-            if path.is_dir() and path.name.startswith("frequency_")
-        )
-        if final_validation_dir.is_dir() else 0
+    final_hotspot_call_accounting = _final_hotspot_call_accounting(
+        final_validation_dir, evaluations,
     )
-    final_validation_hotspot_calls = max(len(evaluations), materialized_final_cases)
     f_hotspot = final_validation.get("f_sus_trans_ghz")
     if final_validation_failure is None:
         nonconverged = [
@@ -1300,11 +1364,9 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
 
     f_rom = selected.get("f_sus_trans_rom_ghz")
     bips1_rom = selected.get("bips1_trans_rom_pred")
-    cases = calibration_cases or {}
-    historical_training_calls = int(cases.get("training_hotspot_calls", 0))
-    historical_holdout_calls = int(cases.get("holdout_hotspot_calls", 0))
-    invocation_training_calls = historical_training_calls if package_status == "calibrated" else 0
-    invocation_holdout_calls = historical_holdout_calls if package_status == "calibrated" else 0
+    calibration_call_accounting = _calibration_call_accounting(
+        calibration_cases, package_status,
+    )
     summary = {
         "schema_version": 1,
         "mode": "transient ROM layout optimization with real-HotSpot validation",
@@ -1328,19 +1390,12 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
         "rom_package_status": package_status,
         "rom_acceptance": package_acceptance,
         "rom_holdout_validation": calibration_acceptance,
-        "training_hotspot_calls": historical_training_calls,
-        "holdout_hotspot_calls": historical_holdout_calls,
-        "calibration_hotspot_calls": historical_training_calls + historical_holdout_calls,
-        "training_hotspot_calls_this_invocation": invocation_training_calls,
-        "holdout_hotspot_calls_this_invocation": invocation_holdout_calls,
-        "calibration_hotspot_calls_this_invocation": (
-            invocation_training_calls + invocation_holdout_calls
-        ),
+        **calibration_call_accounting,
         "optimizer_hotspot_calls": optimization.get(
             "hotspot_calls_inside_optimizer"
         ),
         "optimization_reused": optimization_reused,
-        "final_validation_hotspot_calls": final_validation_hotspot_calls,
+        **final_hotspot_call_accounting,
         "final_validation_classification": final_validation_classification,
         "final_validation_failure": final_validation_failure,
         "f_sus_trans_rom_pred_ghz": f_rom,

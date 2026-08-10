@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import time
 
-from workflow.common import sha256_file, write_json
+from workflow.common import read_json, sha256_file, write_json
 from workflow.transient.run_hotspot_transient import (
     DEFAULT_HOTSPOT,
     read_named_temperatures,
@@ -35,6 +35,58 @@ def _regular_file(path: Path, label: str) -> Path:
 
 def _sha256(path: Path) -> str:
     return "sha256:" + sha256_file(path)
+
+
+def validate_hotspot_steady_record(
+    case_dir: Path,
+    hotspot: Path = DEFAULT_HOTSPOT,
+    expected_record: dict | None = None,
+) -> dict:
+    """Rehash and validate one persisted matched steady initialization."""
+    raw_case = Path(case_dir)
+    if raw_case.is_symlink() or not raw_case.is_dir():
+        raise FileNotFoundError(
+            f"steady initialization case must be a regular directory: {raw_case}"
+        )
+    case_dir = raw_case.resolve()
+    hotspot = _regular_file(Path(hotspot), "HotSpot binary")
+    record_path = _regular_file(
+        case_dir / "steady_initialization.json",
+        "steady initialization record",
+    )
+    record = read_json(record_path)
+    if not isinstance(record, dict):
+        raise ValueError("steady initialization record must be a dictionary")
+    if expected_record is not None and record != expected_record:
+        raise ValueError("steady initialization returned and persisted records differ")
+    command = record.get("command")
+    if (not isinstance(command, list) or "-o" in command
+            or "-steady_file" not in command
+            or "-grid_steady_file" not in command
+            or record.get("return_code") != 0):
+        raise ValueError("steady initialization command evidence differs")
+    inputs = {
+        name: _regular_file(
+            case_dir / name, f"steady initialization input {name}"
+        )
+        for name in _INPUT_FILES
+    }
+    expected_inputs = {
+        **{name: _sha256(path) for name, path in inputs.items()},
+        "hotspot_binary": _sha256(hotspot),
+    }
+    outputs = {
+        name: _regular_file(
+            case_dir / name, f"steady initialization output {name}"
+        )
+        for name in _OUTPUT_FILES
+    }
+    expected_outputs = {name: _sha256(path) for name, path in outputs.items()}
+    if record.get("input_sha256") != expected_inputs:
+        raise ValueError("steady initialization input hashes differ")
+    if record.get("output_sha256") != expected_outputs:
+        raise ValueError("steady initialization output hashes differ")
+    return record
 
 
 def run_hotspot_steady(case_dir: Path,
@@ -133,5 +185,4 @@ def run_hotspot_steady(case_dir: Path,
         },
     }
     write_json(case_dir / "steady_initialization.json", result)
-    return result
-
+    return validate_hotspot_steady_record(case_dir, hotspot, result)

@@ -13,8 +13,17 @@ from workflow.transient.run_hotspot_transient import (
     DEFAULT_HOTSPOT, parse_ttrace_grid, run_hotspot_transient,
     summarize_period_end_convergence,
 )
+from workflow.transient.run_hotspot_steady import run_hotspot_steady
 from workflow.transient.run_transient_pipeline import validate_steady_output
 from workflow.transient.validation import validate_power_windows
+
+
+class TransientThermalEvaluationError(RuntimeError):
+    """A final thermal evaluation failure with an explicit audit category."""
+
+    def __init__(self, category: str, message: str):
+        super().__init__(message)
+        self.category = category
 
 
 def _positive(value: object, label: str) -> float:
@@ -158,13 +167,42 @@ def search_layout_frequency(modules_path: Path, layout_path: Path,
         case = output_dir / f"frequency_{frequency_ghz.hex()}_ghz"
         trace = materialize_trace(modules_path, layout_path, power_windows_path, case,
                                   config, frequency_ghz / f0, period_repeats)
-        thermal = run_hotspot_transient(case, hotspot=hotspot, initial_temperature="ambient")
+        try:
+            initialization = run_hotspot_steady(case, hotspot=hotspot)
+        except (OSError, RuntimeError) as error:
+            raise TransientThermalEvaluationError(
+                "steady_initialization_tool_failure", str(error)
+            ) from error
+        except ValueError as error:
+            raise TransientThermalEvaluationError(
+                "steady_initialization_contract_failure", str(error)
+            ) from error
+        try:
+            thermal = run_hotspot_transient(
+                case,
+                hotspot=hotspot,
+                initial_temperature="steady",
+                steady_source=case / "initialization.steady.txt",
+            )
+        except (OSError, RuntimeError) as error:
+            raise TransientThermalEvaluationError(
+                "transient_hotspot_tool_failure", str(error)
+            ) from error
+        except ValueError as error:
+            raise TransientThermalEvaluationError(
+                "transient_hotspot_contract_failure", str(error)
+            ) from error
         names, rows = parse_ttrace_grid(case / "transient.ttrace")
         convergence = summarize_period_end_convergence(rows, trace["windows_per_period"])
         peak = last_period_peak(rows, trace["windows_per_period"])
         return {"frequency_ghz": frequency_ghz, "converged": convergence["period_count"] >= 2 and convergence["last_delta_max_c"] <= tolerance,
                 "last_period_peak_c": peak["tmax_c"], "last_period_peak_unit": names[peak["unit_index"]],
-                "period_end_convergence": convergence, "trace_peak_c": thermal["trace_peak"]["tmax_c"]}
+                "period_end_convergence": convergence, "trace_peak_c": thermal["trace_peak"]["tmax_c"],
+                "initial_temperature": "average_power_steady",
+                "steady_initialization": initialization,
+                "initialization_hotspot_calls": 1,
+                "transient_hotspot_calls": 1,
+                "hotspot_calls": 2}
 
     search = find_sustainable_frequency(evaluate, grid, tsafe, frequency_tolerance_ghz)
     result = {"schema_version": 1, "mode": "operational transient sustainable-frequency verification", "non_formal": True, "paper_equivalent": False,
