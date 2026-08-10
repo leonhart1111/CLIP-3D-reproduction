@@ -1240,6 +1240,12 @@ class HotSpotSteadyInitializationTests(unittest.TestCase):
             record = {
                 "command": [
                     str(hotspot),
+                    "-c", "hotspot.config",
+                    "-p", "power_transient.ptrace",
+                    "-grid_layer_file", "stack.lcf",
+                    "-materials_file", "materials.txt",
+                    "-model_type", "grid",
+                    "-detailed_3D", "on",
                     "-steady_file", "initialization.steady.txt",
                     "-grid_steady_file", "initialization.grid.steady.txt",
                 ],
@@ -1274,6 +1280,46 @@ class HotSpotSteadyInitializationTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, "output hashes differ"):
+                validate_hotspot_steady_record(case, hotspot)
+
+    def test_steady_record_rejects_noncanonical_input_argument(self):
+        # Break caught: flag-presence validation must not accept a steady solve
+        # that read a different power trace while retaining the output flags.
+        with tempfile.TemporaryDirectory() as temporary:
+            case = Path(temporary) / "case"
+            case.mkdir()
+            for name, payload in (
+                ("hotspot.config", "config\n"),
+                ("power_transient.ptrace", "unit\n1.0\n"),
+                ("stack.lcf", "stack\n"),
+                ("materials.txt", "material\n"),
+            ):
+                (case / name).write_text(payload, encoding="utf-8")
+            hotspot = Path(temporary) / "hotspot"
+            hotspot.write_text("synthetic executable\n", encoding="utf-8")
+
+            def fake_hotspot(command, **kwargs):
+                cwd = Path(kwargs["cwd"])
+                (cwd / "initialization.steady.txt").write_text(
+                    "unit 390.0\n", encoding="utf-8"
+                )
+                (cwd / "initialization.grid.steady.txt").write_text(
+                    "cell0 390.0\n", encoding="utf-8"
+                )
+                return type("Process", (), {"returncode": 0, "stdout": "ok"})()
+
+            with patch(
+                "workflow.transient.run_hotspot_steady.subprocess.run",
+                side_effect=fake_hotspot,
+            ):
+                run_hotspot_steady(case, hotspot)
+            record_path = case / "steady_initialization.json"
+            record = read_json(record_path)
+            index = record["command"].index("-p") + 1
+            record["command"][index] = "other_power.ptrace"
+            write_json(record_path, record)
+
+            with self.assertRaisesRegex(ValueError, "canonical command"):
                 validate_hotspot_steady_record(case, hotspot)
 
 

@@ -78,7 +78,7 @@ python -m workflow.run_lifting_pipeline \
 
 公共入口会在复用稳态预检之前校验离散搜索控制；偶数网格、未包含 fixed-bin、非法 tier 或不受支持的通信聚合会直接拒绝。fixed-bin 与 CLIP 两个优化候选各自输出的 `r2_wire_cycles` 都必须与本分支 `r2_latency.json` 的 `components_cycles.layout_wire` 及 `layout_delays.traffic_weighted_wire_cycles` 完全相等，否则两次 R2 都不会启动，并在不一致的分支留下 `integer_cycle_identity` 失败记录。
 
-接受包会绑定 canonical R1 元数据、窗口功耗、模块与布局几何、配置、HotSpot 二进制、网格、热堆栈、冷却、允许的 L2 tier，以及完整校准设计（8 个锚点、2 个留出点、插值域和 Delaunay simplices）的哈希/identity。复用只读取包内 `anchors.json`，不会用当前代码重新生成设计；`pod_model.npz` 中的 B_L2 anchor ID、拟合 case 顺序、训练输入/温度哈希、转换阈值和设计哈希必须与 `fit_report.json` 完全一致。复用还会重新读取 `calibration_cases.json` 与 `validation_report.json`，校验训练/留出 case 的点与布局映射、两份留出稳态初值、包内 artifact 哈希、全部留出 gate 和误差阈值，并保留历史留出 RMSE/峰温误差。case artifact 路径只允许相对于包根目录，源 `modules.json` 的原始字节也会复制进包，因此完整包可整体移动后复用；路径逃逸、symlink、证据缺失、清单缺失或清单哈希陈旧都会拒绝复用。不得只复制或修改接受标记。旧的 10-call 环境温度起步包不满足新契约，必须重新校准。
+接受包会绑定 canonical/周期 R1 各自的 `status.json`、`r1_metadata.json`、`stats.txt` 六份原始输入哈希，以及窗口功耗、模块与布局几何、配置、HotSpot 二进制、网格、热堆栈、冷却、允许的 L2 tier 和完整校准设计（8 个锚点、2 个留出点、插值域和 Delaunay simplices）的哈希/identity。复用只读取包内 `anchors.json`，不会用当前代码重新生成设计；`pod_model.npz` 中的 B_L2 anchor ID、拟合 case 顺序、训练输入/温度哈希、转换阈值和设计哈希必须与 `fit_report.json` 完全一致。复用还会重新读取 `calibration_cases.json` 与 `validation_report.json`，校验训练/留出 case 的点与布局映射、两份留出稳态初值、包内 artifact 哈希、全部留出 gate 和误差阈值，并保留历史留出 RMSE/峰温误差。case artifact 路径只允许相对于包根目录，源 `modules.json` 的原始字节也会复制进包，因此完整包可整体移动后复用；路径逃逸、symlink、证据缺失、清单缺失或清单哈希陈旧都会拒绝复用。不得只复制或修改接受标记。旧的 10-call 环境温度起步包不满足新契约，必须重新校准。
 
 ## 固定的 8+2+2 调用及产物
 
@@ -179,6 +179,9 @@ time python -m workflow.transient.run_transient_r1 \
   --sample-ms 2
 ```
 
+这些是“新输出目录”命令。若某目录已有中断尝试，默认不得覆盖，应换一个新目录；
+`--rerun` 只用于用户明确决定放弃该目录旧证据后的恢复，不属于正常可恢复流程。
+
 两个 `status.json` 均为 `success` 后，先只运行 ROM 校准、布局搜索和真实 HotSpot 热验收，不启动 R2：
 
 ```bash
@@ -194,7 +197,9 @@ python -m workflow.experiments.transient_rom_balanced2 \
   --run-r2
 ```
 
-第二条命令会先重新校验两个热 checkpoint，然后在新的 `r2/` 子目录中复用各自的 12-call ROM 包，分别执行 fixed-bin 和 CLIP-3D 的真实 HotSpot/R2。已完成且通过哈希和内容校验的 checkpoint 会复用；非空但不完整的目录不会被覆盖，必须换新的输出根目录。
+第二条命令会先重新校验两个热 checkpoint，然后在新的 `r2/` 子目录中复用各自的 12-call ROM 包，分别执行 fixed-bin 和 CLIP-3D 的真实 HotSpot/R2。checkpoint 绑定 selection、科学配置、稳态基线、canonical/周期 R1、ROM acceptance/manifest、对应 thermal package 和 paired branches 的路径与 SHA-256；复用时还逐项重验 manifest inventory、acceptance 的配置/R1 身份，以及每次真实 `transient_result.json` 的完整 HotSpot 命令。任一输入字节或 live artifact 变化都会拒绝复用。任何已有 point output、状态或日志都视为一次既有尝试，除非完整 checkpoint 重新验证成功，否则不得覆盖，必须换新的输出根目录。
+
+当前通用验证器兼容早期已完成的 12-call 包：若旧 `calibration_cases.json` 尚未显式列出 `initial.steady.txt` 或 `transient_result.json`，验证器只会从同一 case 目录读取这两个文件，并要求它们已被完整 package manifest 绑定。由于这类旧包尚未记录六份原始 R1 哈希，Balanced-2 严格 checkpoint 入口不会复用它们；可重新校准生成带 R1 绑定的新包。旧 10-call ambient-start 包仍然拒绝。
 
 主要产物为：
 

@@ -22,6 +22,12 @@ from workflow.common import (
     write_json,
 )
 from workflow.run_lifting_pipeline import validate_config
+from workflow.transient.rom.contracts import (
+    parse_settings,
+    require_package_calibration_evidence,
+    require_rom_artifact_manifest,
+)
+from workflow.transient.rom.evidence import ROM_CLASSIFICATION
 from workflow.transient.run_transient_r1 import completed as transient_r1_completed
 
 
@@ -181,6 +187,11 @@ def preflight_inputs(
     ):
         raise ValueError("scientific config must remain exploratory transient-ROM")
 
+    global_hashes = {
+        "selection": sha256_file(selection_path),
+        "config": sha256_file(config_path),
+        "steady_baseline_csv": sha256_file(steady_baseline_csv),
+    }
     baseline = _baseline_rows(steady_baseline_csv)
     validated_points = []
     for point in points:
@@ -203,19 +214,28 @@ def preflight_inputs(
             for field in ("workload", "l1d_size", "l2_size")
         ):
             raise ValueError(f"periodic R1 metadata differs from {_point_key(point)}")
+        r1_hashes = {
+            "canonical_status": sha256_file(canonical / "status.json"),
+            "canonical_metadata": sha256_file(canonical / "r1_metadata.json"),
+            "canonical_stats": sha256_file(canonical / "stats.txt"),
+            "periodic_status": sha256_file(periodic / "status.json"),
+            "periodic_metadata": sha256_file(periodic / "r1_metadata.json"),
+            "periodic_stats": sha256_file(periodic / "stats.txt"),
+        }
         validated_points.append({
             **point,
             "key": _point_key(point),
             "canonical_r1": str(canonical),
             "periodic_r1": str(periodic),
             "steady_baseline": _matching_baseline(baseline, point),
-            "input_sha256": {
-                "canonical_status": sha256_file(canonical / "status.json"),
-                "canonical_metadata": sha256_file(canonical / "r1_metadata.json"),
-                "canonical_stats": sha256_file(canonical / "stats.txt"),
-                "periodic_status": sha256_file(periodic / "status.json"),
-                "periodic_metadata": sha256_file(periodic / "r1_metadata.json"),
-                "periodic_stats": sha256_file(periodic / "stats.txt"),
+            "input_sha256": r1_hashes,
+            "checkpoint_identity": {
+                "selection": str(selection_path),
+                "config": str(config_path),
+                "steady_baseline_csv": str(steady_baseline_csv),
+                "canonical_r1": str(canonical),
+                "periodic_r1": str(periodic),
+                "input_sha256": {**global_hashes, **r1_hashes},
             },
         })
 
@@ -228,11 +248,7 @@ def preflight_inputs(
         "selection": str(selection_path),
         "config": str(config_path),
         "steady_baseline_csv": str(steady_baseline_csv),
-        "input_sha256": {
-            "selection": sha256_file(selection_path),
-            "config": sha256_file(config_path),
-            "steady_baseline_csv": sha256_file(steady_baseline_csv),
-        },
+        "input_sha256": global_hashes,
         "points": validated_points,
     }
 
@@ -266,8 +282,121 @@ def _summary_path(point_output: Path) -> Path:
     return point_output / "transient_rom/transient_rom_summary.json"
 
 
+def _checkpoint_path(point_output: Path) -> Path:
+    return point_output / "balanced2_checkpoint.json"
+
+
+def _package_evidence(package: Path, point: dict) -> dict:
+    package = Path(package).resolve()
+    acceptance = package / "rom_acceptance.json"
+    manifest = package / "rom_artifact_manifest.json"
+    acceptance_record = read_json(acceptance) if acceptance.is_file() else None
+    if (
+        not acceptance.is_file()
+        or not manifest.is_file()
+        or not isinstance(acceptance_record, dict)
+        or acceptance_record.get("schema_version") != 1
+        or acceptance_record.get("accepted") is not True
+        or any(
+            acceptance_record.get(field) != value
+            for field, value in ROM_CLASSIFICATION.items()
+        )
+    ):
+        raise ValueError(
+            f"thermal checkpoint ROM package is invalid for {_point_key(point)}"
+        )
+    require_rom_artifact_manifest(package)
+    identity = acceptance_record.get("identity")
+    checkpoint_identity = point.get("checkpoint_identity")
+    input_hashes = (
+        checkpoint_identity.get("input_sha256")
+        if isinstance(checkpoint_identity, dict) else None
+    )
+    if not isinstance(identity, dict) or not isinstance(input_hashes, dict):
+        raise ValueError(f"ROM package identity is invalid for {_point_key(point)}")
+    expected_identities = {
+        "configuration_hash": "sha256:" + str(input_hashes.get("config", "")),
+        "canonical_r1_metadata_hash": (
+            "sha256:" + str(input_hashes.get("canonical_metadata", ""))
+        ),
+        "r1_input_hashes": {
+            field: "sha256:" + str(input_hashes.get(field, ""))
+            for field in (
+                "canonical_status", "canonical_metadata", "canonical_stats",
+                "periodic_status", "periodic_metadata", "periodic_stats",
+            )
+        },
+    }
+    for field, expected in expected_identities.items():
+        if identity.get(field) != expected:
+            label = (
+                "R1 input hash identity"
+                if field == "r1_input_hashes" else field.replace("_", " ")
+            )
+            raise ValueError(f"ROM package {label} differs for {_point_key(point)}")
+    config_value = checkpoint_identity.get("config")
+    if not isinstance(config_value, str):
+        raise ValueError(f"ROM package config identity is invalid for {_point_key(point)}")
+    package_evidence = require_package_calibration_evidence(
+        package, identity, parse_settings(read_json(Path(config_value).resolve()))
+    )
+    if package_evidence.get("acceptance") != acceptance_record:
+        raise ValueError(
+            f"ROM package calibration acceptance differs for {_point_key(point)}"
+        )
+    return {
+        "rom_package": str(package),
+        "rom_acceptance_sha256": sha256_file(acceptance),
+        "rom_manifest_sha256": sha256_file(manifest),
+        "rom_acceptance_record": acceptance_record,
+    }
+
+
+def _checkpoint_record(phase: str, point: dict, artifacts: dict) -> dict:
+    identity = point.get("checkpoint_identity")
+    if not isinstance(identity, dict):
+        raise ValueError(f"{_point_key(point)} lacks checkpoint identity")
+    return {
+        "schema_version": 1,
+        "phase": phase,
+        "point": point["key"],
+        "scientific_identity": identity,
+        "artifacts": artifacts,
+    }
+
+
+def _bind_checkpoint(
+    point_output: Path, phase: str, point: dict, artifacts: dict,
+) -> None:
+    write_json(
+        _checkpoint_path(point_output),
+        _checkpoint_record(phase, point, artifacts),
+    )
+
+
+def _require_bound_checkpoint(
+    point_output: Path, phase: str, point: dict, artifacts: dict,
+) -> dict:
+    path = _checkpoint_path(point_output)
+    if not path.is_file():
+        raise ValueError(f"{phase} checkpoint identity is missing")
+    record = read_json(path)
+    expected = _checkpoint_record(phase, point, artifacts)
+    if record != expected:
+        raise ValueError(f"{phase} checkpoint scientific identity differs")
+    return {
+        "checkpoint_path": str(path.resolve()),
+        "checkpoint_sha256": sha256_file(path),
+    }
+
+
 def _require_summary_identity(summary: dict, point: dict, *, r2: bool) -> None:
     expected_state = "success" if r2 else "validated"
+    checkpoint_identity = point.get("checkpoint_identity")
+    expected_config = (
+        checkpoint_identity.get("config")
+        if isinstance(checkpoint_identity, dict) else None
+    )
     if (
         summary.get("schema_version") != 1
         or summary.get("thermal_mode") != "transient-rom"
@@ -279,6 +408,9 @@ def _require_summary_identity(summary: dict, point: dict, *, r2: bool) -> None:
         != Path(point["canonical_r1"]).resolve()
         or Path(str(summary.get("transient_r1", ""))).resolve()
         != Path(point["periodic_r1"]).resolve()
+        or not isinstance(expected_config, str)
+        or Path(str(summary.get("config", ""))).resolve()
+        != Path(expected_config).resolve()
     ):
         raise ValueError(
             f"{_point_key(point)} {'R2' if r2 else 'thermal'} checkpoint identity differs"
@@ -346,8 +478,7 @@ def _validated_branch(summary: dict, key: str, *, r2: bool) -> dict:
     return branch
 
 
-def validate_thermal_checkpoint(point_output: Path, point: dict) -> dict:
-    """Require a complete paired real-HotSpot checkpoint without R2."""
+def _thermal_artifacts(point_output: Path, point: dict) -> dict:
     point_output = Path(point_output).resolve()
     summary_path = _summary_path(point_output)
     if not summary_path.is_file():
@@ -362,20 +493,34 @@ def validate_thermal_checkpoint(point_output: Path, point: dict) -> dict:
     if not isinstance(package_value, str):
         raise ValueError(f"thermal checkpoint lacks a ROM package for {_point_key(point)}")
     package = Path(package_value).resolve()
-    acceptance = package / "rom_acceptance.json"
-    if not acceptance.is_file() or read_json(acceptance).get("accepted") is not True:
-        raise ValueError(f"thermal checkpoint ROM package is invalid for {_point_key(point)}")
+    expected_package = (point_output / "transient_rom/rom_package").resolve()
+    if package != expected_package:
+        raise ValueError(f"thermal ROM package differs for {_point_key(point)}")
+    package_evidence = _package_evidence(package, point)
+    if summary.get("rom_acceptance") != package_evidence["rom_acceptance_record"]:
+        raise ValueError(f"thermal ROM acceptance differs for {_point_key(point)}")
     return {
         "summary": summary,
         "summary_path": str(summary_path),
         "summary_sha256": sha256_file(summary_path),
-        "rom_package": str(package),
-        "rom_acceptance_sha256": sha256_file(acceptance),
+        **package_evidence,
     }
 
 
-def validate_r2_checkpoint(point_output: Path, point: dict) -> dict:
-    """Require paired measured R2 evidence for one transient-ROM point."""
+def validate_thermal_checkpoint(point_output: Path, point: dict) -> dict:
+    """Require a complete scientifically bound HotSpot checkpoint without R2."""
+    point_output = Path(point_output).resolve()
+    result = _thermal_artifacts(point_output, point)
+    bound = _require_bound_checkpoint(
+        point_output,
+        "thermal",
+        point,
+        {key: value for key, value in result.items() if key != "summary"},
+    )
+    return {**result, **bound}
+
+
+def _r2_artifacts(point_output: Path, point: dict) -> dict:
     point_output = Path(point_output).resolve()
     summary_path = _summary_path(point_output)
     if not summary_path.is_file():
@@ -386,6 +531,16 @@ def validate_r2_checkpoint(point_output: Path, point: dict) -> dict:
     _require_summary_identity(summary, point, r2=True)
     fixed = _validated_branch(summary, "fixed_bin", r2=True)
     clip = _validated_branch(summary, "clip3d", r2=True)
+    slug = _point_slug(point)
+    expected_package = (
+        point_output.parents[1] / "thermal" / slug
+        / "transient_rom/rom_package"
+    ).resolve()
+    if Path(str(summary.get("rom_package", ""))).resolve() != expected_package:
+        raise ValueError(f"R2 ROM package differs for {_point_key(point)}")
+    package_evidence = _package_evidence(expected_package, point)
+    if summary.get("rom_acceptance") != package_evidence["rom_acceptance_record"]:
+        raise ValueError(f"R2 ROM acceptance differs for {_point_key(point)}")
     paired_path = point_output / "transient_rom/final_validation/paired_comparison.json"
     if not paired_path.is_file():
         raise ValueError(f"R2 checkpoint lacks paired comparison for {_point_key(point)}")
@@ -397,6 +552,8 @@ def validate_r2_checkpoint(point_output: Path, point: dict) -> dict:
         not isinstance(paired, dict)
         or paired.get("non_formal") is not True
         or paired.get("paper_equivalent") is not False
+        or paired.get("fixed_bin") != fixed
+        or paired.get("clip3d") != clip
         or not math.isclose(
             _finite_number(
                 paired.get("bips2_trans_improvement_percent"),
@@ -406,7 +563,12 @@ def validate_r2_checkpoint(point_output: Path, point: dict) -> dict:
             rel_tol=1e-12,
         )
     ):
-        raise ValueError(f"R2 paired comparison differs for {_point_key(point)}")
+        raise ValueError(f"R2 paired branch comparison differs for {_point_key(point)}")
+    thermal_checkpoint = _checkpoint_path(
+        point_output.parents[1] / "thermal" / slug
+    )
+    if not thermal_checkpoint.is_file():
+        raise ValueError(f"R2 thermal checkpoint differs for {_point_key(point)}")
     return {
         "summary": summary,
         "summary_path": str(summary_path),
@@ -414,7 +576,26 @@ def validate_r2_checkpoint(point_output: Path, point: dict) -> dict:
         "paired": paired,
         "paired_path": str(paired_path.resolve()),
         "paired_sha256": sha256_file(paired_path),
+        **package_evidence,
+        "thermal_checkpoint": str(thermal_checkpoint.resolve()),
+        "thermal_checkpoint_sha256": sha256_file(thermal_checkpoint),
     }
+
+
+def validate_r2_checkpoint(point_output: Path, point: dict) -> dict:
+    """Require scientifically bound paired measured R2 evidence."""
+    point_output = Path(point_output).resolve()
+    result = _r2_artifacts(point_output, point)
+    bound = _require_bound_checkpoint(
+        point_output,
+        "r2",
+        point,
+        {
+            key: value for key, value in result.items()
+            if key not in ("summary", "paired")
+        },
+    )
+    return {**result, **bound}
 
 
 def _default_invoke(command: list[str], stdout_path: Path, stderr_path: Path) -> int:
@@ -423,6 +604,41 @@ def _default_invoke(command: list[str], stdout_path: Path, stderr_path: Path) ->
         "w", encoding="utf-8"
     ) as stderr:
         return subprocess.run(command, stdout=stdout, stderr=stderr).returncode
+
+
+def _attempt_paths(output_root: Path, phase: str, point: dict) -> tuple[Path, ...]:
+    slug = _point_slug(point)
+    return (
+        output_root / phase / slug,
+        output_root / "status" / f"{phase}_{slug}.json",
+        output_root / "logs" / f"{phase}_{slug}.stdout.log",
+        output_root / "logs" / f"{phase}_{slug}.stderr.log",
+    )
+
+
+def _has_attempt_evidence(output_root: Path, phase: str, point: dict) -> bool:
+    for path in _attempt_paths(output_root, phase, point):
+        if path.is_symlink() or path.is_file():
+            return True
+        if path.is_dir() and any(path.iterdir()):
+            return True
+    return False
+
+
+def _require_resumable_phase(
+    inputs: dict, output_root: Path, *, execute_r2: bool,
+) -> None:
+    phase = "r2" if execute_r2 else "thermal"
+    validator = validate_r2_checkpoint if execute_r2 else validate_thermal_checkpoint
+    for point in inputs["points"]:
+        point_output = output_root / phase / _point_slug(point)
+        if _summary_path(point_output).is_file():
+            validator(point_output, point)
+        elif _has_attempt_evidence(output_root, phase, point):
+            raise ValueError(
+                f"{phase} has an existing attempt for {_point_key(point)}; "
+                "use a new output root"
+            )
 
 
 def _run_one(
@@ -437,12 +653,14 @@ def _run_one(
     slug = _point_slug(point)
     point_output = output_root / phase / slug
     validator = validate_r2_checkpoint if execute_r2 else validate_thermal_checkpoint
+    artifact_validator = _r2_artifacts if execute_r2 else _thermal_artifacts
     summary_path = _summary_path(point_output)
     if summary_path.is_file():
         return validator(point_output, point)
-    if point_output.exists() and any(point_output.iterdir()):
+    if _has_attempt_evidence(output_root, phase, point):
         raise ValueError(
-            f"{phase} checkpoint directory is nonempty but incomplete: {point_output}"
+            f"{phase} has an existing attempt for {_point_key(point)}; "
+            "use a new output root"
         )
 
     command = [
@@ -482,6 +700,12 @@ def _run_one(
         })
         raise RuntimeError(f"{phase} pipeline failed for {point['key']}: rc={return_code}")
     try:
+        checkpoint = artifact_validator(point_output, point)
+        bound_artifacts = {
+            key: value for key, value in checkpoint.items()
+            if key not in ("summary", "paired")
+        }
+        _bind_checkpoint(point_output, phase, point, bound_artifacts)
         checkpoint = validator(point_output, point)
     except (OSError, ValueError) as error:
         write_json(status_path, {
@@ -498,6 +722,8 @@ def _run_one(
         "command": command,
         "summary": checkpoint["summary_path"],
         "summary_sha256": checkpoint["summary_sha256"],
+        "checkpoint": checkpoint["checkpoint_path"],
+        "checkpoint_sha256": checkpoint["checkpoint_sha256"],
     })
     return checkpoint
 
@@ -542,13 +768,36 @@ def run_validation_set(
         if len(thermal) != len(inputs["points"]):
             raise ValueError("both thermal points must validate before R2")
 
+    _require_resumable_phase(inputs, output_root, execute_r2=execute_r2)
+
     selected_invoke = invoke or _default_invoke
     checkpoints = []
-    for point in inputs["points"]:
-        checkpoints.append(_run_one(
-            point, output_root, Path(config_path), execute_r2=execute_r2,
-            invoke=selected_invoke,
-        ))
+    phase = "r2" if execute_r2 else "thermal"
+    root_status = {
+        "schema_version": 1,
+        "state": "running",
+        "phase": phase,
+        "non_formal": True,
+        "paper_equivalent": False,
+        "point_count": len(inputs["points"]),
+        "completed_points": [],
+    }
+    write_json(output_root / "status.json", root_status)
+    try:
+        for point in inputs["points"]:
+            checkpoints.append(_run_one(
+                point, output_root, Path(config_path), execute_r2=execute_r2,
+                invoke=selected_invoke,
+            ))
+            root_status["completed_points"].append(point["key"])
+            write_json(output_root / "status.json", root_status)
+    except Exception as error:
+        root_status.update({
+            "state": "failed",
+            "error": f"{type(error).__name__}: {error}",
+        })
+        write_json(output_root / "status.json", root_status)
+        raise
     state = "r2_validated" if execute_r2 else "thermal_validated"
     result = {
         "schema_version": 1,
@@ -556,11 +805,14 @@ def run_validation_set(
         "non_formal": True,
         "paper_equivalent": False,
         "point_count": len(checkpoints),
+        "completed_points": [point["key"] for point in inputs["points"]],
         "points": [
             {
                 "key": point["key"],
                 "summary": checkpoint["summary_path"],
                 "summary_sha256": checkpoint["summary_sha256"],
+                "checkpoint": checkpoint["checkpoint_path"],
+                "checkpoint_sha256": checkpoint["checkpoint_sha256"],
             }
             for point, checkpoint in zip(inputs["points"], checkpoints)
         ],

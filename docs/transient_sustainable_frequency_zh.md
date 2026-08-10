@@ -1,6 +1,6 @@
 # 瞬态热约束下的持续频率：数学推导与 CLIP-3D 扩展设计
 
-> **状态：设计记录，尚未接入优化器。**
+> **状态：瞬态 ROM 已接入独立的“仅 L2 可移动”探索性优化入口；双点真实验证待周期 R1 完成。**
 >
 > 本文档给出在不把 HotSpot 放入布局优化内循环的前提下，将 CLIP-3D 的稳态
 > 持续频率模型扩展为瞬态模型的严格推导。它不改变已经完成的稳态复现、R1、R2
@@ -12,14 +12,15 @@ CLIP-3D 的原始方法在早期三维芯片设计阶段，以闭式频率模型
 布局反复调用 HotSpot。优化器因此能直接搜索实际吞吐率（BIPS）最优的布局，而不是
 搜索人为加权的“温度 + 线长”代理目标。
 
-当前项目已有的瞬态旁路为：
+当前项目保留原有瞬态旁路：
 
 ```text
 专用周期统计 R1 → 窗口统计 → 每窗口 McPAT → HotSpot 瞬态温度轨迹
 ```
 
-它回答的是“在名义频率 `f0` 下，给定功耗轨迹会产生什么温度波动”。它**尚未**计算
-瞬态持续安全频率，也不能把轨迹中的一个 `Tmax(f0)` 直接代入稳态 Equation (13)。
+它回答的是“在名义频率 `f0` 下，给定功耗轨迹会产生什么温度波动”。新增的瞬态 ROM
+入口在此基础上计算瞬态持续安全频率；两条路径并存，且都不能把轨迹中的一个
+`Tmax(f0)` 直接代入稳态 Equation (13)。
 
 本设计的目标是定义并快速评价：
 
@@ -244,15 +245,16 @@ benchmark 轨迹**，因为它忽略了 Equation (9)。它不能作为本项目�
 
 ## 7. 初始条件：采用周期稳态而非 `f0` 稳态温度
 
-现有瞬态验证以对应布局的 `steady.txt` 作为初温，即：
+legacy 瞬态旁路以对应布局在 \(f_0\) 下的 `steady.txt` 作为初温，即：
 
 \[
 \mathbf T(0)=\mathbf T_{\rm steady}(f_0).
 \]
 
 这适合观察“从 \(f_0\) 的平均功耗稳态出发”的短时间热波动，但不同频率下它不是
-一致的初始条件。若研究对象是“持续安全频率”，推荐将一个 ROI 功耗轨迹视作周期性
-重复负载，并使用**周期稳态**。
+一致的初始条件。新增 ROM 的 holdout 与最终验证会先在**该布局、该频率缩放功耗**下
+求匹配的平均功耗稳态作为预热初值，再重复 ROI 并用全网格相邻周期末差值验证 PSS；
+最终持续频率仍由达到**周期稳态**后的完整周期峰温判定，而不是由预热初值判定。
 
 设一个 ROI 有 \(N\) 个窗口。定义：
 
@@ -528,11 +530,13 @@ ROM 仅用于快速搜索。任何报告的最终数字仍须由 HotSpot 验证�
 | 现有位置 | 作用 | 与本设计的关系 |
 |---|---|---|
 | `workflow/thermal/sustainable_frequency.py` | 论文稳态 Equation (13) | 保留为稳态基线，不应原地替换 |
-| `workflow/floorplan/optimize_layout.py` | 现有 L2 优化和稳态空间热代理 | 未来新增独立瞬态优化入口，不破坏该入口 |
+| `workflow/floorplan/optimize_layout.py` | 现有 L2 优化和稳态空间热代理 | 保留；瞬态 ROM 使用独立入口，不原地替换 |
 | `workflow/transient/run_transient_r1.py` | 专用周期统计 R1 | 提供 \(\Delta t_k^0\) 与功耗活动来源 |
 | `workflow/transient/stats_windows.py` | 将累计统计拆为连续窗口 | 提供窗口边界和实际时长 |
 | `workflow/transient/run_windowed_mcpat.py` | 每窗口 McPAT | 提供 \(\mathbf l_k,\mathbf d_k\) |
-| `workflow/transient/run_hotspot_transient.py` | 当前 \(f_0\) HotSpot 瞬态验证 | 保留；未来新增频率缩放/PSS 验证包装器 |
+| `workflow/transient/run_hotspot_transient.py` | HotSpot 瞬态求解 | 已由频率缩放/PSS 验证与 ROM 校准流程复用 |
 | `workflow/transient/run_dual_layout_validation.py` | 两个已有布局的瞬态对比 | 继续作为验证，不把结果误作新频率模型 |
+| `workflow/transient/rom/` | 8 次训练、2 次稳态预热、2 次留出瞬态的 ROM 校准及零 HotSpot 内循环优化 | 已实现，始终标记为 non-formal、paper-inequivalent |
+| `workflow/experiments/transient_rom_balanced2.py` | MATMUL/STENCIL 双点、热优先、可恢复的真实验证入口 | 已实现；等待两个 2 ms 周期 R1 后运行 |
 
 本文件提出的是独立扩展，不应修改冻结的稳态复现目录或正在运行的 R1/R2 实验。

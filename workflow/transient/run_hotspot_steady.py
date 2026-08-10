@@ -37,6 +37,21 @@ def _sha256(path: Path) -> str:
     return "sha256:" + sha256_file(path)
 
 
+def canonical_hotspot_steady_command(hotspot: Path | str) -> list[str]:
+    """Return the only command accepted for average-power initialization."""
+    return [
+        str(hotspot),
+        "-c", "hotspot.config",
+        "-p", "power_transient.ptrace",
+        "-grid_layer_file", "stack.lcf",
+        "-materials_file", "materials.txt",
+        "-model_type", "grid",
+        "-detailed_3D", "on",
+        "-steady_file", "initialization.steady.txt",
+        "-grid_steady_file", "initialization.grid.steady.txt",
+    ]
+
+
 def validate_hotspot_steady_record(
     case_dir: Path,
     hotspot: Path = DEFAULT_HOTSPOT,
@@ -60,11 +75,11 @@ def validate_hotspot_steady_record(
     if expected_record is not None and record != expected_record:
         raise ValueError("steady initialization returned and persisted records differ")
     command = record.get("command")
-    if (not isinstance(command, list) or "-o" in command
-            or "-steady_file" not in command
-            or "-grid_steady_file" not in command
-            or record.get("return_code") != 0):
-        raise ValueError("steady initialization command evidence differs")
+    if (
+        command != canonical_hotspot_steady_command(hotspot)
+        or record.get("return_code") != 0
+    ):
+        raise ValueError("steady initialization canonical command evidence differs")
     inputs = {
         name: _regular_file(
             case_dir / name, f"steady initialization input {name}"
@@ -114,17 +129,7 @@ def run_hotspot_steady(case_dir: Path,
             "steady initialization outputs already exist: " + ", ".join(stale)
         )
 
-    command = [
-        str(hotspot),
-        "-c", "hotspot.config",
-        "-p", "power_transient.ptrace",
-        "-grid_layer_file", "stack.lcf",
-        "-materials_file", "materials.txt",
-        "-model_type", "grid",
-        "-detailed_3D", "on",
-        "-steady_file", "initialization.steady.txt",
-        "-grid_steady_file", "initialization.grid.steady.txt",
-    ]
+    command = canonical_hotspot_steady_command(hotspot)
     started = time.perf_counter()
     process = subprocess.run(
         command,

@@ -15,6 +15,7 @@ from workflow.common import read_json, write_json
 from workflow.transient.rom.contracts import (
     ROMSettings,
     parse_settings,
+    r1_input_hash_identity,
     rom_input_identity,
     write_rom_artifact_manifest,
 )
@@ -236,6 +237,9 @@ def _package_identity(modules_path: Path, power_windows_path: Path,
     canonical_metadata = Path(canonical_source) / "r1_metadata.json"
     if not canonical_metadata.is_file():
         raise FileNotFoundError(canonical_metadata)
+    periodic_source = power_windows.get("transient_r1")
+    if not isinstance(periodic_source, str) or not periodic_source:
+        raise ValueError("power windows lack transient_r1 provenance")
     physical = config.get("physical") if isinstance(config, dict) else None
     frequency = config.get("frequency") if isinstance(config, dict) else None
     if not isinstance(physical, dict) or not isinstance(frequency, dict):
@@ -260,6 +264,9 @@ def _package_identity(modules_path: Path, power_windows_path: Path,
         },
         allowed_l2_tiers=design.get("allowed_l2_tiers"),
         calibration_design_hash=calibration_design_hash(design),
+        r1_input_hashes=r1_input_hash_identity(
+            Path(canonical_source), Path(periodic_source)
+        ),
     )
 
 

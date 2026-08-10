@@ -186,6 +186,7 @@ def _case_artifacts(case_dir: Path, package_dir: Path, modules_path: Path,
         "power_windows": power_path.resolve(),
         "power_trace": (case_dir / "power_transient.ptrace").resolve(),
         "temperature_trace": (case_dir / "transient.ttrace").resolve(),
+        "transient_result": (case_dir / "transient_result.json").resolve(),
     }
     if include_initialization:
         paths.update({
@@ -198,6 +199,7 @@ def _case_artifacts(case_dir: Path, package_dir: Path, modules_path: Path,
             "initialization_grid_steady": (
                 case_dir / "initialization.grid.steady.txt"
             ).resolve(),
+            "initial_steady": (case_dir / "initial.steady.txt").resolve(),
         })
     if any(not path.is_file() for path in paths.values()):
         missing = [str(path) for path in paths.values() if not path.is_file()]
