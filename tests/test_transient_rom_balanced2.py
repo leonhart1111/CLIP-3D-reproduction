@@ -11,7 +11,10 @@ import unittest
 from pathlib import Path
 
 from workflow.common import PROJECT_ROOT, read_json, write_json
-from workflow.experiments.transient_rom_balanced2 import preflight_inputs
+from workflow.experiments.transient_rom_balanced2 import (
+    preflight_inputs,
+    run_validation_set,
+)
 
 
 SCIENTIFIC_CONFIG = (
@@ -193,6 +196,142 @@ class Balanced2PreflightTests(unittest.TestCase):
         write_json(self.selection, selection)
         with self.assertRaisesRegex(ValueError, "sample_interval_ms"):
             self.invoke()
+
+
+class Balanced2RunnerTests(Balanced2PreflightTests):
+    def setUp(self) -> None:
+        super().setUp()
+        self.output = self.root / "output"
+        self.calls: list[list[str]] = []
+
+    @staticmethod
+    def argument(command: list[str], name: str) -> str:
+        return command[command.index(name) + 1]
+
+    def write_pipeline_result(self, command: list[str]) -> None:
+        output = Path(self.argument(command, "--output-dir"))
+        source = Path(self.argument(command, "--r1-dir")).resolve()
+        periodic = Path(self.argument(command, "--transient-rom-r1-dir")).resolve()
+        config = Path(self.argument(command, "--config")).resolve()
+        is_r2 = "--run-r2" in command
+        workload = read_json(source / "r1_metadata.json")["workload"]
+        rom = output / "transient_rom"
+        package = (
+            Path(self.argument(command, "--transient-rom-package-dir")).resolve()
+            if is_r2 else rom / "rom_package"
+        )
+        if not is_r2:
+            package.mkdir(parents=True, exist_ok=True)
+            write_json(package / "rom_acceptance.json", {"accepted": True})
+        branches = {}
+        for branch_name, frequency, ipc in (
+            ("fixed_bin", 1.10, 2.0),
+            ("clip3d", 1.12 if workload == "matmul" else 0.98, 2.1),
+        ):
+            branches[branch_name] = {
+                "branch": "fixed-bin" if branch_name == "fixed_bin" else "clip3d",
+                "state": "validated" if not is_r2 else "success",
+                "failure": None,
+                "validation_classification": "validated",
+                "validated_f_sus_trans_hotspot_ghz": frequency,
+                "measured_ipc2": ipc if is_r2 else None,
+                "measured_bips2_trans": ipc * frequency if is_r2 else None,
+                "r2_requested": is_r2,
+                "r2_executed": is_r2,
+            }
+        summary = {
+            "schema_version": 1,
+            "thermal_mode": "transient-rom",
+            "non_formal": True,
+            "paper_equivalent": False,
+            "state": "success" if is_r2 else "validated",
+            "source_r1": str(source),
+            "config": str(config),
+            "transient_r1": str(periodic),
+            "sample_interval_ms": 2.0,
+            "rom_package": str(package.resolve()),
+            "rom_acceptance": {"accepted": True},
+            "training_hotspot_calls": 8,
+            "holdout_initialization_hotspot_calls": 2,
+            "holdout_transient_hotspot_calls": 2,
+            "calibration_hotspot_calls": 12,
+            "optimizer_hotspot_calls": 0,
+            "final_initialization_hotspot_calls": 4,
+            "final_transient_hotspot_calls": 4,
+            "final_validation_hotspot_calls": 8,
+            "r2_requested": is_r2,
+            "r2_executed": is_r2,
+            "branches": branches,
+        }
+        write_json(rom / "transient_rom_summary.json", summary)
+        if is_r2:
+            paired_dir = rom / "final_validation"
+            paired_dir.mkdir(parents=True, exist_ok=True)
+            fixed_bips = branches["fixed_bin"]["measured_bips2_trans"]
+            clip_bips = branches["clip3d"]["measured_bips2_trans"]
+            write_json(paired_dir / "paired_comparison.json", {
+                "schema_version": 1,
+                "non_formal": True,
+                "paper_equivalent": False,
+                "fixed_bin": branches["fixed_bin"],
+                "clip3d": branches["clip3d"],
+                "bips2_trans_improvement_percent": (
+                    (clip_bips / fixed_bips - 1.0) * 100.0
+                ),
+            })
+
+    def fake_invoke(self, command: list[str], stdout: Path, stderr: Path) -> int:
+        self.calls.append(command)
+        stdout.parent.mkdir(parents=True, exist_ok=True)
+        stdout.write_text("synthetic success\n", encoding="utf-8")
+        stderr.write_text("", encoding="utf-8")
+        self.write_pipeline_result(command)
+        return 0
+
+    def run_set(self, *, execute_r2: bool = False) -> dict:
+        return run_validation_set(
+            self.selection, self.canonical, self.periodic,
+            self.baseline, self.config, self.output,
+            execute_r2=execute_r2, invoke=self.fake_invoke,
+        )
+
+    def test_thermal_phase_validates_both_points_before_r2(self) -> None:
+        result = self.run_set()
+        self.assertEqual(result["state"], "thermal_validated")
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue(all("--transient-rom-calibrate" in call for call in self.calls))
+        self.assertTrue(all("--run-r2" not in call for call in self.calls))
+        self.assertIn("matmul_64kB_512kB", " ".join(self.calls[0]))
+        self.assertIn("stencil_64kB_512kB", " ".join(self.calls[1]))
+
+    def test_valid_thermal_checkpoints_are_reused_after_validation(self) -> None:
+        self.run_set()
+        self.calls.clear()
+        result = self.run_set()
+        self.assertEqual(result["state"], "thermal_validated")
+        self.assertEqual(self.calls, [])
+
+    def test_malformed_existing_checkpoint_is_not_overwritten(self) -> None:
+        point = self.output / "thermal/matmul_64kB_512kB/transient_rom"
+        point.mkdir(parents=True)
+        write_json(point / "transient_rom_summary.json", {"state": "validated"})
+        with self.assertRaisesRegex(ValueError, "thermal checkpoint"):
+            self.run_set()
+        self.assertEqual(self.calls, [])
+
+    def test_r2_is_gated_by_both_thermal_points(self) -> None:
+        with self.assertRaisesRegex(ValueError, "both thermal"):
+            self.run_set(execute_r2=True)
+        self.assertEqual(self.calls, [])
+
+        self.run_set()
+        self.calls.clear()
+        result = self.run_set(execute_r2=True)
+        self.assertEqual(result["state"], "r2_validated")
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue(all("--run-r2" in call for call in self.calls))
+        self.assertTrue(all("--transient-rom-calibrate" not in call for call in self.calls))
+        self.assertTrue(all("--transient-rom-package-dir" in call for call in self.calls))
 
 
 if __name__ == "__main__":
