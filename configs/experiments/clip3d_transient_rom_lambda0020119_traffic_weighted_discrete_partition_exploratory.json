@@ -84,6 +84,7 @@
     "wire_aggregation": "traffic-weighted"
   },
   "transient_rom": {
+    "backend": "five-state",
     "enabled": true,
     "non_formal": true,
     "paper_equivalent": false,
@@ -107,7 +108,14 @@
     "max_holdout_peak_error_c": 1.0,
     "max_holdout_grid_rmse_c": 0.75,
     "search_grid_points_per_axis": 25,
-    "refinement_starts": 5
+    "refinement_starts": 5,
+    "five_state": {
+      "tau_core_s": 0.166,
+      "tau_l2_s": 0.166,
+      "spatial_model": "area-quadrature",
+      "quadrature_order": 2,
+      "parameter_status": "provisional"
+    }
   },
   "formal_validation": {
     "strict_p1": false,

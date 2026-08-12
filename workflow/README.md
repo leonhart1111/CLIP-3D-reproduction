@@ -37,3 +37,25 @@ non-formal operational 验证，不是论文正式复现。
 `modules.json` 会保留原始计数、精确 counter 名、权重、统计文件和测量窗口。
 这是非正式研究扩展；R2 仍把结果作为一个标量写入共享 `L2XBar`，不能解释为
 每核心独立延迟或 IPC 因果敏感度。
+
+瞬态热约束的 `--thermal-mode transient-rom` 默认使用轻量五状态闭式代理：
+Core0--Core3 与共享 L2 各保留一个一阶热惯性状态，按窗口递推
+`T_next=a*T+(1-a)*T_eq`，优化器内部 HotSpot 调用数为 0。后端由
+`transient_rom.backend` 配置，默认值是 `five-state`；原矩阵 POD-ROM 仍可用
+`pod-rom` 选择。`transient_rom.five_state.tau_core_s`、`tau_l2_s` 和
+`parameter_status` 会写入每次报告；默认时间常数是 provisional 控制值，不是已完成的
+参数测量。
+
+five-state 流程示例：
+
+```bash
+python -m workflow.run_lifting_pipeline \
+  --r1-dir "$R1" --output-dir "$OUT" \
+  --config configs/experiments/clip3d_transient_rom_lambda0020119_traffic_weighted_discrete_partition_exploratory.json \
+  --thermal-mode transient-rom \
+  --transient-rom-r1-dir "$PERIODIC_R1" \
+  --run-r2
+```
+
+两种后端都必须经过最终真实 HotSpot 周期验证；five-state 结果是 non-formal、
+paper-inequivalent 研究扩展。

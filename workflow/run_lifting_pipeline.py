@@ -857,6 +857,11 @@ def main() -> None:
         "--transient-rom-package-dir", type=Path,
         help="reuse an accepted ROM package from a separate read-only path",
     )
+    parser.add_argument(
+        "--transient-thermal-backend", choices=("five-state", "pod-rom"),
+        help=("override transient_rom.backend; default is five-state when the "
+              "configuration omits it"),
+    )
     args = parser.parse_args()
     if args.thermal_mode == "transient-rom" and args.transient:
         raise SystemExit(
@@ -928,6 +933,7 @@ def main() -> None:
                 if args.transient_rom_package_dir else None
             ),
             rerun_r2=args.rerun_r2,
+            backend=args.transient_thermal_backend,
         )
     if args.transient:
         from workflow.transient.run_transient_pipeline import run_transient_pipeline

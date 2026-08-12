@@ -3061,6 +3061,7 @@ class ROMPipelineTests(unittest.TestCase):
                 "l1_pipeline_cycles": 1,
             },
             "transient_rom": {
+                "backend": "pod-rom",
                 "enabled": True,
                 "calibration_runs": 8,
                 "validation_runs": 2,

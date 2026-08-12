@@ -92,10 +92,8 @@ def _optimize_five_state(modules_path: Path, output_dir: Path,
     if not isinstance(allowed_tiers, list) or not allowed_tiers:
         raise ValueError("layout_optimizer.allowed_l2_tiers must be a list")
     wire_objective = optimizer.get("wire_objective", "continuous")
-    if wire_objective != "discrete-partition":
-        raise ValueError(
-            "five-state backend currently requires wire_objective=discrete-partition"
-        )
+    if wire_objective not in ("continuous", "r2-quantized", "discrete-partition"):
+        raise ValueError("unsupported transient wire objective")
     grid_steps = optimizer.get("partition_grid_steps", 41)
     include_fixed = optimizer.get("include_fixed_baseline", True)
     lambda_wire = _finite(
@@ -154,15 +152,52 @@ def _optimize_five_state(modules_path: Path, output_dir: Path,
             "temperature_evidence": _peak_evidence(search, sustainable),
         }
 
-    search = search_discrete_partitions(
-        base_layout=base,
-        l2_name=l2_name,
-        allowed_tiers=allowed_tiers,
-        grid_steps=grid_steps,
-        include_fixed_baseline=include_fixed,
-        evaluate=evaluate,
-    )
-    selected = search["selected"]
+    if wire_objective == "discrete-partition":
+        search = search_discrete_partitions(
+            base_layout=base,
+            l2_name=l2_name,
+            allowed_tiers=allowed_tiers,
+            grid_steps=grid_steps,
+            include_fixed_baseline=include_fixed,
+            evaluate=evaluate,
+        )
+        selected = search["selected"]
+        search = {**search, "shared_partition_engine": True}
+    else:
+        # The ordinary transient config has no integer partition requirement.
+        # Evaluate a finite, deterministic lattice and use the same score.
+        original = l2s[0]
+        upper_x = float(base["die_width_mm"]) - float(original["width_mm"])
+        upper_y = float(base["die_height_mm"]) - float(original["height_mm"])
+        points = []
+        for tier in allowed_tiers:
+            for yi in range(25):
+                for xi in range(25):
+                    try:
+                        layout = place_l2(
+                            base, l2_name, int(tier),
+                            upper_x * xi / 24.0, upper_y * yi / 24.0,
+                        )
+                        candidate = evaluate(layout, "lattice", f"GRID-{yi}-{xi}")
+                    except ValueError:
+                        candidate = None
+                    if candidate is not None:
+                        points.append(candidate)
+        if not points:
+            raise RuntimeError("five-state lattice found no legal selectable placement")
+        selected = min(
+            points,
+            key=lambda item: (
+                item["score"], item["tier"], item["y_mm"], item["x_mm"]
+            ),
+        )
+        search = {
+            "search_kind": "lattice",
+            "lattice_points_per_axis": 25,
+            "candidate_count": len(points),
+            "candidates": points,
+            "fixed_baseline_included": False,
+        }
     selected_layout = place_l2(
         base, l2_name, selected["tier"], selected["x_mm"], selected["y_mm"]
     )

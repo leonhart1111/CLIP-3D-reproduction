@@ -897,12 +897,14 @@ def _execute_branch_r2(branch: dict, source_r1_dir: Path, output_dir: Path,
     return updated
 
 
-def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
-                               output_dir: Path, config_path: Path,
-                               transient_r1_dir: Path | None,
-                               calibrate: bool, execute_r2: bool, *,
-                               rom_package_dir: Path | None = None,
-                               rerun_r2: bool = False) -> dict:
+def _run_transient_pipeline_core(
+        source_r1_dir: Path, steady_preflight_dir: Path,
+        output_dir: Path, config_path: Path,
+        transient_r1_dir: Path | None,
+        calibrate: bool, execute_r2: bool, *,
+        rom_package_dir: Path | None = None,
+        rerun_r2: bool = False,
+        thermal_backend: str = "pod-rom") -> dict:
     """Run one gated ROM optimization and final real-HotSpot validation."""
     source_r1_dir = Path(source_r1_dir).resolve()
     steady_preflight_dir = Path(steady_preflight_dir).resolve()
@@ -1021,12 +1023,18 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
     calibration_cases = None
     calibration_evidence = None
     completed_calibration = (
+        thermal_backend == "pod-rom"
+        and
         rerun_r2 and calibrate
         and (package_dir / "rom_artifact_manifest.json").is_file()
         and (package_dir / "rom_acceptance.json").is_file()
         and (package_dir / "validation_report.json").is_file()
     )
-    if completed_calibration:
+    if thermal_backend == "five-state":
+        calibration_acceptance = None
+        package_status = "not-required"
+        package_dir = None
+    elif completed_calibration:
         _validate_artifact_manifest(package_dir)
         calibration_evidence = _load_calibration_evidence(package_dir, settings)
         calibration_cases = calibration_evidence["cases"]
@@ -1051,7 +1059,7 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
         package_status = "reused"
 
     optimization_dir = output_dir / "optimization"
-    if (rerun_r2
+    if (thermal_backend == "pod-rom" and rerun_r2
             and (optimization_dir / "optimization_report.json").is_file()
             and (optimization_dir / "proposed_layout.json").is_file()):
         optimization = _reuse_optimization(
@@ -1060,23 +1068,33 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
         )
         optimization_reused = True
     else:
-        optimization = optimize_transient_layout(
-            modules_path, package_dir, optimization_dir, config_path,
-            power_windows_path, hotspot=hotspot,
-        )
+        if thermal_backend == "five-state":
+            from workflow.transient.optimize_layout import (
+                optimize_transient_layout as optimize_backend_layout,
+            )
+            optimization = optimize_backend_layout(
+                modules_path, optimization_dir, config_path,
+                power_windows_path, backend="five-state",
+            )
+        else:
+            optimization = optimize_transient_layout(
+                modules_path, package_dir, optimization_dir, config_path,
+                power_windows_path, hotspot=hotspot,
+            )
         optimization_reused = False
     proposed_layout = Path(optimization["proposed_layout"]).resolve()
     selected = optimization.get("selected")
     if not isinstance(selected, dict):
         raise ValueError("ROM optimization lacks a selected candidate")
     package_acceptance = optimization.get("package_acceptance")
-    if (not isinstance(package_acceptance, dict)
-            or package_acceptance.get("accepted") is not True
-            or not isinstance(package_acceptance.get("identity"), dict)):
-        raise ValueError("ROM optimization lacks complete accepted-package identity")
-    if (calibration_evidence is not None
-            and package_acceptance != calibration_evidence["acceptance"]):
-        raise ValueError("ROM optimization acceptance differs from saved calibration evidence")
+    if thermal_backend == "pod-rom":
+        if (not isinstance(package_acceptance, dict)
+                or package_acceptance.get("accepted") is not True
+                or not isinstance(package_acceptance.get("identity"), dict)):
+            raise ValueError("ROM optimization lacks complete accepted-package identity")
+        if (calibration_evidence is not None
+                and package_acceptance != calibration_evidence["acceptance"]):
+            raise ValueError("ROM optimization acceptance differs from saved calibration evidence")
 
     delay = config.get("delay")
     if not isinstance(delay, dict):
@@ -1166,6 +1184,8 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
             "schema_version": 1,
             "mode": "paired transient ROM discrete-partition validation",
             "thermal_mode": "transient-rom",
+            "thermal_backend": thermal_backend,
+            "parameter_status": optimization.get("parameter_status"),
             "non_formal": True,
             "paper_equivalent": False,
             "state": pipeline_state,
@@ -1181,7 +1201,7 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
             "power_windows_reused": power_windows_reused,
             "power_windows_preparations_this_run": 0 if power_windows_reused else 1,
             "power_trace_identity": prepared.get("power_trace_identity"),
-            "rom_package": str(package_dir),
+            "rom_package": str(package_dir) if package_dir is not None else None,
             "rom_package_status": package_status,
             "rom_acceptance": package_acceptance,
             "rom_holdout_validation": calibration_acceptance,
@@ -1231,7 +1251,7 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
                 "modules": str(modules_path),
                 "cacti": str(cacti_path),
                 "power_windows": str(power_windows_path),
-                "rom_package": str(package_dir),
+                "rom_package": str(package_dir) if package_dir is not None else None,
                 "optimization_report": str(
                     (optimization_dir / "optimization_report.json").resolve()
                 ),
@@ -1371,6 +1391,8 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
         "schema_version": 1,
         "mode": "transient ROM layout optimization with real-HotSpot validation",
         "thermal_mode": "transient-rom",
+        "thermal_backend": thermal_backend,
+        "parameter_status": optimization.get("parameter_status"),
         "non_formal": True,
         "paper_equivalent": False,
         "state": pipeline_state,
@@ -1386,7 +1408,7 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
         "power_windows_reused": power_windows_reused,
         "power_windows_preparations_this_run": 0 if power_windows_reused else 1,
         "power_trace_identity": prepared.get("power_trace_identity"),
-        "rom_package": str(package_dir),
+        "rom_package": str(package_dir) if package_dir is not None else None,
         "rom_package_status": package_status,
         "rom_acceptance": package_acceptance,
         "rom_holdout_validation": calibration_acceptance,
@@ -1415,21 +1437,28 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
             "modules": str(modules_path),
             "cacti": str(cacti_path),
             "power_windows": str(power_windows_path),
-            "rom_package": str(package_dir),
+            "rom_package": str(package_dir) if package_dir is not None else None,
             "rom_package_manifest": (
                 str((package_dir / "rom_artifact_manifest.json").resolve())
-                if (package_dir / "rom_artifact_manifest.json").is_file()
+                if package_dir is not None
+                and (package_dir / "rom_artifact_manifest.json").is_file()
                 else None
             ),
-            "calibration_manifest": str(
-                (package_dir / "calibration_manifest.json").resolve()
+            "calibration_manifest": (
+                str((package_dir / "calibration_manifest.json").resolve())
+                if package_dir is not None else None
             ),
-            "anchors": str((package_dir / "anchors.json").resolve()),
-            "calibration_cases": str(
-                (package_dir / "calibration_cases.json").resolve()
+            "anchors": (
+                str((package_dir / "anchors.json").resolve())
+                if package_dir is not None else None
             ),
-            "holdout_validation": str(
-                (package_dir / "validation_report.json").resolve()
+            "calibration_cases": (
+                str((package_dir / "calibration_cases.json").resolve())
+                if package_dir is not None else None
+            ),
+            "holdout_validation": (
+                str((package_dir / "validation_report.json").resolve())
+                if package_dir is not None else None
             ),
             "optimization_report": str(
                 (optimization_dir / "optimization_report.json").resolve()
@@ -1466,3 +1495,54 @@ def run_transient_rom_pipeline(source_r1_dir: Path, steady_preflight_dir: Path,
     write_json(output_dir / "transient_rom_summary.json", summary)
     _write_artifact_manifest(output_dir)
     return summary
+
+
+def _run_pod_rom_pipeline(
+        source_r1_dir: Path, steady_preflight_dir: Path,
+        output_dir: Path, config_path: Path,
+        transient_r1_dir: Path | None,
+        calibrate: bool, execute_r2: bool, *,
+        rom_package_dir: Path | None = None,
+        rerun_r2: bool = False) -> dict:
+    """Preserve the original POD-ROM implementation behind an explicit backend."""
+    return _run_transient_pipeline_core(
+        source_r1_dir, steady_preflight_dir, output_dir, config_path,
+        transient_r1_dir, calibrate, execute_r2,
+        rom_package_dir=rom_package_dir, rerun_r2=rerun_r2,
+        thermal_backend="pod-rom",
+    )
+
+
+def run_transient_rom_pipeline(
+        source_r1_dir: Path, steady_preflight_dir: Path,
+        output_dir: Path, config_path: Path,
+        transient_r1_dir: Path | None,
+        calibrate: bool, execute_r2: bool, *,
+        rom_package_dir: Path | None = None,
+        rerun_r2: bool = False,
+        backend: str | None = None) -> dict:
+    """Run the configured transient proxy with shared final validation."""
+    config_path = Path(config_path).resolve()
+    config = read_json(config_path)
+    from workflow.transient.five_state import parse_five_state_settings
+
+    configured = parse_five_state_settings(config).backend
+    selected = backend or configured
+    if selected not in ("five-state", "pod-rom"):
+        raise ValueError("transient thermal backend must be five-state or pod-rom")
+    if selected == "five-state":
+        if calibrate:
+            raise ValueError("five-state backend does not use ROM calibration")
+        if rom_package_dir is not None:
+            raise ValueError("five-state backend does not use a ROM package")
+        from workflow.transient.five_state_pipeline import run_five_state_pipeline
+
+        return run_five_state_pipeline(
+            source_r1_dir, steady_preflight_dir, output_dir, config_path,
+            transient_r1_dir, execute_r2=execute_r2, rerun_r2=rerun_r2,
+        )
+    return _run_pod_rom_pipeline(
+        source_r1_dir, steady_preflight_dir, output_dir, config_path,
+        transient_r1_dir, calibrate, execute_r2,
+        rom_package_dir=rom_package_dir, rerun_r2=rerun_r2,
+    )

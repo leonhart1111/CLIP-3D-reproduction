@@ -4,6 +4,7 @@ import math
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from workflow.common import read_json, write_json
 from workflow.transient.five_state import (
@@ -286,6 +287,81 @@ class FiveStateOptimizerTests(unittest.TestCase, FiveStateFixture):
                 self.config_path,
                 self.windows_path,
             )
+
+    def test_continuous_wire_objective_has_a_deterministic_grid_path(self) -> None:
+        # Catches making the new optional backend unusable with the ordinary config.
+        config = read_json(self.config_path)
+        config["layout_optimizer"]["wire_objective"] = "continuous"
+        write_json(self.config_path, config)
+        report = optimize_transient_layout(
+            self.modules_path,
+            self.root / "continuous_optimization",
+            self.config_path,
+            self.windows_path,
+        )
+        self.assertEqual(report["thermal_backend"], "five-state")
+        self.assertEqual(report["search"]["search_kind"], "lattice")
+        self.assertTrue(Path(report["proposed_layout"]).is_file())
+
+
+class FiveStatePipelineRoutingTests(unittest.TestCase):
+    def pipeline_arguments(self) -> dict:
+        root = Path("/tmp/five-state-routing-test")
+        return {
+            "source_r1_dir": root / "r1",
+            "steady_preflight_dir": root / "steady",
+            "output_dir": root / "output",
+            "config_path": root / "config.json",
+            "transient_r1_dir": root / "transient-r1",
+            "calibrate": False,
+            "execute_r2": False,
+        }
+
+    def test_default_backend_routes_to_five_state_pipeline(self) -> None:
+        # Catches omission falling back to the POD calibration pipeline.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        with patch(
+            "workflow.transient.rom.run_pipeline.read_json",
+            return_value={"transient_rom": {}},
+        ), patch(
+            "workflow.transient.five_state_pipeline.run_five_state_pipeline",
+            return_value={"thermal_backend": "five-state"},
+        ) as five, patch(
+            "workflow.transient.rom.run_pipeline._run_pod_rom_pipeline",
+            side_effect=AssertionError("POD must not run"),
+        ):
+            result = run_transient_rom_pipeline(**self.pipeline_arguments())
+        self.assertEqual(result["thermal_backend"], "five-state")
+        self.assertEqual(five.call_count, 1)
+
+    def test_explicit_pod_backend_routes_to_preserved_pipeline(self) -> None:
+        # Catches deleting or bypassing the requested old ROM implementation.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        expected = {"thermal_backend": "pod-rom"}
+        with patch(
+            "workflow.transient.rom.run_pipeline.read_json",
+            return_value={"transient_rom": {"backend": "pod-rom"}},
+        ), patch(
+            "workflow.transient.rom.run_pipeline._run_pod_rom_pipeline",
+            return_value=expected,
+        ) as pod:
+            result = run_transient_rom_pipeline(**self.pipeline_arguments())
+        self.assertEqual(result, expected)
+        self.assertEqual(pod.call_count, 1)
+
+    def test_five_state_rejects_pod_package_controls(self) -> None:
+        # Catches accepting meaningless calibration flags and then ignoring them.
+        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+
+        arguments = self.pipeline_arguments()
+        arguments["calibrate"] = True
+        with patch(
+            "workflow.transient.rom.run_pipeline.read_json",
+            return_value={"transient_rom": {}},
+        ), self.assertRaisesRegex(ValueError, "five-state.*calibrat"):
+            run_transient_rom_pipeline(**arguments)
 
 
 if __name__ == "__main__":
