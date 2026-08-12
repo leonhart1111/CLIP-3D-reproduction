@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
+import tempfile
 import unittest
 
+from workflow.common import read_json, write_json
 from workflow.transient.five_state import (
     evaluate_five_state,
     find_five_state_sustainable_frequency,
     parse_five_state_settings,
 )
+from workflow.transient.optimize_layout import optimize_transient_layout
 
 
 class FiveStateFixture:
@@ -203,6 +207,85 @@ class FiveStateNumericsTests(unittest.TestCase, FiveStateFixture):
         windows["windows"][0]["modules"][0].pop("leakage_power_w")
         with self.assertRaises(ValueError):
             evaluate_five_state(self.layout(), windows, 2.0, self.config())
+
+
+class FiveStateOptimizerTests(unittest.TestCase, FiveStateFixture):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.modules_path = self.root / "modules.json"
+        self.windows_path = self.root / "power_windows.json"
+        self.config_path = self.root / "config.json"
+        modules = []
+        for module in self.layout()["modules"]:
+            copy = dict(module)
+            copy["area_mm2"] = copy["width_mm"] * copy["height_mm"]
+            copy["dynamic_power_w"] = 0.1
+            copy["leakage_power_w"] = 0.1
+            copy["total_power_w"] = 0.2
+            if copy["kind"] == "l2":
+                copy["preferred_width_mm"] = copy["width_mm"]
+            modules.append(copy)
+        write_json(self.modules_path, {
+            "schema_version": 1,
+            "ipc1": 2.0,
+            "modules": modules,
+            "communication_profile": {
+                "status": "available",
+                "per_core": {
+                    str(core): {"normalized_weight": weight}
+                    for core, weight in enumerate((0.1, 0.2, 0.3, 0.4))
+                },
+            },
+        })
+        write_json(self.windows_path, self.windows())
+        config = self.config()
+        config["physical"] = {"utilization": 0.7}
+        config["layout_optimizer"].update({
+            "lambda_wire": 0.0020119,
+            "allowed_l2_tiers": [1],
+            "wire_objective": "discrete-partition",
+            "partition_grid_steps": 5,
+            "include_fixed_baseline": True,
+        })
+        config["delay"] = {
+            "wire_rounding": "nearest",
+            "wire_aggregation": "traffic-weighted",
+        }
+        write_json(self.config_path, config)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_discrete_search_uses_five_state_without_hotspot_or_package(self) -> None:
+        # Catches accidentally routing the default backend through POD calibration.
+        report = optimize_transient_layout(
+            self.modules_path,
+            self.root / "optimization",
+            self.config_path,
+            self.windows_path,
+        )
+        self.assertEqual(report["thermal_backend"], "five-state")
+        self.assertEqual(report["parameter_status"], "measured")
+        self.assertEqual(report["hotspot_calls_inside_optimizer"], 0)
+        self.assertTrue(report["search"]["fixed_baseline_included"])
+        self.assertIsInstance(report["selected"]["r2_wire_cycles"], int)
+        self.assertTrue(Path(report["proposed_layout"]).is_file())
+        saved = read_json(self.root / "optimization/optimization_report.json")
+        self.assertEqual(saved["selected"], report["selected"])
+
+    def test_backend_dispatch_rejects_pod_without_package(self) -> None:
+        # Catches silently falling back to five-state when POD was explicitly requested.
+        config = read_json(self.config_path)
+        config["transient_rom"]["backend"] = "pod-rom"
+        write_json(self.config_path, config)
+        with self.assertRaisesRegex(ValueError, "package_dir"):
+            optimize_transient_layout(
+                self.modules_path,
+                self.root / "pod_optimization",
+                self.config_path,
+                self.windows_path,
+            )
 
 
 if __name__ == "__main__":
