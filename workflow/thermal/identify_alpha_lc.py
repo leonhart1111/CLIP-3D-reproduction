@@ -12,6 +12,8 @@ import statistics
 import argparse
 import subprocess
 import time
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from workflow.common import PROJECT_ROOT, read_json, sha256_file, write_json
@@ -343,6 +345,41 @@ def unit_power_model(model: dict, source_name: str,
         "purpose": "HotSpot spatial system identification only",
     }
     return result
+
+
+def unit_response_ratio_from_temperatures(
+        values: list[tuple[str, float]], ambient_k: float,
+        source_tier: int) -> dict:
+    """Compare active silicon layers at the same XY peak coordinate."""
+    if source_tier not in (0, 1):
+        raise ValueError("unit-response source tier must be 0 or 1")
+    active_layer = {0: 1, 1: 3}
+    layers: dict[int, dict[str, float]] = {1: {}, 3: {}}
+    pattern = re.compile(r"^layer_(1|3)_t[01]_(r\d+_c\d+)$")
+    for name, value in values:
+        match = pattern.match(name)
+        if match:
+            layers[int(match.group(1))][match.group(2)] = float(value)
+    if not layers[1] or set(layers[1]) != set(layers[3]):
+        raise ValueError("HotSpot active layers lack matching XY temperature cells")
+    same_layer = active_layer[source_tier]
+    cross_layer = active_layer[1 - source_tier]
+    coordinate = max(
+        layers[same_layer],
+        key=lambda name: (layers[same_layer][name], name),
+    )
+    same_rise = layers[same_layer][coordinate] - float(ambient_k)
+    cross_rise = layers[cross_layer][coordinate] - float(ambient_k)
+    if same_rise <= 0 or cross_rise < 0:
+        raise ValueError("unit-response active-layer rises must be physically nonnegative")
+    return {
+        "source_tier": source_tier, "peak_coordinate": coordinate,
+        "same_tier_active_layer": same_layer,
+        "cross_tier_active_layer": cross_layer,
+        "same_tier_rise_c": same_rise,
+        "cross_tier_rise_c": cross_rise,
+        "ratio": cross_rise / same_rise,
+    }
 
 
 def _percentile(values: list[float], probability: float) -> float:
@@ -695,6 +732,20 @@ def main() -> None:
     model_parser.add_argument("--r1-dir", type=Path, required=True)
     model_parser.add_argument("--config", type=Path, required=True)
     model_parser.add_argument("--output-dir", type=Path, required=True)
+    grid_parser = subparsers.add_parser(
+        "grid-convergence", help="run six layouts at 32/64/128 grids"
+    )
+    grid_parser.add_argument("--model", type=Path, required=True)
+    grid_parser.add_argument("--config", type=Path, required=True)
+    grid_parser.add_argument("--output-dir", type=Path, required=True)
+    grid_parser.add_argument("--jobs", type=int, default=6)
+    unit_parser = subparsers.add_parser(
+        "unit-response", help="run the 72-case matched one-watt campaign"
+    )
+    unit_parser.add_argument("--model", type=Path, action="append", required=True)
+    unit_parser.add_argument("--config", type=Path, required=True)
+    unit_parser.add_argument("--output-dir", type=Path, required=True)
+    unit_parser.add_argument("--jobs", type=int, default=12)
     args = parser.parse_args()
     if args.command == "plan":
         config = read_json(args.config)
@@ -711,6 +762,22 @@ def main() -> None:
         print(
             f"prepared unscaled model: {report['modules']} "
             f"(reused={report['reused']})"
+        )
+    elif args.command == "grid-convergence":
+        report = run_grid_campaign(
+            args.model, read_json(args.config), args.output_dir, args.jobs
+        )
+        print(
+            f"grid convergence: accepted={report['accepted']}, "
+            f"selected={report['selected_grid_size']}"
+        )
+    elif args.command == "unit-response":
+        report = run_unit_response_campaign(
+            args.model, read_json(args.config), args.output_dir, args.jobs
+        )
+        print(
+            f"cross-tier unit response: accepted={report['accepted']}, "
+            f"weight={report['estimate']:.9g}"
         )
 
 
@@ -801,3 +868,218 @@ def placement_design(model_path: Path, utilization: float,
             f"geometry provides only {len(selected)} of {requested} requested placements"
         )
     return selected
+
+
+def unit_response_design(model_paths: list[Path], utilization: float) -> list[dict]:
+    """Return 72 balanced source-shape/tier/position unit-response cases."""
+    if len(model_paths) != 3:
+        raise ValueError("unit-response design requires small, medium, and large models")
+    labels = (
+        "center", "corner_ll", "corner_ur",
+        "edge_bottom", "edge_right", "near_core0",
+    )
+    design = []
+    for model_index, model_path in enumerate(model_paths):
+        model_path = Path(model_path).resolve()
+        model = read_json(model_path)
+        placements = {case["label"]: case for case in placement_design(
+            model_path, utilization
+        )}
+        base = baseline_layout(model, utilization)
+        core = next(module for module in base["modules"] if module.get("kind") == "core")
+        l2 = next(module for module in base["modules"] if module.get("kind") == "l2")
+        for source_shape, template in (("core", core), ("l2", l2)):
+            for source_tier in (0, 1):
+                for position_label in labels:
+                    placement = placements[position_label]
+                    placed_l2 = next(
+                        module for module in placement["layout"]["modules"]
+                        if module["kind"] == "l2"
+                    )
+                    if source_shape == "l2":
+                        x_mm, y_mm = placed_l2["x_mm"], placed_l2["y_mm"]
+                    else:
+                        max_x = base["die_width_mm"] - template["width_mm"]
+                        max_y = base["die_width_mm"] - template["height_mm"]
+                        x_mm = placement["fx"] * max_x
+                        y_mm = placement["fy"] * max_y
+                    source = dict(
+                        template,
+                        name="unit_source", kind=f"unit_{source_shape}",
+                        tier=source_tier, x_mm=x_mm, y_mm=y_mm,
+                        dynamic_power_w=1.0, leakage_power_w=0.0,
+                        total_power_w=1.0,
+                    )
+                    source["area_mm2"] = source["width_mm"] * source["height_mm"]
+                    source["power_density_w_per_mm2"] = 1.0 / source["area_mm2"]
+                    layout = {
+                        "schema_version": 1,
+                        "policy": "one-watt unit-response system identification",
+                        "die_width_mm": base["die_width_mm"],
+                        "die_height_mm": base["die_height_mm"],
+                        "modules": [source],
+                    }
+                    check_geometry(layout["modules"], base["die_width_mm"])
+                    label = (
+                        f"model{model_index}_{source_shape}_tier{source_tier}_"
+                        f"{position_label}"
+                    )
+                    design.append({
+                        "label": label, "model_path": str(model_path),
+                        "model_index": model_index, "source_shape": source_shape,
+                        "source_tier": source_tier, "position_label": position_label,
+                        "layout": layout,
+                    })
+    return design
+
+
+def grid_campaign_design(placements: list[dict],
+                         grids: tuple[int, ...] = (32, 64, 128)) -> list[dict]:
+    wanted = (
+        "corner_ll", "corner_lr", "corner_ul", "corner_ur",
+        "center", "near_core0",
+    )
+    by_label = {case["label"]: case for case in placements}
+    missing = [label for label in wanted if label not in by_label]
+    if missing:
+        raise ValueError("grid campaign lacks layouts: " + ", ".join(missing))
+    return [
+        {"label": label, "grid_size": int(grid),
+         "layout": by_label[label]["layout"]}
+        for grid in grids for label in wanted
+    ]
+
+
+def assemble_relative_samples(cases: list[dict],
+                              reference_label: str = "corner_ll") -> list[dict]:
+    """Subtract each work point's own HotSpot reference temperature."""
+    groups: dict[str, list[dict]] = {}
+    for case in cases:
+        groups.setdefault(str(case["group"]), []).append(case)
+    result = []
+    for group, records in groups.items():
+        references = [record for record in records
+                      if str(record["label"]) == reference_label]
+        if len(references) != 1:
+            raise ValueError(
+                f"group {group} requires exactly one {reference_label} reference"
+            )
+        reference_tmax = float(references[0]["tmax_c"])
+        for record in records:
+            sample = dict(record)
+            sample["is_reference"] = str(record["label"]) == reference_label
+            sample["reference_label"] = reference_label
+            sample["reference_tmax_c"] = reference_tmax
+            sample["delta_t_c"] = float(record["tmax_c"]) - reference_tmax
+            result.append(sample)
+    return result
+
+
+def _parallel_hotspot_design(model_path: Path, design: list[dict],
+                             physical: dict, output_root: Path,
+                             jobs: int, stimulus_kind: str) -> list[dict]:
+    if jobs < 1:
+        raise ValueError("HotSpot jobs must be positive")
+    output_root = Path(output_root).resolve()
+
+    def run(case: dict) -> dict:
+        local_physical = dict(physical)
+        local_physical["grid_size"] = int(
+            case.get("grid_size", physical["grid_size"])
+        )
+        result = run_hotspot_case(
+            model_path, case["layout"], local_physical,
+            {"kind": stimulus_kind, "label": case["label"]},
+            output_root / "cases", DEFAULT_HOTSPOT,
+        )
+        return {
+            **{key: value for key, value in case.items() if key != "layout"},
+            "tmax_c": float(result["tmax_c"]),
+            "case_dir": result["case_dir"], "reused": result["reused"],
+        }
+
+    results = []
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        futures = {executor.submit(run, case): case["label"] for case in design}
+        for completed, future in enumerate(as_completed(futures), 1):
+            results.append(future.result())
+            write_json(output_root / "progress.json", {
+                "schema_version": 1, "completed": completed,
+                "total": len(design), "last_label": futures[future],
+            })
+    return sorted(results, key=lambda item: (
+        int(item.get("grid_size", 0)), str(item["label"])
+    ))
+
+
+def run_grid_campaign(model_path: Path, config: dict, output_root: Path,
+                      jobs: int = 6) -> dict:
+    validate_identification_config(config)
+    validate_model_contract(read_json(model_path))
+    physical = config["physical"]
+    placements = placement_design(model_path, float(physical["utilization"]))
+    grids = tuple(int(value) for value in physical["grid_convergence_sizes"])
+    design = grid_campaign_design(placements, grids)
+    records = _parallel_hotspot_design(
+        model_path, design, physical, output_root, jobs, "grid-convergence"
+    )
+    report = evaluate_grid_convergence(
+        records, grids, float(physical["grid_convergence_tolerance_c"])
+    )
+    report["records"] = records
+    write_json(Path(output_root) / "grid_convergence_report.json", report)
+    return report
+
+
+def run_unit_response_campaign(model_paths: list[Path], config: dict,
+                               output_root: Path, jobs: int = 12) -> dict:
+    validate_identification_config(config)
+    physical = dict(config["physical"])
+    for path in model_paths:
+        validate_model_contract(read_json(path))
+    design = unit_response_design(
+        model_paths, float(physical["utilization"])
+    )
+    output_root = Path(output_root).resolve()
+
+    def run(case: dict) -> dict:
+        model_path = Path(case["model_path"])
+        result = run_hotspot_case(
+            model_path, case["layout"], physical,
+            {"kind": "unit-power", "label": case["label"]},
+            output_root / "cases", DEFAULT_HOTSPOT,
+        )
+        from workflow.thermal.run_hotspot import temperatures
+        values = temperatures(Path(result["case_dir"]) / "steady.txt")
+        response = unit_response_ratio_from_temperatures(
+            values, float(physical["ambient_c"]) + 273.15,
+            int(case["source_tier"]),
+        )
+        return {
+            **{key: value for key, value in case.items() if key != "layout"},
+            **response, "case_dir": result["case_dir"], "reused": result["reused"],
+        }
+
+    records = []
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        futures = {executor.submit(run, case): case["label"] for case in design}
+        for completed, future in enumerate(as_completed(futures), 1):
+            records.append(future.result())
+            write_json(output_root / "progress.json", {
+                "completed": completed, "total": len(design),
+                "last_label": futures[future],
+            })
+    estimate_input = [{
+        "label": record["label"], "ambient_c": 0.0,
+        "same_tier_tmax_c": record["same_tier_rise_c"],
+        "cross_tier_tmax_c": record["cross_tier_rise_c"],
+    } for record in records]
+    identification = config["identification"]
+    report = estimate_cross_tier_weight(
+        estimate_input, int(identification["bootstrap_samples"]),
+        int(identification["bootstrap_seed"]),
+        float(identification["cross_tier_max_relative_interval_width"]),
+    )
+    report["records"] = sorted(records, key=lambda item: item["label"])
+    write_json(output_root / "unit_response_report.json", report)
+    return report

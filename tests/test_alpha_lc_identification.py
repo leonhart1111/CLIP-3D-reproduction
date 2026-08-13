@@ -14,10 +14,14 @@ from workflow.thermal.identify_alpha_lc import (
     evaluate_grid_convergence,
     estimate_cross_tier_weight,
     fit_alpha_lc,
+    assemble_relative_samples,
+    grid_campaign_design,
     identification_plan,
     placement_design,
     run_hotspot_case,
     unit_power_model,
+    unit_response_ratio_from_temperatures,
+    unit_response_design,
     validate_identification_config,
     validate_model_contract,
 )
@@ -89,6 +93,7 @@ class AlphaLcKernelTests(unittest.TestCase):
 class PlacementDesignTests(unittest.TestCase):
     def write_model(self, root: Path, l2_area: float = 1.0,
                     preferred_width_mm: float | None = None) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
         modules = []
         for core in range(4):
             modules.append({
@@ -253,6 +258,19 @@ class GridConvergenceTests(unittest.TestCase):
             self.assertEqual(materialize_mock.call_count, 2)
             self.assertEqual(hotspot_mock.call_count, 2)
 
+    def test_grid_campaign_design_is_six_layouts_by_three_grids(self):
+        placements = [
+            {"label": label, "layout": {"label": label}}
+            for label in (
+                "center", "corner_ll", "corner_lr", "corner_ul",
+                "corner_ur", "near_core0", "edge_top",
+            )
+        ]
+        design = grid_campaign_design(placements, (32, 64, 128))
+        self.assertEqual(len(design), 18)
+        self.assertEqual({case["grid_size"] for case in design}, {32, 64, 128})
+        self.assertNotIn("edge_top", {case["label"] for case in design})
+
 
 class UnitResponseTests(unittest.TestCase):
     def test_unit_power_model_changes_only_copied_power_fields(self):
@@ -329,6 +347,43 @@ class UnitResponseTests(unittest.TestCase):
         self.assertFalse(report["accepted"])
         self.assertIn("relative interval width", report["rejection_reasons"][0])
 
+    def test_unit_response_compares_same_xy_on_active_layers(self):
+        values = [
+            ("layer_1_t0_r00_c00", 310.0),
+            ("layer_1_t0_r00_c01", 320.0),
+            ("layer_3_t1_r00_c00", 305.0),
+            ("layer_3_t1_r00_c01", 312.0),
+            ("inode_0", 400.0),
+        ]
+        bottom = unit_response_ratio_from_temperatures(
+            values, ambient_k=300.0, source_tier=0,
+        )
+        self.assertEqual(bottom["peak_coordinate"], "r00_c01")
+        self.assertAlmostEqual(bottom["same_tier_rise_c"], 20.0)
+        self.assertAlmostEqual(bottom["cross_tier_rise_c"], 12.0)
+        self.assertAlmostEqual(bottom["ratio"], 0.6)
+        top = unit_response_ratio_from_temperatures(
+            values, ambient_k=300.0, source_tier=1,
+        )
+        self.assertEqual(top["peak_coordinate"], "r00_c01")
+        self.assertAlmostEqual(top["same_tier_rise_c"], 12.0)
+        self.assertAlmostEqual(top["cross_tier_rise_c"], 20.0)
+
+    def test_formal_unit_response_design_has_72_balanced_cases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model_paths = []
+            for index, l2_area in enumerate((0.5, 1.0, 2.0)):
+                path = PlacementDesignTests().write_model(
+                    root / f"m{index}", l2_area=l2_area,
+                )
+                model_paths.append(path)
+            design = unit_response_design(model_paths, utilization=0.70)
+        self.assertEqual(len(design), 72)
+        self.assertEqual({case["source_tier"] for case in design}, {0, 1})
+        self.assertEqual({case["source_shape"] for case in design}, {"core", "l2"})
+        self.assertEqual(len({case["label"] for case in design}), 72)
+
 
 class AlphaLcFitTests(unittest.TestCase):
     def synthetic_samples(self, alpha: float = 1.4,
@@ -402,6 +457,27 @@ class AlphaLcFitTests(unittest.TestCase):
             sample["delta_t_c"] = 0.0
         with self.assertRaisesRegex(ValueError, "spatially degenerate"):
             fit_alpha_lc(samples, 0.7, bootstrap_samples=20)
+
+    def test_relative_samples_use_reference_inside_each_work_point(self):
+        cases = [
+            {"group": "fft-a", "workload": "fft", "architecture": "a",
+             "label": "corner_ll", "tmax_c": 90.0, "modules": [],
+             "die_side_mm": 8.0},
+            {"group": "fft-a", "workload": "fft", "architecture": "a",
+             "label": "center", "tmax_c": 89.5, "modules": [],
+             "die_side_mm": 8.0},
+            {"group": "stream-b", "workload": "stream", "architecture": "b",
+             "label": "corner_ll", "tmax_c": 120.0, "modules": [],
+             "die_side_mm": 10.0},
+            {"group": "stream-b", "workload": "stream", "architecture": "b",
+             "label": "center", "tmax_c": 121.25, "modules": [],
+             "die_side_mm": 10.0},
+        ]
+        samples = assemble_relative_samples(cases, reference_label="corner_ll")
+        values = {(s["group"], s["label"]): s["delta_t_c"] for s in samples}
+        self.assertEqual(values[("fft-a", "center")], -0.5)
+        self.assertEqual(values[("stream-b", "center")], 1.25)
+        self.assertTrue(values[("fft-a", "corner_ll")] == 0.0)
 
 
 class CampaignCliTests(unittest.TestCase):
