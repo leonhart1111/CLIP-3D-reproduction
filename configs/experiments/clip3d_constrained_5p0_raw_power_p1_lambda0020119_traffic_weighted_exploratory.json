@@ -28,9 +28,6 @@
     "tiers": 2,
     "grid_size": 32,
     "utilization": 0.7,
-    "area_reference_mm2": 150.0,
-    "area_reference_raw_mm2": 45.7538495872,
-    "area_reference_basis": "McPAT non-cache area plus local CACTI L1I/L1D/L2 area for 4-core 32kB/512kB reference",
     "thermal_stack": {
       "silicon_resistivity_mk_per_w": 0.01,
       "tim_resistivity_mk_per_w": 0.25,
@@ -97,7 +94,7 @@
     "paper": [
       "45 nm, 4 cores, 2 GHz",
       "32x32 power grid on each active tier",
-      "70% utilization and 150 mm^2 reference calibration",
+      "70% floorplan utilization; die area is derived from unscaled local McPAT/CACTI geometry",
       "T_safe=95 C, T_amb=25 C, f_min=0.4 GHz",
       "Constrained cooling R_conv=5.0 K/W"
     ],

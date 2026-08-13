@@ -164,6 +164,18 @@ def validate_config(config: dict, layout_method: str) -> None:
             "cacti.use_paper_table_ii has been removed; cache area and latency "
             "must come from the local CACTI run"
         )
+    forbidden_area_controls = {
+        "area_reference_mm2", "area_reference_raw_mm2",
+        "area_reference_basis", "area_scale",
+    }
+    requested_area_controls = forbidden_area_controls.intersection(
+        config.get("physical", {})
+    )
+    if requested_area_controls:
+        raise ValueError(
+            "global area scaling is forbidden; remove physical controls: "
+            f"{sorted(requested_area_controls)}"
+        )
     physical_r = float(config["physical"]["r_convec_k_per_w"])
     optimizer_r = float(config["layout_optimizer"]["r_convec_k_per_w"])
     if layout_method != "fixed-bin" and not abs(physical_r - optimizer_r) < 1e-12:
@@ -620,11 +632,9 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
 
     started = time.perf_counter()
     modules_path = output_dir / "modules.json"
-    reference_raw = float(physical.get("area_reference_raw_mm2", 45.7538495872))
-    area_scale = float(physical["area_reference_mm2"]) / reference_raw
     cacti_json = output_dir / "cacti/cacti_characterization.json"
     model = build_model(
-        r1_dir, mcpat_dir / "mcpat.json", cacti_json, modules_path, area_scale,
+        r1_dir, mcpat_dir / "mcpat.json", cacti_json, modules_path,
         require_communication_profile=(
             config["delay"].get("wire_aggregation", "mean") == "traffic-weighted"
         ),
@@ -775,7 +785,7 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
                     "ambient_c": frequency["ambient_c"]},
         "module_count": len(model["modules"]), "total_power_w": model["totals"]["total_power_w"],
         "power_provenance": model["power_provenance"],
-        "area_calibration": model.get("area_calibration"),
+        "area_provenance": model.get("area_provenance"),
         "power_distribution": model.get("power_distribution"),
         "communication_profile": model.get("communication_profile"),
         "gamma": model["gamma"], "tmax_c": thermal["tmax_c"],

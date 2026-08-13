@@ -674,6 +674,8 @@ class ParserTests(unittest.TestCase):
             })
             cacti_path = root / "cacti.json"
             write_json(cacti_path, {"records": [
+                {"level": "l1i", "size": "32kB", "size_bytes": 32 * 1024,
+                 "area_mm2": 0.2, "width_mm": 0.5, "height_mm": 0.4},
                 {"level": "l1d", "size": "32kB", "size_bytes": 32 * 1024,
                  "area_mm2": 0.2, "width_mm": 0.5, "height_mm": 0.4},
                 {"level": "l2", "size": "512kB", "size_bytes": 512 * 1024,
@@ -683,7 +685,7 @@ class ParserTests(unittest.TestCase):
             metadata.pop("instruction_window_scope")
             write_json(r1_dir / "r1_metadata.json", metadata)
             model = build_model(
-                r1_dir, mcpat_path, cacti_path, output, area_scale=1.0,
+                r1_dir, mcpat_path, cacti_path, output,
                 require_communication_profile=True,
             )
             self.assertEqual(model, read_json(output))
@@ -807,7 +809,7 @@ Cache height x width (mm): 2 x 4
         ]
         metadata = {"l1i_size": "32kB", "l1d_size": "64kB", "l2_size": "512kB"}
         cacti = {"records": [
-            {"level": "l1d", "size": "32kB", "size_bytes": 32 * 1024,
+            {"level": "l1i", "size": "32kB", "size_bytes": 32 * 1024,
              "area_mm2": 0.20, "width_mm": 0.50, "height_mm": 0.40,
              "value_source": "local CACTI run"},
             {"level": "l1d", "size": "64kB", "size_bytes": 64 * 1024,
@@ -817,14 +819,15 @@ Cache height x width (mm): 2 x 4
              "area_mm2": 2.50, "width_mm": 2.50, "height_mm": 1.00,
              "value_source": "local CACTI run"},
         ]}
-        physical = apply_physical_areas(modules, metadata, cacti, 2.0)
+        physical = apply_physical_areas(modules, metadata, cacti)
         by_kind = {module["kind"]: module for module in physical}
-        self.assertAlmostEqual(by_kind["core_logic"]["area_mm2"], 20.0)
+        self.assertAlmostEqual(by_kind["core_logic"]["area_mm2"], 10.0)
         self.assertEqual(by_kind["core_logic"]["area_source"], "McPAT")
-        self.assertAlmostEqual(by_kind["l1d"]["area_mm2"], 0.60)
-        self.assertAlmostEqual(by_kind["l1d"]["raw_area_mm2"], 30.0)
+        self.assertAlmostEqual(by_kind["l1d"]["area_mm2"], 0.30)
+        self.assertAlmostEqual(by_kind["l1d"]["mcpat_reported_area_mm2"], 30.0)
         self.assertEqual(by_kind["l1d"]["area_source"], "local CACTI run")
-        self.assertAlmostEqual(by_kind["l2"]["preferred_width_mm"], 2.5 * math.sqrt(2.0))
+        self.assertAlmostEqual(by_kind["l2"]["preferred_width_mm"], 2.5)
+        self.assertNotIn("area_before_global_scale_mm2", by_kind["l2"])
 
     def test_pipeline_rejects_removed_paper_table_ii_switch(self):
         config = {

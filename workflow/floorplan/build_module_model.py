@@ -17,14 +17,6 @@ from workflow.common import (
 )
 
 
-# The reference pre-scale area combines McPAT non-cache logic with local CACTI
-# cache areas for the paper reference architecture (4 cores, 32-kB L1I/L1D,
-# 512-kB shared L2).  Cache area and delay must come from the local CACTI run,
-# not from paper tables.
-DEFAULT_REFERENCE_RAW_AREA_MM2 = 45.7538495872
-DEFAULT_AREA_SCALE = 150.0 / DEFAULT_REFERENCE_RAW_AREA_MM2
-
-
 def extract_communication_profile(stats: dict[str, float], num_cores: int,
                                   stats_path: Path,
                                   instruction_window_scope: object,
@@ -108,38 +100,30 @@ def cache_record(cacti: dict, level: str, size: str) -> dict:
     return matches[0]
 
 
-def apply_physical_areas(modules: list[dict], metadata: dict, cacti: dict,
-                         area_scale: float) -> list[dict]:
-    """Use CACTI cache geometry and McPAT non-cache area, then scale globally."""
-    if area_scale <= 0:
-        raise ValueError("area scale must be positive")
+def apply_physical_areas(modules: list[dict], metadata: dict,
+                         cacti: dict) -> list[dict]:
+    """Use measured CACTI cache geometry and unmodified McPAT logic area."""
     cache_geometry = {
-        "l1i": cache_record(cacti, "l1d", metadata["l1i_size"]),
+        "l1i": cache_record(cacti, "l1i", metadata["l1i_size"]),
         "l1d": cache_record(cacti, "l1d", metadata["l1d_size"]),
         "l2": cache_record(cacti, "l2", metadata["l2_size"]),
     }
-    dimension_scale = area_scale ** 0.5
     result = []
     for source in modules:
         module = dict(source)
-        module["raw_area_mm2"] = float(source["area_mm2"])
+        mcpat_area = float(source["area_mm2"])
         geometry = cache_geometry.get(module["kind"])
         if geometry is None:
-            pre_scale_area = module["raw_area_mm2"]
+            module["area_mm2"] = mcpat_area
             module["area_source"] = "McPAT"
         else:
-            pre_scale_area = float(geometry["area_mm2"])
+            module["mcpat_reported_area_mm2"] = mcpat_area
+            module["area_mm2"] = float(geometry["area_mm2"])
             module["area_source"] = geometry.get("value_source", "CACTI")
             module["cacti_level"] = geometry["level"]
             module["cacti_size"] = geometry["size"]
-            module["preferred_width_mm"] = (
-                float(geometry["width_mm"]) * dimension_scale
-            )
-            module["preferred_height_mm"] = (
-                float(geometry["height_mm"]) * dimension_scale
-            )
-        module["area_before_global_scale_mm2"] = pre_scale_area
-        module["area_mm2"] = pre_scale_area * area_scale
+            module["preferred_width_mm"] = float(geometry["width_mm"])
+            module["preferred_height_mm"] = float(geometry["height_mm"])
         module["power_density_w_per_mm2"] = (
             module["total_power_w"] / module["area_mm2"]
         )
@@ -148,7 +132,6 @@ def apply_physical_areas(modules: list[dict], metadata: dict, cacti: dict,
 
 
 def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
-                area_scale: float = DEFAULT_AREA_SCALE,
                 require_communication_profile: bool = False) -> dict:
     metadata = dict(read_json(r1_dir / "r1_metadata.json"))
     metadata["instruction_window_scope"] = instruction_window_scope(metadata)
@@ -163,7 +146,7 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
     )
     mcpat = read_json(mcpat_json)
     cacti = read_json(cacti_json)
-    modules = apply_physical_areas(mcpat["modules"], metadata, cacti, area_scale)
+    modules = apply_physical_areas(mcpat["modules"], metadata, cacti)
     totals = {
         "area_mm2": sum(module["area_mm2"] for module in modules),
         "dynamic_power_w": sum(module["dynamic_power_w"] for module in modules),
@@ -186,7 +169,7 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
     for values in by_kind.values():
         values["power_fraction"] = values["total_power_w"] / totals["total_power_w"]
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_r1": str(r1_dir.resolve()),
         "source_mcpat": str(mcpat_json.resolve()),
         "source_cacti": str(cacti_json.resolve()),
@@ -194,16 +177,10 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
         "ipc1": aggregate_ipc(stats, num_cores),
         "communication_profile": communication_profile,
         "power_provenance": mcpat["power_provenance"],
-        "area_calibration": {
-            "scale_factor": area_scale,
-            "reference_target_mm2": 150.0,
-            "reference_raw_mm2": 150.0 / area_scale,
-            "reference_architecture": "4 cores, L1D=32kB, L2=512kB, 45nm",
-            "pre_scale_sources": {
-                "core_logic_and_interconnect": "McPAT",
-                "l1i_l1d_l2": "local CACTI run",
-            },
-            "scope": "global area scale only; power is not scaled",
+        "area_provenance": {
+            "core_logic_and_interconnect": "unmodified McPAT area",
+            "l1i_l1d_l2": "unmodified local CACTI area and dimensions",
+            "global_scaling": "none",
         },
         "power_distribution": {
             "by_kind": by_kind,
@@ -225,11 +202,10 @@ def main() -> None:
     parser.add_argument("--mcpat-json", type=Path, required=True)
     parser.add_argument("--cacti-json", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--area-scale", type=float, default=DEFAULT_AREA_SCALE)
     args = parser.parse_args()
     result = build_model(
         args.r1_dir.resolve(), args.mcpat_json.resolve(),
-        args.cacti_json.resolve(), args.output.resolve(), args.area_scale
+        args.cacti_json.resolve(), args.output.resolve()
     )
     print(
         f"Module model: {len(result['modules'])} modules, "

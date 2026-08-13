@@ -12,6 +12,8 @@ from workflow.cache_contract import (
 )
 from workflow.cacti.characterize_cache import make_config
 from workflow.mcpat.gem5_to_mcpat import convert, named_child, component_by_id
+from workflow.common import PROJECT_ROOT
+from workflow.run_lifting_pipeline import validate_config
 
 
 class CacheCycleTests(unittest.TestCase):
@@ -140,6 +142,32 @@ class McPATContractTests(unittest.TestCase):
                     self.assertEqual(named_child(component, "param", name).get("value"), value)
             self.assertEqual(report["cache_contract"]["records"][2]["bank_count"], 1)
             self.assertEqual(report["cache_contract"]["records"][2]["output_width_bits"], 512)
+
+
+class UnscaledConfigurationTests(unittest.TestCase):
+    def test_official_configs_have_no_global_area_calibration(self):
+        forbidden = {
+            "area_reference_mm2", "area_reference_raw_mm2",
+            "area_reference_basis",
+        }
+        for path in sorted((PROJECT_ROOT / "configs/experiments").glob("*.json")):
+            with self.subTest(path=path.name):
+                config = json.loads(path.read_text(encoding="utf-8"))
+                self.assertTrue(forbidden.isdisjoint(config.get("physical", {})))
+                self.assertNotIn("150 mm^2 reference calibration", path.read_text())
+
+    def test_pipeline_rejects_new_area_scaling_controls(self):
+        config = {
+            "schema_version": 1,
+            "physical": {
+                "r_convec_k_per_w": 5.0,
+                "area_reference_mm2": 150.0,
+            },
+            "layout_optimizer": {"r_convec_k_per_w": 5.0},
+            "mcpat": {}, "cacti": {}, "delay": {},
+        }
+        with self.assertRaisesRegex(ValueError, "area scaling"):
+            validate_config(config, "fixed-bin")
 
 
 if __name__ == "__main__":
