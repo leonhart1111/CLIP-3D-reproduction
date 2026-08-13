@@ -667,6 +667,25 @@ def _fit_core(samples: list[dict], cross_tier_weight: float,
     }
 
 
+def _fit_core_on_ratio_grid(
+        samples: list[dict], cross_tier_weight: float,
+        ratios: tuple[float, ...], huber_delta_c: float,
+        feature_cache: SpatialFeatureCache) -> dict:
+    candidates = []
+    for ratio in ratios:
+        rows = _feature_rows(
+            samples, cross_tier_weight, ratio, feature_cache,
+        )
+        alpha, objective = _robust_nonnegative_slope(rows, huber_delta_c)
+        candidates.append((objective, ratio, alpha))
+    objective, ratio, alpha = min(candidates)
+    return {
+        "alpha": alpha,
+        "lc_die_side_ratio": ratio,
+        "objective": objective,
+    }
+
+
 def _average_ranks(values: list[float]) -> list[float]:
     order = sorted(range(len(values)), key=lambda index: (values[index], index))
     ranks = [0.0] * len(values)
@@ -896,6 +915,11 @@ def fit_alpha_lc(samples: list[dict], cross_tier_weight: float,
     for sample in samples:
         groups.setdefault(str(sample["group"]), []).append(sample)
     group_names = sorted(groups)
+    log_low, log_high = map(math.log, map(float, lc_bounds_ratio))
+    bootstrap_ratios = tuple(
+        math.exp(log_low + (log_high - log_low) * index / 160)
+        for index in range(161)
+    )
     rng = random.Random(seed)
     boot_alpha, boot_ratio = [], []
     for _ in range(bootstrap_samples):
@@ -906,14 +930,22 @@ def fit_alpha_lc(samples: list[dict], cross_tier_weight: float,
                 duplicate = dict(sample)
                 duplicate["group"] = f"{group}#bootstrap{occurrence}"
                 resampled.append(duplicate)
-        local = _fit_core(
-            resampled, cross_tier_weight, lc_bounds_ratio, huber_delta_c,
+        local = _fit_core_on_ratio_grid(
+            resampled, cross_tier_weight, bootstrap_ratios, huber_delta_c,
             feature_cache,
         )
         boot_alpha.append(local["alpha"])
         boot_ratio.append(local["lc_die_side_ratio"])
     bootstrap = {
         "samples": bootstrap_samples, "seed": seed,
+        "method": "whole-work-point bootstrap on frozen log-Lc grid",
+        "lc_grid_points": len(bootstrap_ratios),
+        "maximum_adjacent_lc_ratio": max(
+            right / left for left, right in zip(
+                bootstrap_ratios, bootstrap_ratios[1:]
+            )
+        ),
+        "per_resample_continuous_refinement": False,
         "alpha_95": {
             "low": _percentile(boot_alpha, 0.025),
             "high": _percentile(boot_alpha, 0.975),

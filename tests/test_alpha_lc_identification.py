@@ -554,6 +554,9 @@ class AlphaLcFitTests(unittest.TestCase):
         self.assertTrue(math.isfinite(
             report["bootstrap"]["alpha_95"]["low"]
         ))
+        self.assertEqual(report["bootstrap"]["lc_grid_points"], 161)
+        self.assertFalse(report["bootstrap"]["per_resample_continuous_refinement"])
+        self.assertLess(report["bootstrap"]["maximum_adjacent_lc_ratio"], 1.04)
 
     def test_spatial_feature_cache_matches_direct_area_quadrature(self):
         sample = self.synthetic_samples()[3]
