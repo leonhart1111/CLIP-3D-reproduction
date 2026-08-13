@@ -594,7 +594,7 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     started = time.perf_counter()
     mcpat_dir = output_dir / "mcpat"
     mcpat_xml = mcpat_dir / "input.xml"
-    convert(r1_dir, mcpat_xml, settings={
+    mapping_report = convert(r1_dir, mcpat_xml, settings={
         key: mcpat_config[key] for key in (
             "temperature_k", "device_type", "longer_channel_device",
             "interconnect_projection_type",
@@ -611,6 +611,7 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
         raise RuntimeError(f"McPAT failed; see {mcpat_dir / 'mcpat.out'}")
     parsed_mcpat = parse_mcpat_text(mcpat_text)
     parsed_mcpat["command"] = command
+    parsed_mcpat["cache_contract"] = mapping_report["cache_contract"]
     write_json(mcpat_dir / "mcpat.json", parsed_mcpat)
     stage_seconds["mcpat"] = time.perf_counter() - started
 

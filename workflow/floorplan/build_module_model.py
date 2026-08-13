@@ -15,6 +15,7 @@ from workflow.common import (
     read_json,
     write_json,
 )
+from workflow.cache_contract import validate_characterization
 
 
 def extract_communication_profile(stats: dict[str, float], num_cores: int,
@@ -122,6 +123,7 @@ def apply_physical_areas(modules: list[dict], metadata: dict,
             module["area_source"] = geometry.get("value_source", "CACTI")
             module["cacti_level"] = geometry["level"]
             module["cacti_size"] = geometry["size"]
+            module["cacti_record_id"] = geometry.get("cacti_record_id")
             module["preferred_width_mm"] = float(geometry["width_mm"])
             module["preferred_height_mm"] = float(geometry["height_mm"])
         module["power_density_w_per_mm2"] = (
@@ -146,6 +148,10 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
     )
     mcpat = read_json(mcpat_json)
     cacti = read_json(cacti_json)
+    cache_contract = mcpat.get("cache_contract")
+    if cache_contract is None:
+        raise ValueError("McPAT artifact lacks the shared cache_contract")
+    validate_characterization(cacti, cache_contract)
     modules = apply_physical_areas(mcpat["modules"], metadata, cacti)
     totals = {
         "area_mm2": sum(module["area_mm2"] for module in modules),
@@ -177,6 +183,8 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
         "ipc1": aggregate_ipc(stats, num_cores),
         "communication_profile": communication_profile,
         "power_provenance": mcpat["power_provenance"],
+        "cache_contract": cache_contract,
+        "cacti_characterization_id": cacti["characterization_id"],
         "area_provenance": {
             "core_logic_and_interconnect": "unmodified McPAT area",
             "l1i_l1d_l2": "unmodified local CACTI area and dimensions",

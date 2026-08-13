@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from workflow.cache_contract import validate_characterization
 from workflow.common import parse_size_bytes, read_json, write_json
 from workflow.floorplan.layout_metrics import (
     communication_weights_from_model,
@@ -32,9 +33,29 @@ def build_vector(modules: Path, cacti_path: Path, output: Path,
     model = read_json(modules)
     metadata = model["architecture"]
     cacti = read_json(cacti_path)
-    l1i = lookup(cacti, "l1d", metadata["l1i_size"])
-    l1d = lookup(cacti, "l1d", metadata["l1d_size"])
-    l2 = lookup(cacti, "l2", metadata["l2_size"])
+    cache_contract = model.get("cache_contract")
+    if cache_contract is None:
+        # Compatibility is limited to unit fixtures and historical artifacts;
+        # newly generated schema-2 module models always carry the contract.
+        l1i = lookup(cacti, "l1d", metadata["l1i_size"])
+        l1d = lookup(cacti, "l1d", metadata["l1d_size"])
+        l2 = lookup(cacti, "l2", metadata["l2_size"])
+        cacti_provenance = None
+    else:
+        selected = validate_characterization(cacti, cache_contract)
+        if model.get("cacti_characterization_id") != cacti.get(
+                "characterization_id"):
+            raise ValueError(
+                "module geometry CACTI identity differs from R2 characterization"
+            )
+        l1i, l1d, l2 = (selected["l1i"], selected["l1d"], selected["l2"])
+        cacti_provenance = {
+            "characterization_id": cacti["characterization_id"],
+            "records": {
+                level: selected[level]["cacti_record_id"]
+                for level in ("l1i", "l1d", "l2")
+            },
+        }
     cores = int(metadata["num_cores"])
     if wire_aggregation not in ("mean", "maximum", "traffic-weighted"):
         raise ValueError(
@@ -102,6 +123,7 @@ def build_vector(modules: Path, cacti_path: Path, output: Path,
         "layout": str(layout_path.resolve()) if layout_path else None,
         "layout_delays": layout_delays,
         "wire_cycle_aggregation_for_r2": wire_aggregation,
+        "cacti_provenance": cacti_provenance,
         "paper_parameters": [
             f"Ncores-1 arbitration = {arbitration}",
             f"{cycles_per_tsv} cycles/TSV x {tsv_hops}",

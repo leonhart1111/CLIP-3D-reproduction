@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from workflow.cacti.characterize_cache import parse_cacti_output
+from workflow.cache_contract import build_cache_contract, stable_identity
 from workflow.analysis.summarize_sweep import summarize
 from workflow.analysis.prepare_raw_power_validation import prepare
 from workflow.analysis.evaluate_operational_proxy import evaluate as evaluate_operational_proxy
@@ -645,6 +646,9 @@ class ParserTests(unittest.TestCase):
                 "l1i_size": "32kB",
                 "l1d_size": "32kB",
                 "l2_size": "512kB",
+                "l1_associativity": 2,
+                "l2_associativity": 8,
+                "cache_line_bytes": 64,
                 "instruction_window_scope": "roi",
             }
             write_json(r1_dir / "r1_metadata.json", metadata)
@@ -658,6 +662,10 @@ class ParserTests(unittest.TestCase):
                 encoding="utf-8",
             )
             mcpat_path = root / "mcpat.json"
+            contract = build_cache_contract(
+                metadata, technology_nm=45, temperature_k=320,
+                device_type=0, interconnect_projection_type=1,
+            )
             write_json(mcpat_path, {
                 "modules": [
                     {"name": "core0_logic", "kind": "core_logic", "core": 0,
@@ -671,16 +679,28 @@ class ParserTests(unittest.TestCase):
                      "total_power_w": 0.2},
                 ],
                 "power_provenance": {"postprocessing": "none"},
+                "cache_contract": contract,
             })
             cacti_path = root / "cacti.json"
-            write_json(cacti_path, {"records": [
-                {"level": "l1i", "size": "32kB", "size_bytes": 32 * 1024,
-                 "area_mm2": 0.2, "width_mm": 0.5, "height_mm": 0.4},
-                {"level": "l1d", "size": "32kB", "size_bytes": 32 * 1024,
-                 "area_mm2": 0.2, "width_mm": 0.5, "height_mm": 0.4},
-                {"level": "l2", "size": "512kB", "size_bytes": 512 * 1024,
-                 "area_mm2": 1.0, "width_mm": 1.0, "height_mm": 1.0},
-            ]})
+            records = []
+            for index, organization in enumerate(contract["records"]):
+                record = {
+                    **organization, "access_time_ns": 0.5 + index * 0.5,
+                    "access_cycles": 1 + index, "area_mm2": 0.2 + index * 0.4,
+                    "width_mm": 0.5 + index * 0.25,
+                    "height_mm": (0.2 + index * 0.4) / (0.5 + index * 0.25),
+                    "config_sha256": "a" * 64, "raw_output_sha256": "b" * 64,
+                }
+                record["cacti_record_id"] = stable_identity(record)
+                records.append(record)
+            characterization = {
+                "schema_version": 2, "frequency_ghz": 2.0,
+                "rounding": "ceiling, minimum one cycle; 1e-12 tolerance at exact integer boundaries",
+                "records": records,
+                "provenance": {"cacti_executable_sha256": "c" * 64},
+            }
+            characterization["characterization_id"] = stable_identity(characterization)
+            write_json(cacti_path, characterization)
             output = root / "modules.json"
             metadata.pop("instruction_window_scope")
             write_json(r1_dir / "r1_metadata.json", metadata)

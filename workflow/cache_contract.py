@@ -118,3 +118,82 @@ def build_cache_contract(
     }
     contract["contract_id"] = stable_identity(contract)
     return contract
+
+
+CONTRACT_FIELDS = (
+    "level", "size_bytes", "associativity", "bank_count",
+    "output_width_bits", "technology_nm", "line_size_bytes",
+    "temperature_k", "device_type", "interconnect_projection",
+    "access_mode", "ecc", "core_count", "cacti_model",
+    "cacti_cache_level",
+)
+
+
+def validate_characterization(cacti: dict, expected_contract: dict) -> dict[str, dict]:
+    """Validate a local CACTI artifact and return one record per cache level."""
+    if int(cacti.get("schema_version", 0)) != 2:
+        raise ValueError("CACTI characterization schema_version must be 2")
+    if not str(cacti.get("rounding", "")).startswith("ceiling"):
+        raise ValueError("CACTI characterization must use ceiling latency rounding")
+    frequency = float(cacti.get("frequency_ghz", 0.0))
+    if not math.isfinite(frequency) or frequency <= 0:
+        raise ValueError("CACTI characterization frequency_ghz must be positive")
+    records = cacti.get("records")
+    if not isinstance(records, list):
+        raise ValueError("CACTI characterization records must be a list")
+
+    actual_by_level: dict[str, dict] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("CACTI characterization record must be an object")
+        level = str(record.get("level", ""))
+        if level in actual_by_level:
+            raise ValueError(f"duplicate CACTI characterization record for {level}")
+        actual_by_level[level] = record
+
+    expected_records = expected_contract.get("records")
+    if not isinstance(expected_records, list):
+        raise ValueError("expected cache contract records must be a list")
+    expected_by_level = {str(record["level"]): record for record in expected_records}
+    if set(actual_by_level) != set(expected_by_level):
+        missing = sorted(set(expected_by_level) - set(actual_by_level))
+        extra = sorted(set(actual_by_level) - set(expected_by_level))
+        raise ValueError(
+            f"CACTI characterization level mismatch: missing={missing}, extra={extra}"
+        )
+
+    for level, expected in expected_by_level.items():
+        actual = actual_by_level[level]
+        for field in CONTRACT_FIELDS:
+            if actual.get(field) != expected.get(field):
+                raise ValueError(
+                    f"CACTI {level}.{field} mismatch: "
+                    f"expected {expected.get(field)!r}, observed {actual.get(field)!r}"
+                )
+        for field in ("access_time_ns", "area_mm2", "width_mm", "height_mm"):
+            try:
+                value = float(actual[field])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"CACTI {level}.{field} must be positive") from error
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"CACTI {level}.{field} must be positive")
+        expected_cycles = cache_access_cycles(actual["access_time_ns"], frequency)
+        if actual.get("access_cycles") != expected_cycles:
+            raise ValueError(
+                f"CACTI {level}.access_cycles mismatch: expected "
+                f"{expected_cycles}, observed {actual.get('access_cycles')!r}"
+            )
+        record_identity = stable_identity({
+            key: value for key, value in actual.items()
+            if key not in ("config", "raw_output", "cacti_record_id")
+        })
+        if actual.get("cacti_record_id") != record_identity:
+            raise ValueError(f"CACTI {level}.cacti_record_id does not match record")
+
+    artifact_identity = stable_identity({
+        key: value for key, value in cacti.items()
+        if key != "characterization_id"
+    })
+    if cacti.get("characterization_id") != artifact_identity:
+        raise ValueError("CACTI characterization_id does not match artifact")
+    return actual_by_level

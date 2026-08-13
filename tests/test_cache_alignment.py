@@ -9,11 +9,15 @@ from pathlib import Path
 from workflow.cache_contract import (
     build_cache_contract,
     cache_access_cycles,
+    stable_identity,
+    validate_characterization,
 )
 from workflow.cacti.characterize_cache import make_config
 from workflow.mcpat.gem5_to_mcpat import convert, named_child, component_by_id
 from workflow.common import PROJECT_ROOT
 from workflow.run_lifting_pipeline import validate_config
+from workflow.r2.build_latency_vector import build_vector
+from workflow.common import write_json
 
 
 class CacheCycleTests(unittest.TestCase):
@@ -168,6 +172,140 @@ class UnscaledConfigurationTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "area scaling"):
             validate_config(config, "fixed-bin")
+
+
+class CharacterizationIdentityTests(unittest.TestCase):
+    def contract(self):
+        return build_cache_contract(
+            CacheContractTests().metadata(), technology_nm=45,
+            temperature_k=320, device_type=0,
+            interconnect_projection_type=1,
+        )
+
+    def characterization(self):
+        records = []
+        for index, contract in enumerate(self.contract()["records"]):
+            record = {
+                **contract,
+                "access_time_ns": 0.5 + index,
+                "access_cycles": 1 + index * 2,
+                "area_mm2": 0.2 + index,
+                "width_mm": 0.5 + index,
+                "height_mm": (0.2 + index) / (0.5 + index),
+                "config_sha256": "a" * 64,
+                "raw_output_sha256": "b" * 64,
+            }
+            record["cacti_record_id"] = stable_identity({
+                key: value for key, value in record.items()
+                if key not in ("config", "raw_output", "cacti_record_id")
+            })
+            records.append(record)
+        result = {
+            "schema_version": 2,
+            "frequency_ghz": 2.0,
+            "rounding": "ceiling, minimum one cycle; 1e-12 tolerance at exact integer boundaries",
+            "records": records,
+            "provenance": {"cacti_executable_sha256": "c" * 64},
+        }
+        result["characterization_id"] = stable_identity(result)
+        return result
+
+    def test_valid_characterization_returns_distinct_level_records(self):
+        selected = validate_characterization(
+            self.characterization(), self.contract()
+        )
+        self.assertEqual(set(selected), {"l1i", "l1d", "l2"})
+
+    def test_every_contract_field_mismatch_is_rejected(self):
+        mutations = {
+            "size_bytes": 12345,
+            "associativity": 99,
+            "bank_count": 2,
+            "output_width_bits": 64,
+            "technology_nm": 22,
+            "temperature_k": 360,
+            "ecc": False,
+        }
+        for field, value in mutations.items():
+            characterization = self.characterization()
+            characterization["records"][0][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, field
+            ):
+                validate_characterization(characterization, self.contract())
+
+    def test_non_ceiling_and_duplicate_records_are_rejected(self):
+        characterization = self.characterization()
+        characterization["rounding"] = "nearest"
+        with self.assertRaisesRegex(ValueError, "ceiling"):
+            validate_characterization(characterization, self.contract())
+        characterization = self.characterization()
+        characterization["records"].append(dict(characterization["records"][0]))
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            validate_characterization(characterization, self.contract())
+
+    def test_tampered_artifact_identity_is_rejected(self):
+        characterization = self.characterization()
+        characterization["characterization_id"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "characterization_id"):
+            validate_characterization(characterization, self.contract())
+
+    def test_r2_records_the_same_characterization_and_record_identities(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            contract = self.contract()
+            cacti = self.characterization()
+            model = {
+                "architecture": {
+                    **CacheContractTests().metadata(), "num_cores": 4,
+                },
+                "cache_contract": contract,
+                "cacti_characterization_id": cacti["characterization_id"],
+                "communication_profile": {"status": "unavailable"},
+                "modules": [],
+            }
+            modules = root / "modules.json"
+            cacti_path = root / "cacti.json"
+            write_json(modules, model)
+            write_json(cacti_path, cacti)
+
+            vector = build_vector(
+                modules, cacti_path, root / "latency.json",
+                tsv_hops=1, wire_cycles=0,
+            )
+
+            provenance = vector["cacti_provenance"]
+            self.assertEqual(
+                provenance["characterization_id"], cacti["characterization_id"]
+            )
+            self.assertEqual(
+                provenance["records"]["l2"],
+                cacti["records"][2]["cacti_record_id"],
+            )
+
+    def test_r2_rejects_characterization_identity_different_from_geometry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            contract = self.contract()
+            cacti = self.characterization()
+            model = {
+                "architecture": {
+                    **CacheContractTests().metadata(), "num_cores": 4,
+                },
+                "cache_contract": contract,
+                "cacti_characterization_id": "0" * 64,
+                "communication_profile": {"status": "unavailable"},
+                "modules": [],
+            }
+            modules = root / "modules.json"
+            cacti_path = root / "cacti.json"
+            write_json(modules, model)
+            write_json(cacti_path, cacti)
+            with self.assertRaisesRegex(ValueError, "geometry.*identity"):
+                build_vector(
+                    modules, cacti_path, root / "latency.json",
+                    tsv_hops=1, wire_cycles=0,
+                )
 
 
 if __name__ == "__main__":
