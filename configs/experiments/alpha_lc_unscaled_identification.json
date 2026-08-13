@@ -1,6 +1,15 @@
 {
   "schema_version": 1,
   "name": "unscaled_alpha_lc_identification",
+  "technology_nm": 45,
+  "frequency": {"f0_ghz": 2.0},
+  "mcpat": {
+    "temperature_k": 320,
+    "device_type": 0,
+    "longer_channel_device": 1,
+    "interconnect_projection_type": 1,
+    "opt_for_clk": 0
+  },
   "workloads": ["fft", "cholesky", "matmul", "stencil", "stream"],
   "l1d_sizes": ["16kB", "64kB", "128kB"],
   "l2_sizes": ["128kB", "512kB", "2048kB"],

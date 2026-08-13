@@ -10,9 +10,14 @@ import copy
 import random
 import statistics
 import argparse
+import subprocess
+import time
 from pathlib import Path
 
-from workflow.common import read_json, write_json
+from workflow.common import PROJECT_ROOT, read_json, sha256_file, write_json
+from workflow.cache_contract import build_cache_contract
+from workflow.cacti.characterize_cache import characterize
+from workflow.floorplan.build_module_model import build_model
 from workflow.floorplan.generate_hotspot_inputs import (
     baseline_layout,
     check_geometry,
@@ -20,6 +25,8 @@ from workflow.floorplan.generate_hotspot_inputs import (
 )
 from workflow.floorplan.optimize_layout import collision_area
 from workflow.floorplan.optimize_layout import spatial_coupling
+from workflow.mcpat.gem5_to_mcpat import convert
+from workflow.mcpat.parse_mcpat import parse_mcpat_text
 from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT, run_hotspot
 
 
@@ -97,6 +104,102 @@ def identification_plan(r1_root: Path, config: dict) -> dict:
         "work_points": work_points,
         "r1_policy": "read-only reuse; no R1 command exists in this workflow",
     }
+
+
+def prepare_unscaled_model(r1_dir: Path, output_dir: Path,
+                           config: dict) -> dict:
+    """Run only CACTI/McPAT model preparation while keeping R1 read-only."""
+    validate_identification_config(config)
+    r1_dir, output_dir = Path(r1_dir).resolve(), Path(output_dir).resolve()
+    required = [r1_dir / "r1_metadata.json", r1_dir / "stats.txt"]
+    if not all(path.is_file() for path in required):
+        raise FileNotFoundError(f"R1 directory lacks completed metadata/statistics: {r1_dir}")
+    before = {path.name: sha256_file(path) for path in required}
+    settings = config.get("mcpat") or {
+        "temperature_k": 320, "device_type": 0,
+        "longer_channel_device": 1, "interconnect_projection_type": 1,
+        "opt_for_clk": 0,
+    }
+    technology_nm = int(config.get("technology_nm", 45))
+    frequency_ghz = float(config.get("frequency", {}).get("f0_ghz", 2.0))
+    tools = {
+        "cacti": PROJECT_ROOT / "tools/src/cacti/cacti",
+        "cacti_config": PROJECT_ROOT / "tools/src/cacti/cache.cfg",
+        "mcpat": PROJECT_ROOT / "tools/src/mcpat/mcpat",
+    }
+    for label, path in tools.items():
+        if not path.is_file():
+            raise FileNotFoundError(f"missing {label}: {path}")
+    identity_payload = {
+        "schema_version": 1, "r1_hashes": before,
+        "settings": settings, "technology_nm": technology_nm,
+        "frequency_ghz": frequency_ghz,
+        "tool_hashes": {label: sha256_file(path) for label, path in tools.items()},
+    }
+    identity = case_identity(identity_payload, {}, {}, {"kind": "model-preparation"})
+    manifest_path = output_dir / "model_preparation_manifest.json"
+    modules_path = output_dir / "modules.json"
+    if manifest_path.is_file() and modules_path.is_file():
+        manifest = read_json(manifest_path)
+        if manifest.get("identity") == identity:
+            validate_model_contract(read_json(modules_path))
+            return {**manifest, "reused": True}
+    output_dir.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    metadata = read_json(required[0])
+    contract = build_cache_contract(
+        metadata, technology_nm=technology_nm,
+        temperature_k=int(settings.get("temperature_k", 320)),
+        device_type=int(settings.get("device_type", 0)),
+        interconnect_projection_type=int(settings.get("interconnect_projection_type", 1)),
+    )
+    characterize(
+        tools["cacti"], tools["cacti_config"], output_dir / "cacti",
+        None, None, frequency_ghz, contracts=contract["records"],
+    )
+    cacti_json = output_dir / "cacti/cacti_characterization.json"
+    cacti_data = read_json(cacti_json)
+    mcpat_dir = output_dir / "mcpat"
+    mcpat_xml = mcpat_dir / "input.xml"
+    mapping = convert(
+        r1_dir, mcpat_xml,
+        settings={key: settings[key] for key in (
+            "temperature_k", "device_type", "longer_channel_device",
+            "interconnect_projection_type",
+        ) if key in settings},
+        cache_characterization=cacti_data,
+    )
+    command = [
+        str(tools["mcpat"]), "-infile", str(mcpat_xml), "-print_level", "5",
+        "-opt_for_clk", str(int(settings.get("opt_for_clk", 0))),
+    ]
+    process = subprocess.run(
+        command, cwd=tools["mcpat"].parent, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    (mcpat_dir / "mcpat.out").write_text(process.stdout, encoding="utf-8")
+    if process.returncode != 0 or "McPAT (version 1.3" not in process.stdout:
+        raise RuntimeError(f"McPAT failed; see {mcpat_dir / 'mcpat.out'}")
+    parsed = parse_mcpat_text(process.stdout)
+    parsed["command"] = command
+    parsed["cache_contract"] = mapping["cache_contract"]
+    parsed["cacti_characterization_id"] = mapping["cacti_characterization_id"]
+    mcpat_json = mcpat_dir / "mcpat.json"
+    write_json(mcpat_json, parsed)
+    model = build_model(r1_dir, mcpat_json, cacti_json, modules_path)
+    validate_model_contract(model)
+    after = {path.name: sha256_file(path) for path in required}
+    if after != before:
+        raise RuntimeError("R1 input hashes changed during read-only model preparation")
+    manifest = {
+        "schema_version": 1, "identity": identity,
+        "identity_payload": identity_payload, "r1_dir": str(r1_dir),
+        "modules": str(modules_path), "r1_hashes_after": after,
+        "elapsed_seconds": time.perf_counter() - started,
+        "reused": False,
+    }
+    write_json(manifest_path, manifest)
+    return manifest
 
 
 def case_identity(model: dict, layout: dict, physical: dict,
@@ -586,6 +689,12 @@ def main() -> None:
     plan_parser.add_argument("--r1-root", type=Path, required=True)
     plan_parser.add_argument("--config", type=Path, required=True)
     plan_parser.add_argument("--output", type=Path, required=True)
+    model_parser = subparsers.add_parser(
+        "prepare-model", help="prepare one unscaled CACTI/McPAT model from existing R1"
+    )
+    model_parser.add_argument("--r1-dir", type=Path, required=True)
+    model_parser.add_argument("--config", type=Path, required=True)
+    model_parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "plan":
         config = read_json(args.config)
@@ -594,6 +703,14 @@ def main() -> None:
         print(
             f"planned {report['work_point_count']} work points and "
             f"{report['intended_real_power_cases']} real-power HotSpot cases"
+        )
+    elif args.command == "prepare-model":
+        report = prepare_unscaled_model(
+            args.r1_dir, args.output_dir, read_json(args.config)
+        )
+        print(
+            f"prepared unscaled model: {report['modules']} "
+            f"(reused={report['reused']})"
         )
 
 
