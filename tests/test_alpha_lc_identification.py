@@ -648,6 +648,14 @@ class AlphaLcFitTests(unittest.TestCase):
             self.assertAlmostEqual(cache.feature(sample, ratio), expected, places=12)
         self.assertEqual(cache.geometry_preparations, 1)
 
+    def test_spatial_feature_cache_uses_compact_double_pair_storage(self):
+        sample = self.synthetic_samples()[0]
+        cache = SpatialFeatureCache([sample], cross_tier_weight=0.7)
+        # Two modules x four quadrature points produce 8 receiver points,
+        # each coupled to 8 source points: 64 (coefficient, distance) pairs.
+        self.assertEqual(cache.geometry_pair_count, 64)
+        self.assertEqual(cache.geometry_storage_bytes, 64 * 2 * 8)
+
     def test_bootstrap_reuses_geometry_preparation_for_duplicate_groups(self):
         samples = self.synthetic_samples()
         report = fit_alpha_lc(

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from array import array
 import hashlib
 import json
 import copy
@@ -509,6 +510,8 @@ class SpatialFeatureCache:
         self._geometry = {}
         self._features = {}
         self.geometry_preparations = 0
+        self.geometry_pair_count = 0
+        self.geometry_storage_bytes = 0
         for sample in samples:
             self._prepare(sample)
 
@@ -536,7 +539,8 @@ class SpatialFeatureCache:
         receivers = []
         for receiver_points, receiver in points:
             for xi, yi in receiver_points:
-                terms = []
+                coefficients = array("d")
+                distances = array("d")
                 for source_points, source in points:
                     coefficient = (
                         float(source["total_power_w"]) / len(source_points)
@@ -544,8 +548,12 @@ class SpatialFeatureCache:
                     if receiver["tier"] != source["tier"]:
                         coefficient *= self.cross_tier_weight
                     for xj, yj in source_points:
-                        terms.append((coefficient, math.hypot(xi - xj, yi - yj) / side))
-                receivers.append(tuple(terms))
+                        coefficients.append(coefficient)
+                        distances.append(math.hypot(xi - xj, yi - yj) / side)
+                receivers.append((coefficients, distances))
+                self.geometry_pair_count += len(coefficients)
+                self.geometry_storage_bytes += coefficients.itemsize * len(coefficients)
+                self.geometry_storage_bytes += distances.itemsize * len(distances)
         self._geometry[key] = tuple(receivers)
         self.geometry_preparations += 1
         return key
@@ -559,8 +567,8 @@ class SpatialFeatureCache:
         if feature_key not in self._features:
             self._features[feature_key] = max(
                 sum(coefficient / math.sqrt(1.0 + (distance / ratio) ** 2)
-                    for coefficient, distance in terms)
-                for terms in self._geometry[key]
+                    for coefficient, distance in zip(coefficients, distances))
+                for coefficients, distances in self._geometry[key]
             )
         return self._features[feature_key]
 
