@@ -11,6 +11,7 @@ from workflow.cache_contract import (
     cache_access_cycles,
 )
 from workflow.cacti.characterize_cache import make_config
+from workflow.mcpat.gem5_to_mcpat import convert, named_child, component_by_id
 
 
 class CacheCycleTests(unittest.TestCase):
@@ -94,6 +95,51 @@ class CacheContractTests(unittest.TestCase):
         for directive in required:
             with self.subTest(directive=directive):
                 self.assertIn(directive, text)
+
+
+class McPATContractTests(unittest.TestCase):
+    def test_mcpat_xml_encodes_the_same_structural_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            r1 = root / "r1"
+            r1.mkdir()
+            metadata = CacheContractTests().metadata()
+            metadata.update({"num_cores": 4, "cpu_clock": "2GHz"})
+            (r1 / "r1_metadata.json").write_text(
+                json.dumps(metadata), encoding="utf-8"
+            )
+            lines = []
+            for core in range(4):
+                lines.extend((
+                    f"system.cpu{core}.numCycles 1000\n",
+                    f"system.cpu{core}.commitStats0.numInsts 100\n",
+                    f"system.cpu{core}.commitStats0.numOps 100\n",
+                ))
+            (r1 / "stats.txt").write_text("".join(lines), encoding="utf-8")
+            xml_path = root / "input.xml"
+            report_path = root / "mapping_report.json"
+
+            template = Path(
+                "/home/zyjiang/Agenticflow/CLIP/tools/src/mcpat/"
+                "ProcessorDescriptionFiles/ARM_A9_2GHz.xml"
+            )
+            report = convert(
+                r1, xml_path, template=template, report_path=report_path
+            )
+
+            tree = ET.parse(xml_path)
+            system = component_by_id(tree.getroot(), "system")
+            expected = {
+                "system.core0.icache": ("icache_config", "16384,64,2,1,10,10,512,0"),
+                "system.core0.dcache": ("dcache_config", "32768,64,2,1,10,10,512,1"),
+                "system.L20": ("L2_config", "524288,64,8,1,10,10,512,1"),
+            }
+            for identifier, (name, value) in expected.items():
+                with self.subTest(identifier=identifier):
+                    component = component_by_id(system, identifier)
+                    self.assertEqual(named_child(component, "param", name).get("value"), value)
+            self.assertEqual(report["cache_contract"]["records"][2]["bank_count"], 1)
+            self.assertEqual(report["cache_contract"]["records"][2]["output_width_bits"], 512)
 
 
 if __name__ == "__main__":

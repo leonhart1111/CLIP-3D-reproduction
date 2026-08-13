@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from workflow.cacti.characterize_cache import characterize
+from workflow.cache_contract import build_cache_contract
 from workflow.common import PROJECT_ROOT, format_temperature_c, read_json, write_json
 from workflow.floorplan.build_module_model import build_model
 from workflow.floorplan.comparison_layouts import METHODS as COMPARISON_METHODS
@@ -602,10 +603,18 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     stage_seconds["mcpat"] = time.perf_counter() - started
 
     started = time.perf_counter()
-    l1_sizes = list(dict.fromkeys((metadata["l1i_size"], metadata["l1d_size"])))
+    cache_contract = build_cache_contract(
+        metadata, technology_nm=int(config["technology_nm"]),
+        temperature_k=int(mcpat_config.get("temperature_k", 320)),
+        device_type=int(mcpat_config.get("device_type", 0)),
+        interconnect_projection_type=int(
+            mcpat_config.get("interconnect_projection_type", 1)
+        ),
+    )
     characterize(
         tools["cacti"], tools["cacti_config"], output_dir / "cacti",
-        l1_sizes, [metadata["l2_size"]], frequency["f0_ghz"],
+        None, None, frequency["f0_ghz"],
+        contracts=cache_contract["records"],
     )
     stage_seconds["cacti"] = time.perf_counter() - started
 

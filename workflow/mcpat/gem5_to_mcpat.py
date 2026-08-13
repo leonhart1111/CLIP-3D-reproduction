@@ -15,6 +15,7 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from workflow.cache_contract import build_cache_contract
 from workflow.common import (
     PROJECT_ROOT,
     parse_frequency_ghz,
@@ -102,7 +103,8 @@ def cache_counts(stats: dict[str, float], core: int, cache: str) -> dict[str, in
             "read_misses": int(read_misses), "write_misses": int(write_misses)}
 
 
-def update_core(core_xml: ET.Element, core: int, metadata: dict, stats: dict) -> dict:
+def update_core(core_xml: ET.Element, core: int, metadata: dict, stats: dict,
+                cache_contract: dict | None = None) -> dict:
     cycles = int(stat(stats, f"system.cpu{core}.numCycles"))
     committed = int(stat(stats, f"system.cpu{core}.commitStats0.numInsts"))
     # gem5 v23 calls this counter numOps.  The old opsCommitted spelling never
@@ -212,18 +214,33 @@ def update_core(core_xml: ET.Element, core: int, metadata: dict, stats: dict) ->
     # These fields constrain physical synthesis, not the R1 ideal gem5 timing;
     # CACTI supplies the timing that is later back-annotated into R2.
     throughput_cycles, latency_cycles = 10, 10
-    line = int(metadata.get("cache_line_bytes", 64))
-    for cache_name, size_key, assoc_key, xml_id in (
-        ("icache", "l1i_size", "l1_associativity", "icache"),
-        ("dcache", "l1d_size", "l1_associativity", "dcache"),
+    cache_records = {
+        record["level"]: record for record in (
+            cache_contract or build_cache_contract(
+                metadata, technology_nm=45,
+                temperature_k=DEFAULT_MCPAT_SETTINGS["temperature_k"],
+                device_type=DEFAULT_MCPAT_SETTINGS["device_type"],
+                interconnect_projection_type=DEFAULT_MCPAT_SETTINGS[
+                    "interconnect_projection_type"
+                ],
+            )
+        )["records"]
+    }
+    for cache_name, level, xml_id in (
+        ("icache", "l1i", "icache"),
+        ("dcache", "l1d", "dcache"),
     ):
         cache = component_by_id(core_xml, f"system.core{core}.{xml_id}")
         cfg_name = f"{xml_id}_config"
-        size = parse_size_bytes(metadata[size_key])
-        assoc = int(metadata[assoc_key])
+        organization = cache_records[level]
         policy = 0 if cache_name == "icache" else 1
         set_named(cache, "param", cfg_name,
-                  f"{size},{line},{assoc},1,{throughput_cycles},{latency_cycles},32,{policy}")
+                  f'{organization["size_bytes"]},'
+                  f'{organization["line_size_bytes"]},'
+                  f'{organization["associativity"]},'
+                  f'{organization["bank_count"]},'
+                  f'{throughput_cycles},{latency_cycles},'
+                  f'{organization["output_width_bits"]},{policy}')
         counts = cache_counts(stats, core, cache_name)
         set_named(cache, "stat", "read_accesses", counts["reads"])
         set_named(cache, "stat", "read_misses", counts["read_misses"])
@@ -287,6 +304,16 @@ def convert(r1_dir: Path, output_xml: Path, template: Path = DEFAULT_TEMPLATE,
     cores = int(metadata.get("num_cores", 4))
     if cores != 4:
         raise ValueError(f"CLIP-3D reproduction requires four cores, got {cores}")
+    cache_contract = build_cache_contract(
+        metadata, technology_nm=45, temperature_k=temperature,
+        device_type=int(mcpat_settings["device_type"]),
+        interconnect_projection_type=int(
+            mcpat_settings["interconnect_projection_type"]
+        ),
+    )
+    cache_records = {
+        record["level"]: record for record in cache_contract["records"]
+    }
     tree = ET.parse(template)
     root = tree.getroot()
     system = component_by_id(root, "system")
@@ -318,15 +345,21 @@ def convert(r1_dir: Path, output_xml: Path, template: Path = DEFAULT_TEMPLATE,
     for core_index in range(cores):
         core_xml = copy.deepcopy(original_core)
         replace_core_identity(core_xml, core_index)
-        mappings.append(update_core(core_xml, core_index, metadata, stats))
+        mappings.append(update_core(
+            core_xml, core_index, metadata, stats, cache_contract
+        ))
         system.insert(insertion_index + core_index, core_xml)
 
     l2 = component_by_id(system, "system.L20")
-    line = int(metadata.get("cache_line_bytes", 64))
-    l2_size = parse_size_bytes(metadata["l2_size"])
-    assoc = int(metadata["l2_associativity"])
+    l2_organization = cache_records["l2"]
+    throughput_cycles, latency_cycles = 10, 10
     set_named(l2, "param", "L2_config",
-              f"{l2_size},{line},{assoc},8,8,23,32,1")
+              f'{l2_organization["size_bytes"]},'
+              f'{l2_organization["line_size_bytes"]},'
+              f'{l2_organization["associativity"]},'
+              f'{l2_organization["bank_count"]},'
+              f'{throughput_cycles},{latency_cycles},'
+              f'{l2_organization["output_width_bits"]},1')
     set_named(l2, "param", "clockrate", system_values["target_core_clockrate"])
     counts = l2_counts(stats)
     for xml_name, key in (("read_accesses", "reads"), ("write_accesses", "writes"),
@@ -344,11 +377,12 @@ def convert(r1_dir: Path, output_xml: Path, template: Path = DEFAULT_TEMPLATE,
     output_xml.parent.mkdir(parents=True, exist_ok=True)
     tree.write(output_xml, encoding="utf-8", xml_declaration=True)
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_r1": str(r1_dir.resolve()),
         "output_xml": str(output_xml.resolve()),
         "technology_nm": 45,
         "mcpat_settings": mcpat_settings,
+        "cache_contract": cache_contract,
         "cores": mappings,
         "l2": counts,
         "paper_parameters": ["4 cores", "2 GHz", "45 nm", "L1 assoc=2", "L2 assoc=8"],
@@ -360,6 +394,7 @@ def convert(r1_dir: Path, output_xml: Path, template: Path = DEFAULT_TEMPLATE,
             "TLB misses are zero because the current SE statistics do not expose a stable per-TLB miss counter.",
             "The schema's 32-bit address widths are retained: this McPAT/CACTI-P build reports no valid array organization with 64-bit widths.",
             "McPAT temperature is an explicitly configured power-model operating point and is not T_safe.",
+            "Cache organization fields are shared with the standalone local CACTI characterization; only McPAT's synthesis throughput and latency constraints are tool-specific.",
         ],
     }
     write_json(report_path or output_xml.with_name("mapping_report.json"), report)
