@@ -94,7 +94,7 @@ row logic或column logic内部泄漏分项；这些分项不参与本流程提�
 
 复用了既有MATMUL 32 kB/512 kB R1，仅运行R1之后的稳态阶段，不运行长耗时
 gem5 R2。验证输出位于临时审计目录
-`/tmp/clip-cacti-unscaled-steady-smoke`，结果为：
+`/tmp/clip-cacti-unscaled-steady-final-smoke`，结果为：
 
 - 未缩放模块总面积：45.753293 mm²；
 - 70% floorplan utilization对应die边长：7.850327 mm；
