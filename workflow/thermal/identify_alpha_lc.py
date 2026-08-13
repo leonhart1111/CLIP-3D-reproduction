@@ -26,7 +26,7 @@ from workflow.floorplan.generate_hotspot_inputs import (
     materialize,
 )
 from workflow.floorplan.optimize_layout import collision_area
-from workflow.floorplan.optimize_layout import spatial_coupling
+from workflow.floorplan.optimize_layout import quadrature_points, spatial_coupling
 from workflow.mcpat.gem5_to_mcpat import convert
 from workflow.mcpat.parse_mcpat import parse_mcpat_text
 from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT, run_hotspot
@@ -490,18 +490,82 @@ def estimate_cross_tier_weight(matched_responses: list[dict],
     }
 
 
+class SpatialFeatureCache:
+    """Cache geometry-only point pairs and exact features across grouped fits."""
+
+    def __init__(self, samples: list[dict], cross_tier_weight: float,
+                 quadrature_order: int = 2):
+        self.cross_tier_weight = float(cross_tier_weight)
+        self.quadrature_order = int(quadrature_order)
+        self._geometry = {}
+        self._features = {}
+        self.geometry_preparations = 0
+        for sample in samples:
+            self._prepare(sample)
+
+    @staticmethod
+    def _key(sample: dict) -> tuple:
+        return (
+            float(sample["die_side_mm"]),
+            tuple((
+                int(module["tier"]), float(module["x_mm"]),
+                float(module["y_mm"]), float(module["width_mm"]),
+                float(module["height_mm"]), float(module["total_power_w"]),
+            ) for module in sample["modules"]),
+        )
+
+    def _prepare(self, sample: dict) -> tuple:
+        key = self._key(sample)
+        if key in self._geometry:
+            return key
+        side = float(sample["die_side_mm"])
+        modules = sample["modules"]
+        points = [
+            (quadrature_points(module, self.quadrature_order), module)
+            for module in modules
+        ]
+        receivers = []
+        for receiver_points, receiver in points:
+            for xi, yi in receiver_points:
+                terms = []
+                for source_points, source in points:
+                    coefficient = (
+                        float(source["total_power_w"]) / len(source_points)
+                    )
+                    if receiver["tier"] != source["tier"]:
+                        coefficient *= self.cross_tier_weight
+                    for xj, yj in source_points:
+                        terms.append((coefficient, math.hypot(xi - xj, yi - yj) / side))
+                receivers.append(tuple(terms))
+        self._geometry[key] = tuple(receivers)
+        self.geometry_preparations += 1
+        return key
+
+    def feature(self, sample: dict, lc_ratio: float) -> float:
+        ratio = float(lc_ratio)
+        if not math.isfinite(ratio) or ratio <= 0:
+            raise ValueError("Lc ratio must be finite and positive")
+        key = self._prepare(sample)
+        feature_key = (key, ratio)
+        if feature_key not in self._features:
+            self._features[feature_key] = max(
+                sum(coefficient / math.sqrt(1.0 + (distance / ratio) ** 2)
+                    for coefficient, distance in terms)
+                for terms in self._geometry[key]
+            )
+        return self._features[feature_key]
+
+
 def _feature_rows(samples: list[dict], cross_tier_weight: float,
-                  lc_ratio: float) -> list[tuple[dict, float, float]]:
+                  lc_ratio: float,
+                  feature_cache: SpatialFeatureCache | None = None
+                  ) -> list[tuple[dict, float, float]]:
+    cache = feature_cache or SpatialFeatureCache(samples, cross_tier_weight)
     reference: dict[str, float] = {}
     raw = []
     for sample in samples:
         group = str(sample["group"])
-        side = float(sample["die_side_mm"])
-        feature = spatial_coupling(
-            sample["modules"], side, cross_tier_weight,
-            spatial_model="area-quadrature", quadrature_order=2,
-            lc_mm=lc_ratio * side,
-        )
+        feature = cache.feature(sample, lc_ratio)
         raw.append((sample, feature))
         if bool(sample.get("is_reference")):
             if group in reference:
@@ -556,14 +620,15 @@ def _robust_nonnegative_slope(rows: list[tuple[dict, float, float]],
 
 def _fit_core(samples: list[dict], cross_tier_weight: float,
               lc_bounds_ratio: tuple[float, float],
-              huber_delta_c: float) -> dict:
+              huber_delta_c: float,
+              feature_cache: SpatialFeatureCache | None = None) -> dict:
     low, high = map(float, lc_bounds_ratio)
     if not 0 < low < high:
         raise ValueError("Lc ratio bounds must be finite, positive, and increasing")
 
     def evaluate(log_ratio: float) -> tuple[float, float, list]:
         ratio = math.exp(log_ratio)
-        rows = _feature_rows(samples, cross_tier_weight, ratio)
+        rows = _feature_rows(samples, cross_tier_weight, ratio, feature_cache)
         alpha, objective = _robust_nonnegative_slope(rows, huber_delta_c)
         return objective, alpha, rows
 
@@ -670,12 +735,14 @@ def _prediction_metrics_from_records(
 def _held_out_fold(train: list[dict], validation: list[dict],
                    cross_tier_weight: float,
                    lc_bounds_ratio: tuple[float, float],
-                   huber_delta_c: float) -> tuple[dict, list[tuple[dict, float, float]]]:
+                   huber_delta_c: float,
+                   feature_cache: SpatialFeatureCache | None = None
+                   ) -> tuple[dict, list[tuple[dict, float, float]]]:
     local = _fit_core(
-        train, cross_tier_weight, lc_bounds_ratio, huber_delta_c,
+        train, cross_tier_weight, lc_bounds_ratio, huber_delta_c, feature_cache,
     )
     rows = _feature_rows(
-        validation, cross_tier_weight, local["lc_die_side_ratio"],
+        validation, cross_tier_weight, local["lc_die_side_ratio"], feature_cache,
     )
     records = [
         (sample, target, local["alpha"] * feature)
@@ -697,7 +764,8 @@ def _held_out_fold(train: list[dict], validation: list[dict],
 def _leave_one_field_out(samples: list[dict], field: str,
                          cross_tier_weight: float,
                          lc_bounds_ratio: tuple[float, float],
-                         huber_delta_c: float) -> dict:
+                         huber_delta_c: float,
+                         feature_cache: SpatialFeatureCache | None = None) -> dict:
     values = sorted({str(sample[field]) for sample in samples})
     if len(values) < 2:
         raise ValueError(f"{field} holdout requires at least two distinct values")
@@ -707,7 +775,7 @@ def _leave_one_field_out(samples: list[dict], field: str,
         validation = [sample for sample in samples if str(sample[field]) == value]
         fold, records = _held_out_fold(
             train, validation, cross_tier_weight,
-            lc_bounds_ratio, huber_delta_c,
+            lc_bounds_ratio, huber_delta_c, feature_cache,
         )
         folds[value] = fold
         out_of_fold.extend(records)
@@ -720,7 +788,8 @@ def _leave_one_field_out(samples: list[dict], field: str,
 
 def _spatial_holdout(samples: list[dict], cross_tier_weight: float,
                      lc_bounds_ratio: tuple[float, float],
-                     huber_delta_c: float) -> dict:
+                     huber_delta_c: float,
+                     feature_cache: SpatialFeatureCache | None = None) -> dict:
     held_out_labels = {"corner_lr", "corner_ul", "corner_ur"}
     train = [sample for sample in samples
              if str(sample["label"]) not in held_out_labels]
@@ -735,7 +804,7 @@ def _spatial_holdout(samples: list[dict], cross_tier_weight: float,
     # but are anchors rather than scored validation observations.
     fold, records = _held_out_fold(
         train, references + held_out, cross_tier_weight,
-        lc_bounds_ratio, huber_delta_c,
+        lc_bounds_ratio, huber_delta_c, feature_cache,
     )
     scored = [record for record in records if not bool(record[0].get("is_reference"))]
     fold["validation_metrics"] = _prediction_metrics_from_records(scored)
@@ -751,29 +820,36 @@ def _spatial_holdout(samples: list[dict], cross_tier_weight: float,
 def cross_validate_alpha_lc(
         samples: list[dict], cross_tier_weight: float,
         lc_bounds_ratio: tuple[float, float] = (0.02, 4.0),
-        huber_delta_c: float = 0.5) -> dict:
+        huber_delta_c: float = 0.5,
+        feature_cache: SpatialFeatureCache | None = None) -> dict:
     """Evaluate parameters on grouped workload, architecture, and spatial holdouts."""
     return {
         "leave_one_workload_out": _leave_one_field_out(
             samples, "workload", cross_tier_weight,
-            lc_bounds_ratio, huber_delta_c,
+            lc_bounds_ratio, huber_delta_c, feature_cache,
         ),
         "leave_one_architecture_out": _leave_one_field_out(
             samples, "architecture", cross_tier_weight,
-            lc_bounds_ratio, huber_delta_c,
+            lc_bounds_ratio, huber_delta_c, feature_cache,
         ),
         "spatial_holdout": _spatial_holdout(
             samples, cross_tier_weight, lc_bounds_ratio, huber_delta_c,
+            feature_cache,
         ),
     }
 
 
 def _jacobian_diagnostics(samples: list[dict], cross_tier_weight: float,
-                          alpha: float, ratio: float) -> dict:
-    rows = _feature_rows(samples, cross_tier_weight, ratio)
+                          alpha: float, ratio: float,
+                          feature_cache: SpatialFeatureCache | None = None) -> dict:
+    rows = _feature_rows(samples, cross_tier_weight, ratio, feature_cache)
     epsilon = 1e-4
-    plus = _feature_rows(samples, cross_tier_weight, ratio * math.exp(epsilon))
-    minus = _feature_rows(samples, cross_tier_weight, ratio * math.exp(-epsilon))
+    plus = _feature_rows(
+        samples, cross_tier_weight, ratio * math.exp(epsilon), feature_cache,
+    )
+    minus = _feature_rows(
+        samples, cross_tier_weight, ratio * math.exp(-epsilon), feature_cache,
+    )
     columns = [
         (row[1], alpha * (p[1] - m[1]) / (2.0 * epsilon))
         for row, p, m in zip(rows, plus, minus)
@@ -798,16 +874,22 @@ def fit_alpha_lc(samples: list[dict], cross_tier_weight: float,
     """Fit alpha and Lc/die-side with whole-work-point validation evidence."""
     if bootstrap_samples < 20:
         raise ValueError("alpha/Lc bootstrap requires at least 20 samples")
-    fit = _fit_core(samples, cross_tier_weight, lc_bounds_ratio, huber_delta_c)
+    feature_cache = SpatialFeatureCache(samples, cross_tier_weight)
+    fit = _fit_core(
+        samples, cross_tier_weight, lc_bounds_ratio, huber_delta_c,
+        feature_cache,
+    )
     metrics = _prediction_metrics(fit["rows"], fit["alpha"])
     diagnostics = _jacobian_diagnostics(
-        samples, cross_tier_weight, fit["alpha"], fit["lc_die_side_ratio"]
+        samples, cross_tier_weight, fit["alpha"], fit["lc_die_side_ratio"],
+        feature_cache,
     )
     if diagnostics["jacobian_rank"] < 2:
         raise ValueError("thermal samples are spatially degenerate")
 
     cross_validation = cross_validate_alpha_lc(
         samples, cross_tier_weight, lc_bounds_ratio, huber_delta_c,
+        feature_cache,
     )
 
     groups: dict[str, list[dict]] = {}
@@ -825,7 +907,8 @@ def fit_alpha_lc(samples: list[dict], cross_tier_weight: float,
                 duplicate["group"] = f"{group}#bootstrap{occurrence}"
                 resampled.append(duplicate)
         local = _fit_core(
-            resampled, cross_tier_weight, lc_bounds_ratio, huber_delta_c
+            resampled, cross_tier_weight, lc_bounds_ratio, huber_delta_c,
+            feature_cache,
         )
         boot_alpha.append(local["alpha"])
         boot_ratio.append(local["lc_die_side_ratio"])
@@ -850,7 +933,11 @@ def fit_alpha_lc(samples: list[dict], cross_tier_weight: float,
         },
         "objective": fit["objective"],
         "metrics": metrics,
-        "diagnostics": {**diagnostics, "parameter_on_boundary": fit["on_boundary"]},
+        "diagnostics": {
+            **diagnostics, "parameter_on_boundary": fit["on_boundary"],
+            "geometry_preparations": feature_cache.geometry_preparations,
+            "cached_exact_feature_count": len(feature_cache._features),
+        },
         "cross_validation": cross_validation,
         "bootstrap": bootstrap,
     }

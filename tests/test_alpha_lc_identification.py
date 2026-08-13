@@ -13,6 +13,7 @@ from workflow.floorplan.generate_hotspot_inputs import grid_power, write_ptrace
 from workflow.thermal.identify_alpha_lc import (
     case_identity,
     cross_validate_alpha_lc,
+    SpatialFeatureCache,
     evaluate_fit_acceptance,
     evaluate_grid_convergence,
     estimate_cross_tier_weight,
@@ -553,6 +554,26 @@ class AlphaLcFitTests(unittest.TestCase):
         self.assertTrue(math.isfinite(
             report["bootstrap"]["alpha_95"]["low"]
         ))
+
+    def test_spatial_feature_cache_matches_direct_area_quadrature(self):
+        sample = self.synthetic_samples()[3]
+        cache = SpatialFeatureCache([sample], cross_tier_weight=0.7)
+        for ratio in (0.02, 0.35, 1.0, 4.0):
+            expected = spatial_coupling(
+                sample["modules"], sample["die_side_mm"], 0.7,
+                "area-quadrature", 2, ratio * sample["die_side_mm"],
+            )
+            self.assertAlmostEqual(cache.feature(sample, ratio), expected, places=12)
+        self.assertEqual(cache.geometry_preparations, 1)
+
+    def test_bootstrap_reuses_geometry_preparation_for_duplicate_groups(self):
+        samples = self.synthetic_samples()
+        report = fit_alpha_lc(
+            samples, cross_tier_weight=0.7, bootstrap_samples=20, seed=5,
+        )
+        self.assertEqual(
+            report["diagnostics"]["geometry_preparations"], len(samples),
+        )
 
     def test_huber_fit_limits_one_outlier(self):
         samples = self.synthetic_samples()
