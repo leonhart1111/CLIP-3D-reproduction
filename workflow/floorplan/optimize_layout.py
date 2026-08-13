@@ -45,12 +45,20 @@ def quadrature_points(module: dict, order: int) -> list[tuple[float, float]]:
     ]
 
 
-def proxy_temperature(modules: list[dict], side: float, ambient: float,
-                      r_convec: float, alpha: float, beta: float,
-                      cross_tier_weight: float,
-                      spatial_model: str = "center",
-                      quadrature_order: int = 2) -> float:
-    total = sum(module["total_power_w"] for module in modules)
+def spatial_coupling(modules: list[dict], side: float,
+                     cross_tier_weight: float,
+                     spatial_model: str = "center",
+                     quadrature_order: int = 2,
+                     lc_mm: float | None = None) -> float:
+    """Return equation-(14)'s spatial power-coupling feature in watts.
+
+    ``lc_mm=None`` preserves the historical CLIP reproduction assumption of
+    half the die side.  Identification code must pass an explicit measured
+    candidate length so that amplitude and spatial decay are not confounded.
+    """
+    length = side / 2.0 if lc_mm is None else float(lc_mm)
+    if not math.isfinite(length) or length <= 0:
+        raise ValueError("thermal characteristic length lc_mm must be finite and positive")
     if spatial_model == "center":
         samples = [(
             [(m["x_mm"] + m["width_mm"] / 2,
@@ -60,7 +68,6 @@ def proxy_temperature(modules: list[dict], side: float, ambient: float,
         samples = [(quadrature_points(m, quadrature_order), m) for m in modules]
     else:
         raise ValueError("thermal proxy spatial_model must be center or area-quadrature")
-    length = side / 2.0
     hotspot = 0.0
     for receiver_points, receiver in samples:
         for xi, yi in receiver_points:
@@ -75,6 +82,20 @@ def proxy_temperature(modules: list[dict], side: float, ambient: float,
                     kernel = 1.0 / math.sqrt(1.0 + (distance / length) ** 2)
                     coupled += point_power * kernel * weight
             hotspot = max(hotspot, coupled)
+    return hotspot
+
+
+def proxy_temperature(modules: list[dict], side: float, ambient: float,
+                      r_convec: float, alpha: float, beta: float,
+                      cross_tier_weight: float,
+                      spatial_model: str = "center",
+                      quadrature_order: int = 2,
+                      lc_mm: float | None = None) -> float:
+    total = sum(module["total_power_w"] for module in modules)
+    hotspot = spatial_coupling(
+        modules, side, cross_tier_weight, spatial_model,
+        quadrature_order, lc_mm,
+    )
     bottom_power = sum(m["total_power_w"] for m in modules if m["tier"] == 0)
     return ambient + r_convec * total + alpha * hotspot + beta * bottom_power
 
