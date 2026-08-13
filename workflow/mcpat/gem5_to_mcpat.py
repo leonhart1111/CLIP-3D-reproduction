@@ -242,7 +242,10 @@ def update_core(core_xml: ET.Element, core: int, metadata: dict, stats: dict,
             int(measured_records[level]["access_cycles"])
             if measured_records is not None else 10
         )
-        throughput_cycles = latency_cycles
+        throughput_cycles = (
+            int(measured_records[level]["cycle_cycles"])
+            if measured_records is not None else 10
+        )
         policy = 0 if cache_name == "icache" else 1
         set_named(cache, "param", cfg_name,
                   f'{organization["size_bytes"]},'
@@ -372,7 +375,10 @@ def convert(r1_dir: Path, output_xml: Path, template: Path = DEFAULT_TEMPLATE,
         int(measured_records["l2"]["access_cycles"])
         if measured_records is not None else 10
     )
-    throughput_cycles = latency_cycles
+    throughput_cycles = (
+        int(measured_records["l2"]["cycle_cycles"])
+        if measured_records is not None else 10
+    )
     set_named(l2, "param", "L2_config",
               f'{l2_organization["size_bytes"]},'
               f'{l2_organization["line_size_bytes"]},'

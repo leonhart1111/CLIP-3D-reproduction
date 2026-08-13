@@ -14,8 +14,9 @@ from workflow.common import PROJECT_ROOT, write_json
 L1_SIZES = ["16kB", "32kB", "64kB", "128kB"]
 L2_SIZES = ["128kB", "256kB", "512kB", "1024kB", "2048kB"]
 REPORT_FIELDS = (
-    "level", "size", "size_bytes", "access_time_ns",
-    "access_cycles_unrounded", "access_cycles", "area_mm2", "width_mm",
+    "level", "size", "size_bytes", "access_time_ns", "cycle_time_ns",
+    "access_cycles_unrounded", "access_cycles", "cycle_cycles_unrounded",
+    "cycle_cycles", "area_mm2", "width_mm",
     "height_mm", "associativity", "bank_count", "output_width_bits",
     "technology_nm", "temperature_k", "config_sha256",
     "raw_output_sha256", "cacti_record_id", "characterization_id",

@@ -40,9 +40,10 @@ L_{cache}=\max\left(1,\left\lceil t_{access} f_0\right\rceil\right),
 - 320 K，ITRS-HP器件，conservative interconnect；
 - normal access、ECC开启、4 cores。
 
-流水线先运行独立CACTI，再将同一记录的向上取整周期写入McPAT XML的
-throughput/latency字段；R2也读取这些记录。因此McPAT功耗、floorplan几何和R2
-延迟共享同一个characterization ID，而不是使用人为的10-cycle占位值。
+流水线先运行独立CACTI，再将同一记录中`cycle_time`与`access_time`分别向上取整，
+写入McPAT XML的throughput与latency字段；R2读取其中的access latency。因此
+McPAT功耗、floorplan几何和R2延迟共享同一个characterization ID，而不是使用
+人为的10-cycle占位值。
 
 ## 面积规则
 

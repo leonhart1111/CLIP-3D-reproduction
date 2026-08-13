@@ -686,7 +686,9 @@ class ParserTests(unittest.TestCase):
             for index, organization in enumerate(contract["records"]):
                 record = {
                     **organization, "access_time_ns": 0.5 + index * 0.5,
-                    "access_cycles": 1 + index, "area_mm2": 0.2 + index * 0.4,
+                    "cycle_time_ns": 0.5 + index * 0.5,
+                    "access_cycles": 1 + index, "cycle_cycles": 1 + index,
+                    "area_mm2": 0.2 + index * 0.4,
                     "width_mm": 0.5 + index * 0.25,
                     "height_mm": (0.2 + index * 0.4) / (0.5 + index * 0.25),
                     "config_sha256": "a" * 64, "raw_output_sha256": "b" * 64,

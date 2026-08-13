@@ -141,9 +141,9 @@ class McPATContractTests(unittest.TestCase):
             tree = ET.parse(xml_path)
             system = component_by_id(tree.getroot(), "system")
             expected = {
-                "system.core0.icache": ("icache_config", "16384,64,2,1,1,1,512,0"),
-                "system.core0.dcache": ("dcache_config", "32768,64,2,1,3,3,512,1"),
-                "system.L20": ("L2_config", "524288,64,8,1,5,5,512,1"),
+                "system.core0.icache": ("icache_config", "16384,64,2,1,2,1,512,0"),
+                "system.core0.dcache": ("dcache_config", "32768,64,2,1,4,3,512,1"),
+                "system.L20": ("L2_config", "524288,64,8,1,6,5,512,1"),
             }
             for identifier, (name, value) in expected.items():
                 with self.subTest(identifier=identifier):
@@ -197,7 +197,9 @@ class CharacterizationIdentityTests(unittest.TestCase):
             record = {
                 **contract,
                 "access_time_ns": 0.5 + index,
+                "cycle_time_ns": 0.75 + index,
                 "access_cycles": 1 + index * 2,
+                "cycle_cycles": 2 + index * 2,
                 "area_mm2": 0.2 + index,
                 "width_mm": 0.5 + index,
                 "height_mm": (0.2 + index) / (0.5 + index),
@@ -331,8 +333,11 @@ class LocalTableReportTests(unittest.TestCase):
                     "level": level, "size": f"{size_kib}kB",
                     "size_bytes": size_kib * 1024,
                     "access_time_ns": 1.01,
+                    "cycle_time_ns": 1.50,
                     "access_cycles_unrounded": 2.02,
                     "access_cycles": 3,
+                    "cycle_cycles_unrounded": 3.0,
+                    "cycle_cycles": 3,
                     "area_mm2": 0.5,
                     "width_mm": 1.0, "height_mm": 0.5,
                     "associativity": 2 if level == "l1d" else 8,

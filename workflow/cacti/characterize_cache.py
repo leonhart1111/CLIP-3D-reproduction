@@ -176,6 +176,10 @@ def characterize(cacti: Path, base_config: Path, output_dir: Path,
                 "access_cycles": cache_access_cycles(
                     values["access_time_ns"], frequency_ghz
                 ),
+                "cycle_cycles_unrounded": values["cycle_time_ns"] / clock_ns,
+                "cycle_cycles": cache_access_cycles(
+                    values["cycle_time_ns"], frequency_ghz
+                ),
                 "value_source": "local CACTI run",
                 "config": str(cfg.resolve()), "raw_output": str(raw.resolve()),
                 "config_sha256": sha256_file(cfg),

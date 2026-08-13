@@ -170,7 +170,10 @@ def validate_characterization(cacti: dict, expected_contract: dict) -> dict[str,
                     f"CACTI {level}.{field} mismatch: "
                     f"expected {expected.get(field)!r}, observed {actual.get(field)!r}"
                 )
-        for field in ("access_time_ns", "area_mm2", "width_mm", "height_mm"):
+        for field in (
+            "access_time_ns", "cycle_time_ns", "area_mm2", "width_mm",
+            "height_mm",
+        ):
             try:
                 value = float(actual[field])
             except (KeyError, TypeError, ValueError) as error:
@@ -182,6 +185,14 @@ def validate_characterization(cacti: dict, expected_contract: dict) -> dict[str,
             raise ValueError(
                 f"CACTI {level}.access_cycles mismatch: expected "
                 f"{expected_cycles}, observed {actual.get('access_cycles')!r}"
+            )
+        expected_cycle_cycles = cache_access_cycles(
+            actual["cycle_time_ns"], frequency
+        )
+        if actual.get("cycle_cycles") != expected_cycle_cycles:
+            raise ValueError(
+                f"CACTI {level}.cycle_cycles mismatch: expected "
+                f"{expected_cycle_cycles}, observed {actual.get('cycle_cycles')!r}"
             )
         record_identity = stable_identity({
             key: value for key, value in actual.items()
