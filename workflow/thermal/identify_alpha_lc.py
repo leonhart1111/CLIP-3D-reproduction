@@ -357,9 +357,10 @@ def unit_response_ratio_from_temperatures(
         raise ValueError("unit-response source tier must be 0 or 1")
     active_layer = {0: 1, 1: 3}
     layers: dict[int, dict[str, float]] = {1: {}, 3: {}}
-    pattern = re.compile(r"^layer_(1|3)_t[01]_(r\d+_c\d+)$")
+    verbose = re.compile(r"^layer_(1|3)_t[01]_(r\d+_c\d+)$")
+    compact = re.compile(r"^layer_(1|3)_[bt](\d+_\d+)$")
     for name, value in values:
-        match = pattern.match(name)
+        match = verbose.match(name) or compact.match(name)
         if match:
             layers[int(match.group(1))][match.group(2)] = float(value)
     if not layers[1] or set(layers[1]) != set(layers[3]):
@@ -890,7 +891,21 @@ def unit_response_design(model_paths: list[Path], utilization: float) -> list[di
             model_path, utilization
         )}
         base = baseline_layout(model, utilization)
-        core = next(module for module in base["modules"] if module.get("kind") == "core")
+        core0 = [module for module in base["modules"] if module.get("core") == 0]
+        if not core0:
+            raise ValueError("unit-response design requires a physical core0 module group")
+        core_left = min(float(module["x_mm"]) for module in core0)
+        core_bottom = min(float(module["y_mm"]) for module in core0)
+        core_right = max(float(module["x_mm"]) + float(module["width_mm"])
+                         for module in core0)
+        core_top = max(float(module["y_mm"]) + float(module["height_mm"])
+                       for module in core0)
+        core = {
+            "name": "core0_cluster", "kind": "core", "core": 0,
+            "area_mm2": (core_right - core_left) * (core_top - core_bottom),
+            "width_mm": core_right - core_left,
+            "height_mm": core_top - core_bottom,
+        }
         l2 = next(module for module in base["modules"] if module.get("kind") == "l2")
         for source_shape, template in (("core", core), ("l2", l2)):
             for source_tier in (0, 1):

@@ -298,7 +298,7 @@ class GridConvergenceTests(unittest.TestCase):
         self.assertEqual({case["grid_size"] for case in design}, {32, 64, 128})
         self.assertNotIn("edge_top", {case["label"] for case in design})
 
-    def test_compact_48_grid_trace_fits_hotspot_line_limit(self):
+    def test_compact_64_grid_trace_fits_hotspot_line_limit(self):
         layout = {
             "die_width_mm": 8.0,
             "modules": [
@@ -312,7 +312,7 @@ class GridConvergenceTests(unittest.TestCase):
                  "total_power_w": 1.1},
             ],
         }
-        grids = grid_power(layout, 48, compact_names=True)
+        grids = grid_power(layout, 64, compact_names=True)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "power.ptrace"
             write_ptrace(path, grids["tiers"], "total_power_w", precision=9)
@@ -418,6 +418,17 @@ class UnitResponseTests(unittest.TestCase):
         self.assertAlmostEqual(top["same_tier_rise_c"], 12.0)
         self.assertAlmostEqual(top["cross_tier_rise_c"], 20.0)
 
+    def test_unit_response_parses_compact_cell_names(self):
+        values = [
+            ("layer_1_b14_21", 320.0),
+            ("layer_3_t14_21", 312.0),
+            ("layer_1_b14_22", 310.0),
+            ("layer_3_t14_22", 306.0),
+        ]
+        result = unit_response_ratio_from_temperatures(values, 300.0, 0)
+        self.assertEqual(result["peak_coordinate"], "14_21")
+        self.assertAlmostEqual(result["ratio"], 0.6)
+
     def test_formal_unit_response_design_has_72_balanced_cases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -432,6 +443,34 @@ class UnitResponseTests(unittest.TestCase):
         self.assertEqual({case["source_tier"] for case in design}, {0, 1})
         self.assertEqual({case["source_shape"] for case in design}, {"core", "l2"})
         self.assertEqual(len({case["label"] for case in design}), 72)
+
+    def test_unit_response_design_supports_granular_core_cluster(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = []
+            for index in range(3):
+                path = PlacementDesignTests().write_model(root / f"m{index}")
+                model = json.loads(path.read_text())
+                granular = []
+                for module in model["modules"]:
+                    if module["kind"] != "core":
+                        granular.append(module)
+                        continue
+                    for suffix in ("front", "back"):
+                        part = dict(module)
+                        part["name"] += f"_{suffix}"
+                        part["kind"] = f"core_{suffix}"
+                        part["area_mm2"] /= 2.0
+                        granular.append(part)
+                model["modules"] = granular
+                path.write_text(json.dumps(model))
+                paths.append(path)
+            design = unit_response_design(paths, 0.70)
+        self.assertEqual(len(design), 72)
+        core_case = next(case for case in design if case["source_shape"] == "core")
+        source = core_case["layout"]["modules"][0]
+        self.assertGreater(source["width_mm"], 0.0)
+        self.assertGreater(source["height_mm"], 0.0)
 
 
 class AlphaLcFitTests(unittest.TestCase):
