@@ -12,6 +12,8 @@ from workflow.floorplan.optimize_layout import spatial_coupling
 from workflow.floorplan.generate_hotspot_inputs import grid_power, write_ptrace
 from workflow.thermal.identify_alpha_lc import (
     case_identity,
+    cross_validate_alpha_lc,
+    evaluate_fit_acceptance,
     evaluate_grid_convergence,
     estimate_cross_tier_weight,
     fit_alpha_lc,
@@ -483,6 +485,7 @@ class AlphaLcFitTests(unittest.TestCase):
                 group = f"{workload}-{size_index}"
                 reference_feature = None
                 group_rows = []
+                labels = ("corner_ll", "center", "edge_bottom", "near_core0", "corner_ur")
                 for position, x in enumerate((0.2, 0.9, 2.1, 3.7, 5.0)):
                     modules = [
                         {"name": "core", "tier": 0, "x_mm": side * 0.42,
@@ -503,7 +506,7 @@ class AlphaLcFitTests(unittest.TestCase):
                     group_rows.append({
                         "group": group, "workload": workload,
                         "architecture": f"size-{size_index}",
-                        "label": f"p{position}", "is_reference": position == 0,
+                        "label": labels[position], "is_reference": position == 0,
                         "modules": modules, "die_side_mm": side,
                         "delta_t_c": alpha * (feature - reference_feature),
                     })
@@ -567,6 +570,65 @@ class AlphaLcFitTests(unittest.TestCase):
         self.assertEqual(values[("fft-a", "center")], -0.5)
         self.assertEqual(values[("stream-b", "center")], 1.25)
         self.assertTrue(values[("fft-a", "corner_ll")] == 0.0)
+
+    def test_grouped_validation_covers_workload_architecture_and_space(self):
+        report = cross_validate_alpha_lc(
+            self.synthetic_samples(), cross_tier_weight=0.7,
+        )
+        self.assertEqual(
+            set(report),
+            {"leave_one_workload_out", "leave_one_architecture_out", "spatial_holdout"},
+        )
+        self.assertEqual(
+            set(report["leave_one_workload_out"]["folds"]),
+            {"fft", "matmul", "stencil"},
+        )
+        self.assertEqual(
+            set(report["leave_one_architecture_out"]["folds"]),
+            {"size-0", "size-1"},
+        )
+        self.assertGreater(
+            report["spatial_holdout"]["aggregate_metrics"]["count"], 0,
+        )
+        for validation in report.values():
+            self.assertLess(validation["aggregate_metrics"]["rmse_c"], 0.02)
+
+    def test_acceptance_uses_held_out_metrics_not_training_metrics(self):
+        good = {
+            "count": 10, "mae_c": 0.0, "rmse_c": 0.0, "spearman": 1.0,
+            "median_selection_regret_c": 0.0,
+            "p95_selection_regret_c": 0.0,
+        }
+        bad = dict(good, mae_c=2.0, rmse_c=2.0, spearman=0.2)
+        report = {
+            "metrics": good,
+            "diagnostics": {"jacobian_rank": 2, "parameter_on_boundary": False},
+            "cross_validation": {
+                "leave_one_workload_out": {
+                    "aggregate_metrics": bad,
+                    "folds": {
+                        "fft": {"validation_metrics": bad},
+                        "matmul": {"validation_metrics": good},
+                    },
+                },
+                "leave_one_architecture_out": {"aggregate_metrics": good, "folds": {}},
+                "spatial_holdout": {"aggregate_metrics": good, "folds": {}},
+            },
+        }
+        thresholds = {
+            "held_out_delta_t_mae_c_max": 0.5,
+            "held_out_delta_t_rmse_c_max": 1.0,
+            "aggregate_spatial_spearman_min": 0.8,
+            "per_workload_spatial_spearman_min": 0.7,
+            "median_selection_regret_c_max": 0.5,
+            "p95_selection_regret_c_max": 1.0,
+            "jacobian_rank_required": 2,
+            "reject_parameter_on_boundary": True,
+        }
+        acceptance = evaluate_fit_acceptance(report, thresholds)
+        self.assertFalse(acceptance["accepted"])
+        self.assertFalse(acceptance["checks"]["workload_holdout_mae"])
+        self.assertFalse(acceptance["checks"]["every_workload_spearman"])
 
 
 class CampaignCliTests(unittest.TestCase):

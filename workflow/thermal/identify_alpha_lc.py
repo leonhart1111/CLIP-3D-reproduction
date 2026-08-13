@@ -594,11 +594,21 @@ def _spearman(actual: list[float], predicted: list[float]) -> float | None:
 
 def _prediction_metrics(rows: list[tuple[dict, float, float]],
                         alpha: float) -> dict:
-    actual = [target for _, _, target in rows]
-    predicted = [alpha * feature for _, feature, _ in rows]
+    return _prediction_metrics_from_records([
+        (sample, target, alpha * feature)
+        for sample, feature, target in rows
+    ])
+
+
+def _prediction_metrics_from_records(
+        records: list[tuple[dict, float, float]]) -> dict:
+    if not records:
+        raise ValueError("prediction metrics require at least one held-out sample")
+    actual = [target for _, target, _ in records]
+    predicted = [prediction for _, _, prediction in records]
     errors = [prediction - target for prediction, target in zip(predicted, actual)]
     groups: dict[str, list[int]] = {}
-    for index, (sample, _, _) in enumerate(rows):
+    for index, (sample, _, _) in enumerate(records):
         groups.setdefault(str(sample["group"]), []).append(index)
     regrets = []
     per_group_spearman = {}
@@ -609,13 +619,114 @@ def _prediction_metrics(rows: list[tuple[dict, float, float]],
         selected = min(indices, key=lambda index: (predicted[index], index))
         regrets.append(actual[selected] - min(group_actual))
     return {
-        "count": len(rows),
+        "count": len(records),
         "mae_c": statistics.mean(abs(error) for error in errors),
         "rmse_c": math.sqrt(statistics.mean(error * error for error in errors)),
         "spearman": _spearman(actual, predicted),
         "per_group_spearman": per_group_spearman,
         "median_selection_regret_c": statistics.median(regrets),
         "p95_selection_regret_c": _percentile(regrets, 0.95),
+    }
+
+
+def _held_out_fold(train: list[dict], validation: list[dict],
+                   cross_tier_weight: float,
+                   lc_bounds_ratio: tuple[float, float],
+                   huber_delta_c: float) -> tuple[dict, list[tuple[dict, float, float]]]:
+    local = _fit_core(
+        train, cross_tier_weight, lc_bounds_ratio, huber_delta_c,
+    )
+    rows = _feature_rows(
+        validation, cross_tier_weight, local["lc_die_side_ratio"],
+    )
+    records = [
+        (sample, target, local["alpha"] * feature)
+        for sample, feature, target in rows
+    ]
+    return {
+        "train_parameters": {
+            "alpha": local["alpha"],
+            "lc_die_side_ratio": local["lc_die_side_ratio"],
+        },
+        "train_group_count": len({str(sample["group"]) for sample in train}),
+        "validation_group_count": len({
+            str(sample["group"]) for sample in validation
+        }),
+        "validation_metrics": _prediction_metrics_from_records(records),
+    }, records
+
+
+def _leave_one_field_out(samples: list[dict], field: str,
+                         cross_tier_weight: float,
+                         lc_bounds_ratio: tuple[float, float],
+                         huber_delta_c: float) -> dict:
+    values = sorted({str(sample[field]) for sample in samples})
+    if len(values) < 2:
+        raise ValueError(f"{field} holdout requires at least two distinct values")
+    folds, out_of_fold = {}, []
+    for value in values:
+        train = [sample for sample in samples if str(sample[field]) != value]
+        validation = [sample for sample in samples if str(sample[field]) == value]
+        fold, records = _held_out_fold(
+            train, validation, cross_tier_weight,
+            lc_bounds_ratio, huber_delta_c,
+        )
+        folds[value] = fold
+        out_of_fold.extend(records)
+    return {
+        "split_unit": field,
+        "folds": folds,
+        "aggregate_metrics": _prediction_metrics_from_records(out_of_fold),
+    }
+
+
+def _spatial_holdout(samples: list[dict], cross_tier_weight: float,
+                     lc_bounds_ratio: tuple[float, float],
+                     huber_delta_c: float) -> dict:
+    held_out_labels = {"corner_lr", "corner_ul", "corner_ur"}
+    train = [sample for sample in samples
+             if str(sample["label"]) not in held_out_labels]
+    references = [sample for sample in samples if bool(sample.get("is_reference"))]
+    held_out = [sample for sample in samples
+                if str(sample["label"]) in held_out_labels]
+    groups = {str(sample["group"]) for sample in samples}
+    held_out_groups = {str(sample["group"]) for sample in held_out}
+    if held_out_groups != groups:
+        raise ValueError("spatial holdout requires designated corner cases in every group")
+    # Reference layouts carry the feature origin needed to form q(x)-q(x0),
+    # but are anchors rather than scored validation observations.
+    fold, records = _held_out_fold(
+        train, references + held_out, cross_tier_weight,
+        lc_bounds_ratio, huber_delta_c,
+    )
+    scored = [record for record in records if not bool(record[0].get("is_reference"))]
+    fold["validation_metrics"] = _prediction_metrics_from_records(scored)
+    fold["reference_layouts_used_as_unscored_anchors"] = len(references)
+    return {
+        "split_unit": "layout_label",
+        "held_out_labels": sorted(held_out_labels),
+        "folds": {"corner_directed": fold},
+        "aggregate_metrics": _prediction_metrics_from_records(scored),
+    }
+
+
+def cross_validate_alpha_lc(
+        samples: list[dict], cross_tier_weight: float,
+        lc_bounds_ratio: tuple[float, float] = (0.02, 4.0),
+        huber_delta_c: float = 0.5) -> dict:
+    """Evaluate parameters on grouped workload, architecture, and spatial holdouts."""
+    return {
+        "leave_one_workload_out": _leave_one_field_out(
+            samples, "workload", cross_tier_weight,
+            lc_bounds_ratio, huber_delta_c,
+        ),
+        "leave_one_architecture_out": _leave_one_field_out(
+            samples, "architecture", cross_tier_weight,
+            lc_bounds_ratio, huber_delta_c,
+        ),
+        "spatial_holdout": _spatial_holdout(
+            samples, cross_tier_weight, lc_bounds_ratio, huber_delta_c,
+        ),
     }
 
 
@@ -657,22 +768,9 @@ def fit_alpha_lc(samples: list[dict], cross_tier_weight: float,
     if diagnostics["jacobian_rank"] < 2:
         raise ValueError("thermal samples are spatially degenerate")
 
-    workloads = sorted({str(sample["workload"]) for sample in samples})
-    leave_one_out = {}
-    for workload in workloads:
-        train = [sample for sample in samples if str(sample["workload"]) != workload]
-        validation = [sample for sample in samples if str(sample["workload"]) == workload]
-        local = _fit_core(train, cross_tier_weight, lc_bounds_ratio, huber_delta_c)
-        rows = _feature_rows(
-            validation, cross_tier_weight, local["lc_die_side_ratio"]
-        )
-        leave_one_out[workload] = {
-            "train_parameters": {
-                "alpha": local["alpha"],
-                "lc_die_side_ratio": local["lc_die_side_ratio"],
-            },
-            "validation_metrics": _prediction_metrics(rows, local["alpha"]),
-        }
+    cross_validation = cross_validate_alpha_lc(
+        samples, cross_tier_weight, lc_bounds_ratio, huber_delta_c,
+    )
 
     groups: dict[str, list[dict]] = {}
     for sample in samples:
@@ -715,8 +813,65 @@ def fit_alpha_lc(samples: list[dict], cross_tier_weight: float,
         "objective": fit["objective"],
         "metrics": metrics,
         "diagnostics": {**diagnostics, "parameter_on_boundary": fit["on_boundary"]},
-        "cross_validation": {"leave_one_workload_out": leave_one_out},
+        "cross_validation": cross_validation,
         "bootstrap": bootstrap,
+    }
+
+
+def evaluate_fit_acceptance(report: dict, acceptance: dict) -> dict:
+    """Apply frozen gates only to genuinely held-out predictions."""
+    cross_validation = report["cross_validation"]
+    workload = cross_validation["leave_one_workload_out"]
+    architecture = cross_validation["leave_one_architecture_out"]
+    spatial = cross_validation["spatial_holdout"]
+    aggregate_splits = {
+        "workload": workload["aggregate_metrics"],
+        "architecture": architecture["aggregate_metrics"],
+        "spatial": spatial["aggregate_metrics"],
+    }
+    mae_max = float(acceptance["held_out_delta_t_mae_c_max"])
+    rmse_max = float(acceptance["held_out_delta_t_rmse_c_max"])
+    spearman_min = float(acceptance["aggregate_spatial_spearman_min"])
+    median_regret_max = float(acceptance["median_selection_regret_c_max"])
+    p95_regret_max = float(acceptance["p95_selection_regret_c_max"])
+    per_workload_min = float(acceptance["per_workload_spatial_spearman_min"])
+    checks = {}
+    for split, metrics in aggregate_splits.items():
+        checks[f"{split}_holdout_mae"] = metrics["mae_c"] <= mae_max
+        checks[f"{split}_holdout_rmse"] = metrics["rmse_c"] <= rmse_max
+        checks[f"{split}_holdout_spearman"] = (
+            metrics["spearman"] is not None
+            and metrics["spearman"] >= spearman_min
+        )
+        checks[f"{split}_holdout_median_selection_regret"] = (
+            metrics["median_selection_regret_c"] <= median_regret_max
+        )
+        checks[f"{split}_holdout_p95_selection_regret"] = (
+            metrics["p95_selection_regret_c"] <= p95_regret_max
+        )
+    workload_spearman = {
+        name: fold["validation_metrics"]["spearman"]
+        for name, fold in workload["folds"].items()
+    }
+    checks["every_workload_spearman"] = all(
+        value is not None and value >= per_workload_min
+        for value in workload_spearman.values()
+    )
+    checks["jacobian_rank"] = (
+        report["diagnostics"]["jacobian_rank"]
+        == int(acceptance["jacobian_rank_required"])
+    )
+    checks["parameters_not_on_boundary"] = (
+        not bool(acceptance.get("reject_parameter_on_boundary", True))
+        or not report["diagnostics"]["parameter_on_boundary"]
+    )
+    return {
+        "accepted": all(checks.values()),
+        "checks": checks,
+        "held_out_metrics": aggregate_splits,
+        "per_workload_spearman": workload_spearman,
+        "thresholds_frozen_before_real_power_results": True,
+        "training_metrics_used_for_acceptance": False,
     }
 
 
@@ -1237,27 +1392,9 @@ def run_fit_campaign(samples_path: Path, unit_report_path: Path,
         int(identification["bootstrap_samples"]),
         int(identification["bootstrap_seed"]),
     )
-    acceptance = config["acceptance"]
-    checks = {
-        "aggregate_mae": report["metrics"]["mae_c"]
-        <= float(acceptance["held_out_delta_t_mae_c_max"]),
-        "aggregate_rmse": report["metrics"]["rmse_c"]
-        <= float(acceptance["held_out_delta_t_rmse_c_max"]),
-        "aggregate_spearman": report["metrics"]["spearman"] is not None
-        and report["metrics"]["spearman"]
-        >= float(acceptance["aggregate_spatial_spearman_min"]),
-        "median_selection_regret": report["metrics"]["median_selection_regret_c"]
-        <= float(acceptance["median_selection_regret_c_max"]),
-        "p95_selection_regret": report["metrics"]["p95_selection_regret_c"]
-        <= float(acceptance["p95_selection_regret_c_max"]),
-        "jacobian_rank": report["diagnostics"]["jacobian_rank"]
-        == int(acceptance["jacobian_rank_required"]),
-        "parameters_not_on_boundary": not report["diagnostics"]["parameter_on_boundary"],
-    }
-    report["acceptance"] = {
-        "accepted": all(checks.values()), "checks": checks,
-        "thresholds_frozen_before_real_power_results": True,
-    }
+    report["acceptance"] = evaluate_fit_acceptance(
+        report, config["acceptance"],
+    )
     output_root = Path(output_root).resolve()
     write_json(output_root / "fit_report.json", report)
     return report
