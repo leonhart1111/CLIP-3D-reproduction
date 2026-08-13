@@ -16,8 +16,10 @@
   "placements_per_point": 13,
   "physical": {
     "grid_size": 32,
-    "grid_convergence_sizes": [32, 64, 128],
+    "grid_convergence_sizes": [24, 32, 48],
     "grid_convergence_tolerance_c": 0.1,
+    "compact_trace": true,
+    "ptrace_precision": 9,
     "utilization": 0.7,
     "ambient_c": 25.0,
     "r_convec_k_per_w": 1.042,

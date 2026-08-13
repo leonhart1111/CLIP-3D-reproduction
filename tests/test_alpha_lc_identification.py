@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from workflow.floorplan.optimize_layout import spatial_coupling
+from workflow.floorplan.generate_hotspot_inputs import grid_power, write_ptrace
 from workflow.thermal.identify_alpha_lc import (
     case_identity,
     evaluate_grid_convergence,
@@ -134,6 +135,32 @@ class PlacementDesignTests(unittest.TestCase):
             self.assertAlmostEqual(placement["y_mm"], l2["y_mm"])
             self.assertGreaterEqual(placement["fx"], 0.0)
             self.assertLessEqual(placement["fx"], 1.0)
+
+    def test_near_core_targets_support_granular_mcpat_core_modules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_model(Path(directory))
+            model = json.loads(path.read_text())
+            granular = []
+            for module in model["modules"]:
+                if module["kind"] != "core":
+                    granular.append(module)
+                    continue
+                for suffix in ("front", "back"):
+                    part = dict(module)
+                    part["name"] = f"{module['name']}_{suffix}"
+                    part["kind"] = f"core_{suffix}"
+                    part["area_mm2"] = module["area_mm2"] / 2.0
+                    part["total_power_w"] = module["total_power_w"] / 2.0
+                    part["dynamic_power_w"] = module["dynamic_power_w"] / 2.0
+                    part["leakage_power_w"] = module["leakage_power_w"] / 2.0
+                    granular.append(part)
+            model["modules"] = granular
+            path.write_text(json.dumps(model))
+            placements = placement_design(path, 0.70)
+        self.assertEqual(
+            {p["label"] for p in placements if p["label"].startswith("near_core")},
+            {"near_core0", "near_core1", "near_core2", "near_core3"},
+        )
 
     def test_rejects_geometry_without_eleven_distinct_positions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -270,6 +297,28 @@ class GridConvergenceTests(unittest.TestCase):
         self.assertEqual(len(design), 18)
         self.assertEqual({case["grid_size"] for case in design}, {32, 64, 128})
         self.assertNotIn("edge_top", {case["label"] for case in design})
+
+    def test_compact_48_grid_trace_fits_hotspot_line_limit(self):
+        layout = {
+            "die_width_mm": 8.0,
+            "modules": [
+                {"name": "bottom", "tier": 0, "x_mm": 0.0, "y_mm": 0.0,
+                 "width_mm": 1.0, "height_mm": 1.0,
+                 "dynamic_power_w": 1.0, "leakage_power_w": 0.1,
+                 "total_power_w": 1.1},
+                {"name": "top", "tier": 1, "x_mm": 4.0, "y_mm": 4.0,
+                 "width_mm": 1.0, "height_mm": 1.0,
+                 "dynamic_power_w": 1.0, "leakage_power_w": 0.1,
+                 "total_power_w": 1.1},
+            ],
+        }
+        grids = grid_power(layout, 48, compact_names=True)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "power.ptrace"
+            write_ptrace(path, grids["tiers"], "total_power_w", precision=9)
+            lengths = [len(line.encode("utf-8")) for line in path.read_text().splitlines()]
+        self.assertLess(max(lengths), 65536)
+        self.assertRegex(grids["tiers"][0]["cells"][0]["name"], r"^b\d\d_\d\d$")
 
 
 class UnitResponseTests(unittest.TestCase):

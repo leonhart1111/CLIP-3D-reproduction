@@ -118,7 +118,8 @@ def check_geometry(modules: list[dict], die_side: float, tolerance: float = 1e-9
                 raise ValueError(f"overlap: {first['name']} and {second['name']}")
 
 
-def grid_power(layout: dict, grid_size: int) -> dict:
+def grid_power(layout: dict, grid_size: int,
+               compact_names: bool = False) -> dict:
     side = layout["die_width_mm"]
     step = side / grid_size
     fields = ("dynamic_power_w", "leakage_power_w", "total_power_w")
@@ -128,7 +129,11 @@ def grid_power(layout: dict, grid_size: int) -> dict:
         cells = []
         for row in range(grid_size):
             for column in range(grid_size):
-                cell = {"name": f"t{tier}_r{row:02d}_c{column:02d}",
+                name = (
+                    f"{'b' if tier == 0 else 't'}{row:02d}_{column:02d}"
+                    if compact_names else f"t{tier}_r{row:02d}_c{column:02d}"
+                )
+                cell = {"name": name,
                         "row": row, "column": column,
                         "x_mm": column * step, "y_mm": row * step,
                         "width_mm": step, "height_mm": step}
@@ -175,11 +180,12 @@ def write_floorplan(path: Path, cells: list[dict]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_ptrace(path: Path, tiers: list[dict], field: str) -> None:
+def write_ptrace(path: Path, tiers: list[dict], field: str,
+                 precision: int = 17) -> None:
     cells = [cell for tier in tiers for cell in tier["cells"]]
     path.write_text(
         "\t".join(cell["name"] for cell in cells) + "\n" +
-        "\t".join(f"{cell[field]:.17g}" for cell in cells) + "\n",
+        "\t".join(f"{cell[field]:.{precision}g}" for cell in cells) + "\n",
         encoding="utf-8",
     )
 
@@ -187,7 +193,9 @@ def write_ptrace(path: Path, tiers: list[dict], field: str) -> None:
 def materialize(model_path: Path, output_dir: Path, grid_size: int = 32,
                 utilization: float = 0.70, ambient_c: float = 25.0,
                 r_convec: float = 3.5, layout_path: Path | None = None,
-                stack_config: dict | None = None) -> dict:
+                stack_config: dict | None = None,
+                compact_trace: bool = False,
+                ptrace_precision: int = 17) -> dict:
     model = read_json(model_path)
     stack = {**DEFAULT_THERMAL_STACK, **(stack_config or {})}
     local_scale = float(stack["local_resistance_scale"])
@@ -203,7 +211,7 @@ def materialize(model_path: Path, output_dir: Path, grid_size: int = 32,
     )
     layout = read_json(layout_path) if layout_path else baseline_layout(model, utilization)
     check_geometry(layout["modules"], layout["die_width_mm"])
-    grids = grid_power(layout, grid_size)
+    grids = grid_power(layout, grid_size, compact_trace)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / "layout.json", layout)
     write_json(output_dir / "power_grid.json", grids)
@@ -211,9 +219,12 @@ def materialize(model_path: Path, output_dir: Path, grid_size: int = 32,
     top = grids["tiers"][1]["cells"]
     write_floorplan(output_dir / "bottom.flp", bottom)
     write_floorplan(output_dir / "top.flp", top)
-    write_ptrace(output_dir / "power.ptrace", grids["tiers"], "total_power_w")
-    write_ptrace(output_dir / "power_dynamic.ptrace", grids["tiers"], "dynamic_power_w")
-    write_ptrace(output_dir / "power_leakage.ptrace", grids["tiers"], "leakage_power_w")
+    write_ptrace(output_dir / "power.ptrace", grids["tiers"], "total_power_w",
+                 ptrace_precision)
+    write_ptrace(output_dir / "power_dynamic.ptrace", grids["tiers"],
+                 "dynamic_power_w", ptrace_precision)
+    write_ptrace(output_dir / "power_leakage.ptrace", grids["tiers"],
+                 "leakage_power_w", ptrace_precision)
 
     lcf = f"""# layer, lateral, power, heat capacity, resistivity, thickness, floorplan
 0
@@ -296,6 +307,7 @@ solid
         "schema_version": 1, "model": str(model_path.resolve()),
         "layout": str((output_dir / "layout.json").resolve()),
         "grid_size": grid_size, "ambient_c": ambient_c, "r_convec_k_per_w": r_convec,
+        "compact_trace": compact_trace, "ptrace_precision": ptrace_precision,
         "thermal_stack": {
             **stack,
             "effective_silicon_resistivity_mk_per_w": silicon_resistivity,

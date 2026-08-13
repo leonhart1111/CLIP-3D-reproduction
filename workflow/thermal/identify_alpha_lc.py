@@ -310,6 +310,8 @@ def run_hotspot_case(model_path: Path, layout: dict, physical: dict,
         model_path, case_dir, int(physical["grid_size"]),
         float(physical["utilization"]), float(physical["ambient_c"]),
         float(physical["r_convec_k_per_w"]), layout_path, stack,
+        bool(physical.get("compact_trace", False)),
+        int(physical.get("ptrace_precision", 17)),
     )
     write_json(manifest_path, expected)
     result = run_hotspot(case_dir, hotspot)
@@ -807,15 +809,21 @@ def placement_design(model_path: Path, utilization: float,
         ("edge_bottom", 0.5, 0.0), ("edge_top", 0.5, 1.0),
         ("edge_left", 0.0, 0.5), ("edge_right", 1.0, 0.5),
     ]
-    cores = sorted(
-        (module for module in fixed if module.get("kind") == "core"),
-        key=lambda module: int(module.get("core", -1)),
-    )
-    if len(cores) != 4:
-        raise ValueError("formal placement design requires exactly four core modules")
-    for core_index, core in enumerate(cores):
-        center_x = float(core["x_mm"]) + float(core["width_mm"]) / 2.0
-        center_y = float(core["y_mm"]) + float(core["height_mm"]) / 2.0
+    core_groups: dict[int, list[dict]] = {}
+    for module in fixed:
+        if module.get("core") is not None:
+            core_groups.setdefault(int(module["core"]), []).append(module)
+    if set(core_groups) != {0, 1, 2, 3}:
+        raise ValueError("formal placement design requires module groups for cores 0..3")
+    for core_index in range(4):
+        group = core_groups[core_index]
+        left = min(float(module["x_mm"]) for module in group)
+        right = max(float(module["x_mm"]) + float(module["width_mm"])
+                    for module in group)
+        bottom = min(float(module["y_mm"]) for module in group)
+        top = max(float(module["y_mm"]) + float(module["height_mm"])
+                  for module in group)
+        center_x, center_y = (left + right) / 2.0, (bottom + top) / 2.0
         targets.append((
             f"near_core{core_index}",
             min(max((center_x - float(l2["width_mm"]) / 2.0) / upper_x, 0.0), 1.0),
