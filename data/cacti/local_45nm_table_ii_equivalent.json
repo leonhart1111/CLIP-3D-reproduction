@@ -3,13 +3,14 @@
   "description": "Local architecture-faithful CACTI Table-II equivalent; paper values are not inputs",
   "frequency_ghz": 2.0,
   "rounding": "ceiling, minimum one cycle; 1e-12 tolerance at exact integer boundaries",
-  "characterization_id": "4f2864725230443fecace0d4cfcfb02341146cdf4481cba6013ff5ea76b8b918",
+  "characterization_id": "6e59c9a34a1c0d945a757c4494ee60315c7115c7281d7e61c032c4fe2572074a",
   "provenance": {
     "cacti_executable": "/home/zyjiang/Agenticflow/CLIP/tools/src/cacti/cacti",
     "cacti_executable_sha256": "e81dc957745ed73ebfd37e394aef6233b253b02cfa1a927dd57df09be47f1a46",
     "cacti_git_revision": null,
     "base_config": "/home/zyjiang/Agenticflow/CLIP/tools/src/cacti/cache.cfg",
-    "base_config_sha256": "e1f7663eeb41571f8687bf7f9bbff652e7929875b59e8b95246fc646e9e07818"
+    "base_config_sha256": "e1f7663eeb41571f8687bf7f9bbff652e7929875b59e8b95246fc646e9e07818",
+    "raw_output_normalization": "trailing whitespace removed; CACTI cells/row-logic leakage and column-logic magnitudes below 1e-300 normalized to zero because CACTI prints nondeterministic uninitialized subnormal values"
   },
   "records": [
     {
@@ -33,7 +34,7 @@
       "config_sha256": "34437ff5cf05416ada014afefa5d13340a4d08efdf1fd7d288b11486401492f5",
       "raw_output_sha256": "77580cdaf2b590412697fa3d292e6f46400290521b801fc6335df812c4ed52c2",
       "cacti_record_id": "830e156438333079d0f76145240562550196f355f36b2ed8d549a3e58ec1ede9",
-      "characterization_id": "4f2864725230443fecace0d4cfcfb02341146cdf4481cba6013ff5ea76b8b918",
+      "characterization_id": "6e59c9a34a1c0d945a757c4494ee60315c7115c7281d7e61c032c4fe2572074a",
       "cacti_git_revision": null,
       "cacti_executable_sha256": "e81dc957745ed73ebfd37e394aef6233b253b02cfa1a927dd57df09be47f1a46",
       "base_config_sha256": "e1f7663eeb41571f8687bf7f9bbff652e7929875b59e8b95246fc646e9e07818"
@@ -57,9 +58,9 @@
       "technology_nm": 45,
       "temperature_k": 320,
       "config_sha256": "d82f6d0b283271f45e35279a82110c55558c73cae6d6a71d2a1b00ef67720155",
-      "raw_output_sha256": "1fa42a05ffcfd3465b8467899cc8a0d8a333de13e443c62e0afd35cd3662f0a3",
-      "cacti_record_id": "46760ecfd832cfd2a49610483daa33ccb51fc1d7df8cf1d5f54aa250cad58a35",
-      "characterization_id": "4f2864725230443fecace0d4cfcfb02341146cdf4481cba6013ff5ea76b8b918",
+      "raw_output_sha256": "9c97bf0e634717ac830f1c347a7eaa36cbdb2d64c28ae3b82b7f5d480612fc21",
+      "cacti_record_id": "289a7df1b9d364ebb7515ac03c312c1e704896c2ede755287f59b34fa56afe62",
+      "characterization_id": "6e59c9a34a1c0d945a757c4494ee60315c7115c7281d7e61c032c4fe2572074a",
       "cacti_git_revision": null,
       "cacti_executable_sha256": "e81dc957745ed73ebfd37e394aef6233b253b02cfa1a927dd57df09be47f1a46",
       "base_config_sha256": "e1f7663eeb41571f8687bf7f9bbff652e7929875b59e8b95246fc646e9e07818"
@@ -85,7 +86,7 @@
       "config_sha256": "327d976fcaf3807de73bd75dc5b08c89595e717fb7e8d88181771be13ac9e704",
       "raw_output_sha256": "8cfc7c84c048c34490b319caedbc76984fcedf449b16531bf81490d7080c8344",
       "cacti_record_id": "8668a0bb652156e71c4d6ad73e5ccba09557d7793b9cab6fef979595c1a3f2e2",
-      "characterization_id": "4f2864725230443fecace0d4cfcfb02341146cdf4481cba6013ff5ea76b8b918",
+      "characterization_id": "6e59c9a34a1c0d945a757c4494ee60315c7115c7281d7e61c032c4fe2572074a",
       "cacti_git_revision": null,
       "cacti_executable_sha256": "e81dc957745ed73ebfd37e394aef6233b253b02cfa1a927dd57df09be47f1a46",
       "base_config_sha256": "e1f7663eeb41571f8687bf7f9bbff652e7929875b59e8b95246fc646e9e07818"
@@ -111,7 +112,7 @@
       "config_sha256": "f2e0b808fce8fec3121db6a1af6cd127cdad5387bcc1b6d930eab35fda63d74a",
       "raw_output_sha256": "d71ce7f063bd20214ab23c251ca6d4a8ba5cb7e1dadb65c78e42d54a738e684d",
       "cacti_record_id": "78338e3b4abcd7822769dd3dbceea6e35ead7407bf7cdef5c148fcf07df3e7cc",
-      "characterization_id": "4f2864725230443fecace0d4cfcfb02341146cdf4481cba6013ff5ea76b8b918",
+      "characterization_id": "6e59c9a34a1c0d945a757c4494ee60315c7115c7281d7e61c032c4fe2572074a",
       "cacti_git_revision": null,
       "cacti_executable_sha256": "e81dc957745ed73ebfd37e394aef6233b253b02cfa1a927dd57df09be47f1a46",
       "base_config_sha256": "e1f7663eeb41571f8687bf7f9bbff652e7929875b59e8b95246fc646e9e07818"
@@ -137,7 +138,7 @@
       "config_sha256": "ee6ab46844be1f2f48cc76d53824ec0a8778cf15b5d84bf2ecec10019191d546",
       "raw_output_sha256": "eac8955a73036c160eb59df9452cbb1b01bf402434e079711604a03ff85f8173",
       "cacti_record_id": "fa1e37c27ff0900a79fd076e53bda9498cb504c31f91549f19327f2acd360e5c",
-      "characterization_id": "4f2864725230443fecace0d4cfcfb02341146cdf4481cba6013ff5ea76b8b918",
+      "characterization_id": "6e59c9a34a1c0d945a757c4494ee60315c7115c7281d7e61c032c4fe2572074a",
       "cacti_git_revision": null,
       "cacti_executable_sha256": "e81dc957745ed73ebfd37e394aef6233b253b02cfa1a927dd57df09be47f1a46",
       "base_config_sha256": "e1f7663eeb41571f8687bf7f9bbff652e7929875b59e8b95246fc646e9e07818"
@@ -163,7 +164,7 @@
       "config_sha256": "0c934abbc0bc5133bea3a26bf5e3142ca03ed6cbfadb60b54a918f0b10a6e9c8",
       "raw_output_sha256": "92956a62556bb4d5ec2a8c8fbd6f132dddfd6c3b6ce1014b0a092e039614a978",
       "cacti_record_id": "4e4aa231be9bc79a2f894e219a752cba0c22be89ec8970187a72e96f6c533220",
-      "characterization_id": "4f2864725230443fecace0d4cfcfb02341146cdf4481cba6013ff5ea76b8b918",
+      "characterization_id": "6e59c9a34a1c0d945a757c4494ee60315c7115c7281d7e61c032c4fe2572074a",
       "cacti_git_revision": null,
       "cacti_executable_sha256": "e81dc957745ed73ebfd37e394aef6233b253b02cfa1a927dd57df09be47f1a46",
       "base_config_sha256": "e1f7663eeb41571f8687bf7f9bbff652e7929875b59e8b95246fc646e9e07818"
@@ -189,7 +190,7 @@
       "config_sha256": "c4b77c728401608aa60740c451eea5154fcdf45389059f08c352f124b4f358ea",
       "raw_output_sha256": "8ac50f623ad83c1e7005134ee64005fa4ca4ba6634e4349f3aaf23b9339df2e4",
       "cacti_record_id": "8343097ddf754273979c0b16814cbef2e86f46840dbe57e3641afb5f6b1cd5ec",
-      "characterization_id": "4f2864725230443fecace0d4cfcfb02341146cdf4481cba6013ff5ea76b8b918",
+      "characterization_id": "6e59c9a34a1c0d945a757c4494ee60315c7115c7281d7e61c032c4fe2572074a",
       "cacti_git_revision": null,
       "cacti_executable_sha256": "e81dc957745ed73ebfd37e394aef6233b253b02cfa1a927dd57df09be47f1a46",
       "base_config_sha256": "e1f7663eeb41571f8687bf7f9bbff652e7929875b59e8b95246fc646e9e07818"
@@ -215,7 +216,7 @@
       "config_sha256": "fa4225d24b128e008c3885903df168d122e152f8e48e1ba9ec15152a7d0079ca",
       "raw_output_sha256": "4b580b542d9161714293c661c666162197a07634bdc6c1ac1f66552777f38501",
       "cacti_record_id": "8a13b247dd5079271f9a8a29a841da0413865012734b9bfcdb866960d46d4b7e",
-      "characterization_id": "4f2864725230443fecace0d4cfcfb02341146cdf4481cba6013ff5ea76b8b918",
+      "characterization_id": "6e59c9a34a1c0d945a757c4494ee60315c7115c7281d7e61c032c4fe2572074a",
       "cacti_git_revision": null,
       "cacti_executable_sha256": "e81dc957745ed73ebfd37e394aef6233b253b02cfa1a927dd57df09be47f1a46",
       "base_config_sha256": "e1f7663eeb41571f8687bf7f9bbff652e7929875b59e8b95246fc646e9e07818"
@@ -241,7 +242,7 @@
       "config_sha256": "fb78991db94d0025ad2b5a42cb13802a683e5631ac09554482387c15d74517ff",
       "raw_output_sha256": "772f3189e93a5129ce43436b435cf239bcc1290fe9fca25d7f76a692d25d81f8",
       "cacti_record_id": "f0de24d8eb3782f7a02b98eeea12a9e60ffd349b0405b9f6092280a06ec033dd",
-      "characterization_id": "4f2864725230443fecace0d4cfcfb02341146cdf4481cba6013ff5ea76b8b918",
+      "characterization_id": "6e59c9a34a1c0d945a757c4494ee60315c7115c7281d7e61c032c4fe2572074a",
       "cacti_git_revision": null,
       "cacti_executable_sha256": "e81dc957745ed73ebfd37e394aef6233b253b02cfa1a927dd57df09be47f1a46",
       "base_config_sha256": "e1f7663eeb41571f8687bf7f9bbff652e7929875b59e8b95246fc646e9e07818"

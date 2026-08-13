@@ -21,6 +21,26 @@ def stable_identity(value: object) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def characterization_identity(characterization: dict) -> str:
+    """Return a content identity while excluding machine-local evidence paths."""
+    normalized = {
+        key: value for key, value in characterization.items()
+        if key != "characterization_id"
+    }
+    normalized["records"] = [
+        {
+            key: value for key, value in record.items()
+            if key not in ("config", "raw_output")
+        }
+        for record in characterization.get("records", [])
+    ]
+    provenance = dict(characterization.get("provenance", {}))
+    provenance.pop("cacti_executable", None)
+    provenance.pop("base_config", None)
+    normalized["provenance"] = provenance
+    return stable_identity(normalized)
+
+
 def cache_access_cycles(access_time_ns: float, frequency_ghz: float) -> int:
     """Convert a physical access time to an integral synchronous latency."""
     access = float(access_time_ns)
@@ -201,10 +221,7 @@ def validate_characterization(cacti: dict, expected_contract: dict) -> dict[str,
         if actual.get("cacti_record_id") != record_identity:
             raise ValueError(f"CACTI {level}.cacti_record_id does not match record")
 
-    artifact_identity = stable_identity({
-        key: value for key, value in cacti.items()
-        if key != "characterization_id"
-    })
+    artifact_identity = characterization_identity(cacti)
     if cacti.get("characterization_id") != artifact_identity:
         raise ValueError("CACTI characterization_id does not match artifact")
     return actual_by_level

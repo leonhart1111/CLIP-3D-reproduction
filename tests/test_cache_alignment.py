@@ -10,10 +10,11 @@ from pathlib import Path
 from workflow.cache_contract import (
     build_cache_contract,
     cache_access_cycles,
+    characterization_identity,
     stable_identity,
     validate_characterization,
 )
-from workflow.cacti.characterize_cache import make_config
+from workflow.cacti.characterize_cache import make_config, normalized_text
 from workflow.mcpat.gem5_to_mcpat import convert, named_child, component_by_id
 from workflow.common import PROJECT_ROOT
 from workflow.run_lifting_pipeline import validate_config
@@ -30,6 +31,20 @@ class CacheCycleTests(unittest.TestCase):
     def test_exact_cycle_boundary_does_not_gain_a_cycle(self):
         self.assertEqual(cache_access_cycles(1.5, 2.0), 3)
         self.assertEqual(cache_access_cycles(1.5000000000000002, 2.0), 3)
+
+    def test_cacti_evidence_normalizes_only_known_subnormal_garbage(self):
+        text = (
+            "\tTotal leakage power in cells (mW): 6.94253e-307  \n"
+            "\tTotal leakage power in row logic(mW): 6.91243e-307\n"
+            "\tTotal leakage power in column logic(mW): 6.90665e-307\n"
+            "\tTotal leakage power in H-tree (mW): 1.25e-12\n"
+        )
+        self.assertEqual(normalized_text(text), (
+            "\tTotal leakage power in cells (mW): 0\n"
+            "\tTotal leakage power in row logic(mW): 0\n"
+            "\tTotal leakage power in column logic(mW): 0\n"
+            "\tTotal leakage power in H-tree (mW): 1.25e-12\n"
+        ))
 
 
 class CacheContractTests(unittest.TestCase):
@@ -218,7 +233,7 @@ class CharacterizationIdentityTests(unittest.TestCase):
             "records": records,
             "provenance": {"cacti_executable_sha256": "c" * 64},
         }
-        result["characterization_id"] = stable_identity(result)
+        result["characterization_id"] = characterization_identity(result)
         return result
 
     def test_valid_characterization_returns_distinct_level_records(self):
@@ -260,6 +275,20 @@ class CharacterizationIdentityTests(unittest.TestCase):
         characterization["characterization_id"] = "0" * 64
         with self.assertRaisesRegex(ValueError, "characterization_id"):
             validate_characterization(characterization, self.contract())
+
+    def test_characterization_identity_is_independent_of_evidence_paths(self):
+        first = self.characterization()
+        second = json.loads(json.dumps(first))
+        for index, record in enumerate(second["records"]):
+            record["config"] = f"/another/output/cache-{index}.cfg"
+            record["raw_output"] = f"/another/output/cache-{index}.stdout.txt"
+        second["provenance"].update({
+            "cacti_executable": "/another/checkout/cacti",
+            "base_config": "/another/checkout/cache.cfg",
+        })
+        self.assertEqual(
+            characterization_identity(first), characterization_identity(second)
+        )
 
     def test_r2_records_the_same_characterization_and_record_identities(self):
         with tempfile.TemporaryDirectory() as temporary:

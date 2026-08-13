@@ -79,6 +79,14 @@ python -m scripts.characterize_local_table_ii \
 来自归档而非独立Git checkout，因此Git revision为null；可执行文件、基础配置
 和源归档仍分别由SHA-256记录。
 
+CACTI在32 kB配置下偶尔会把未初始化的亚正规数（约`1e-307`）打印到cells、
+row logic或column logic内部泄漏分项；这些分项不参与本流程提取的总泄漏、延迟
+或面积。为使证据可重复，stdout保存前会去除行尾空白，并且只把上述三个已知
+字段中绝对值小于`1e-300`的数规范为0；规范化规则写入
+`provenance.raw_output_normalization`，其他文本不改动。characterization ID由
+内容和文件SHA-256构成，不包含输出目录或工具路径，因此相同工具与参数在不同
+目录运行会得到相同ID。
+
 论文Table II只允许在报告中作为外部对照。其数值不得导入JSON、缓存查找代码或
 正式配置，也不得通过搜索CACTI参数来刻意逼近。
 

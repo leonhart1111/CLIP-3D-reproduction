@@ -12,6 +12,7 @@ from pathlib import Path
 from workflow.cache_contract import (
     build_cache_contract,
     cache_access_cycles,
+    characterization_identity,
     stable_identity,
 )
 from workflow.common import PROJECT_ROOT, parse_size_bytes, sha256_file, write_json
@@ -75,8 +76,20 @@ def make_config(base: str, contract: dict) -> str:
 
 
 def normalized_text(text: str) -> str:
-    """Preserve tool evidence while removing non-semantic trailing whitespace."""
-    return "\n".join(line.rstrip() for line in text.rstrip().splitlines()) + "\n"
+    """Preserve CACTI evidence while removing known non-semantic instability."""
+    lines = []
+    unstable_subnormal = re.compile(
+        r"^(\s*Total leakage power in (?:cells|row logic|column logic)\s*"
+        r"\(mW\):\s*)"
+        r"([0-9.eE+-]+)\s*$"
+    )
+    for original in text.rstrip().splitlines():
+        line = original.rstrip()
+        match = unstable_subnormal.match(line)
+        if match and abs(float(match.group(2))) < 1e-300:
+            line = f"{match.group(1)}0"
+        lines.append(line)
+    return "\n".join(lines) + "\n"
 
 
 def parse_cacti_output(text: str) -> dict[str, float]:
@@ -155,7 +168,7 @@ def characterize(cacti: Path, base_config: Path, output_dir: Path,
             size_bytes = int(contract["size_bytes"])
             stem = f"{level}_{size_bytes}"
             cfg = output_dir / f"{stem}.cfg"
-            raw = output_dir / f"{stem}.out"
+            raw = output_dir / f"{stem}.stdout.txt"
             cfg.write_text(make_config(base, contract), encoding="utf-8")
             process = subprocess.run(
                 [str(cacti.resolve()), "-infile", str(cfg.resolve())],
@@ -201,12 +214,14 @@ def characterize(cacti: Path, base_config: Path, output_dir: Path,
             "cacti_git_revision": local_git_revision(cacti.resolve().parent),
             "base_config": str(base_config.resolve()),
             "base_config_sha256": base_config_hash,
+            "raw_output_normalization": (
+                "trailing whitespace removed; CACTI cells/row-logic leakage "
+                "and column-logic magnitudes below 1e-300 normalized to zero because CACTI "
+                "prints nondeterministic uninitialized subnormal values"
+            ),
         },
     }
-    result["characterization_id"] = stable_identity({
-        key: value for key, value in result.items()
-        if key != "characterization_id"
-    })
+    result["characterization_id"] = characterization_identity(result)
     write_json(output_dir / "cacti_characterization.json", result)
     return result
 
