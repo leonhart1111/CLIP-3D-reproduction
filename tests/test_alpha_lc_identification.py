@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import math
+import argparse
 import json
 import tempfile
 import unittest
@@ -13,9 +14,12 @@ from workflow.thermal.identify_alpha_lc import (
     evaluate_grid_convergence,
     estimate_cross_tier_weight,
     fit_alpha_lc,
+    identification_plan,
     placement_design,
     run_hotspot_case,
     unit_power_model,
+    validate_identification_config,
+    validate_model_contract,
 )
 
 
@@ -398,6 +402,71 @@ class AlphaLcFitTests(unittest.TestCase):
             sample["delta_t_c"] = 0.0
         with self.assertRaisesRegex(ValueError, "spatially degenerate"):
             fit_alpha_lc(samples, 0.7, bootstrap_samples=20)
+
+
+class CampaignCliTests(unittest.TestCase):
+    def valid_config(self) -> dict:
+        return {
+            "schema_version": 1,
+            "workloads": ["fft", "cholesky", "matmul", "stencil", "stream"],
+            "l1d_sizes": ["16kB", "64kB", "128kB"],
+            "l2_sizes": ["128kB", "512kB", "2048kB"],
+            "placements_per_point": 13,
+            "physical": {
+                "grid_size": 32, "utilization": 0.70,
+                "ambient_c": 25.0, "r_convec_k_per_w": 1.042,
+                "thermal_stack": {"local_resistance_scale": 1.0},
+            },
+        }
+
+    def valid_model(self) -> dict:
+        return {
+            "power_provenance": {
+                "dynamic": "McPAT Runtime Dynamic",
+                "leakage": "McPAT Subthreshold Leakage + Gate Leakage",
+                "postprocessing": "none",
+            },
+            "area_provenance": {"global_scaling": "none"},
+            "cacti_characterization_id": "abc",
+            "modules": [{"name": "l2"}],
+        }
+
+    def test_config_rejects_nonphysical_scale(self):
+        config = self.valid_config()
+        config["physical"]["thermal_stack"]["local_resistance_scale"] = 8.72
+        with self.assertRaisesRegex(ValueError, "local_resistance_scale.*1.0"):
+            validate_identification_config(config)
+
+    def test_model_contract_rejects_scaled_or_postprocessed_inputs(self):
+        scaled = self.valid_model()
+        scaled["area_provenance"]["global_scaling"] = "150 mm2"
+        with self.assertRaisesRegex(ValueError, "unscaled"):
+            validate_model_contract(scaled)
+        adjusted = self.valid_model()
+        adjusted["power_provenance"]["postprocessing"] = "multiplied"
+        with self.assertRaisesRegex(ValueError, "raw McPAT"):
+            validate_model_contract(adjusted)
+
+    def test_plan_requires_all_45_completed_r1_points(self):
+        config = self.valid_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for workload in config["workloads"]:
+                for l1d in config["l1d_sizes"]:
+                    for l2 in config["l2_sizes"]:
+                        point = root / workload / f"l1d_{l1d}" / f"l2_{l2}"
+                        point.mkdir(parents=True)
+                        (point / "r1_metadata.json").write_text("{}")
+                        (point / "stats.txt").write_text("simInsts 1\n")
+            report = identification_plan(root, config)
+        self.assertEqual(report["work_point_count"], 45)
+        self.assertEqual(report["intended_real_power_cases"], 585)
+        self.assertEqual(len(report["work_points"]), 45)
+
+    def test_plan_rejects_missing_r1_without_rerunning_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(FileNotFoundError, "completed R1"):
+                identification_plan(Path(directory), self.valid_config())
 
 
 if __name__ == "__main__":

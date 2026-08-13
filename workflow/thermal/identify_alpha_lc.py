@@ -9,6 +9,7 @@ import json
 import copy
 import random
 import statistics
+import argparse
 from pathlib import Path
 
 from workflow.common import read_json, write_json
@@ -28,6 +29,74 @@ PLACEMENT_LABELS = (
     "edge_bottom", "edge_top", "edge_left", "edge_right",
     "near_core0", "near_core1", "near_core2", "near_core3",
 )
+
+
+def validate_identification_config(config: dict) -> None:
+    if config.get("schema_version") != 1:
+        raise ValueError("unsupported alpha/Lc identification config schema")
+    physical = config.get("physical") or {}
+    stack = physical.get("thermal_stack") or {}
+    if float(stack.get("local_resistance_scale", math.nan)) != 1.0:
+        raise ValueError("alpha/Lc identification requires local_resistance_scale == 1.0")
+    if int(config.get("placements_per_point", 0)) != len(PLACEMENT_LABELS):
+        raise ValueError(f"formal campaign requires {len(PLACEMENT_LABELS)} placements per point")
+    if not 0 < float(physical.get("utilization", 0)) <= 1:
+        raise ValueError("physical utilization must be in (0, 1]")
+    if int(physical.get("grid_size", 0)) < 2:
+        raise ValueError("physical grid_size must be at least 2")
+    expected_workloads = {"fft", "cholesky", "matmul", "stencil", "stream"}
+    if set(config.get("workloads", [])) != expected_workloads:
+        raise ValueError("formal campaign requires all five declared workloads")
+
+
+def validate_model_contract(model: dict) -> None:
+    if (model.get("area_provenance") or {}).get("global_scaling") != "none":
+        raise ValueError("alpha/Lc evidence must use an unscaled physical model")
+    provenance = model.get("power_provenance") or {}
+    expected = {
+        "dynamic": "McPAT Runtime Dynamic",
+        "leakage": "McPAT Subthreshold Leakage + Gate Leakage",
+        "postprocessing": "none",
+    }
+    if any(provenance.get(key) != value for key, value in expected.items()):
+        raise ValueError("alpha/Lc evidence requires raw McPAT power with no postprocessing")
+    if not model.get("cacti_characterization_id"):
+        raise ValueError("model lacks local CACTI characterization identity")
+
+
+def identification_plan(r1_root: Path, config: dict) -> dict:
+    """Inventory existing R1 without starting or modifying any simulation."""
+    validate_identification_config(config)
+    root = Path(r1_root).resolve()
+    work_points = []
+    missing = []
+    for workload in config["workloads"]:
+        for l1d in config["l1d_sizes"]:
+            for l2 in config["l2_sizes"]:
+                point = root / workload / f"l1d_{l1d}" / f"l2_{l2}"
+                required = (point / "r1_metadata.json", point / "stats.txt")
+                if not all(path.is_file() for path in required):
+                    missing.append(str(point))
+                work_points.append({
+                    "workload": workload, "l1d_size": l1d, "l2_size": l2,
+                    "r1_dir": str(point),
+                })
+    if missing:
+        raise FileNotFoundError(
+            f"formal campaign requires completed R1 for all 45 points; missing {len(missing)}: "
+            + ", ".join(missing[:3])
+        )
+    return {
+        "schema_version": 1,
+        "r1_root": str(root),
+        "work_point_count": len(work_points),
+        "placements_per_point": int(config["placements_per_point"]),
+        "intended_real_power_cases": (
+            len(work_points) * int(config["placements_per_point"])
+        ),
+        "work_points": work_points,
+        "r1_policy": "read-only reuse; no R1 command exists in this workflow",
+    }
 
 
 def case_identity(model: dict, layout: dict, physical: dict,
@@ -506,6 +575,30 @@ def fit_alpha_lc(samples: list[dict], cross_tier_weight: float,
         "cross_validation": {"leave_one_workload_out": leave_one_out},
         "bootstrap": bootstrap,
     }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    plan_parser = subparsers.add_parser(
+        "plan", help="inventory the read-only 45-point R1 campaign"
+    )
+    plan_parser.add_argument("--r1-root", type=Path, required=True)
+    plan_parser.add_argument("--config", type=Path, required=True)
+    plan_parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    if args.command == "plan":
+        config = read_json(args.config)
+        report = identification_plan(args.r1_root, config)
+        write_json(args.output, report)
+        print(
+            f"planned {report['work_point_count']} work points and "
+            f"{report['intended_real_power_cases']} real-power HotSpot cases"
+        )
+
+
+if __name__ == "__main__":
+    main()
 
 
 def _normalized_lattice(steps: int = 41) -> list[tuple[float, float]]:
