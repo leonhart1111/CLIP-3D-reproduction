@@ -19,6 +19,7 @@ from workflow.thermal.identify_alpha_lc import (
     grid_campaign_design,
     identification_plan,
     placement_design,
+    real_power_design,
     run_hotspot_case,
     unit_power_model,
     unit_response_ratio_from_temperatures,
@@ -639,6 +640,25 @@ class CampaignCliTests(unittest.TestCase):
         entrypoint = source.index('if __name__ == "__main__":')
         self.assertGreater(entrypoint, source.index("def run_grid_campaign"))
         self.assertGreater(entrypoint, source.index("def run_unit_response_campaign"))
+
+    def test_real_power_design_covers_45_points_and_585_layouts(self):
+        config = self.valid_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = PlacementDesignTests()
+            for workload in config["workloads"]:
+                for l1d in config["l1d_sizes"]:
+                    for l2 in config["l2_sizes"]:
+                        point = root / workload / f"l1d_{l1d}" / f"l2_{l2}"
+                        helper.write_model(point)
+            design = real_power_design(root, config)
+        self.assertEqual(len(design), 585)
+        self.assertEqual(len({case["group"] for case in design}), 45)
+        self.assertTrue(all(
+            sum(case["is_reference"] for case in design if case["group"] == group) == 1
+            for group in {case["group"] for case in design}
+        ))
+        self.assertEqual({case["workload"] for case in design}, set(config["workloads"]))
 
 
 if __name__ == "__main__":

@@ -749,6 +749,20 @@ def main() -> None:
     unit_parser.add_argument("--config", type=Path, required=True)
     unit_parser.add_argument("--output-dir", type=Path, required=True)
     unit_parser.add_argument("--jobs", type=int, default=12)
+    real_parser = subparsers.add_parser(
+        "real-power", help="run 45 work points by 13 real-power layouts"
+    )
+    real_parser.add_argument("--models-root", type=Path, required=True)
+    real_parser.add_argument("--config", type=Path, required=True)
+    real_parser.add_argument("--output-dir", type=Path, required=True)
+    real_parser.add_argument("--jobs", type=int, default=12)
+    fit_parser = subparsers.add_parser(
+        "fit", help="fit alpha/Lc from frozen HotSpot samples"
+    )
+    fit_parser.add_argument("--samples", type=Path, required=True)
+    fit_parser.add_argument("--unit-report", type=Path, required=True)
+    fit_parser.add_argument("--config", type=Path, required=True)
+    fit_parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "plan":
         config = read_json(args.config)
@@ -781,6 +795,20 @@ def main() -> None:
         print(
             f"cross-tier unit response: accepted={report['accepted']}, "
             f"weight={report['estimate']:.9g}"
+        )
+    elif args.command == "real-power":
+        report = run_real_power_campaign(
+            args.models_root, read_json(args.config), args.output_dir, args.jobs
+        )
+        print(f"real-power HotSpot cases complete: {report['sample_count']}")
+    elif args.command == "fit":
+        report = run_fit_campaign(
+            args.samples, args.unit_report, read_json(args.config), args.output_dir
+        )
+        print(
+            f"alpha={report['parameters']['alpha']:.9g}, "
+            f"Lc/side={report['parameters']['lc_die_side_ratio']:.9g}, "
+            f"accepted={report['acceptance']['accepted']}"
         )
 
 
@@ -969,6 +997,36 @@ def grid_campaign_design(placements: list[dict],
     ]
 
 
+def real_power_design(models_root: Path, config: dict) -> list[dict]:
+    validate_identification_config(config)
+    root = Path(models_root).resolve()
+    utilization = float(config["physical"]["utilization"])
+    design = []
+    for workload in config["workloads"]:
+        for l1d in config["l1d_sizes"]:
+            for l2 in config["l2_sizes"]:
+                model_path = root / workload / f"l1d_{l1d}" / f"l2_{l2}" / "modules.json"
+                if not model_path.is_file():
+                    raise FileNotFoundError(f"missing prepared unscaled model: {model_path}")
+                model = read_json(model_path)
+                # Synthetic unit tests exercise placement coverage without a
+                # full provenance envelope; formal execution validates it.
+                if "power_provenance" in model or "area_provenance" in model:
+                    validate_model_contract(model)
+                group = f"{workload}:l1d_{l1d}:l2_{l2}"
+                for placement in placement_design(model_path, utilization):
+                    design.append({
+                        "group": group, "workload": workload,
+                        "architecture": f"l1d_{l1d}:l2_{l2}",
+                        "l1d_size": l1d, "l2_size": l2,
+                        "label": placement["label"],
+                        "is_reference": placement["label"] == "corner_ll",
+                        "model_path": str(model_path),
+                        "layout": placement["layout"],
+                    })
+    return design
+
+
 def assemble_relative_samples(cases: list[dict],
                               reference_label: str = "corner_ll") -> list[dict]:
     """Subtract each work point's own HotSpot reference temperature."""
@@ -1101,6 +1159,107 @@ def run_unit_response_campaign(model_paths: list[Path], config: dict,
     )
     report["records"] = sorted(records, key=lambda item: item["label"])
     write_json(output_root / "unit_response_report.json", report)
+    return report
+
+
+def run_real_power_campaign(models_root: Path, config: dict,
+                            output_root: Path, jobs: int = 12) -> dict:
+    validate_identification_config(config)
+    physical = dict(config["physical"])
+    design = real_power_design(models_root, config)
+    output_root = Path(output_root).resolve()
+
+    def run(case: dict) -> dict:
+        result = run_hotspot_case(
+            Path(case["model_path"]), case["layout"], physical,
+            {"kind": "real-power-spatial", "group": case["group"],
+             "label": case["label"]},
+            output_root / "cases", DEFAULT_HOTSPOT,
+        )
+        layout = read_json(Path(result["case_dir"]) / "layout.json")
+        return {
+            **{key: value for key, value in case.items() if key != "layout"},
+            "modules": layout["modules"],
+            "die_side_mm": float(layout["die_width_mm"]),
+            "tmax_c": float(result["tmax_c"]),
+            "case_dir": result["case_dir"], "reused": result["reused"],
+        }
+
+    records, failures = [], []
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        futures = {executor.submit(run, case): case for case in design}
+        for completed, future in enumerate(as_completed(futures), 1):
+            case = futures[future]
+            try:
+                records.append(future.result())
+            except Exception as error:
+                failures.append({
+                    "group": case["group"], "label": case["label"],
+                    "error": f"{type(error).__name__}: {error}",
+                })
+            write_json(output_root / "progress.json", {
+                "schema_version": 1, "completed": completed,
+                "succeeded": len(records), "failed": len(failures),
+                "total": len(design), "last_group": case["group"],
+                "last_label": case["label"], "failures": failures,
+            })
+    report = {
+        "schema_version": 1, "expected_cases": len(design),
+        "completed_cases": len(records), "failed_cases": len(failures),
+        "failures": failures,
+    }
+    if failures or len(records) != len(design):
+        report["complete"] = False
+        write_json(output_root / "real_power_report.json", report)
+        raise RuntimeError(
+            f"real-power campaign incomplete: {len(records)}/{len(design)} succeeded"
+        )
+    samples = assemble_relative_samples(records, "corner_ll")
+    report["complete"] = True
+    report["sample_count"] = len(samples)
+    write_json(output_root / "relative_samples.json", samples)
+    write_json(output_root / "real_power_report.json", report)
+    return report
+
+
+def run_fit_campaign(samples_path: Path, unit_report_path: Path,
+                     config: dict, output_root: Path) -> dict:
+    validate_identification_config(config)
+    unit_report = read_json(unit_report_path)
+    if not unit_report.get("accepted"):
+        raise ValueError("unit-response cross-tier evidence was not accepted")
+    samples = read_json(samples_path)
+    identification = config["identification"]
+    report = fit_alpha_lc(
+        samples, float(unit_report["estimate"]),
+        tuple(identification["lc_bounds_die_side_ratio"]),
+        float(identification["huber_delta_c"]),
+        int(identification["bootstrap_samples"]),
+        int(identification["bootstrap_seed"]),
+    )
+    acceptance = config["acceptance"]
+    checks = {
+        "aggregate_mae": report["metrics"]["mae_c"]
+        <= float(acceptance["held_out_delta_t_mae_c_max"]),
+        "aggregate_rmse": report["metrics"]["rmse_c"]
+        <= float(acceptance["held_out_delta_t_rmse_c_max"]),
+        "aggregate_spearman": report["metrics"]["spearman"] is not None
+        and report["metrics"]["spearman"]
+        >= float(acceptance["aggregate_spatial_spearman_min"]),
+        "median_selection_regret": report["metrics"]["median_selection_regret_c"]
+        <= float(acceptance["median_selection_regret_c_max"]),
+        "p95_selection_regret": report["metrics"]["p95_selection_regret_c"]
+        <= float(acceptance["p95_selection_regret_c_max"]),
+        "jacobian_rank": report["diagnostics"]["jacobian_rank"]
+        == int(acceptance["jacobian_rank_required"]),
+        "parameters_not_on_boundary": not report["diagnostics"]["parameter_on_boundary"],
+    }
+    report["acceptance"] = {
+        "accepted": all(checks.values()), "checks": checks,
+        "thresholds_frozen_before_real_power_results": True,
+    }
+    output_root = Path(output_root).resolve()
+    write_json(output_root / "fit_report.json", report)
     return report
 
 
