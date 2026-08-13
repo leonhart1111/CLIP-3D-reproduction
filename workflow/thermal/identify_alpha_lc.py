@@ -56,9 +56,16 @@ def validate_identification_config(config: dict) -> None:
     convergence_grids = [
         int(value) for value in physical.get("grid_convergence_sizes", [])
     ]
-    if convergence_grids and int(physical["grid_size"]) < max(convergence_grids):
+    selected_grid = int(physical.get(
+        "grid_convergence_selected_size", physical["grid_size"],
+    ))
+    if convergence_grids and selected_grid not in convergence_grids:
         raise ValueError(
-            "physical grid_size must equal or exceed the finest convergence grid"
+            "selected convergence grid must belong to the declared campaign"
+        )
+    if int(physical["grid_size"]) != selected_grid:
+        raise ValueError(
+            "physical grid_size must match the selected convergence grid"
         )
     expected_workloads = {"fft", "cholesky", "matmul", "stencil", "stream"}
     if set(config.get("workloads", [])) != expected_workloads:

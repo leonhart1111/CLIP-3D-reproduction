@@ -774,10 +774,16 @@ class CampaignCliTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "local_resistance_scale.*1.0"):
             validate_identification_config(config)
 
-    def test_config_rejects_production_grid_below_convergence_reference(self):
+    def test_config_requires_production_grid_to_match_convergence_selection(self):
         config = self.valid_config()
         config["physical"]["grid_convergence_sizes"] = [16, 32, 64]
-        with self.assertRaisesRegex(ValueError, "grid_size.*finest convergence grid"):
+        config["physical"]["grid_convergence_selected_size"] = 64
+        with self.assertRaisesRegex(ValueError, "grid_size.*selected convergence grid"):
+            validate_identification_config(config)
+        config["physical"]["grid_size"] = 64
+        validate_identification_config(config)
+        config["physical"]["grid_convergence_selected_size"] = 48
+        with self.assertRaisesRegex(ValueError, "selected convergence grid.*campaign"):
             validate_identification_config(config)
 
     def test_model_contract_rejects_scaled_or_postprocessed_inputs(self):
