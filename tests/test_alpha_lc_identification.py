@@ -11,8 +11,10 @@ from workflow.floorplan.optimize_layout import spatial_coupling
 from workflow.thermal.identify_alpha_lc import (
     case_identity,
     evaluate_grid_convergence,
+    estimate_cross_tier_weight,
     placement_design,
     run_hotspot_case,
+    unit_power_model,
 )
 
 
@@ -245,6 +247,82 @@ class GridConvergenceTests(unittest.TestCase):
             self.assertNotEqual(first["case_dir"], changed["case_dir"])
             self.assertEqual(materialize_mock.call_count, 2)
             self.assertEqual(hotspot_mock.call_count, 2)
+
+
+class UnitResponseTests(unittest.TestCase):
+    def test_unit_power_model_changes_only_copied_power_fields(self):
+        model = {
+            "schema_version": 3,
+            "modules": [
+                {"name": "core0", "dynamic_power_w": 2.0,
+                 "leakage_power_w": 0.2, "total_power_w": 2.2,
+                 "area_mm2": 4.0},
+                {"name": "l2", "dynamic_power_w": 0.5,
+                 "leakage_power_w": 0.1, "total_power_w": 0.6,
+                 "area_mm2": 1.0},
+            ],
+        }
+        original = json.loads(json.dumps(model))
+        stimulated = unit_power_model(model, "l2")
+        self.assertEqual(model, original)
+        core, l2 = stimulated["modules"]
+        self.assertEqual(
+            (core["dynamic_power_w"], core["leakage_power_w"], core["total_power_w"]),
+            (0.0, 0.0, 0.0),
+        )
+        self.assertEqual(
+            (l2["dynamic_power_w"], l2["leakage_power_w"], l2["total_power_w"]),
+            (1.0, 0.0, 1.0),
+        )
+        self.assertEqual(stimulated["unit_power_stimulus"]["source_name"], "l2")
+
+    def test_unit_power_model_rejects_missing_or_duplicate_source(self):
+        duplicate = {"modules": [
+            {"name": "x", "dynamic_power_w": 1, "leakage_power_w": 0,
+             "total_power_w": 1},
+            {"name": "x", "dynamic_power_w": 1, "leakage_power_w": 0,
+             "total_power_w": 1},
+        ]}
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            unit_power_model(duplicate, "x")
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            unit_power_model(duplicate, "missing")
+
+    def test_cross_tier_estimator_uses_rise_ratio_and_is_reproducible(self):
+        cases = [
+            {"label": f"case{i}", "ambient_c": 25.0,
+             "same_tier_tmax_c": 25.0 + same,
+             "cross_tier_tmax_c": 25.0 + cross}
+            for i, (same, cross) in enumerate(
+                ((10.0, 7.0), (20.0, 14.0), (5.0, 3.5), (8.0, 5.6))
+            )
+        ]
+        first = estimate_cross_tier_weight(cases, bootstrap_samples=200, seed=7)
+        second = estimate_cross_tier_weight(cases, bootstrap_samples=200, seed=7)
+        self.assertEqual(first, second)
+        self.assertAlmostEqual(first["estimate"], 0.7)
+        self.assertTrue(first["accepted"])
+        self.assertEqual(len(first["per_case_ratios"]), 4)
+
+    def test_cross_tier_estimator_rejects_invalid_denominator_and_instability(self):
+        with self.assertRaisesRegex(ValueError, "same-tier temperature rise"):
+            estimate_cross_tier_weight([{
+                "label": "bad", "ambient_c": 25.0,
+                "same_tier_tmax_c": 25.0, "cross_tier_tmax_c": 26.0,
+            }], bootstrap_samples=20)
+        unstable = [
+            {"label": "a", "ambient_c": 25.0,
+             "same_tier_tmax_c": 35.0, "cross_tier_tmax_c": 26.0},
+            {"label": "b", "ambient_c": 25.0,
+             "same_tier_tmax_c": 35.0, "cross_tier_tmax_c": 34.0},
+            {"label": "c", "ambient_c": 25.0,
+             "same_tier_tmax_c": 35.0, "cross_tier_tmax_c": 30.0},
+        ]
+        report = estimate_cross_tier_weight(
+            unstable, bootstrap_samples=500, seed=11,
+        )
+        self.assertFalse(report["accepted"])
+        self.assertIn("relative interval width", report["rejection_reasons"][0])
 
 
 if __name__ == "__main__":

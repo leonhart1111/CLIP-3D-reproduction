@@ -6,6 +6,9 @@ from __future__ import annotations
 import math
 import hashlib
 import json
+import copy
+import random
+import statistics
 from pathlib import Path
 
 from workflow.common import read_json, write_json
@@ -138,6 +141,101 @@ def run_hotspot_case(model_path: Path, layout: dict, physical: dict,
     return {
         **result, "case_identity": identity,
         "case_dir": str(case_dir), "reused": False,
+    }
+
+
+def unit_power_model(model: dict, source_name: str,
+                     source_power_w: float = 1.0) -> dict:
+    """Return an isolated model with exactly one unit-power source."""
+    source_power_w = float(source_power_w)
+    if not math.isfinite(source_power_w) or source_power_w <= 0:
+        raise ValueError("unit source power must be finite and positive")
+    matches = [module for module in model.get("modules", [])
+               if module.get("name") == source_name]
+    if len(matches) != 1:
+        raise ValueError("unit-power stimulus requires exactly one named source")
+    result = copy.deepcopy(model)
+    for module in result["modules"]:
+        active = module["name"] == source_name
+        module["dynamic_power_w"] = source_power_w if active else 0.0
+        module["leakage_power_w"] = 0.0
+        module["total_power_w"] = source_power_w if active else 0.0
+        if "area_mm2" in module and float(module["area_mm2"]) > 0:
+            module["power_density_w_per_mm2"] = (
+                module["total_power_w"] / float(module["area_mm2"])
+            )
+    result["unit_power_stimulus"] = {
+        "source_name": source_name,
+        "source_power_w": source_power_w,
+        "purpose": "HotSpot spatial system identification only",
+    }
+    return result
+
+
+def _percentile(values: list[float], probability: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        raise ValueError("percentile requires non-empty values")
+    position = (len(ordered) - 1) * probability
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
+
+
+def estimate_cross_tier_weight(matched_responses: list[dict],
+                               bootstrap_samples: int = 1000,
+                               seed: int = 20260813,
+                               max_relative_interval_width: float = 0.50) -> dict:
+    """Estimate scalar cross-tier coupling from matched one-watt rises."""
+    if not matched_responses:
+        raise ValueError("cross-tier estimation requires matched responses")
+    if bootstrap_samples < 20:
+        raise ValueError("cross-tier bootstrap requires at least 20 samples")
+    ratios = []
+    records = []
+    for case in matched_responses:
+        ambient = float(case["ambient_c"])
+        same_rise = float(case["same_tier_tmax_c"]) - ambient
+        cross_rise = float(case["cross_tier_tmax_c"]) - ambient
+        if not math.isfinite(same_rise) or same_rise <= 0:
+            raise ValueError("same-tier temperature rise must be finite and positive")
+        if not math.isfinite(cross_rise) or cross_rise < 0:
+            raise ValueError("cross-tier temperature rise must be finite and nonnegative")
+        ratio = cross_rise / same_rise
+        ratios.append(ratio)
+        records.append({
+            "label": str(case["label"]), "same_tier_rise_c": same_rise,
+            "cross_tier_rise_c": cross_rise, "ratio": ratio,
+        })
+    estimate = statistics.median(ratios)
+    rng = random.Random(seed)
+    bootstrap = [
+        statistics.median(rng.choices(ratios, k=len(ratios)))
+        for _ in range(bootstrap_samples)
+    ]
+    low, high = _percentile(bootstrap, 0.025), _percentile(bootstrap, 0.975)
+    relative_width = (high - low) / estimate if estimate > 0 else math.inf
+    reasons = []
+    if not all(math.isfinite(value) for value in (estimate, low, high)):
+        reasons.append("bootstrap interval is not finite")
+    if relative_width > max_relative_interval_width:
+        reasons.append(
+            "relative interval width exceeds the predeclared stability ceiling"
+        )
+    return {
+        "schema_version": 1,
+        "method": "median matched unit-power rise ratio with whole-case bootstrap",
+        "estimate": estimate,
+        "confidence_interval_95": {"low": low, "high": high},
+        "relative_interval_width": relative_width,
+        "bootstrap_samples": bootstrap_samples,
+        "bootstrap_seed": seed,
+        "per_case_ratios": records,
+        "accepted": not reasons,
+        "rejection_reasons": reasons,
     }
 
 
