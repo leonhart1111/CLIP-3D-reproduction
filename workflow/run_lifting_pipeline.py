@@ -592,30 +592,6 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     stage_seconds = {}
 
     started = time.perf_counter()
-    mcpat_dir = output_dir / "mcpat"
-    mcpat_xml = mcpat_dir / "input.xml"
-    mapping_report = convert(r1_dir, mcpat_xml, settings={
-        key: mcpat_config[key] for key in (
-            "temperature_k", "device_type", "longer_channel_device",
-            "interconnect_projection_type",
-        ) if key in mcpat_config
-    })
-    opt_for_clk = int(mcpat_config.get("opt_for_clk", 0))
-    command = [str(tools["mcpat"]), "-infile", str(mcpat_xml),
-               "-print_level", "5", "-opt_for_clk", str(opt_for_clk)]
-    process = subprocess.run(command, cwd=tools["mcpat"].parent, text=True,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    mcpat_text = process.stdout
-    (mcpat_dir / "mcpat.out").write_text(mcpat_text, encoding="utf-8")
-    if process.returncode != 0 or "McPAT (version 1.3" not in mcpat_text or "results" not in mcpat_text:
-        raise RuntimeError(f"McPAT failed; see {mcpat_dir / 'mcpat.out'}")
-    parsed_mcpat = parse_mcpat_text(mcpat_text)
-    parsed_mcpat["command"] = command
-    parsed_mcpat["cache_contract"] = mapping_report["cache_contract"]
-    write_json(mcpat_dir / "mcpat.json", parsed_mcpat)
-    stage_seconds["mcpat"] = time.perf_counter() - started
-
-    started = time.perf_counter()
     cache_contract = build_cache_contract(
         metadata, technology_nm=int(config["technology_nm"]),
         temperature_k=int(mcpat_config.get("temperature_k", 320)),
@@ -629,11 +605,43 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
         None, None, frequency["f0_ghz"],
         contracts=cache_contract["records"],
     )
+    cacti_json = output_dir / "cacti/cacti_characterization.json"
+    cacti_characterization = read_json(cacti_json)
     stage_seconds["cacti"] = time.perf_counter() - started
 
     started = time.perf_counter()
+    mcpat_dir = output_dir / "mcpat"
+    mcpat_xml = mcpat_dir / "input.xml"
+    mapping_report = convert(
+        r1_dir, mcpat_xml,
+        settings={
+            key: mcpat_config[key] for key in (
+                "temperature_k", "device_type", "longer_channel_device",
+                "interconnect_projection_type",
+            ) if key in mcpat_config
+        },
+        cache_characterization=cacti_characterization,
+    )
+    opt_for_clk = int(mcpat_config.get("opt_for_clk", 0))
+    command = [str(tools["mcpat"]), "-infile", str(mcpat_xml),
+               "-print_level", "5", "-opt_for_clk", str(opt_for_clk)]
+    process = subprocess.run(command, cwd=tools["mcpat"].parent, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    mcpat_text = process.stdout
+    (mcpat_dir / "mcpat.out").write_text(mcpat_text, encoding="utf-8")
+    if process.returncode != 0 or "McPAT (version 1.3" not in mcpat_text or "results" not in mcpat_text:
+        raise RuntimeError(f"McPAT failed; see {mcpat_dir / 'mcpat.out'}")
+    parsed_mcpat = parse_mcpat_text(mcpat_text)
+    parsed_mcpat["command"] = command
+    parsed_mcpat["cache_contract"] = mapping_report["cache_contract"]
+    parsed_mcpat["cacti_characterization_id"] = mapping_report[
+        "cacti_characterization_id"
+    ]
+    write_json(mcpat_dir / "mcpat.json", parsed_mcpat)
+    stage_seconds["mcpat"] = time.perf_counter() - started
+
+    started = time.perf_counter()
     modules_path = output_dir / "modules.json"
-    cacti_json = output_dir / "cacti/cacti_characterization.json"
     model = build_model(
         r1_dir, mcpat_dir / "mcpat.json", cacti_json, modules_path,
         require_communication_profile=(

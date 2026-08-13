@@ -701,6 +701,11 @@ class ParserTests(unittest.TestCase):
             }
             characterization["characterization_id"] = stable_identity(characterization)
             write_json(cacti_path, characterization)
+            mcpat_payload = read_json(mcpat_path)
+            mcpat_payload["cacti_characterization_id"] = characterization[
+                "characterization_id"
+            ]
+            write_json(mcpat_path, mcpat_payload)
             output = root / "modules.json"
             metadata.pop("instruction_window_scope")
             write_json(r1_dir / "r1_metadata.json", metadata)

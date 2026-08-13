@@ -152,6 +152,11 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
     if cache_contract is None:
         raise ValueError("McPAT artifact lacks the shared cache_contract")
     validate_characterization(cacti, cache_contract)
+    if mcpat.get("cacti_characterization_id") != cacti.get(
+            "characterization_id"):
+        raise ValueError(
+            "McPAT cache timing CACTI identity differs from module geometry"
+        )
     modules = apply_physical_areas(mcpat["modules"], metadata, cacti)
     totals = {
         "area_mm2": sum(module["area_mm2"] for module in modules),

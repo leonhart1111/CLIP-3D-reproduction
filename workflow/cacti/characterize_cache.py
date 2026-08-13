@@ -71,7 +71,12 @@ def make_config(base: str, contract: dict) -> str:
     text = replace_directive(
         text, "Add ECC", f'- "{str(bool(contract["ecc"])).lower()}"'
     )
-    return text
+    return "\n".join(line.rstrip() for line in text.rstrip().splitlines()) + "\n"
+
+
+def normalized_text(text: str) -> str:
+    """Preserve tool evidence while removing non-semantic trailing whitespace."""
+    return "\n".join(line.rstrip() for line in text.rstrip().splitlines()) + "\n"
 
 
 def parse_cacti_output(text: str) -> dict[str, float]:
@@ -158,7 +163,7 @@ def characterize(cacti: Path, base_config: Path, output_dir: Path,
                 # CACTI resolves tech_params/* relative to its working directory.
                 cwd=cacti.resolve().parent,
             )
-            raw.write_text(process.stdout, encoding="utf-8")
+            raw.write_text(normalized_text(process.stdout), encoding="utf-8")
             if process.returncode != 0:
                 raise RuntimeError(f"CACTI failed for {level} {size_text}; see {raw}")
             values = parse_cacti_output(process.stdout)

@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+import csv
 from pathlib import Path
 
 from workflow.cache_contract import (
@@ -18,6 +19,7 @@ from workflow.common import PROJECT_ROOT
 from workflow.run_lifting_pipeline import validate_config
 from workflow.r2.build_latency_vector import build_vector
 from workflow.common import write_json
+from scripts.characterize_local_table_ii import write_reports
 
 
 class CacheCycleTests(unittest.TestCase):
@@ -89,6 +91,7 @@ class CacheContractTests(unittest.TestCase):
             device_type=0, interconnect_projection_type=1,
         )["records"][2]
         text = make_config(base, record)
+        self.assertTrue(all(line == line.rstrip() for line in text.splitlines()))
         required = (
             "-size (bytes) 524288", "-block size (bytes) 64",
             "-associativity 8", "-UCA bank count 1",
@@ -129,16 +132,18 @@ class McPATContractTests(unittest.TestCase):
                 "/home/zyjiang/Agenticflow/CLIP/tools/src/mcpat/"
                 "ProcessorDescriptionFiles/ARM_A9_2GHz.xml"
             )
+            characterization = CharacterizationIdentityTests().characterization()
             report = convert(
-                r1, xml_path, template=template, report_path=report_path
+                r1, xml_path, template=template, report_path=report_path,
+                cache_characterization=characterization,
             )
 
             tree = ET.parse(xml_path)
             system = component_by_id(tree.getroot(), "system")
             expected = {
-                "system.core0.icache": ("icache_config", "16384,64,2,1,10,10,512,0"),
-                "system.core0.dcache": ("dcache_config", "32768,64,2,1,10,10,512,1"),
-                "system.L20": ("L2_config", "524288,64,8,1,10,10,512,1"),
+                "system.core0.icache": ("icache_config", "16384,64,2,1,1,1,512,0"),
+                "system.core0.dcache": ("dcache_config", "32768,64,2,1,3,3,512,1"),
+                "system.L20": ("L2_config", "524288,64,8,1,5,5,512,1"),
             }
             for identifier, (name, value) in expected.items():
                 with self.subTest(identifier=identifier):
@@ -146,6 +151,10 @@ class McPATContractTests(unittest.TestCase):
                     self.assertEqual(named_child(component, "param", name).get("value"), value)
             self.assertEqual(report["cache_contract"]["records"][2]["bank_count"], 1)
             self.assertEqual(report["cache_contract"]["records"][2]["output_width_bits"], 512)
+            self.assertEqual(
+                report["cacti_characterization_id"],
+                characterization["characterization_id"],
+            )
 
 
 class UnscaledConfigurationTests(unittest.TestCase):
@@ -306,6 +315,56 @@ class CharacterizationIdentityTests(unittest.TestCase):
                     modules, cacti_path, root / "latency.json",
                     tsv_hops=1, wire_cycles=0,
                 )
+
+
+class LocalTableReportTests(unittest.TestCase):
+    def test_report_writes_ordered_nine_row_provenance_table(self):
+        records = []
+        sizes = (
+            (("l1d", 16), ("l1d", 32), ("l1d", 64), ("l1d", 128)),
+            (("l2", 128), ("l2", 256), ("l2", 512),
+             ("l2", 1024), ("l2", 2048)),
+        )
+        for level_sizes in sizes:
+            for level, size_kib in level_sizes:
+                records.append({
+                    "level": level, "size": f"{size_kib}kB",
+                    "size_bytes": size_kib * 1024,
+                    "access_time_ns": 1.01,
+                    "access_cycles_unrounded": 2.02,
+                    "access_cycles": 3,
+                    "area_mm2": 0.5,
+                    "width_mm": 1.0, "height_mm": 0.5,
+                    "associativity": 2 if level == "l1d" else 8,
+                    "bank_count": 1, "output_width_bits": 512,
+                    "technology_nm": 45, "temperature_k": 320,
+                    "config_sha256": "a" * 64,
+                    "raw_output_sha256": "b" * 64,
+                    "cacti_record_id": "c" * 64,
+                })
+        characterization = {
+            "schema_version": 2, "frequency_ghz": 2.0,
+            "rounding": "ceiling, minimum one cycle",
+            "characterization_id": "d" * 64,
+            "records": records,
+            "provenance": {
+                "cacti_git_revision": "e" * 40,
+                "cacti_executable_sha256": "f" * 64,
+                "base_config_sha256": "0" * 64,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            json_path, csv_path = write_reports(characterization, root)
+            payload = json.loads(json_path.read_text())
+            with csv_path.open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+        self.assertEqual(len(payload["records"]), 9)
+        self.assertEqual(len(rows), 9)
+        self.assertEqual(rows[0]["level"], "l1d")
+        self.assertEqual(rows[-1]["size_bytes"], str(2048 * 1024))
+        self.assertEqual(rows[0]["access_cycles"], "3")
+        self.assertEqual(rows[0]["cacti_executable_sha256"], "f" * 64)
 
 
 if __name__ == "__main__":

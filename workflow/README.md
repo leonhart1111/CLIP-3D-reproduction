@@ -23,6 +23,10 @@ non-formal operational 验证，不是论文正式复现。
 
 当前受限冷却配置是 `configs/experiments/clip3d_constrained_5p0.json`。
 动态功耗和漏电功耗直接来自 McPAT，不使用论文结果拟合的乘数。
+缓存组织由 `workflow/cache_contract.py` 统一定义，McPAT与独立CACTI必须共享
+容量、cache line、关联度、bank、输出宽度、工艺、温度和器件假设。缓存面积与
+访问延迟来自本地CACTI，非缓存面积来自McPAT，整个流程不进行150 mm²全局缩放。
+本地九容量测量、完整参数和复现命令见 `docs/local_cacti_table_ii_zh.md`。
 
 参数研究工具：
 
