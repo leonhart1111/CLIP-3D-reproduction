@@ -18,6 +18,7 @@ from workflow.floorplan.generate_hotspot_inputs import (
     materialize,
 )
 from workflow.floorplan.optimize_layout import collision_area
+from workflow.floorplan.optimize_layout import spatial_coupling
 from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT, run_hotspot
 
 
@@ -236,6 +237,274 @@ def estimate_cross_tier_weight(matched_responses: list[dict],
         "per_case_ratios": records,
         "accepted": not reasons,
         "rejection_reasons": reasons,
+    }
+
+
+def _feature_rows(samples: list[dict], cross_tier_weight: float,
+                  lc_ratio: float) -> list[tuple[dict, float, float]]:
+    reference: dict[str, float] = {}
+    raw = []
+    for sample in samples:
+        group = str(sample["group"])
+        side = float(sample["die_side_mm"])
+        feature = spatial_coupling(
+            sample["modules"], side, cross_tier_weight,
+            spatial_model="area-quadrature", quadrature_order=2,
+            lc_mm=lc_ratio * side,
+        )
+        raw.append((sample, feature))
+        if bool(sample.get("is_reference")):
+            if group in reference:
+                raise ValueError(f"multiple reference layouts in group {group}")
+            reference[group] = feature
+    groups = {str(sample["group"]) for sample in samples}
+    if set(reference) != groups:
+        raise ValueError("every work-point group requires exactly one reference layout")
+    return [
+        (sample, feature - reference[str(sample["group"])],
+         float(sample["delta_t_c"]))
+        for sample, feature in raw
+    ]
+
+
+def _huber_loss(residual: float, delta: float) -> float:
+    magnitude = abs(residual)
+    if magnitude <= delta:
+        return 0.5 * residual * residual
+    return delta * (magnitude - 0.5 * delta)
+
+
+def _robust_nonnegative_slope(rows: list[tuple[dict, float, float]],
+                              huber_delta_c: float) -> tuple[float, float]:
+    denominator = sum(feature * feature for _, feature, _ in rows)
+    if denominator <= 1e-24:
+        raise ValueError("thermal samples are spatially degenerate")
+    alpha = max(0.0, sum(feature * target for _, feature, target in rows) / denominator)
+    for _ in range(100):
+        numerator = 0.0
+        weighted_denominator = 0.0
+        for _, feature, target in rows:
+            residual = alpha * feature - target
+            weight = 1.0 if abs(residual) <= huber_delta_c else (
+                huber_delta_c / abs(residual)
+            )
+            numerator += weight * feature * target
+            weighted_denominator += weight * feature * feature
+        if weighted_denominator <= 1e-24:
+            raise ValueError("thermal samples are spatially degenerate")
+        updated = max(0.0, numerator / weighted_denominator)
+        if abs(updated - alpha) <= 1e-12 * max(1.0, alpha):
+            alpha = updated
+            break
+        alpha = updated
+    objective = sum(
+        _huber_loss(alpha * feature - target, huber_delta_c)
+        for _, feature, target in rows
+    )
+    return alpha, objective
+
+
+def _fit_core(samples: list[dict], cross_tier_weight: float,
+              lc_bounds_ratio: tuple[float, float],
+              huber_delta_c: float) -> dict:
+    low, high = map(float, lc_bounds_ratio)
+    if not 0 < low < high:
+        raise ValueError("Lc ratio bounds must be finite, positive, and increasing")
+
+    def evaluate(log_ratio: float) -> tuple[float, float, list]:
+        ratio = math.exp(log_ratio)
+        rows = _feature_rows(samples, cross_tier_weight, ratio)
+        alpha, objective = _robust_nonnegative_slope(rows, huber_delta_c)
+        return objective, alpha, rows
+
+    log_low, log_high = math.log(low), math.log(high)
+    scan = []
+    for index in range(161):
+        log_ratio = log_low + (log_high - log_low) * index / 160
+        scan.append((evaluate(log_ratio)[0], log_ratio))
+    _, best_log = min(scan)
+    step = (log_high - log_low) / 160
+    left, right = max(log_low, best_log - step), min(log_high, best_log + step)
+    golden = (math.sqrt(5.0) - 1.0) / 2.0
+    x1 = right - golden * (right - left)
+    x2 = left + golden * (right - left)
+    f1, f2 = evaluate(x1)[0], evaluate(x2)[0]
+    for _ in range(80):
+        if right - left < 1e-10:
+            break
+        if f1 <= f2:
+            right, x2, f2 = x2, x1, f1
+            x1 = right - golden * (right - left)
+            f1 = evaluate(x1)[0]
+        else:
+            left, x1, f1 = x1, x2, f2
+            x2 = left + golden * (right - left)
+            f2 = evaluate(x2)[0]
+    best_log = (left + right) / 2.0
+    objective, alpha, rows = evaluate(best_log)
+    ratio = math.exp(best_log)
+    on_boundary = (
+        ratio <= low * (1.0 + 1e-5) or ratio >= high * (1.0 - 1e-5)
+    )
+    return {
+        "alpha": alpha, "lc_die_side_ratio": ratio,
+        "objective": objective, "rows": rows, "on_boundary": on_boundary,
+    }
+
+
+def _average_ranks(values: list[float]) -> list[float]:
+    order = sorted(range(len(values)), key=lambda index: (values[index], index))
+    ranks = [0.0] * len(values)
+    position = 0
+    while position < len(order):
+        end = position + 1
+        while end < len(order) and values[order[end]] == values[order[position]]:
+            end += 1
+        rank = (position + 1 + end) / 2.0
+        for offset in range(position, end):
+            ranks[order[offset]] = rank
+        position = end
+    return ranks
+
+
+def _spearman(actual: list[float], predicted: list[float]) -> float | None:
+    if len(actual) < 2:
+        return None
+    left, right = _average_ranks(actual), _average_ranks(predicted)
+    left_mean, right_mean = statistics.mean(left), statistics.mean(right)
+    numerator = sum((a - left_mean) * (b - right_mean) for a, b in zip(left, right))
+    denominator = math.sqrt(
+        sum((a - left_mean) ** 2 for a in left)
+        * sum((b - right_mean) ** 2 for b in right)
+    )
+    return numerator / denominator if denominator > 0 else None
+
+
+def _prediction_metrics(rows: list[tuple[dict, float, float]],
+                        alpha: float) -> dict:
+    actual = [target for _, _, target in rows]
+    predicted = [alpha * feature for _, feature, _ in rows]
+    errors = [prediction - target for prediction, target in zip(predicted, actual)]
+    groups: dict[str, list[int]] = {}
+    for index, (sample, _, _) in enumerate(rows):
+        groups.setdefault(str(sample["group"]), []).append(index)
+    regrets = []
+    per_group_spearman = {}
+    for group, indices in groups.items():
+        group_actual = [actual[index] for index in indices]
+        group_predicted = [predicted[index] for index in indices]
+        per_group_spearman[group] = _spearman(group_actual, group_predicted)
+        selected = min(indices, key=lambda index: (predicted[index], index))
+        regrets.append(actual[selected] - min(group_actual))
+    return {
+        "count": len(rows),
+        "mae_c": statistics.mean(abs(error) for error in errors),
+        "rmse_c": math.sqrt(statistics.mean(error * error for error in errors)),
+        "spearman": _spearman(actual, predicted),
+        "per_group_spearman": per_group_spearman,
+        "median_selection_regret_c": statistics.median(regrets),
+        "p95_selection_regret_c": _percentile(regrets, 0.95),
+    }
+
+
+def _jacobian_diagnostics(samples: list[dict], cross_tier_weight: float,
+                          alpha: float, ratio: float) -> dict:
+    rows = _feature_rows(samples, cross_tier_weight, ratio)
+    epsilon = 1e-4
+    plus = _feature_rows(samples, cross_tier_weight, ratio * math.exp(epsilon))
+    minus = _feature_rows(samples, cross_tier_weight, ratio * math.exp(-epsilon))
+    columns = [
+        (row[1], alpha * (p[1] - m[1]) / (2.0 * epsilon))
+        for row, p, m in zip(rows, plus, minus)
+    ]
+    aa = sum(a * a for a, _ in columns)
+    ab = sum(a * b for a, b in columns)
+    bb = sum(b * b for _, b in columns)
+    trace, determinant = aa + bb, aa * bb - ab * ab
+    discriminant = max(trace * trace - 4.0 * determinant, 0.0)
+    eigen_high = (trace + math.sqrt(discriminant)) / 2.0
+    eigen_low = (trace - math.sqrt(discriminant)) / 2.0
+    rank = int(eigen_high > 1e-16) + int(eigen_low > eigen_high * 1e-12)
+    condition = math.sqrt(eigen_high / eigen_low) if eigen_low > 0 else math.inf
+    return {"jacobian_rank": rank, "jacobian_condition": condition}
+
+
+def fit_alpha_lc(samples: list[dict], cross_tier_weight: float,
+                 lc_bounds_ratio: tuple[float, float] = (0.02, 4.0),
+                 huber_delta_c: float = 0.5,
+                 bootstrap_samples: int = 1000,
+                 seed: int = 20260813) -> dict:
+    """Fit alpha and Lc/die-side with whole-work-point validation evidence."""
+    if bootstrap_samples < 20:
+        raise ValueError("alpha/Lc bootstrap requires at least 20 samples")
+    fit = _fit_core(samples, cross_tier_weight, lc_bounds_ratio, huber_delta_c)
+    metrics = _prediction_metrics(fit["rows"], fit["alpha"])
+    diagnostics = _jacobian_diagnostics(
+        samples, cross_tier_weight, fit["alpha"], fit["lc_die_side_ratio"]
+    )
+    if diagnostics["jacobian_rank"] < 2:
+        raise ValueError("thermal samples are spatially degenerate")
+
+    workloads = sorted({str(sample["workload"]) for sample in samples})
+    leave_one_out = {}
+    for workload in workloads:
+        train = [sample for sample in samples if str(sample["workload"]) != workload]
+        validation = [sample for sample in samples if str(sample["workload"]) == workload]
+        local = _fit_core(train, cross_tier_weight, lc_bounds_ratio, huber_delta_c)
+        rows = _feature_rows(
+            validation, cross_tier_weight, local["lc_die_side_ratio"]
+        )
+        leave_one_out[workload] = {
+            "train_parameters": {
+                "alpha": local["alpha"],
+                "lc_die_side_ratio": local["lc_die_side_ratio"],
+            },
+            "validation_metrics": _prediction_metrics(rows, local["alpha"]),
+        }
+
+    groups: dict[str, list[dict]] = {}
+    for sample in samples:
+        groups.setdefault(str(sample["group"]), []).append(sample)
+    group_names = sorted(groups)
+    rng = random.Random(seed)
+    boot_alpha, boot_ratio = [], []
+    for _ in range(bootstrap_samples):
+        chosen = rng.choices(group_names, k=len(group_names))
+        resampled = []
+        for occurrence, group in enumerate(chosen):
+            for sample in groups[group]:
+                duplicate = dict(sample)
+                duplicate["group"] = f"{group}#bootstrap{occurrence}"
+                resampled.append(duplicate)
+        local = _fit_core(
+            resampled, cross_tier_weight, lc_bounds_ratio, huber_delta_c
+        )
+        boot_alpha.append(local["alpha"])
+        boot_ratio.append(local["lc_die_side_ratio"])
+    bootstrap = {
+        "samples": bootstrap_samples, "seed": seed,
+        "alpha_95": {
+            "low": _percentile(boot_alpha, 0.025),
+            "high": _percentile(boot_alpha, 0.975),
+        },
+        "lc_die_side_ratio_95": {
+            "low": _percentile(boot_ratio, 0.025),
+            "high": _percentile(boot_ratio, 0.975),
+        },
+    }
+    return {
+        "schema_version": 1,
+        "method": "nested log-Lc search and nonnegative Huber slope",
+        "parameters": {
+            "alpha": fit["alpha"],
+            "lc_die_side_ratio": fit["lc_die_side_ratio"],
+            "cross_tier_weight": float(cross_tier_weight),
+        },
+        "objective": fit["objective"],
+        "metrics": metrics,
+        "diagnostics": {**diagnostics, "parameter_on_boundary": fit["on_boundary"]},
+        "cross_validation": {"leave_one_workload_out": leave_one_out},
+        "bootstrap": bootstrap,
     }
 
 

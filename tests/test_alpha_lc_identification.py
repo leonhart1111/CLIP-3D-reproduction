@@ -12,6 +12,7 @@ from workflow.thermal.identify_alpha_lc import (
     case_identity,
     evaluate_grid_convergence,
     estimate_cross_tier_weight,
+    fit_alpha_lc,
     placement_design,
     run_hotspot_case,
     unit_power_model,
@@ -323,6 +324,80 @@ class UnitResponseTests(unittest.TestCase):
         )
         self.assertFalse(report["accepted"])
         self.assertIn("relative interval width", report["rejection_reasons"][0])
+
+
+class AlphaLcFitTests(unittest.TestCase):
+    def synthetic_samples(self, alpha: float = 1.4,
+                          lc_ratio: float = 0.35) -> list[dict]:
+        samples = []
+        for workload_index, workload in enumerate(("fft", "matmul", "stencil")):
+            for size_index, side in enumerate((6.0, 9.0)):
+                group = f"{workload}-{size_index}"
+                reference_feature = None
+                group_rows = []
+                for position, x in enumerate((0.2, 0.9, 2.1, 3.7, 5.0)):
+                    modules = [
+                        {"name": "core", "tier": 0, "x_mm": side * 0.42,
+                         "y_mm": side * 0.42, "width_mm": 1.0,
+                         "height_mm": 1.0, "total_power_w": 4.0},
+                        {"name": "l2", "tier": 1,
+                         "x_mm": min(x * side / 6.0, side - 0.8),
+                         "y_mm": side * (0.15 + 0.1 * workload_index),
+                         "width_mm": 0.8, "height_mm": 0.8,
+                         "total_power_w": 0.8 + 0.1 * size_index},
+                    ]
+                    feature = spatial_coupling(
+                        modules, side, 0.7, "area-quadrature", 2,
+                        lc_mm=lc_ratio * side,
+                    )
+                    if reference_feature is None:
+                        reference_feature = feature
+                    group_rows.append({
+                        "group": group, "workload": workload,
+                        "architecture": f"size-{size_index}",
+                        "label": f"p{position}", "is_reference": position == 0,
+                        "modules": modules, "die_side_mm": side,
+                        "delta_t_c": alpha * (feature - reference_feature),
+                    })
+                samples.extend(group_rows)
+        return samples
+
+    def test_recovers_known_alpha_and_length_ratio(self):
+        report = fit_alpha_lc(
+            self.synthetic_samples(), cross_tier_weight=0.7,
+            bootstrap_samples=100, seed=17,
+        )
+        self.assertAlmostEqual(report["parameters"]["alpha"], 1.4, delta=0.07)
+        self.assertAlmostEqual(
+            report["parameters"]["lc_die_side_ratio"], 0.35, delta=0.018,
+        )
+        self.assertEqual(report["diagnostics"]["jacobian_rank"], 2)
+        self.assertTrue(report["cross_validation"]["leave_one_workload_out"])
+        self.assertLess(report["metrics"]["rmse_c"], 0.02)
+        self.assertTrue(math.isfinite(
+            report["bootstrap"]["alpha_95"]["low"]
+        ))
+
+    def test_huber_fit_limits_one_outlier(self):
+        samples = self.synthetic_samples()
+        samples[-1]["delta_t_c"] += 4.0
+        report = fit_alpha_lc(
+            samples, cross_tier_weight=0.7,
+            bootstrap_samples=50, seed=9,
+        )
+        self.assertAlmostEqual(report["parameters"]["alpha"], 1.4, delta=0.25)
+        self.assertAlmostEqual(
+            report["parameters"]["lc_die_side_ratio"], 0.35, delta=0.12,
+        )
+
+    def test_rejects_spatially_degenerate_samples(self):
+        samples = self.synthetic_samples()
+        for sample in samples:
+            sample["modules"] = samples[0]["modules"]
+            sample["die_side_mm"] = samples[0]["die_side_mm"]
+            sample["delta_t_c"] = 0.0
+        with self.assertRaisesRegex(ValueError, "spatially degenerate"):
+            fit_alpha_lc(samples, 0.7, bootstrap_samples=20)
 
 
 if __name__ == "__main__":
