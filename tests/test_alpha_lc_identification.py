@@ -399,6 +399,31 @@ class UnitResponseTests(unittest.TestCase):
         self.assertFalse(report["accepted"])
         self.assertIn("relative interval width", report["rejection_reasons"][0])
 
+    def test_cross_tier_estimator_reports_and_rejects_directional_heterogeneity(self):
+        cases = []
+        for source_tier, ratio in ((0, 0.4), (1, 0.8)):
+            for index in range(12):
+                cases.append({
+                    "label": f"tier{source_tier}_{index}",
+                    "ambient_c": 25.0,
+                    "same_tier_tmax_c": 35.0,
+                    "cross_tier_tmax_c": 25.0 + 10.0 * ratio,
+                    "source_tier": source_tier,
+                    "source_shape": "l2",
+                    "model_index": index % 3,
+                })
+        report = estimate_cross_tier_weight(
+            cases, bootstrap_samples=200, seed=3,
+            max_relative_interval_width=0.5,
+        )
+        self.assertEqual(
+            set(report["stratified_estimates"]["source_tier"]), {"0", "1"},
+        )
+        self.assertFalse(report["accepted"])
+        self.assertTrue(any(
+            "source_tier" in reason for reason in report["rejection_reasons"]
+        ))
+
     def test_unit_response_compares_same_xy_on_active_layers(self):
         values = [
             ("layer_1_t0_r00_c00", 310.0),

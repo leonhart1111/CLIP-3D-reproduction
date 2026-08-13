@@ -429,6 +429,9 @@ def estimate_cross_tier_weight(matched_responses: list[dict],
         records.append({
             "label": str(case["label"]), "same_tier_rise_c": same_rise,
             "cross_tier_rise_c": cross_rise, "ratio": ratio,
+            **{field: case[field] for field in (
+                "source_tier", "source_shape", "model_index",
+            ) if field in case},
         })
     estimate = statistics.median(ratios)
     rng = random.Random(seed)
@@ -445,6 +448,33 @@ def estimate_cross_tier_weight(matched_responses: list[dict],
         reasons.append(
             "relative interval width exceeds the predeclared stability ceiling"
         )
+    stratified = {}
+    for field in ("source_tier", "source_shape", "model_index"):
+        groups = {}
+        for record in records:
+            if field in record:
+                groups.setdefault(str(record[field]), []).append(record["ratio"])
+        if groups:
+            estimates = {
+                value: {
+                    "count": len(values),
+                    "median": statistics.median(values),
+                    "minimum": min(values),
+                    "maximum": max(values),
+                }
+                for value, values in sorted(groups.items())
+            }
+            medians = [entry["median"] for entry in estimates.values()]
+            relative_span = (
+                (max(medians) - min(medians)) / estimate
+                if estimate > 0 else math.inf
+            )
+            stratified[field] = estimates
+            if len(estimates) > 1 and relative_span > max_relative_interval_width:
+                reasons.append(
+                    f"{field} stratum median span exceeds the predeclared "
+                    "stability ceiling"
+                )
     return {
         "schema_version": 1,
         "method": "median matched unit-power rise ratio with whole-case bootstrap",
@@ -454,6 +484,7 @@ def estimate_cross_tier_weight(matched_responses: list[dict],
         "bootstrap_samples": bootstrap_samples,
         "bootstrap_seed": seed,
         "per_case_ratios": records,
+        "stratified_estimates": stratified,
         "accepted": not reasons,
         "rejection_reasons": reasons,
     }
@@ -1312,6 +1343,9 @@ def run_unit_response_campaign(model_paths: list[Path], config: dict,
         "label": record["label"], "ambient_c": 0.0,
         "same_tier_tmax_c": record["same_tier_rise_c"],
         "cross_tier_tmax_c": record["cross_tier_rise_c"],
+        "source_tier": record["source_tier"],
+        "source_shape": record["source_shape"],
+        "model_index": record["model_index"],
     } for record in records]
     identification = config["identification"]
     report = estimate_cross_tier_weight(
