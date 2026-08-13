@@ -331,6 +331,15 @@ def write_metadata(args, binary, options, stdin_path, environment):
         "l2_size": args.l2_size,
         "l2_associativity": 8,
         "cache_line_bytes": 64,
+        "l1_cache_banks": 1,
+        "l2_cache_banks": 1,
+        "l1_cache_output_width_bits": 512,
+        "l2_cache_output_width_bits": 512,
+        "cache_organization_provenance": {
+            "bank_count": "one gem5 Cache object per modeled cache",
+            "l2_output_width": "system.to_l2_bus width=64 bytes/cycle",
+            "l1_output_width": "one full 64-byte cache line for CACTI array characterization",
+        },
         "memory_size": args.mem_size,
         "latencies": {
             "l1i": {"tag": args.l1i_tag_latency, "data": args.l1i_data_latency,

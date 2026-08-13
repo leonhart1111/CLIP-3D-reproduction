@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import argparse
-import math
+import json
 import re
 import subprocess
 from pathlib import Path
 
-from workflow.common import PROJECT_ROOT, parse_size_bytes, write_json
+from workflow.cache_contract import (
+    build_cache_contract,
+    cache_access_cycles,
+    stable_identity,
+)
+from workflow.common import PROJECT_ROOT, parse_size_bytes, sha256_file, write_json
 
 
 DEFAULT_CACTI = PROJECT_ROOT / "tools/src/cacti/cacti"
@@ -27,16 +32,45 @@ def replace_directive(text: str, directive: str, value: str) -> str:
     return updated
 
 
-def make_config(base: str, size_bytes: int, associativity: int) -> str:
+def make_config(base: str, contract: dict) -> str:
     text = base
-    text = replace_directive(text, "size (bytes)", str(size_bytes))
-    text = replace_directive(text, "block size (bytes)", "64")
-    text = replace_directive(text, "associativity", str(associativity))
-    text = replace_directive(text, "technology (u)", "0.045")
-    # Use a full 64-byte cache line and keep the local CACTI result as the
-    # single source of cache area and latency.
-    text = replace_directive(text, "output/input bus width", "512")
-    text = replace_directive(text, "Core count", "4")
+    text = replace_directive(text, "size (bytes)", str(contract["size_bytes"]))
+    text = replace_directive(
+        text, "block size (bytes)", str(contract["line_size_bytes"])
+    )
+    text = replace_directive(text, "associativity", str(contract["associativity"]))
+    text = replace_directive(text, "UCA bank count", str(contract["bank_count"]))
+    text = replace_directive(
+        text, "technology (u)", f'{contract["technology_nm"] / 1000:g}'
+    )
+    text = replace_directive(
+        text, "output/input bus width", str(contract["output_width_bits"])
+    )
+    text = replace_directive(
+        text, "operating temperature (K)", str(contract["temperature_k"])
+    )
+    for directive in (
+        "Data array cell type", "Data array peripheral type",
+        "Tag array cell type", "Tag array peripheral type",
+    ):
+        text = replace_directive(text, directive, f'- "{contract["device_type"]}"')
+    text = replace_directive(
+        text, "access mode (normal, sequential, fast)",
+        f'- "{contract["access_mode"]}"',
+    )
+    text = replace_directive(
+        text, "Cache model (NUCA, UCA)", f'- "{contract["cacti_model"]}"'
+    )
+    text = replace_directive(
+        text, "Interconnect projection", f'- "{contract["interconnect_projection"]}"'
+    )
+    text = replace_directive(text, "Core count", str(contract["core_count"]))
+    text = replace_directive(
+        text, "Cache level (L2/L3)", f'- "{contract["cacti_cache_level"]}"'
+    )
+    text = replace_directive(
+        text, "Add ECC", f'- "{str(bool(contract["ecc"])).lower()}"'
+    )
     return text
 
 
@@ -62,19 +96,62 @@ def parse_cacti_output(text: str) -> dict[str, float]:
     return result
 
 
+def local_git_revision(directory: Path) -> str | None:
+    process = subprocess.run(
+        ["git", "-C", str(directory), "rev-parse", "--show-toplevel", "HEAD"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    if process.returncode != 0:
+        return None
+    lines = process.stdout.splitlines()
+    if len(lines) != 2 or Path(lines[0]).resolve() != directory.resolve():
+        return None
+    return lines[1]
+
+
 def characterize(cacti: Path, base_config: Path, output_dir: Path,
-                 l1_sizes: list[str], l2_sizes: list[str],
-                 frequency_ghz: float) -> dict:
+                 l1_sizes: list[str] | None, l2_sizes: list[str] | None,
+                 frequency_ghz: float, contracts: list[dict] | None = None,
+                 *, technology_nm: int = 45, temperature_k: int = 320,
+                 device_type: int = 0,
+                 interconnect_projection_type: int = 1) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     base = base_config.read_text(encoding="utf-8", errors="replace")
+    if contracts is None:
+        contracts = []
+        for level, sizes, associativity in (
+            ("l1d", l1_sizes or [], 2), ("l2", l2_sizes or [], 8)
+        ):
+            for size_text in sizes:
+                metadata = {
+                    "l1i_size": size_text, "l1d_size": size_text,
+                    "l2_size": size_text, "l1_associativity": 2,
+                    "l2_associativity": 8, "cache_line_bytes": 64,
+                    "num_cores": 4,
+                }
+                generated = build_cache_contract(
+                    metadata, technology_nm=technology_nm,
+                    temperature_k=temperature_k, device_type=device_type,
+                    interconnect_projection_type=interconnect_projection_type,
+                )
+                contracts.append(next(
+                    record for record in generated["records"]
+                    if record["level"] == level
+                ))
+    if not contracts:
+        raise ValueError("CACTI characterization requires at least one cache contract")
+
+    executable_hash = sha256_file(cacti)
+    base_config_hash = sha256_file(base_config)
     records = []
-    for level, sizes, associativity in (("l1d", l1_sizes, 2), ("l2", l2_sizes, 8)):
-        for size_text in sizes:
-            size_bytes = parse_size_bytes(size_text)
+    for contract in contracts:
+            level = str(contract["level"])
+            size_text = str(contract["size"])
+            size_bytes = int(contract["size_bytes"])
             stem = f"{level}_{size_bytes}"
             cfg = output_dir / f"{stem}.cfg"
             raw = output_dir / f"{stem}.out"
-            cfg.write_text(make_config(base, size_bytes, associativity), encoding="utf-8")
+            cfg.write_text(make_config(base, contract), encoding="utf-8")
             process = subprocess.run(
                 [str(cacti.resolve()), "-infile", str(cfg.resolve())],
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -85,25 +162,42 @@ def characterize(cacti: Path, base_config: Path, output_dir: Path,
             if process.returncode != 0:
                 raise RuntimeError(f"CACTI failed for {level} {size_text}; see {raw}")
             values = parse_cacti_output(process.stdout)
-            value_source = "local CACTI run"
             clock_ns = 1.0 / frequency_ghz
-            records.append({
-                "level": level, "size": size_text, "size_bytes": size_bytes,
-                "associativity": associativity, "technology_nm": 45,
+            record = {
+                **contract,
                 **values,
                 "clock_period_ns": clock_ns,
                 "access_cycles_unrounded": values["access_time_ns"] / clock_ns,
-                "access_cycles": max(1, int(math.floor(values["access_time_ns"] / clock_ns + 0.5))),
-                "value_source": value_source,
+                "access_cycles": cache_access_cycles(
+                    values["access_time_ns"], frequency_ghz
+                ),
+                "value_source": "local CACTI run",
                 "config": str(cfg.resolve()), "raw_output": str(raw.resolve()),
+                "config_sha256": sha256_file(cfg),
+                "raw_output_sha256": sha256_file(raw),
+            }
+            record["cacti_record_id"] = stable_identity({
+                key: value for key, value in record.items()
+                if key not in ("config", "raw_output", "cacti_record_id")
             })
+            records.append(record)
     result = {
-        "schema_version": 1, "frequency_ghz": frequency_ghz,
+        "schema_version": 2, "frequency_ghz": frequency_ghz,
         "cache_value_source": "local CACTI run",
-        "rounding": "nearest integer, floor(x + 0.5), minimum one cycle",
+        "rounding": "ceiling, minimum one cycle; 1e-12 tolerance at exact integer boundaries",
         "records": records,
-        "cacti_parameters": ["45 nm", "L1 associativity 2", "L2 associativity 8"],
+        "provenance": {
+            "cacti_executable": str(cacti.resolve()),
+            "cacti_executable_sha256": executable_hash,
+            "cacti_git_revision": local_git_revision(cacti.resolve().parent),
+            "base_config": str(base_config.resolve()),
+            "base_config_sha256": base_config_hash,
+        },
     }
+    result["characterization_id"] = stable_identity({
+        key: value for key, value in result.items()
+        if key != "characterization_id"
+    })
     write_json(output_dir / "cacti_characterization.json", result)
     return result
 
@@ -116,9 +210,11 @@ def main() -> None:
     parser.add_argument("--l1-sizes", nargs="+", default=["16kB", "32kB", "64kB", "128kB"])
     parser.add_argument("--l2-sizes", nargs="+", default=["128kB", "256kB", "512kB", "1024kB", "2048kB"])
     parser.add_argument("--frequency-ghz", type=float, default=2.0)
+    parser.add_argument("--temperature-k", type=int, default=320)
     args = parser.parse_args()
     result = characterize(args.cacti, args.base_config, args.output_dir,
-                          args.l1_sizes, args.l2_sizes, args.frequency_ghz)
+                          args.l1_sizes, args.l2_sizes, args.frequency_ghz,
+                          temperature_k=args.temperature_k)
     print(f"CACTI characterized {len(result['records'])} cache geometries")
 
 
