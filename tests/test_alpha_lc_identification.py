@@ -367,6 +367,24 @@ class GridConvergenceTests(unittest.TestCase):
             self.assertTrue(whitespace)
             self.assertTrue(all(cell["total_power_w"] == 0.0 for cell in whitespace))
 
+    def test_module_level_input_fills_an_empty_active_tier_with_whitespace(self):
+        layout = {
+            "die_width_mm": 4.0,
+            "modules": [{
+                "name": "unit_source", "kind": "unit_core", "tier": 0,
+                "x_mm": 1.0, "y_mm": 1.0,
+                "width_mm": 1.0, "height_mm": 1.0,
+                "dynamic_power_w": 1.0, "leakage_power_w": 0.0,
+                "total_power_w": 1.0,
+            }],
+        }
+        module_input = module_power(layout)
+        top = module_input["tiers"][1]["cells"]
+        self.assertEqual(len(top), 1)
+        self.assertEqual(top[0]["kind"], "whitespace")
+        self.assertAlmostEqual(top[0]["area_mm2"], 16.0)
+        self.assertEqual(top[0]["total_power_w"], 0.0)
+
     def test_grid_temperature_parser_preserves_layer_and_cell_identity(self):
         values = parse_grid_temperatures(
             "Layer 0:\n0\t300.0\n1\t301.0\nLayer 1:\n0\t310.0\n1\t311.0\n"

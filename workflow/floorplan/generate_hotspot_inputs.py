@@ -199,7 +199,14 @@ def module_power(layout: dict) -> dict:
         cells = [dict(module) for module in layout["modules"]
                  if int(module["tier"]) == tier]
         if not cells:
-            raise ValueError(f"module-level HotSpot input lacks tier {tier} modules")
+            cells = [{
+                "name": f"ws_t{tier}_0", "kind": "whitespace", "tier": tier,
+                "x_mm": 0.0, "y_mm": 0.0,
+                "width_mm": side, "height_mm": side,
+                "area_mm2": side * side,
+                "dynamic_power_w": 0.0, "leakage_power_w": 0.0,
+                "total_power_w": 0.0, "power_density_w_per_mm2": 0.0,
+            }]
         x_edges = sorted({0.0, side, *(
             coordinate
             for module in cells
