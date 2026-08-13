@@ -190,12 +190,69 @@ def write_ptrace(path: Path, tiers: list[dict], field: str,
     )
 
 
+def module_power(layout: dict) -> dict:
+    """Use real module rectangles as HotSpot floorplan/power units."""
+    fields = ("dynamic_power_w", "leakage_power_w", "total_power_w")
+    tiers, checks = [], []
+    side = float(layout["die_width_mm"])
+    for tier in (0, 1):
+        cells = [dict(module) for module in layout["modules"]
+                 if int(module["tier"]) == tier]
+        if not cells:
+            raise ValueError(f"module-level HotSpot input lacks tier {tier} modules")
+        x_edges = sorted({0.0, side, *(
+            coordinate
+            for module in cells
+            for coordinate in (
+                float(module["x_mm"]),
+                float(module["x_mm"]) + float(module["width_mm"]),
+            )
+        )})
+        y_edges = sorted({0.0, side, *(
+            coordinate
+            for module in cells
+            for coordinate in (
+                float(module["y_mm"]),
+                float(module["y_mm"]) + float(module["height_mm"]),
+            )
+        )})
+        whitespace_index = 0
+        for x0, x1 in zip(x_edges, x_edges[1:]):
+            for y0, y1 in zip(y_edges, y_edges[1:]):
+                if x1 - x0 <= 1e-12 or y1 - y0 <= 1e-12:
+                    continue
+                probe = {"x_mm": x0, "y_mm": y0,
+                         "width_mm": x1 - x0, "height_mm": y1 - y0}
+                if any(overlap(module, x0, y0, x1, y1) > 1e-15
+                       for module in cells):
+                    continue
+                cells.append({
+                    "name": f"ws_t{tier}_{whitespace_index}",
+                    "kind": "whitespace", "tier": tier,
+                    **probe, "area_mm2": (x1 - x0) * (y1 - y0),
+                    "dynamic_power_w": 0.0, "leakage_power_w": 0.0,
+                    "total_power_w": 0.0, "power_density_w_per_mm2": 0.0,
+                })
+                whitespace_index += 1
+        check_geometry(cells, side)
+        tier_checks = {"tier": tier}
+        for field in fields:
+            source = sum(float(module[field]) for module in cells)
+            tier_checks[field] = {
+                "source": source, "grid": source, "residual": 0.0,
+            }
+        checks.append(tier_checks)
+        tiers.append({"tier": tier, "cells": cells})
+    return {"tiers": tiers, "power_conservation": checks}
+
+
 def materialize(model_path: Path, output_dir: Path, grid_size: int = 32,
                 utilization: float = 0.70, ambient_c: float = 25.0,
                 r_convec: float = 3.5, layout_path: Path | None = None,
                 stack_config: dict | None = None,
                 compact_trace: bool = False,
-                ptrace_precision: int = 17) -> dict:
+                ptrace_precision: int = 17,
+                input_granularity: str = "grid-cell") -> dict:
     model = read_json(model_path)
     stack = {**DEFAULT_THERMAL_STACK, **(stack_config or {})}
     local_scale = float(stack["local_resistance_scale"])
@@ -211,7 +268,16 @@ def materialize(model_path: Path, output_dir: Path, grid_size: int = 32,
     )
     layout = read_json(layout_path) if layout_path else baseline_layout(model, utilization)
     check_geometry(layout["modules"], layout["die_width_mm"])
-    grids = grid_power(layout, grid_size, compact_trace)
+    if input_granularity == "grid-cell":
+        grids = grid_power(layout, grid_size, compact_trace)
+    elif input_granularity == "module":
+        grids = {
+            "grid_size": grid_size,
+            "cell_side_mm": layout["die_width_mm"] / grid_size,
+            **module_power(layout),
+        }
+    else:
+        raise ValueError("HotSpot input_granularity must be grid-cell or module")
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / "layout.json", layout)
     write_json(output_dir / "power_grid.json", grids)
@@ -308,6 +374,8 @@ solid
         "layout": str((output_dir / "layout.json").resolve()),
         "grid_size": grid_size, "ambient_c": ambient_c, "r_convec_k_per_w": r_convec,
         "compact_trace": compact_trace, "ptrace_precision": ptrace_precision,
+        "input_granularity": input_granularity,
+        "active_power_layers": [1, 3],
         "thermal_stack": {
             **stack,
             "effective_silicon_resistivity_mk_per_w": silicon_resistivity,

@@ -35,6 +35,36 @@ def temperatures(path: Path) -> list[tuple[str, float]]:
     return parse_temperatures(path.read_text(encoding="utf-8"))
 
 
+def parse_grid_temperatures(text: str) -> list[tuple[str, float]]:
+    """Parse HotSpot's grid.steady layer sections without losing layer identity."""
+    layer = None
+    values = []
+    header = re.compile(r"^Layer\s+(\d+):$")
+    for raw in text.splitlines():
+        line = raw.strip()
+        match = header.match(line)
+        if match:
+            layer = int(match.group(1))
+            continue
+        if not line or layer is None:
+            continue
+        fields = line.split()
+        if len(fields) != 2:
+            raise ValueError("invalid HotSpot grid steady temperature line")
+        try:
+            index, value = int(fields[0]), float(fields[1])
+        except ValueError as error:
+            raise ValueError("invalid HotSpot grid steady temperature value") from error
+        values.append((f"layer_{layer}_g{index}", value))
+    if not values:
+        raise ValueError("no temperatures in HotSpot grid steady output")
+    return values
+
+
+def grid_temperatures(path: Path) -> list[tuple[str, float]]:
+    return parse_grid_temperatures(path.read_text(encoding="utf-8"))
+
+
 def run_hotspot(case_dir: Path, hotspot: Path = DEFAULT_HOTSPOT,
                 ptrace_name: str = "power.ptrace", result_name: str = "thermal_result.json",
                 steady_name: str | None = None,
@@ -59,9 +89,16 @@ def run_hotspot(case_dir: Path, hotspot: Path = DEFAULT_HOTSPOT,
     (case_dir / "hotspot.log").write_text(process.stdout, encoding="utf-8")
     if process.returncode != 0 or not steady.is_file():
         raise RuntimeError(f"HotSpot failed (rc={process.returncode}); see {case_dir / 'hotspot.log'}")
-    samples = temperatures(steady)
-    peak_name, peak_k = max(samples, key=lambda item: item[1])
     manifest = read_json(case_dir / "hotspot_manifest.json")
+    if manifest.get("input_granularity", "grid-cell") == "module":
+        active = set(int(value) for value in manifest["active_power_layers"])
+        samples = [
+            (name, value) for name, value in grid_temperatures(grid_steady)
+            if int(name.split("_")[1]) in active
+        ]
+    else:
+        samples = temperatures(steady)
+    peak_name, peak_k = max(samples, key=lambda item: item[1])
     result = {
         "schema_version": 1, "command": command, "return_code": process.returncode,
         "power_trace": str((case_dir / ptrace_name).resolve()),

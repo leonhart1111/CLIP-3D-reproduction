@@ -319,6 +319,7 @@ def run_hotspot_case(model_path: Path, layout: dict, physical: dict,
         float(physical["r_convec_k_per_w"]), layout_path, stack,
         bool(physical.get("compact_trace", False)),
         int(physical.get("ptrace_precision", 17)),
+        str(physical.get("input_granularity", "grid-cell")),
     )
     write_json(manifest_path, expected)
     result = run_hotspot(case_dir, hotspot)
@@ -366,8 +367,9 @@ def unit_response_ratio_from_temperatures(
     layers: dict[int, dict[str, float]] = {1: {}, 3: {}}
     verbose = re.compile(r"^layer_(1|3)_t[01]_(r\d+_c\d+)$")
     compact = re.compile(r"^layer_(1|3)_[bt](\d+_\d+)$")
+    native_grid = re.compile(r"^layer_(1|3)_g(\d+)$")
     for name, value in values:
-        match = verbose.match(name) or compact.match(name)
+        match = verbose.match(name) or compact.match(name) or native_grid.match(name)
         if match:
             layers[int(match.group(1))][match.group(2)] = float(value)
     if not layers[1] or set(layers[1]) != set(layers[3]):
@@ -1438,8 +1440,13 @@ def run_unit_response_campaign(model_paths: list[Path], config: dict,
             {"kind": "unit-power", "label": case["label"]},
             output_root / "cases", DEFAULT_HOTSPOT,
         )
-        from workflow.thermal.run_hotspot import temperatures
-        values = temperatures(Path(result["case_dir"]) / "steady.txt")
+        from workflow.thermal.run_hotspot import grid_temperatures, temperatures
+        if physical.get("input_granularity", "grid-cell") == "module":
+            values = grid_temperatures(
+                Path(result["case_dir"]) / "grid.steady.txt"
+            )
+        else:
+            values = temperatures(Path(result["case_dir"]) / "steady.txt")
         response = unit_response_ratio_from_temperatures(
             values, float(physical["ambient_c"]) + 273.15,
             int(case["source_tier"]),

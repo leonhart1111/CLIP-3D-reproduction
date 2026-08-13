@@ -9,7 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from workflow.floorplan.optimize_layout import spatial_coupling
-from workflow.floorplan.generate_hotspot_inputs import grid_power, write_ptrace
+from workflow.floorplan.generate_hotspot_inputs import (
+    check_geometry, grid_power, materialize, module_power, write_ptrace,
+)
+from workflow.thermal.run_hotspot import parse_grid_temperatures
 from workflow.thermal.identify_alpha_lc import (
     case_identity,
     cross_validate_alpha_lc,
@@ -324,6 +327,55 @@ class GridConvergenceTests(unittest.TestCase):
         self.assertLess(max(lengths), 65536)
         self.assertRegex(grids["tiers"][0]["cells"][0]["name"], r"^b\d\d_\d\d$")
 
+    def test_module_level_input_keeps_128_grid_out_of_ptrace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model_path = PlacementDesignTests().write_model(root / "model")
+            layout = placement_design(model_path, 0.70)[0]["layout"]
+            layout_path = root / "candidate.json"
+            layout_path.write_text(json.dumps(layout))
+            manifest = materialize(
+                model_path, root / "case", grid_size=128,
+                utilization=0.70, ambient_c=25.0, r_convec=1.042,
+                layout_path=layout_path, input_granularity="module",
+                ptrace_precision=9,
+            )
+            lines = (root / "case/power.ptrace").read_text().splitlines()
+            names = lines[0].split()
+        self.assertEqual(manifest["input_granularity"], "module")
+        self.assertGreater(len(names), len(layout["modules"]))
+        self.assertTrue({module["name"] for module in layout["modules"]}.issubset(names))
+        self.assertLess(max(len(line.encode()) for line in lines), 65536)
+        self.assertEqual(manifest["grid_size"], 128)
+        for tier in manifest["power_conservation"]:
+            self.assertAlmostEqual(tier["total_power_w"]["residual"], 0.0)
+
+    def test_module_level_whitespace_exactly_tiles_each_die_layer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = PlacementDesignTests().write_model(Path(directory))
+            layout = placement_design(model_path, 0.70)[0]["layout"]
+        module_input = module_power(layout)
+        side = layout["die_width_mm"]
+        for tier in module_input["tiers"]:
+            cells = tier["cells"]
+            self.assertAlmostEqual(
+                sum(cell["width_mm"] * cell["height_mm"] for cell in cells),
+                side * side, places=9,
+            )
+            check_geometry(cells, side)
+            whitespace = [cell for cell in cells if cell["kind"] == "whitespace"]
+            self.assertTrue(whitespace)
+            self.assertTrue(all(cell["total_power_w"] == 0.0 for cell in whitespace))
+
+    def test_grid_temperature_parser_preserves_layer_and_cell_identity(self):
+        values = parse_grid_temperatures(
+            "Layer 0:\n0\t300.0\n1\t301.0\nLayer 1:\n0\t310.0\n1\t311.0\n"
+        )
+        self.assertEqual(values, [
+            ("layer_0_g0", 300.0), ("layer_0_g1", 301.0),
+            ("layer_1_g0", 310.0), ("layer_1_g1", 311.0),
+        ])
+
 
 class UnitResponseTests(unittest.TestCase):
     def test_unit_power_model_changes_only_copied_power_fields(self):
@@ -456,6 +508,15 @@ class UnitResponseTests(unittest.TestCase):
         ]
         result = unit_response_ratio_from_temperatures(values, 300.0, 0)
         self.assertEqual(result["peak_coordinate"], "14_21")
+        self.assertAlmostEqual(result["ratio"], 0.6)
+
+    def test_unit_response_parses_native_grid_cell_names(self):
+        values = [
+            ("layer_1_g10", 320.0), ("layer_3_g10", 312.0),
+            ("layer_1_g11", 310.0), ("layer_3_g11", 306.0),
+        ]
+        result = unit_response_ratio_from_temperatures(values, 300.0, 0)
+        self.assertEqual(result["peak_coordinate"], "10")
         self.assertAlmostEqual(result["ratio"], 0.6)
 
     def test_formal_unit_response_design_has_72_balanced_cases(self):
