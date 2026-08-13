@@ -819,6 +819,20 @@ class BalancedSelectionTests(unittest.TestCase):
                         },
                     },
                 })
+                characterization_id = "c" * 64
+                write_json(point / "cacti/cacti_characterization.json", {
+                    "schema_version": 2,
+                    "characterization_id": characterization_id,
+                })
+                write_json(point / "modules.json", {
+                    "schema_version": 2,
+                    "cacti_characterization_id": characterization_id,
+                    "area_provenance": {
+                        "core_logic_and_interconnect": "unmodified McPAT area",
+                        "l1i_l1d_l2": "unmodified local CACTI area and dimensions",
+                        "global_scaling": "none",
+                    },
+                })
         return fixed_root, clip_root
 
     def _selection(self):
@@ -835,6 +849,13 @@ class BalancedSelectionTests(unittest.TestCase):
         result = validate_selection(manifest, self.grid)
 
         self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["physical_model"], {
+            "cache_characterization": "local-cacti-schema-v2",
+            "non_cache_area": "unmodified-mcpat",
+            "cache_area": "unmodified-local-cacti",
+            "global_area_scaling": "none",
+            "historical_scaled_layouts_reusable": False,
+        })
         self.assertEqual(result["selected_count"], 50)
         self.assertEqual(result["workload_count"], 5)
         self.assertEqual(len(set(keys)), 50)
@@ -902,6 +923,36 @@ class BalancedSelectionTests(unittest.TestCase):
         missing.unlink()
 
         with self.assertRaisesRegex(ValueError, "fixed-bin root.*100"):
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path,
+                                  selection=manifest)
+
+    def test_preflight_rejects_historical_scaled_geometry_after_config_repin(self):
+        """A new config hash must not make scaled historical layouts reusable."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        manifest, keys = self._selection()
+        fixed_root, clip_root = self._write_layout_roots()
+        point = fixed_root / keys[0].relative_path()
+        modules = read_json(point / "modules.json")
+        modules["area_provenance"]["global_scaling"] = "legacy 150 mm2 calibration"
+        write_json(point / "modules.json", modules)
+
+        with self.assertRaisesRegex(ValueError, "unscaled physical model"):
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path,
+                                  selection=manifest)
+
+    def test_preflight_rejects_mismatched_cacti_characterization_identity(self):
+        """Geometry and local CACTI evidence must describe one characterization."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        manifest, keys = self._selection()
+        fixed_root, clip_root = self._write_layout_roots()
+        point = clip_root / keys[0].relative_path()
+        modules = read_json(point / "modules.json")
+        modules["cacti_characterization_id"] = "d" * 64
+        write_json(point / "modules.json", modules)
+
+        with self.assertRaisesRegex(ValueError, "CACTI characterization identity"):
             validate_layout_roots(fixed_root, clip_root, keys, self.config_path,
                                   selection=manifest)
 
