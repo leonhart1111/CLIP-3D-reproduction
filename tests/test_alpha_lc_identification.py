@@ -664,6 +664,12 @@ class CampaignCliTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "local_resistance_scale.*1.0"):
             validate_identification_config(config)
 
+    def test_config_rejects_production_grid_below_convergence_reference(self):
+        config = self.valid_config()
+        config["physical"]["grid_convergence_sizes"] = [16, 32, 64]
+        with self.assertRaisesRegex(ValueError, "grid_size.*finest convergence grid"):
+            validate_identification_config(config)
+
     def test_model_contract_rejects_scaled_or_postprocessed_inputs(self):
         scaled = self.valid_model()
         scaled["area_provenance"]["global_scaling"] = "150 mm2"

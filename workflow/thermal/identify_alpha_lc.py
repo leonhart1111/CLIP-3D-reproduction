@@ -53,6 +53,13 @@ def validate_identification_config(config: dict) -> None:
         raise ValueError("physical utilization must be in (0, 1]")
     if int(physical.get("grid_size", 0)) < 2:
         raise ValueError("physical grid_size must be at least 2")
+    convergence_grids = [
+        int(value) for value in physical.get("grid_convergence_sizes", [])
+    ]
+    if convergence_grids and int(physical["grid_size"]) < max(convergence_grids):
+        raise ValueError(
+            "physical grid_size must equal or exceed the finest convergence grid"
+        )
     expected_workloads = {"fft", "cholesky", "matmul", "stencil", "stream"}
     if set(config.get("workloads", [])) != expected_workloads:
         raise ValueError("formal campaign requires all five declared workloads")
