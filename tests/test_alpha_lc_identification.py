@@ -544,6 +544,14 @@ class CampaignCliTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "completed R1"):
                 identification_plan(Path(directory), self.valid_config())
 
+    def test_module_entrypoint_runs_after_all_command_handlers_are_defined(self):
+        source = Path(
+            "workflow/thermal/identify_alpha_lc.py"
+        ).read_text(encoding="utf-8")
+        entrypoint = source.index('if __name__ == "__main__":')
+        self.assertGreater(entrypoint, source.index("def run_grid_campaign"))
+        self.assertGreater(entrypoint, source.index("def run_unit_response_campaign"))
+
 
 if __name__ == "__main__":
     unittest.main()

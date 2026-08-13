@@ -781,10 +781,6 @@ def main() -> None:
         )
 
 
-if __name__ == "__main__":
-    main()
-
-
 def _normalized_lattice(steps: int = 41) -> list[tuple[float, float]]:
     values = [index / (steps - 1) for index in range(steps)]
     return [(x, y) for y in values for x in values]
@@ -1083,3 +1079,7 @@ def run_unit_response_campaign(model_paths: list[Path], config: dict,
     report["records"] = sorted(records, key=lambda item: item["label"])
     write_json(output_root / "unit_response_report.json", report)
     return report
+
+
+if __name__ == "__main__":
+    main()
