@@ -393,7 +393,7 @@ solid
                    "hotspot.config", "power.ptrace", "power_dynamic.ptrace",
                    "power_leakage.ptrace", "power_grid.json")},
         "power_conservation": grids["power_conservation"],
-        "paper_parameters": ["32x32 per tier", "five layers", "50um active silicon"],
+        "paper_parameters": [f"{grid_size}x{grid_size} per tier", "five layers", "50um active silicon"],
         "reproduction_assumptions": [
             "Experiment T_amb=25 C is used; methodology prose separately mentions a 45 C natural-convection setup.",
             "The passive interposer thickness is 100 um because the translated paper does not publish it.",

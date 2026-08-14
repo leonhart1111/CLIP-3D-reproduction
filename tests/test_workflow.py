@@ -53,7 +53,7 @@ from workflow.r2.run_wire_sensitivity import (
 )
 from workflow.run_lifting_pipeline import (
     evaluate_comparison_candidates, main as run_lifting_pipeline_main,
-    optimize_clip3d_layout, select_clip3d_candidate, validate_config,
+    optimize_clip3d_layout, run_pipeline, select_clip3d_candidate, validate_config,
 )
 from workflow.run_lifting_sweep import (
     completed as lifting_completed,
@@ -79,6 +79,129 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_pipeline_forwards_hotspot_materialization_contract(self):
+        """Fixed-bin and paper-single runs must preserve identification inputs."""
+        # Break caught: omitting or changing a physical materialization control
+        # in either pipeline branch silently reverts its HotSpot inputs to the
+        # historical grid-cell/default-trace contract.
+        materialization_controls = {
+            "input_granularity": "module",
+            "compact_trace": True,
+            "ptrace_precision": 9,
+        }
+        config = {
+            "schema_version": 1,
+            "technology_nm": 45,
+            "frequency": {
+                "ambient_c": 25.0, "f0_ghz": 2.0, "fmin_ghz": 0.4,
+                "tsafe_c": 95.0,
+            },
+            "physical": {
+                "grid_size": 64, "tiers": 2, "utilization": 0.70,
+                "r_convec_k_per_w": 5.0, **materialization_controls,
+            },
+            "layout_optimizer": {
+                "alpha": 0.3, "beta": 0.0, "cross_tier_weight": 0.65,
+                "lambda_wire": 0.01, "r_convec_k_per_w": 5.0,
+                "validation_policy": "paper-single",
+            },
+            "delay": {},
+            "mcpat": {},
+        }
+        model = {
+            "modules": [{"name": "bottom", "tier": 0, "total_power_w": 1.0},
+                        {"name": "top", "tier": 1, "total_power_w": 1.0}],
+            "totals": {"total_power_w": 2.0}, "gamma": 0.2,
+            "power_provenance": {}, "area_provenance": {},
+            "power_distribution": {
+                "movable_kinds": [], "movable_power_w": 0.0,
+                "movable_power_fraction": 0.0,
+            },
+        }
+        vector = {
+            "wire_cycle_aggregation_for_r2": "mean",
+            "critical_l1d_to_l2_cycles": 1,
+            "layout_delays": {
+                "wire_cycles_unrounded": 1.0,
+                "maximum_wire_cycles_unrounded": 1.0,
+                "wire_cycles": 1, "maximum_wire_cycles": 1,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            r1_dir = root / "r1"
+            r1_dir.mkdir()
+            write_json(r1_dir / "r1_metadata.json", {
+                "workload": "fixture", "l1d_size": "32kB", "l2_size": "512kB",
+            })
+            (r1_dir / "stats.txt").write_text("", encoding="utf-8")
+            config_path = root / "config.json"
+            write_json(config_path, config)
+
+            def characterize_case(*args, **_kwargs):
+                output_dir = args[2]
+                output_dir.mkdir(parents=True, exist_ok=True)
+                write_json(output_dir / "cacti_characterization.json", {})
+
+            def build_module_case(*args, **_kwargs):
+                write_json(args[3], model)
+                return model
+
+            def convert_case(*args, **_kwargs):
+                args[1].parent.mkdir(parents=True, exist_ok=True)
+                return {"cache_contract": {}, "cacti_characterization_id": "id"}
+
+            def materialize_case(_modules, hotspot_dir, *_args, **_kwargs):
+                hotspot_dir.mkdir(parents=True, exist_ok=True)
+                write_json(hotspot_dir / "layout.json", {
+                    "modules": model["modules"],
+                })
+
+            def optimize_case(_modules, _layout, report_path, _config):
+                write_json(report_path, {
+                    "selected": {"proxy_tmax_c": 80.0},
+                    "candidates": [{"tier": 1, "collision_mm2": 0.0}],
+                })
+
+            with patch(
+                "workflow.run_lifting_pipeline.materialize",
+                side_effect=materialize_case,
+            ) as materialize_mock, patch(
+                "workflow.run_lifting_pipeline.build_cache_contract",
+                return_value={"records": []},
+            ), patch(
+                "workflow.run_lifting_pipeline.characterize",
+                side_effect=characterize_case,
+            ), patch(
+                "workflow.run_lifting_pipeline.convert",
+                side_effect=convert_case,
+            ), patch(
+                "workflow.run_lifting_pipeline.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 0, "McPAT (version 1.3 results"),
+            ), patch(
+                "workflow.run_lifting_pipeline.parse_mcpat_text", return_value={},
+            ), patch(
+                "workflow.run_lifting_pipeline.build_model", side_effect=build_module_case,
+            ), patch(
+                "workflow.run_lifting_pipeline.optimize_clip3d_layout",
+                side_effect=optimize_case,
+            ), patch(
+                "workflow.run_lifting_pipeline.run_hotspot", return_value={"tmax_c": 80.0},
+            ), patch(
+                "workflow.run_lifting_pipeline.evaluate",
+                return_value={"sustainable_frequency_ghz": 1.0, "ipc1": 1.0,
+                              "bips1_thermal": 1.0},
+            ), patch(
+                "workflow.run_lifting_pipeline.build_vector", return_value=vector,
+            ):
+                run_pipeline(r1_dir, root / "fixed", config_path, "fixed-bin")
+                run_pipeline(r1_dir, root / "paper-single", config_path, "clip3d")
+
+            self.assertEqual(materialize_mock.call_count, 2)
+            for call in materialize_mock.call_args_list:
+                self.assertEqual(call.kwargs, materialization_controls)
+
     def test_lifting_cli_accepts_discrete_partition_override(self):
         process = subprocess.run(
             [
@@ -868,6 +991,30 @@ Cache height x width (mm): 2 x 4
         with self.assertRaisesRegex(ValueError, "use_paper_table_ii has been removed"):
             validate_config(config, "fixed-bin")
 
+    def test_pipeline_rejects_invalid_hotspot_materialization_controls(self):
+        """Identification controls must not accept coercible configuration values."""
+        # Break caught: accepting an invalid value can silently materialize
+        # grid-cell/default traces instead of the requested identification case.
+        base = {
+            "schema_version": 1,
+            "physical": {"r_convec_k_per_w": 5.0},
+            "layout_optimizer": {"r_convec_k_per_w": 5.0},
+            "mcpat": {},
+            "delay": {},
+        }
+        invalid_cases = (
+            ("input_granularity", "cells", "input_granularity"),
+            ("compact_trace", 1, "compact_trace"),
+            ("ptrace_precision", True, "ptrace_precision"),
+            ("ptrace_precision", 0, "ptrace_precision"),
+        )
+        for key, value, label in invalid_cases:
+            with self.subTest(key=key, value=value):
+                config = deepcopy(base)
+                config["physical"][key] = value
+                with self.assertRaisesRegex(ValueError, label):
+                    validate_config(config, "fixed-bin")
+
 
 class GridTests(unittest.TestCase):
     def model(self):
@@ -1064,6 +1211,23 @@ class GridTests(unittest.TestCase):
         for tier in gridded["power_conservation"]:
             for field in ("dynamic_power_w", "leakage_power_w", "total_power_w"):
                 self.assertLess(abs(tier[field]["residual"]), 1e-10)
+
+    def test_materialize_records_selected_grid_and_granularity(self):
+        """Manifest provenance must describe the actual HotSpot inputs."""
+        # Break caught: keeping the historical 32x32 manifest text obscures
+        # a parameter-identification run's grid resolution.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model_path = root / "modules.json"
+            write_json(model_path, self.model())
+
+            manifest = materialize(
+                model_path, root / "case", grid_size=64,
+                input_granularity="module",
+            )
+
+        self.assertEqual(manifest["paper_parameters"][0], "64x64 per tier")
+        self.assertEqual(manifest["input_granularity"], "module")
 
     def test_fixed_bin_l2_is_lower_left(self):
         layout = baseline_layout(self.model())

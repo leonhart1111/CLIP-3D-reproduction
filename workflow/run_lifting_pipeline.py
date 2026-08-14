@@ -83,6 +83,27 @@ def finite_number(value: object, label: str) -> float:
     return result
 
 
+def hotspot_materialization_options(physical: dict) -> dict:
+    input_granularity = physical.get("input_granularity", "grid-cell")
+    if input_granularity not in ("grid-cell", "module"):
+        raise ValueError(
+            "physical.input_granularity must be grid-cell or module"
+        )
+    compact_trace = physical.get("compact_trace", False)
+    if type(compact_trace) is not bool:
+        raise ValueError("physical.compact_trace must be a boolean")
+    ptrace_precision = physical.get("ptrace_precision", 17)
+    if (not isinstance(ptrace_precision, int)
+            or isinstance(ptrace_precision, bool)
+            or ptrace_precision <= 0):
+        raise ValueError("physical.ptrace_precision must be a positive integer")
+    return {
+        "input_granularity": input_granularity,
+        "compact_trace": compact_trace,
+        "ptrace_precision": ptrace_precision,
+    }
+
+
 def validate_accepted_strict_p1(config: dict) -> None:
     """Verify that an accepted strict-P1 config still derives from its reports."""
     formal = config.get("formal_validation", {})
@@ -176,6 +197,7 @@ def validate_config(config: dict, layout_method: str) -> None:
             "global area scaling is forbidden; remove physical controls: "
             f"{sorted(requested_area_controls)}"
         )
+    hotspot_materialization_options(config["physical"])
     physical_r = float(config["physical"]["r_convec_k_per_w"])
     optimizer_r = float(config["layout_optimizer"]["r_convec_k_per_w"])
     if layout_method != "fixed-bin" and not abs(physical_r - optimizer_r) < 1e-12:
@@ -304,6 +326,7 @@ def evaluate_comparison_candidates(modules_path: Path, output_dir: Path,
             modules_path, hotspot_dir, physical["grid_size"], physical["utilization"],
             frequency["ambient_c"], physical["r_convec_k_per_w"], layout_path,
             physical.get("thermal_stack"),
+            **hotspot_materialization_options(physical),
         )
         thermal = run_hotspot(hotspot_dir)
         performance = evaluate(
@@ -423,6 +446,7 @@ def evaluate_clip3d_candidate(modules_path: Path, proposed_layout: Path,
             modules_path, hotspot_dir, physical["grid_size"], physical["utilization"],
             frequency["ambient_c"], physical["r_convec_k_per_w"], layout,
             physical.get("thermal_stack"),
+            **hotspot_materialization_options(physical),
         )
         thermal = run_hotspot(hotspot_dir, hotspot_tool)
         performance = evaluate(
@@ -509,6 +533,7 @@ def evaluate_clip3d_paper_single(modules_path: Path, proposed_layout: Path,
         modules_path, hotspot_dir, physical["grid_size"], physical["utilization"],
         frequency["ambient_c"], physical["r_convec_k_per_w"], proposed_layout,
         physical.get("thermal_stack"),
+        **hotspot_materialization_options(physical),
     )
     thermal = run_hotspot(hotspot_dir, hotspot_tool)
     selection = {
@@ -679,7 +704,8 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
         materialize(modules_path, hotspot_dir, physical["grid_size"],
                     physical["utilization"], frequency["ambient_c"],
                     physical["r_convec_k_per_w"], None,
-                    physical.get("thermal_stack"))
+                    physical.get("thermal_stack"),
+                    **hotspot_materialization_options(physical))
         layout_path = hotspot_dir / "layout.json"
         thermal = run_hotspot(hotspot_dir, tools["hotspot"])
     stage_seconds["layout_and_hotspot"] = time.perf_counter() - started
