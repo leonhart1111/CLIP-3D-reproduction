@@ -151,10 +151,17 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
              wire_rounding: str = "nearest",
              wire_aggregation: str = "mean",
              partition_grid_steps: int = 41,
-             include_fixed_baseline: bool = True) -> dict:
+             include_fixed_baseline: bool = True,
+             lc_die_side_ratio: float | None = None) -> dict:
     model = read_json(model_path)
     base = baseline_layout(model, utilization)
     side = base["die_width_mm"]
+    lc_ratio = 0.5 if lc_die_side_ratio is None else float(lc_die_side_ratio)
+    if not math.isfinite(lc_ratio) or lc_ratio <= 0:
+        raise ValueError(
+            "thermal characteristic length ratio must be finite and positive"
+        )
+    lc_mm = side * lc_ratio
     original = next(m for m in base["modules"] if m["kind"] == "l2")
     fixed = [dict(m) for m in base["modules"] if m["kind"] != "l2"]
     upper = (side - original["width_mm"], side - original["height_mm"])
@@ -202,6 +209,7 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
     baseline_proxy = proxy_temperature(
         base["modules"], side, ambient, r_convec, alpha, beta,
         cross_tier_weight, proxy_spatial_model, proxy_quadrature_order,
+        lc_mm,
     )
     baseline_frequency = closed_form_frequency(
         baseline_proxy, model["gamma"], f0_ghz, fmin_ghz, tsafe, ambient
@@ -234,6 +242,7 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                 modules, side, ambient, r_convec, alpha, beta,
                 cross_tier_weight, proxy_spatial_model,
                 proxy_quadrature_order,
+                lc_mm,
             )
             frequency, frequency_state, raw_frequency = closed_form_frequency(
                 proxy, model["gamma"], f0_ghz, fmin_ghz, tsafe, ambient
@@ -312,7 +321,7 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                 collision = collision_area(l2, fixed)
                 proxy = proxy_temperature(modules, side, ambient, r_convec, alpha, beta,
                                           cross_tier_weight, proxy_spatial_model,
-                                          proxy_quadrature_order)
+                                          proxy_quadrature_order, lc_mm)
                 frequency = closed_form_frequency(proxy, model["gamma"], f0_ghz,
                                                    fmin_ghz, tsafe, ambient)[0]
                 _, wire = selected_wire_cycles(modules)
@@ -337,7 +346,7 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                 collision = collision_area(l2, fixed)
                 proxy = proxy_temperature(modules, side, ambient, r_convec, alpha, beta,
                                           cross_tier_weight, proxy_spatial_model,
-                                          proxy_quadrature_order)
+                                          proxy_quadrature_order, lc_mm)
                 frequency, frequency_state, raw_frequency = closed_form_frequency(
                     proxy, model["gamma"], f0_ghz, fmin_ghz, tsafe, ambient
                 )
@@ -430,6 +439,8 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                        "allowed_l2_tiers": list(tiers),
                        "proxy_spatial_model": proxy_spatial_model,
                        "proxy_quadrature_order": proxy_quadrature_order,
+                       "lc_die_side_ratio": lc_ratio,
+                       "lc_mm": lc_mm,
                        "wire_objective": wire_objective,
                        "wire_aggregation": wire_aggregation,
                        "wire_rounding": wire_rounding,

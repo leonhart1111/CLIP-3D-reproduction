@@ -997,6 +997,7 @@ class GridTests(unittest.TestCase):
                 "physical": {"utilization": 0.70, "r_convec_k_per_w": 5.0},
                 "layout_optimizer": {
                     "alpha": 0.3, "beta": 0.1, "cross_tier_weight": 0.65,
+                    "lc_die_side_ratio": 0.3525311644629249,
                     "lambda_wire": 0.0020119160767721133,
                     "allowed_l2_tiers": [1], "require_scipy": False,
                     "wire_objective": "discrete-partition",
@@ -1017,6 +1018,46 @@ class GridTests(unittest.TestCase):
             self.assertTrue(
                 report["discrete_search"]["fixed_baseline_included"]
             )
+            self.assertEqual(
+                report["parameters"]["lc_die_side_ratio"],
+                0.3525311644629249,
+            )
+
+    def test_optimizer_uses_explicit_lc_ratio(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            write_json(root / "modules.json", model)
+            side = baseline_layout(model)["die_width_mm"]
+            reports = [
+                optimize(
+                    root / "modules.json", root / f"layout-{ratio}.json",
+                    root / f"report-{ratio}.json", allowed_l2_tiers=[1],
+                    require_scipy=False, lc_die_side_ratio=ratio,
+                )
+                for ratio in (0.25, 0.75)
+            ]
+
+            for ratio, report in zip((0.25, 0.75), reports):
+                self.assertEqual(report["parameters"]["lc_die_side_ratio"], ratio)
+                self.assertEqual(report["parameters"]["lc_mm"], side * ratio)
+            self.assertNotAlmostEqual(
+                reports[0]["selected"]["proxy_tmax_c"],
+                reports[1]["selected"]["proxy_tmax_c"],
+                places=9,
+            )
+
+    def test_optimizer_rejects_nonpositive_or_nonfinite_lc_ratio(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+            for ratio in (0.0, -0.25, math.nan, math.inf):
+                with self.subTest(ratio=ratio):
+                    with self.assertRaisesRegex(ValueError, "finite and positive"):
+                        optimize(
+                            root / "modules.json", root / "layout.json",
+                            root / "report.json", lc_die_side_ratio=ratio,
+                        )
 
     def test_exact_power_conservation(self):
         gridded = grid_power(baseline_layout(self.model()), 8)

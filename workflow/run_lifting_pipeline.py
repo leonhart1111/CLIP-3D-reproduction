@@ -553,6 +553,7 @@ def optimize_clip3d_layout(modules_path: Path, proposed_layout: Path,
         delay.get("wire_aggregation", "mean"),
         int(optimizer.get("partition_grid_steps", 41)),
         optimizer.get("include_fixed_baseline", True),
+        optimizer.get("lc_die_side_ratio"),
     )
 
 
