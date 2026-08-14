@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "name": "unscaled_alpha_lc_rejected_20260814",
+  "method": "strict-P1 relative-temperature alpha/Lc identification",
+  "fit_report": {
+    "path": "results/parameter_studies/unscaled_alpha_lc_20260813/fit_report.json",
+    "sha256": "918f93b775d5131c98b5c8300dae468b8bc2a87e29f66cd109c53bcd25795c89"
+  },
+  "fit": {
+    "parameters": {
+      "alpha": 3.348558894986864,
+      "lc_die_side_ratio": 0.3525311644629249,
+      "cross_tier_weight": 0.8378797681280803,
+      "beta": 0.0
+    },
+    "beta_status": "fixed_unidentifiable_under_p1"
+  },
+  "physical_identity": {
+    "technology_nm": 45,
+    "tiers": 2,
+    "grid_size": 64,
+    "input_granularity": "module",
+    "compact_trace": true,
+    "ptrace_precision": 9,
+    "utilization": 0.7,
+    "ambient_c": 25.0,
+    "r_convec_k_per_w": 1.042,
+    "global_scaling": "none",
+    "power_postprocessing": "none",
+    "thermal_stack": {
+      "silicon_resistivity_mk_per_w": 0.01,
+      "tim_resistivity_mk_per_w": 0.25,
+      "interposer_thickness_m": 0.0001,
+      "active_silicon_thickness_m": 0.00005,
+      "tim_thickness_m": 0.00002,
+      "local_resistance_scale": 1.0,
+      "silicon_resistance_scale": 1.0,
+      "tim_resistance_scale": 1.0
+    },
+    "source": "local unscaled CACTI/McPAT/HotSpot toolchain"
+  },
+  "accepted_for_formal_or_shared_use": false,
+  "rejection": {
+    "status": "rejected",
+    "reason": "The fit is retained for a non-formal diagnostic only; no formal or shared-parameter promotion was authorized."
+  }
+}

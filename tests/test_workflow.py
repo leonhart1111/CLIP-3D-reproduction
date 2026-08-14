@@ -310,6 +310,75 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertIn("validation RMSE=12.345679 C", output.getvalue())
 
+    def test_rejected_alpha_lc_diagnostic_config_is_exact(self):
+        """The diagnostic binds rejected alpha/Lc evidence to both layout paths."""
+        root = Path(__file__).resolve().parents[1]
+        manifest = read_json(root / "manifests/parameter_provenance/unscaled_alpha_lc_rejected_20260814.json")
+        config = read_json(root / "configs/experiments/clip3d_unscaled_alpha_lc_rejected_diagnostic.json")
+
+        self.assertEqual(manifest["fit_report"]["sha256"], "918f93b775d5131c98b5c8300dae468b8bc2a87e29f66cd109c53bcd25795c89")
+        self.assertEqual(manifest["fit"]["parameters"], {
+            "alpha": 3.348558894986864,
+            "lc_die_side_ratio": 0.3525311644629249,
+            "cross_tier_weight": 0.8378797681280803,
+            "beta": 0.0,
+        })
+        self.assertFalse(manifest["accepted_for_formal_or_shared_use"])
+        physical_identity = manifest["physical_identity"]
+        self.assertEqual(physical_identity["technology_nm"], 45)
+        self.assertEqual(physical_identity["tiers"], 2)
+        self.assertEqual(physical_identity["grid_size"], 64)
+        self.assertEqual(physical_identity["input_granularity"], "module")
+        self.assertTrue(physical_identity["compact_trace"])
+        self.assertEqual(physical_identity["ptrace_precision"], 9)
+        self.assertEqual(physical_identity["utilization"], 0.7)
+        self.assertEqual(physical_identity["ambient_c"], 25.0)
+        self.assertEqual(physical_identity["r_convec_k_per_w"], 1.042)
+        self.assertEqual(physical_identity["global_scaling"], "none")
+        self.assertEqual(physical_identity["thermal_stack"], {
+            "silicon_resistivity_mk_per_w": 0.01,
+            "tim_resistivity_mk_per_w": 0.25,
+            "interposer_thickness_m": 0.0001,
+            "active_silicon_thickness_m": 0.00005,
+            "tim_thickness_m": 0.00002,
+            "local_resistance_scale": 1.0,
+            "silicon_resistance_scale": 1.0,
+            "tim_resistance_scale": 1.0,
+        })
+        self.assertEqual(config["experiment_classification"], {
+            "mode": "rejected-alpha-lc-diagnostic", "non_formal": True,
+            "paper_equivalent": False, "shared_parameter_accepted": False,
+        })
+        physical = config["physical"]
+        self.assertEqual(physical["grid_size"], 64)
+        self.assertEqual(physical["input_granularity"], "module")
+        self.assertTrue(physical["compact_trace"])
+        self.assertEqual(physical["ptrace_precision"], 9)
+        self.assertEqual(physical["r_convec_k_per_w"], 1.042)
+        self.assertEqual(physical["thermal_stack"]["local_resistance_scale"], 1.0)
+        self.assertEqual(physical["thermal_stack"]["silicon_resistance_scale"], 1.0)
+        self.assertEqual(physical["thermal_stack"]["tim_resistance_scale"], 1.0)
+        optimizer = config["layout_optimizer"]
+        self.assertEqual(optimizer["alpha"], 3.348558894986864)
+        self.assertEqual(optimizer["lc_die_side_ratio"], 0.3525311644629249)
+        self.assertEqual(optimizer["cross_tier_weight"], 0.8378797681280803)
+        self.assertEqual(optimizer["beta"], 0.0)
+        self.assertEqual(optimizer["allowed_l2_tiers"], [1])
+        self.assertEqual(optimizer["validation_policy"], "paper-single")
+        self.assertEqual(optimizer["proxy_spatial_model"], "area-quadrature")
+        self.assertEqual(optimizer["proxy_quadrature_order"], 2)
+        self.assertEqual(optimizer["wire_objective"], "discrete-partition")
+        self.assertEqual(optimizer["lambda_wire"], 0.0020119160767721133)
+        lambda_provenance = optimizer["parameter_provenance"]["lambda_wire"]
+        self.assertEqual(lambda_provenance["source"], "manifests/parameter_provenance/lambda_wire_fft_rejected.json")
+        self.assertEqual(lambda_provenance["field"], "lambda_wire")
+        self.assertEqual(lambda_provenance["value"], optimizer["lambda_wire"])
+        self.assertFalse(lambda_provenance["accepted_for_formal_or_shared_use"])
+        self.assertFalse(config["formal_validation"]["accepted"])
+        validate_config(config, "fixed-bin")
+        validate_config(config, "clip3d")
+
+
 class FrequencyTests(unittest.TestCase):
     def test_separated_frequency_trace_scales_only_dynamic_power(self):
         """Changing frequency must not scale per-cell leakage power."""
@@ -1789,7 +1858,6 @@ class GridTests(unittest.TestCase):
                 validation["frequencies"][0]["trace_sums_w"]["composed"],
                 validation["frequencies"][0]["trace_sums_w"]["total_at_f0"],
             )
-
 
 class OperationalProfileTests(unittest.TestCase):
     @staticmethod
