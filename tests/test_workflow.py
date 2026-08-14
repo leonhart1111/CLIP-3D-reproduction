@@ -5,10 +5,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from copy import deepcopy
 from io import StringIO
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
 
 from workflow.cacti.characterize_cache import parse_cacti_output
@@ -2337,6 +2338,21 @@ class ThermalModeDispatchTests(unittest.TestCase):
             "sustainable_frequency_ghz": 2.0,
         }
 
+    @contextmanager
+    def patch_rom_pipeline(self, **patch_kwargs):
+        """Supply the optional ROM import only for CLI dispatch tests."""
+        module_name = "workflow.transient.rom.run_pipeline"
+        import workflow.transient.rom as rom_package
+
+        stub = ModuleType(module_name)
+        stub.run_transient_rom_pipeline = lambda *_args, **_kwargs: None
+        with patch.dict(sys.modules, {module_name: stub}), patch.object(
+            rom_package, "run_pipeline", stub, create=True,
+        ), patch.object(
+            stub, "run_transient_rom_pipeline", **patch_kwargs,
+        ) as pipeline:
+            yield pipeline
+
     def test_steady_mode_calls_legacy_pipeline_without_rom_dispatch(self):
         # Break caught: making ROM the default would alter every historical
         # steady invocation and import its optional NumPy/SciPy dependency.
@@ -2372,8 +2388,7 @@ class ThermalModeDispatchTests(unittest.TestCase):
         with patch(
             "workflow.run_lifting_pipeline.run_pipeline",
             return_value=self.steady_summary(),
-        ) as steady, patch(
-            "workflow.transient.rom.run_pipeline.run_transient_rom_pipeline",
+        ) as steady, self.patch_rom_pipeline(
             return_value=rom_summary,
         ) as rom:
             self.invoke_cli(
@@ -2417,8 +2432,7 @@ class ThermalModeDispatchTests(unittest.TestCase):
 
         with patch(
             "workflow.run_lifting_pipeline.run_pipeline"
-        ) as steady, patch(
-            "workflow.transient.rom.run_pipeline.run_transient_rom_pipeline",
+        ) as steady, self.patch_rom_pipeline(
             return_value={"f_sus_trans_hotspot_ghz": None},
         ) as rom, self.assertRaisesRegex(ValueError, "fixed-bin baseline"):
             self.invoke_cli("--thermal-mode", "transient-rom")
@@ -2449,8 +2463,7 @@ class ThermalModeDispatchTests(unittest.TestCase):
 
         with patch(
             "workflow.run_lifting_pipeline.run_pipeline"
-        ) as steady, patch(
-            "workflow.transient.rom.run_pipeline.run_transient_rom_pipeline",
+        ) as steady, self.patch_rom_pipeline(
             return_value=paired_summary,
         ) as rom:
             stdout = self.invoke_cli("--thermal-mode", "transient-rom")
@@ -2464,8 +2477,7 @@ class ThermalModeDispatchTests(unittest.TestCase):
         # fixed OUTPUT/transient_rom sibling identity required for auditing.
         with patch(
             "workflow.run_lifting_pipeline.run_pipeline"
-        ) as steady, patch(
-            "workflow.transient.rom.run_pipeline.run_transient_rom_pipeline"
+        ) as steady, self.patch_rom_pipeline(
         ) as rom:
             stderr = StringIO()
             with redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
