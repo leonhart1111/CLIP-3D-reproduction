@@ -10,7 +10,11 @@ import unittest
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
-from workflow.cache_contract import mcpat_embedded_cache_record_identity
+from workflow.cache_contract import (
+    build_cache_contract,
+    mcpat_embedded_cache_record_identity,
+    stable_identity,
+)
 from workflow.floorplan.build_module_model import (
     apply_mcpat_cache_geometry,
     build_model,
@@ -23,6 +27,7 @@ from workflow.mcpat.gem5_to_mcpat import (
     named_child,
 )
 from workflow.mcpat.run_mcpat import run_mcpat
+from workflow.mcpat.parse_mcpat import parse_mcpat_text
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,12 +38,15 @@ MARKER = "CLIP_MCPAT_CACTI_P_V1"
 
 
 def native_text() -> str:
-    def metrics(area: float, dynamic: float, indent: str = "  ") -> str:
+    def metrics(
+            area: float, dynamic: float, indent: str = "  ",
+            subthreshold: float = 0.1, gate: float = 0.02,
+    ) -> str:
         return (
             f"{indent}Area = {area} mm^2\n"
             f"{indent}Runtime Dynamic = {dynamic} W\n"
-            f"{indent}Subthreshold Leakage = 0.1 W\n"
-            f"{indent}Gate Leakage = 0.01 W\n"
+            f"{indent}Subthreshold Leakage = {subthreshold} W\n"
+            f"{indent}Gate Leakage = {gate} W\n"
         )
 
     records = []
@@ -63,12 +71,16 @@ def native_text() -> str:
     separator = "*" * 40
     for _core in range(4):
         sections.append(
-            "Core:\n" + metrics(20.0, 2.0)
+            "Core:\n" + metrics(20.0, 2.0, subthreshold=0.6, gate=0.12)
             + "Instruction Fetch Unit:\n" + metrics(4.0, 0.4, "    ")
-            + "Instruction Cache:\n" + metrics(1.0, 0.1, "      ")
+            + "Instruction Cache:\n" + metrics(
+                1.0, 0.1, "      ", subthreshold=0.02, gate=0.004,
+            )
             + "Renaming Unit:\n" + metrics(2.0, 0.2, "    ")
             + "Load Store Unit:\n" + metrics(4.0, 0.4, "    ")
-            + "Data Cache:\n" + metrics(1.0, 0.1, "      ")
+            + "Data Cache:\n" + metrics(
+                1.0, 0.1, "      ", subthreshold=0.02, gate=0.004,
+            )
             + "Memory Management Unit:\n" + metrics(2.0, 0.2, "    ")
             + "Execution Unit:\n" + metrics(5.0, 0.5, "    ")
         )
@@ -166,6 +178,32 @@ def granular_34_modules() -> list[dict]:
     return modules
 
 
+def hand_derived_core_parent_metrics() -> dict:
+    core_total = {
+        "area_mm2": 8.0, "dynamic_power_w": 4.0,
+        "subthreshold_leakage_w": 0.64, "gate_leakage_w": 0.16,
+        "leakage_power_w": 0.8, "total_power_w": 4.8,
+    }
+    functional_parent = {
+        "area_mm2": 2.0, "dynamic_power_w": 1.0,
+        "subthreshold_leakage_w": 0.16, "gate_leakage_w": 0.04,
+        "leakage_power_w": 0.2, "total_power_w": 1.2,
+    }
+    return {
+        "schema_version": 1,
+        "authority": "McPAT print-level-5 parent blocks before subtraction",
+        "records": [
+            {
+                "core": core,
+                "core_total": dict(core_total),
+                "instruction_fetch_unit": dict(functional_parent),
+                "load_store_unit": dict(functional_parent),
+            }
+            for core in range(4)
+        ],
+    }
+
+
 class EmbeddedCACTIParserTests(unittest.TestCase):
     def test_accepts_exact_four_core_record_set(self):
         records = parse_embedded_cacti_records(native_text(), expected_core_count=4)
@@ -192,6 +230,24 @@ class EmbeddedCACTIParserTests(unittest.TestCase):
 
 
 class McPATGeometryTests(unittest.TestCase):
+    def test_parser_retains_original_parent_metrics_before_cache_subtraction(self):
+        # Break caught: losing the only independent quantities that can prove
+        # IFU/L1I, LSU/L1D, and whole-core conservation after subtraction.
+        parsed = parse_mcpat_text(native_text())
+        evidence = parsed["core_parent_metrics"]
+        self.assertEqual(
+            evidence["authority"],
+            "McPAT print-level-5 parent blocks before subtraction",
+        )
+        self.assertEqual(len(evidence["records"]), 4)
+        self.assertEqual(evidence["records"][0]["core_total"]["area_mm2"], 20.0)
+        self.assertEqual(
+            evidence["records"][0]["instruction_fetch_unit"]["area_mm2"], 4.0
+        )
+        self.assertEqual(
+            evidence["records"][0]["load_store_unit"]["area_mm2"], 4.0
+        )
+
     def test_preserves_mcpat_area_and_embedded_aspect_ratio(self):
         # Break caught: replacing aggregate McPAT cache area with raw array area.
         result = apply_mcpat_cache_geometry(
@@ -307,6 +363,18 @@ class McPATGeometryTests(unittest.TestCase):
             with self.subTest(modules=modules), self.assertRaises(ValueError):
                 validate_mobility_contract(modules)
 
+    def test_contract_rejects_aggregate_identity_and_non_string_names(self):
+        relabeled = granular_34_modules()
+        residual = next(
+            module for module in relabeled if module["name"] == "core0_other"
+        )
+        residual["name"] = "core0_logic"
+        non_string = granular_34_modules()
+        non_string[0]["name"] = 7
+        for modules in (relabeled, non_string):
+            with self.subTest(modules=modules), self.assertRaises(ValueError):
+                validate_mobility_contract(modules)
+
     def test_contract_rejects_missing_functional_kind_and_multiple_l2s(self):
         missing_kind = [
             module for module in granular_34_modules()
@@ -329,6 +397,10 @@ class McPATGeometryTests(unittest.TestCase):
             "l1_associativity": 2, "l2_associativity": 8,
             "cache_line_bytes": 64,
         }
+        cache_contract = build_cache_contract(
+            metadata, technology_nm=45, temperature_k=320,
+            device_type=0, interconnect_projection_type=1,
+        )
         (r1 / "r1_metadata.json").write_text(json.dumps(metadata))
         (r1 / "stats.txt").write_text("".join(
             f"system.cpu{core}.commitStats0.numInsts 100\n"
@@ -344,27 +416,33 @@ class McPATGeometryTests(unittest.TestCase):
         calculated_totals = {
             field: sum(module[field] for module in modules)
             for field in (
-                "area_mm2", "dynamic_power_w", "leakage_power_w", "total_power_w",
+                "area_mm2", "dynamic_power_w", "subthreshold_leakage_w",
+                "gate_leakage_w", "leakage_power_w", "total_power_w",
             )
         }
         payload = {
             "modules": modules,
             "module_totals": calculated_totals if module_totals is None else module_totals,
+            "core_parent_metrics": hand_derived_core_parent_metrics(),
             "checks": {
                 "core_count": 4,
                 "core_logic_granularity": "McPAT top-level functional blocks",
             },
             "power_provenance": {"postprocessing": "none"},
-            "cache_contract": {"schema_version": 1, "contract_id": "d" * 64},
+            "cache_contract": cache_contract,
             "embedded_cacti_p": {
                 "schema_version": 1,
                 "authority": "McPAT 1.3 embedded CACTI-P",
                 "records": embedded_records(),
             },
             "provenance": provenance or {
-                "xml_sha256": "1" * 64, "mapping_sha256": "2" * 64,
-                "output_sha256": "3" * 64, "binary_sha256": "4" * 64,
-                "patch_sha256": "5" * 64,
+                "schema_version": 1,
+                "authority": "CLIP strict patched McPAT 1.3 runner",
+                "hashes": {
+                    "xml_sha256": "1" * 64, "mapping_sha256": "2" * 64,
+                    "output_sha256": "3" * 64, "binary_sha256": "4" * 64,
+                    "patch_sha256": "5" * 64,
+                },
             },
             "source_cacti": "/legacy/cacti.json",
             "cacti_characterization_id": "a" * 64,
@@ -393,6 +471,24 @@ class McPATGeometryTests(unittest.TestCase):
         self.assertEqual(model["mobility_contract"]["movable_names"], ["shared_l2"])
         self.assertEqual(len(model["mobility_contract"]["fixed_names"]), 33)
         self.assertEqual(model["totals"], source["module_totals"])
+        parent_residuals = model["conservation"]["parent_subtraction"][
+            "serialized_children_minus_parent"
+        ]
+        for record in parent_residuals:
+            for parent in (
+                "core_total", "instruction_fetch_unit", "load_store_unit",
+            ):
+                self.assertEqual(
+                    set(record[parent]),
+                    {
+                        "area_mm2", "dynamic_power_w",
+                        "subthreshold_leakage_w", "gate_leakage_w",
+                        "leakage_power_w", "total_power_w",
+                    },
+                )
+                self.assertTrue(all(
+                    value == 0.0 for value in record[parent].values()
+                ))
         self.assertNotIn("source_cacti", model)
         self.assertNotIn("cacti_characterization_id", model)
         forbidden = {
@@ -414,7 +510,11 @@ class McPATGeometryTests(unittest.TestCase):
             missing_hash = dict(complete)
             missing_hash.pop("output_sha256")
             r1, mcpat_path, _ = self.write_native_model_inputs(
-                root, provenance=missing_hash,
+                root, provenance={
+                    "schema_version": 1,
+                    "authority": "CLIP strict patched McPAT 1.3 runner",
+                    "hashes": missing_hash,
+                },
             )
             with self.assertRaisesRegex(ValueError, "hash|provenance"):
                 build_model(r1, mcpat_path, root / "modules.json")
@@ -444,6 +544,103 @@ class McPATGeometryTests(unittest.TestCase):
                 payload["checks"] = checks
                 mcpat_path.write_text(json.dumps(payload))
                 with self.assertRaisesRegex(ValueError, "strict|granular|core"):
+                    build_model(r1, mcpat_path, root / "modules.json")
+
+    def test_build_model_rejects_malformed_cache_and_provenance_schemas(self):
+        def rehash_cache_contract(contract: dict, record_index: int) -> None:
+            contract["records"][record_index]["contract_record_id"] = stable_identity({
+                key: value for key, value in contract["records"][record_index].items()
+                if key != "contract_record_id"
+            })
+            contract["contract_id"] = stable_identity({
+                key: value for key, value in contract.items()
+                if key != "contract_id"
+            })
+
+        def forge_cache_model(payload: dict) -> None:
+            contract = payload["cache_contract"]
+            contract["records"][0]["cacti_model"] = "forged-model"
+            rehash_cache_contract(contract, 0)
+
+        def forge_cache_technology_mismatch(payload: dict) -> None:
+            contract = payload["cache_contract"]
+            contract["records"][0]["technology_nm"] += 1
+            rehash_cache_contract(contract, 0)
+
+        mutations = (
+            ("cache-contract-type", lambda payload: payload.update({
+                "cache_contract": "legacy",
+            })),
+            ("cache-contract-fields", lambda payload: payload.update({
+                "cache_contract": {"schema_version": 2},
+            })),
+            ("cache-contract-version", lambda payload: payload["cache_contract"].update({
+                "schema_version": 99,
+            })),
+            ("cache-contract-semantic", forge_cache_model),
+            ("cache-contract-common-fields", forge_cache_technology_mismatch),
+            ("provenance-version", lambda payload: payload["provenance"].update({
+                "schema_version": 99,
+            })),
+            ("provenance-authority", lambda payload: payload["provenance"].update({
+                "authority": "untrusted runner",
+            })),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                r1, mcpat_path, payload = self.write_native_model_inputs(root)
+                mutate(payload)
+                mcpat_path.write_text(json.dumps(payload))
+                with self.assertRaisesRegex(
+                    ValueError, "cache contract|provenance|schema|authority",
+                ):
+                    build_model(r1, mcpat_path, root / "modules.json")
+
+    def test_build_model_rejects_non_integer_parent_core_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            r1, mcpat_path, payload = self.write_native_model_inputs(root)
+            payload["core_parent_metrics"]["records"][1]["core"] = True
+            mcpat_path.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ValueError, "parent|core"):
+                build_model(r1, mcpat_path, root / "modules.json")
+
+    def test_build_model_rejects_self_consistent_totals_that_exceed_parent(self):
+        # Break caught: module_totals is derived from modules, so changing both
+        # cannot prove subtraction against the original printed parent.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            r1, mcpat_path, payload = self.write_native_model_inputs(root)
+            child = next(
+                module for module in payload["modules"]
+                if module["name"] == "core0_ifu"
+            )
+            child["dynamic_power_w"] += 0.25
+            child["total_power_w"] += 0.25
+            payload["module_totals"] = {
+                field: sum(module[field] for module in payload["modules"])
+                for field in (
+                    "area_mm2", "dynamic_power_w", "subthreshold_leakage_w",
+                    "gate_leakage_w", "leakage_power_w", "total_power_w",
+                )
+            }
+            mcpat_path.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ValueError, "parent|subtraction|conserv"):
+                build_model(r1, mcpat_path, root / "modules.json")
+
+    def test_build_model_checks_every_parent_conservation_field(self):
+        fields = (
+            "area_mm2", "dynamic_power_w", "subthreshold_leakage_w",
+            "gate_leakage_w", "total_power_w",
+        )
+        for field in fields:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                r1, mcpat_path, payload = self.write_native_model_inputs(root)
+                payload["core_parent_metrics"]["records"][0]["core_total"][field] += 1.0
+                mcpat_path.write_text(json.dumps(payload))
+                with self.assertRaisesRegex(ValueError, "parent"):
                     build_model(r1, mcpat_path, root / "modules.json")
 
 
@@ -595,8 +792,13 @@ class McPATRunnerTests(unittest.TestCase):
         self.assertTrue((self.out / "input.xml").is_file())
         self.assertTrue((self.out / "mcpat.out").is_file())
         self.assertTrue((self.out / "mcpat.json").is_file())
+        self.assertEqual(result["provenance"]["schema_version"], 1)
         self.assertEqual(
-            result["provenance"]["output_sha256"],
+            result["provenance"]["authority"],
+            "CLIP strict patched McPAT 1.3 runner",
+        )
+        self.assertEqual(
+            result["provenance"]["hashes"]["output_sha256"],
             hashlib.sha256((self.out / "mcpat.out").read_bytes()).hexdigest(),
         )
 

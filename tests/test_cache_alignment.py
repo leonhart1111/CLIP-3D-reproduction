@@ -68,6 +68,11 @@ class CacheContractTests(unittest.TestCase):
             self.metadata(), technology_nm=45, temperature_k=320,
             device_type=0, interconnect_projection_type=1,
         )
+        self.assertEqual(contract["schema_version"], 2)
+        self.assertEqual(
+            contract["authority"],
+            "gem5 R1 metadata for McPAT cache organization",
+        )
         records = {record["level"]: record for record in contract["records"]}
         self.assertEqual(set(records), {"l1i", "l1d", "l2"})
         self.assertEqual(records["l1i"]["size_bytes"], 16 * 1024)

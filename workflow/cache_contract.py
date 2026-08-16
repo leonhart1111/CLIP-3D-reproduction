@@ -12,6 +12,9 @@ from workflow.common import parse_size_bytes
 
 DEVICE_TYPES = {0: "itrs-hp", 1: "itrs-lstp", 2: "itrs-lop"}
 INTERCONNECT_PROJECTIONS = {0: "aggressive", 1: "conservative"}
+CACHE_CONTRACT_SCHEMA_VERSION = 2
+CACHE_CONTRACT_AUTHORITY = "gem5 R1 metadata for McPAT cache organization"
+CACHE_CONTRACT_SOURCE = "gem5 R1 metadata plus explicit physical-model settings"
 MCPAT_EMBEDDED_CACTI_IDENTITY_FIELDS = (
     "access_time_s", "cache", "core", "cycle_time_s", "height_mm",
     "mcpat_version", "model", "width_mm",
@@ -170,8 +173,9 @@ def build_cache_contract(
         records.append(record)
 
     contract = {
-        "schema_version": 1,
-        "source": "gem5 R1 metadata plus explicit physical-model settings",
+        "schema_version": CACHE_CONTRACT_SCHEMA_VERSION,
+        "authority": CACHE_CONTRACT_AUTHORITY,
+        "source": CACHE_CONTRACT_SOURCE,
         "legacy_defaults_applied": applied,
         "records": records,
     }
@@ -186,6 +190,111 @@ CONTRACT_FIELDS = (
     "access_mode", "ecc", "core_count", "cacti_model",
     "cacti_cache_level",
 )
+_CACHE_COMMON_FIELDS = (
+    "technology_nm", "line_size_bytes", "temperature_k", "device_type",
+    "interconnect_projection", "access_mode", "ecc", "core_count",
+    "cacti_model", "cacti_cache_level",
+)
+
+
+def validate_cache_contract(contract: object,
+                            expected_core_count: int = 4) -> dict:
+    """Validate and return the corrected gem5-to-McPAT cache contract."""
+    if not isinstance(contract, dict) or set(contract) != {
+        "schema_version", "authority", "source", "legacy_defaults_applied",
+        "records", "contract_id",
+    }:
+        raise ValueError("McPAT cache contract has an invalid object schema")
+    if contract.get("schema_version") != CACHE_CONTRACT_SCHEMA_VERSION:
+        raise ValueError("McPAT cache contract schema_version must be 2")
+    if contract.get("authority") != CACHE_CONTRACT_AUTHORITY:
+        raise ValueError("McPAT cache contract has an invalid authority")
+    if contract.get("source") != CACHE_CONTRACT_SOURCE:
+        raise ValueError("McPAT cache contract has an invalid source")
+    if isinstance(expected_core_count, bool) or not isinstance(
+            expected_core_count, int) or expected_core_count <= 0:
+        raise ValueError("expected cache-contract core count must be positive")
+    defaults = contract.get("legacy_defaults_applied")
+    if not isinstance(defaults, dict) or any(
+        key not in {
+            "l1_cache_banks", "l2_cache_banks",
+            "l1_cache_output_width_bits", "l2_cache_output_width_bits",
+        } or isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for key, value in defaults.items()
+    ):
+        raise ValueError("McPAT cache contract legacy defaults are invalid")
+    records = contract.get("records")
+    if not isinstance(records, list) or len(records) != 3:
+        raise ValueError("McPAT cache contract must contain three records")
+    expected_record_fields = set(CONTRACT_FIELDS) | {
+        "size", "contract_record_id",
+    }
+    levels = []
+    common_settings = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != expected_record_fields:
+            raise ValueError("McPAT cache contract record schema is invalid")
+        level = record.get("level")
+        levels.append(level)
+        if record.get("core_count") != expected_core_count:
+            raise ValueError(f"McPAT cache contract {level}.core_count mismatch")
+        for field in (
+            "size_bytes", "associativity", "bank_count", "output_width_bits",
+            "technology_nm", "line_size_bytes", "temperature_k", "core_count",
+        ):
+            value = record.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"McPAT cache contract {level}.{field} is invalid")
+        size = record.get("size")
+        try:
+            valid_size = (
+                isinstance(size, str)
+                and parse_size_bytes(size) == record["size_bytes"]
+            )
+        except (TypeError, ValueError):
+            valid_size = False
+        if not valid_size:
+            raise ValueError(f"McPAT cache contract {level}.size is invalid")
+        expected_values = {
+            "device_type": tuple(DEVICE_TYPES.values()),
+            "interconnect_projection": tuple(INTERCONNECT_PROJECTIONS.values()),
+            "access_mode": ("normal",),
+            "cacti_model": ("UCA",),
+            "cacti_cache_level": ("L2",),
+        }
+        for field, allowed in expected_values.items():
+            if record.get(field) not in allowed:
+                raise ValueError(
+                    f"McPAT cache contract {level}.{field} is invalid"
+                )
+        if record.get("ecc") is not True:
+            raise ValueError(f"McPAT cache contract {level}.ecc is invalid")
+        temperature = record["temperature_k"]
+        if temperature % 10 or not 300 <= temperature <= 400:
+            raise ValueError(
+                f"McPAT cache contract {level}.temperature_k is invalid"
+            )
+        expected_record_id = stable_identity({
+            key: value for key, value in record.items()
+            if key != "contract_record_id"
+        })
+        if record.get("contract_record_id") != expected_record_id:
+            raise ValueError(
+                f"McPAT cache contract {level}.contract_record_id mismatch"
+            )
+        common_settings.append(tuple(
+            record[field] for field in _CACHE_COMMON_FIELDS
+        ))
+    if set(levels) != {"l1i", "l1d", "l2"} or len(levels) != len(set(levels)):
+        raise ValueError("McPAT cache contract cache levels are invalid")
+    if len(set(common_settings)) != 1:
+        raise ValueError("McPAT cache contract common settings disagree across levels")
+    expected_contract_id = stable_identity({
+        key: value for key, value in contract.items() if key != "contract_id"
+    })
+    if contract.get("contract_id") != expected_contract_id:
+        raise ValueError("McPAT cache contract contract_id mismatch")
+    return dict(contract)
 
 
 def validate_characterization(cacti: dict, expected_contract: dict) -> dict[str, dict]:

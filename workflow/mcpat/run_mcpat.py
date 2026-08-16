@@ -16,6 +16,8 @@ DEFAULT_MCPAT = PROJECT_ROOT / "tools/src/mcpat/mcpat"
 PATCH_FILE = PROJECT_ROOT / "patches/mcpat/0001-emit-embedded-cacti-p-metrics.patch"
 BUILD_PROVENANCE = PROJECT_ROOT / "tools/build/mcpat/build_provenance.json"
 VERSION_HEADER = "McPAT (version 1.3"
+MCPAT_PROVENANCE_SCHEMA_VERSION = 1
+MCPAT_PROVENANCE_AUTHORITY = "CLIP strict patched McPAT 1.3 runner"
 _MODEL_SETTING_KEYS = {
     "temperature_k", "device_type", "longer_channel_device",
     "interconnect_projection_type",
@@ -99,13 +101,20 @@ def run_mcpat(r1_dir: Path, output_dir: Path, settings: dict,
     parsed["cache_contract"] = mapping["cache_contract"]
     parsed["optimization_constraints"] = mapping["optimization_constraints"]
     parsed["provenance"] = {
-        "xml_sha256": sha256_file(xml_path),
-        "mapping_sha256": sha256_file(mapping_path),
-        "output_sha256": sha256_file(output_path),
-        "binary_sha256": binary_evidence["binary_sha256"],
-        "patch_sha256": sha256_file(PATCH_FILE),
-        **({"build_provenance_sha256": binary_evidence["build_provenance_sha256"]}
-           if "build_provenance_sha256" in binary_evidence else {}),
+        "schema_version": MCPAT_PROVENANCE_SCHEMA_VERSION,
+        "authority": MCPAT_PROVENANCE_AUTHORITY,
+        "hashes": {
+            "xml_sha256": sha256_file(xml_path),
+            "mapping_sha256": sha256_file(mapping_path),
+            "output_sha256": sha256_file(output_path),
+            "binary_sha256": binary_evidence["binary_sha256"],
+            "patch_sha256": sha256_file(PATCH_FILE),
+            **({
+                "build_provenance_sha256": binary_evidence[
+                    "build_provenance_sha256"
+                ],
+            } if "build_provenance_sha256" in binary_evidence else {}),
+        },
     }
     write_json(output_dir / "mcpat.json", parsed)
     return parsed

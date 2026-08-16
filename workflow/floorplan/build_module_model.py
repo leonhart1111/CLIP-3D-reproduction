@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 from pathlib import Path
 
 from workflow.common import (
@@ -17,6 +18,11 @@ from workflow.common import (
 )
 from workflow.cache_contract import (
     mcpat_embedded_cache_record_identity,
+    validate_cache_contract,
+)
+from workflow.mcpat.run_mcpat import (
+    MCPAT_PROVENANCE_AUTHORITY,
+    MCPAT_PROVENANCE_SCHEMA_VERSION,
 )
 
 
@@ -204,10 +210,13 @@ def validate_mobility_contract(modules: list[dict], expected_cores: int = 4) -> 
     if not isinstance(modules, list) or not modules:
         raise ValueError("module model must contain physical modules")
 
-    names = [str(module.get("name", "")) for module in modules]
-    if any(not name for name in names) or len(names) != len(set(names)):
+    names = [module.get("name") for module in modules]
+    if any(not isinstance(name, str) or not name for name in names) \
+            or len(names) != len(set(names)):
         raise ValueError("physical module names must be non-empty and unique")
-    if any(module.get("kind") == "core_logic" for module in modules):
+    if any(module.get("kind") == "core_logic" for module in modules) or any(
+        re.fullmatch(r"core[0-9]+_logic", name) for name in names
+    ):
         raise ValueError("aggregate core_logic fallback is not a granular module")
 
     required_kinds = {
@@ -265,16 +274,31 @@ _MCPAT_HASH_FIELDS = (
     "patch_sha256",
 )
 _CONSERVATION_FIELDS = (
-    "area_mm2", "dynamic_power_w", "leakage_power_w", "total_power_w",
+    "area_mm2", "dynamic_power_w", "subthreshold_leakage_w",
+    "gate_leakage_w", "leakage_power_w", "total_power_w",
 )
 
 
 def _validated_mcpat_provenance(mcpat: dict) -> dict:
     provenance = mcpat.get("provenance")
-    if not isinstance(provenance, dict):
-        raise ValueError("McPAT artifact lacks hash provenance")
-    for field in _MCPAT_HASH_FIELDS:
-        value = provenance.get(field)
+    if not isinstance(provenance, dict) or set(provenance) != {
+        "schema_version", "authority", "hashes",
+    }:
+        raise ValueError("McPAT artifact lacks versioned hash provenance")
+    if provenance.get("schema_version") != MCPAT_PROVENANCE_SCHEMA_VERSION:
+        raise ValueError("McPAT provenance schema_version must be 1")
+    if provenance.get("authority") != MCPAT_PROVENANCE_AUTHORITY:
+        raise ValueError("McPAT provenance authority is invalid")
+    hashes = provenance.get("hashes")
+    required_hashes = set(_MCPAT_HASH_FIELDS)
+    allowed_hash_sets = (
+        required_hashes,
+        required_hashes | {"build_provenance_sha256"},
+    )
+    if not isinstance(hashes, dict) or set(hashes) not in allowed_hash_sets:
+        raise ValueError("McPAT provenance hash schema is invalid")
+    for field in hashes:
+        value = hashes.get(field)
         try:
             valid = (
                 isinstance(value, str) and len(value) == 64
@@ -284,14 +308,124 @@ def _validated_mcpat_provenance(mcpat: dict) -> dict:
             valid = False
         if not valid:
             raise ValueError(f"McPAT provenance {field} must be a nonzero SHA-256 hash")
-    return dict(provenance)
+    return {
+        "schema_version": MCPAT_PROVENANCE_SCHEMA_VERSION,
+        "authority": MCPAT_PROVENANCE_AUTHORITY,
+        "hashes": dict(hashes),
+    }
 
 
-def _validate_module_conservation(mcpat: dict, modules: list[dict]) -> tuple[dict, dict]:
-    totals = {
+def _metric_totals(modules: list[dict]) -> dict:
+    return {
         field: sum(float(module[field]) for module in modules)
         for field in _CONSERVATION_FIELDS
     }
+
+
+def _validate_parent_metrics(metrics: object, label: str) -> dict:
+    if not isinstance(metrics, dict) or set(metrics) != set(_CONSERVATION_FIELDS):
+        raise ValueError(f"McPAT parent {label} has an invalid metric schema")
+    validated = {}
+    for field in _CONSERVATION_FIELDS:
+        value = metrics[field]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(float(value)) or float(value) < 0:
+            raise ValueError(f"McPAT parent {label}.{field} must be finite and nonnegative")
+        validated[field] = float(value)
+    if not math.isclose(
+        validated["leakage_power_w"],
+        validated["subthreshold_leakage_w"] + validated["gate_leakage_w"],
+        rel_tol=1e-12, abs_tol=1e-12,
+    ) or not math.isclose(
+        validated["total_power_w"],
+        validated["dynamic_power_w"] + validated["leakage_power_w"],
+        rel_tol=1e-12, abs_tol=1e-12,
+    ):
+        raise ValueError(f"McPAT parent {label} has inconsistent derived power")
+    return validated
+
+
+def _compare_parent_to_children(parent: dict, children: list[dict],
+                                label: str) -> dict:
+    observed = _metric_totals(children)
+    residuals = {}
+    for field in _CONSERVATION_FIELDS:
+        residuals[field] = observed[field] - parent[field]
+        if not math.isclose(
+            observed[field], parent[field], rel_tol=1e-12, abs_tol=1e-12,
+        ):
+            raise ValueError(
+                f"McPAT parent conservation failed for {label}.{field}: "
+                f"parent={parent[field]}, children={observed[field]}"
+            )
+    return residuals
+
+
+def _validate_core_parent_conservation(mcpat: dict, modules: list[dict]) -> dict:
+    evidence = mcpat.get("core_parent_metrics")
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "schema_version", "authority", "records",
+    } or evidence.get("schema_version") != 1 or evidence.get("authority") != (
+        "McPAT print-level-5 parent blocks before subtraction"
+    ) or not isinstance(evidence.get("records"), list):
+        raise ValueError("McPAT artifact lacks versioned parent subtraction evidence")
+    records = evidence["records"]
+    if len(records) != 4 or any(
+        not isinstance(record, dict)
+        or isinstance(record.get("core"), bool)
+        or not isinstance(record.get("core"), int)
+        for record in records
+    ) or {record["core"] for record in records} != set(range(4)):
+        raise ValueError("McPAT parent subtraction evidence must cover four cores")
+
+    residuals = []
+    for core in range(4):
+        record = next(record for record in records if record.get("core") == core)
+        if set(record) != {
+            "core", "core_total", "instruction_fetch_unit", "load_store_unit",
+        }:
+            raise ValueError(f"McPAT core {core} parent evidence schema is invalid")
+        parents = {
+            label: _validate_parent_metrics(record[key], f"core{core}.{label}")
+            for label, key in (
+                ("core_total", "core_total"),
+                ("instruction_fetch_unit", "instruction_fetch_unit"),
+                ("load_store_unit", "load_store_unit"),
+            )
+        }
+        core_modules = [module for module in modules if module.get("core") == core]
+        ifu_children = [
+            module for module in core_modules
+            if module.get("kind") in {"core_ifu", "l1i"}
+        ]
+        lsu_children = [
+            module for module in core_modules
+            if module.get("kind") in {"core_lsu", "l1d"}
+        ]
+        residuals.append({
+            "core": core,
+            "core_total": _compare_parent_to_children(
+                parents["core_total"], core_modules, f"core{core}.core_total"
+            ),
+            "instruction_fetch_unit": _compare_parent_to_children(
+                parents["instruction_fetch_unit"], ifu_children,
+                f"core{core}.instruction_fetch_unit",
+            ),
+            "load_store_unit": _compare_parent_to_children(
+                parents["load_store_unit"], lsu_children,
+                f"core{core}.load_store_unit",
+            ),
+        })
+    return {
+        "authority": evidence["authority"],
+        "serialized_children_minus_parent": residuals,
+    }
+
+
+def _validate_module_conservation(
+        mcpat: dict, modules: list[dict], *, require_granular_cores: bool,
+) -> tuple[dict, dict]:
+    totals = _metric_totals(modules)
     expected = mcpat.get("module_totals")
     if not isinstance(expected, dict):
         raise ValueError("McPAT artifact lacks module_totals conservation evidence")
@@ -309,7 +443,7 @@ def _validate_module_conservation(mcpat: dict, modules: list[dict]) -> tuple[dic
                 f"McPAT module conservation failed for {field}: "
                 f"source={source_value}, serialized={observed}"
             )
-    return totals, {
+    result = {
         "status": "passed",
         "source": "McPAT parsed module_totals",
         "relative_tolerance": 1e-12,
@@ -317,6 +451,11 @@ def _validate_module_conservation(mcpat: dict, modules: list[dict]) -> tuple[dic
         "source_totals": {field: float(expected[field]) for field in _CONSERVATION_FIELDS},
         "serialized_minus_source": residuals,
     }
+    if require_granular_cores:
+        result["parent_subtraction"] = _validate_core_parent_conservation(
+            mcpat, modules
+        )
+    return totals, result
 
 
 def _validate_module_power(module: dict) -> None:
@@ -370,9 +509,9 @@ def build_model(r1_dir: Path, mcpat_json: Path, output: Path,
         require_communication_profile,
     )
     mcpat = read_json(mcpat_json)
-    cache_contract = mcpat.get("cache_contract")
-    if cache_contract is None:
-        raise ValueError("McPAT artifact lacks the shared cache_contract")
+    cache_contract = validate_cache_contract(
+        mcpat.get("cache_contract"), expected_core_count=4,
+    )
     embedded = mcpat.get("embedded_cacti_p") or {}
     if embedded.get("schema_version") != 1 or embedded.get(
             "authority") != "McPAT 1.3 embedded CACTI-P":
@@ -432,7 +571,9 @@ def build_model(r1_dir: Path, mcpat_json: Path, output: Path,
                 module["name"] for module in modules if module["name"] != "shared_l2"
             ],
         }
-    totals, conservation = _validate_module_conservation(mcpat, modules)
+    totals, conservation = _validate_module_conservation(
+        mcpat, modules, require_granular_cores=require_granular_cores,
+    )
     kinds = sorted({module["kind"] for module in modules})
     by_kind = {
         kind: {

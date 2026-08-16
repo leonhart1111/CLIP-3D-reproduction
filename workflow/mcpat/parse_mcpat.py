@@ -102,7 +102,7 @@ def subtract(base: dict[str, float], children: list[dict[str, float]]) -> dict[s
 
 def granular_core_logic(chunk: str, core_total: dict[str, float],
                         icache: dict[str, float], dcache: dict[str, float],
-                        core_index: int) -> list[dict] | None:
+                        core_index: int) -> tuple[list[dict], dict] | None:
     """Return non-overlapping top-level McPAT core blocks when available.
 
     Detailed McPAT output contains workload-dependent power for IFU, rename,
@@ -126,6 +126,12 @@ def granular_core_logic(chunk: str, core_total: dict[str, float],
         }
     except ValueError:
         return None
+    parent_metrics = {
+        "core": core_index,
+        "core_total": dict(core_total),
+        "instruction_fetch_unit": dict(values["ifu"]),
+        "load_store_unit": dict(values["lsu"]),
+    }
     values["ifu"] = subtract(values["ifu"], [icache])
     values["lsu"] = subtract(values["lsu"], [dcache])
     pieces = []
@@ -141,7 +147,7 @@ def granular_core_logic(chunk: str, core_total: dict[str, float],
             "name": f"core{core_index}_other", "kind": "core_other",
             "core": core_index, **remainder,
         })
-    return pieces
+    return pieces, parent_metrics
 
 
 def _parse_mcpat_power_blocks(text: str) -> dict:
@@ -157,16 +163,20 @@ def _parse_mcpat_power_blocks(text: str) -> dict:
         raise ValueError("McPAT must be run with -print_level 5 to expose core submodules")
 
     modules = []
+    core_parent_records = []
     for index, chunk in enumerate(core_chunks):
         core_total = metrics(chunk[re.search(r"^Core:\s*$", chunk, re.M).end():])
         icache = metrics(first_heading_block(chunk, "Instruction Cache"))
         dcache = metrics(first_heading_block(chunk, "Data Cache"))
-        logic_blocks = granular_core_logic(chunk, core_total, icache, dcache, index)
-        if logic_blocks is None:
+        granular = granular_core_logic(chunk, core_total, icache, dcache, index)
+        if granular is None:
             logic_blocks = [{
                 "name": f"core{index}_logic", "kind": "core_logic", "core": index,
                 **subtract(core_total, [icache, dcache]),
             }]
+        else:
+            logic_blocks, parent_metrics = granular
+            core_parent_records.append(parent_metrics)
         modules.extend(logic_blocks)
         modules.extend((
             {"name": f"core{index}_l1i", "kind": "l1i", "core": index, **icache},
@@ -183,7 +193,10 @@ def _parse_mcpat_power_blocks(text: str) -> dict:
 
     totals = {
         key: sum(module[key] for module in modules)
-        for key in ("area_mm2", "dynamic_power_w", "leakage_power_w", "total_power_w")
+        for key in (
+            "area_mm2", "dynamic_power_w", "subthreshold_leakage_w",
+            "gate_leakage_w", "leakage_power_w", "total_power_w",
+        )
     }
     return {
         "schema_version": 1,
@@ -197,6 +210,11 @@ def _parse_mcpat_power_blocks(text: str) -> dict:
         "processor": processor,
         "modules": modules,
         "module_totals": totals,
+        "core_parent_metrics": {
+            "schema_version": 1,
+            "authority": "McPAT print-level-5 parent blocks before subtraction",
+            "records": core_parent_records,
+        },
         "checks": {
             "core_count": len(core_chunks),
             "core_logic_granularity": (

@@ -874,17 +874,25 @@ class ParserTests(unittest.TestCase):
                 modules.extend((
                     {"name": f"core{core}_logic", "kind": "core_logic", "core": core,
                      "area_mm2": 1.0, "dynamic_power_w": 1.0,
+                     "subthreshold_leakage_w": 0.08,
+                     "gate_leakage_w": 0.02,
                      "leakage_power_w": 0.1, "total_power_w": 1.1},
                     {"name": f"core{core}_l1i", "kind": "l1i", "core": core,
                      "area_mm2": 0.2, "dynamic_power_w": 0.1,
+                     "subthreshold_leakage_w": 0.015,
+                     "gate_leakage_w": 0.005,
                      "leakage_power_w": 0.02, "total_power_w": 0.12},
                     {"name": f"core{core}_l1d", "kind": "l1d", "core": core,
                      "area_mm2": 0.3, "dynamic_power_w": 0.1,
+                     "subthreshold_leakage_w": 0.015,
+                     "gate_leakage_w": 0.005,
                      "leakage_power_w": 0.02, "total_power_w": 0.12},
                 ))
             modules.append({
                 "name": "shared_l2", "kind": "l2", "area_mm2": 1.0,
-                "dynamic_power_w": 0.1, "leakage_power_w": 0.1,
+                "dynamic_power_w": 0.1,
+                "subthreshold_leakage_w": 0.08,
+                "gate_leakage_w": 0.02, "leakage_power_w": 0.1,
                 "total_power_w": 0.2,
             })
             records = []
@@ -904,8 +912,8 @@ class ParserTests(unittest.TestCase):
             module_totals = {
                 field: sum(module[field] for module in modules)
                 for field in (
-                    "area_mm2", "dynamic_power_w", "leakage_power_w",
-                    "total_power_w",
+                    "area_mm2", "dynamic_power_w", "subthreshold_leakage_w",
+                    "gate_leakage_w", "leakage_power_w", "total_power_w",
                 )
             }
             write_json(mcpat_path, {
@@ -922,9 +930,15 @@ class ParserTests(unittest.TestCase):
                     "records": records,
                 },
                 "provenance": {
-                    "xml_sha256": "1" * 64, "mapping_sha256": "2" * 64,
-                    "output_sha256": "3" * 64, "binary_sha256": "4" * 64,
-                    "patch_sha256": "5" * 64,
+                    "schema_version": 1,
+                    "authority": "CLIP strict patched McPAT 1.3 runner",
+                    "hashes": {
+                        "xml_sha256": "1" * 64,
+                        "mapping_sha256": "2" * 64,
+                        "output_sha256": "3" * 64,
+                        "binary_sha256": "4" * 64,
+                        "patch_sha256": "5" * 64,
+                    },
                 },
             })
             output = root / "modules.json"
