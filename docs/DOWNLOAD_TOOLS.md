@@ -93,6 +93,27 @@ fi
 make -C tools/src/hotspot hotspot
 ```
 
+### McPAT 内嵌 CACTI-P 指标补丁与重建
+
+McPAT 已内嵌 CACTI-P；本工程不再为校正后的流程单独运行 CACTI。每次重新下载
+McPAT 后，使用下列脚本应用受版本约束的补丁并执行干净重建：
+
+```bash
+scripts/build_mcpat.sh
+```
+
+脚本会先以反向 dry-run 检测已经应用的补丁；否则仅在正向 dry-run 成功时应用
+`patches/mcpat/0001-emit-embedded-cacti-p-metrics.patch`。补丁只在 McPAT print level 5
+输出已计算的内嵌 CACTI-P `local_result`，并以 `CLIP_MCPAT_CACTI_P_V1` 记录 L1I、L1D
+和共享 L2 的访问时间、周期时间与阵列尺寸；它不改变 CACTI-P 的输入、代价函数或
+缓存构建。脚本运行 `make clean` 后重建，并为实际二进制和补丁 SHA-256、构建命令及
+UTC 时间戳写入 `tools/build/mcpat/build_provenance.json`。
+
+上游 McPAT makefile 默认强制 `-m32`。脚本默认通过 `CXX=g++ CC=gcc` 进行本机构建，
+以避免未安装 32 位开发头文件的主机失败；如需另一套编译器，可在调用前设置
+`MCPAT_CXX` 和 `MCPAT_CC`。脚本仅修改不受仓库跟踪的 `tools/src/mcpat` 工具树，绝不
+修改 CLIP 仓库中受跟踪的源码。
+
 ## 4. 指定其他版本
 
 下载脚本接受环境变量。例如：

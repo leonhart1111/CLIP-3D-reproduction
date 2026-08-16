@@ -1,0 +1,59 @@
+--- a/processor.cc
++++ b/processor.cc
+@@ -33,6 +33,7 @@
+ #include <cmath>
+ #include <assert.h>
+ #include <fstream>
++#include <iomanip>
+ #include "parameter.h"
+ #include "array.h"
+ #include "const.h"
+@@ -43,6 +44,26 @@
+ #include "version.h"
+ 
+ 
++static void emit_embedded_cacti_p_metric(
++    const char *cache_name, int core_index, const uca_org_t &result)
++{
++	std::ios::fmtflags saved_flags = std::cout.flags();
++	std::streamsize saved_precision = std::cout.precision();
++	std::cout << std::scientific << std::setprecision(17)
++		<< "CLIP_MCPAT_CACTI_P_V1"
++		<< " cache=" << cache_name
++		<< " core=" << core_index
++		<< " access_time_s=" << result.access_time
++		<< " cycle_time_s=" << result.cycle_time
++		<< " height_mm=" << result.cache_ht * 1e-3
++		<< " width_mm=" << result.cache_len * 1e-3
++		<< " mcpat_version=1.3 model=embedded-cacti-p"
++		<< std::endl;
++	std::cout.flags(saved_flags);
++	std::cout.precision(saved_precision);
++}
++
++
+ Processor::Processor(ParseXML *XML_interface)
+ :XML(XML_interface),//TODO: using one global copy may have problems.
+  mc(0),
+@@ -699,6 +719,21 @@
+ 				cout <<"*****************************************************************************************"<<endl;
+ 			}
+ 		}
++		if (plevel >= 5)
++		{
++			for (i = 0; i < numCore; i++)
++			{
++				emit_embedded_cacti_p_metric("l1i", i,
++					cores[i]->ifu->icache.caches->local_result);
++				emit_embedded_cacti_p_metric("l1d", i,
++					cores[i]->lsu->dcache.caches->local_result);
++			}
++			for (i = 0; i < numL2; i++)
++			{
++				emit_embedded_cacti_p_metric("l2", -1,
++					l2array[i]->unicache.caches->local_result);
++			}
++		}
+ 	}
+ 	else
+ 	{
