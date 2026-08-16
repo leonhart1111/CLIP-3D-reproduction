@@ -1016,6 +1016,31 @@ Cache height x width (mm): 2 x 4
             "McPAT top-level functional blocks",
         )
 
+    def test_strict_parser_rejects_aggregate_core_fallback(self):
+        sep = "*" * 40
+        processor = metric_lines(12, 6, 1, 1)
+        core = (
+            metric_lines(8, 4, 0.8, 0.2)
+            + "Instruction Cache:\n" + metric_lines(1, 0.5, 0.1, 0.1, "    ")
+            + "Data Cache:\n" + metric_lines(2, 1, 0.2, 0.1, "    ")
+        )
+        text = (
+            "Technology 45 nm\nCore clock Rate(MHz) 2000\nProcessor:\n" + processor
+            + f"\n{sep}\nCore:\n" + core + f"\n{sep}\nL2\n" + metric_lines(3, 1, 0.3, 0.2)
+        )
+        self.assertEqual(
+            parse_mcpat_text(
+                text, require_granular_cores=False, require_embedded_cacti=False,
+            )["checks"]["core_logic_granularity"],
+            "legacy aggregate core_logic fallback",
+        )
+        with self.assertRaises(ValueError):
+            parse_mcpat_text(text, expected_core_count=4)
+        with self.assertRaises(ValueError):
+            parse_mcpat_text(text, expected_core_count=1, require_granular_cores=True)
+        with self.assertRaises(ValueError):
+            parse_mcpat_text(text, expected_core_count=1, require_embedded_cacti=True)
+
     def test_module_model_consumes_cacti_cache_geometry(self):
         modules = [
             {"name": "core0_logic", "kind": "core_logic", "area_mm2": 10.0,

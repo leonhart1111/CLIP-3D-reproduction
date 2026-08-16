@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 from workflow.common import write_json
+from workflow.mcpat.cache_metrics import parse_embedded_cacti_records
 
 
 METRIC_RE = re.compile(
@@ -143,7 +144,7 @@ def granular_core_logic(chunk: str, core_total: dict[str, float],
     return pieces
 
 
-def parse_mcpat_text(text: str) -> dict:
+def _parse_mcpat_power_blocks(text: str) -> dict:
     technology = re.search(r"Technology\s+([0-9.]+)\s+nm", text)
     clock = re.search(r"Core clock Rate\(MHz\)\s+([0-9.]+)", text)
     processor_match = re.search(r"^Processor:\s*$", text, re.M)
@@ -207,6 +208,62 @@ def parse_mcpat_text(text: str) -> dict:
             "note": "Processor totals may contain components intentionally omitted from the physical module list.",
         },
     }
+
+
+def require_exact_core_count(result: dict, expected: int) -> None:
+    """Require exactly cores 0 through ``expected - 1`` in McPAT modules."""
+    if isinstance(expected, bool) or expected <= 0:
+        raise ValueError("expected core count must be a positive integer")
+    observed = {
+        module.get("core") for module in result.get("modules", [])
+        if module.get("core") is not None
+    }
+    required = set(range(expected))
+    if observed != required or result.get("checks", {}).get("core_count") != expected:
+        raise ValueError(
+            f"McPAT core count mismatch: expected {expected}, observed {sorted(observed)}"
+        )
+
+
+def require_detailed_functional_blocks(result: dict) -> None:
+    """Reject the legacy aggregate core rectangle in strict physical parsing."""
+    modules = result.get("modules", [])
+    if any(re.fullmatch(r"core[0-9]+_logic", str(module.get("name", "")))
+           for module in modules):
+        raise ValueError("strict McPAT parsing rejects aggregate core_logic modules")
+    required_kinds = {
+        "core_ifu", "core_rename", "core_lsu", "core_mmu", "core_exec",
+    }
+    for core in {module.get("core") for module in modules if module.get("core") is not None}:
+        found = {
+            module.get("kind") for module in modules if module.get("core") == core
+        }
+        missing = required_kinds - found
+        if missing:
+            raise ValueError(
+                f"McPAT core {core} lacks detailed functional blocks: {sorted(missing)}"
+            )
+
+
+def parse_mcpat_text(
+        text: str, *, expected_core_count: int | None = None,
+        require_granular_cores: bool = False,
+        require_embedded_cacti: bool = False) -> dict:
+    """Parse McPAT output, enabling formal physical-model checks on demand."""
+    result = _parse_mcpat_power_blocks(text)
+    if expected_core_count is not None:
+        require_exact_core_count(result, expected_core_count)
+    if require_granular_cores:
+        require_detailed_functional_blocks(result)
+    if require_embedded_cacti:
+        result["embedded_cacti_p"] = {
+            "schema_version": 1,
+            "authority": "McPAT 1.3 embedded CACTI-P",
+            "records": parse_embedded_cacti_records(
+                text, expected_core_count or 4
+            ),
+        }
+    return result
 
 
 def main() -> None:

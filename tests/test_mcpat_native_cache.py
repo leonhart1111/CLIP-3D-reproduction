@@ -8,12 +8,80 @@ import subprocess
 import tempfile
 import unittest
 
+from workflow.mcpat.cache_metrics import parse_embedded_cacti_records
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PATCH = ROOT / "patches/mcpat/0001-emit-embedded-cacti-p-metrics.patch"
 BUILD = ROOT / "scripts/build_mcpat.sh"
 MCPAT_SOURCE = ROOT / "tools/src/mcpat"
 MARKER = "CLIP_MCPAT_CACTI_P_V1"
+
+
+def native_text() -> str:
+    records = []
+    for cache, core in (
+        *(("l1i", index) for index in range(4)),
+        *(("l1d", index) for index in range(4)),
+        ("l2", -1),
+    ):
+        records.append(
+            f"{MARKER} cache={cache} core={core} "
+            "access_time_s=1.25000000000000000e-09 "
+            "cycle_time_s=2.50000000000000000e-09 "
+            "height_mm=4.00000000000000000e-01 "
+            "width_mm=8.00000000000000000e-01 "
+            "mcpat_version=1.3 model=embedded-cacti-p"
+        )
+    return "\n".join(records) + "\n"
+
+
+def duplicate_l1i() -> str:
+    return native_text() + native_text().splitlines()[0] + "\n"
+
+
+def nan_l2() -> str:
+    return native_text().replace(
+        "access_time_s=1.25000000000000000e-09",
+        "access_time_s=nan",
+        1,
+    )
+
+
+def missing_core3_l1d() -> str:
+    return "\n".join(
+        line for line in native_text().splitlines()
+        if not ("cache=l1d" in line and "core=3" in line)
+    ) + "\n"
+
+
+def noncanonical_l2_core() -> str:
+    return native_text().replace("cache=l2 core=-1", "cache=l2 core=-2")
+
+
+class EmbeddedCACTIParserTests(unittest.TestCase):
+    def test_accepts_exact_four_core_record_set(self):
+        records = parse_embedded_cacti_records(native_text(), expected_core_count=4)
+        self.assertEqual(len(records), 9)
+        self.assertEqual(
+            {(record["cache"], record["core"]) for record in records},
+            {
+                *(("l1i", index) for index in range(4)),
+                *(("l1d", index) for index in range(4)),
+                ("l2", None),
+            },
+        )
+        self.assertEqual(
+            records[0]["record_id"],
+            "800ce674d18a6e977cda6ef8d65e7731968e8cf60c34be8dcd2acb0bd47061ca",
+        )
+
+    def test_rejects_duplicate_nonfinite_and_missing_records(self):
+        for broken in (
+            duplicate_l1i(), nan_l2(), missing_core3_l1d(), noncanonical_l2_core()
+        ):
+            with self.assertRaises(ValueError):
+                parse_embedded_cacti_records(broken, expected_core_count=4)
 
 
 class McPATPatchTests(unittest.TestCase):
