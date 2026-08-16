@@ -987,6 +987,45 @@ class BalancedSelectionTests(unittest.TestCase):
         self.assertEqual(report["clip3d"]["existing_r2_count"], 0)
         self.assertEqual(report["config_sha256"], sha256_file(self.config_path))
 
+    def test_batch_sweep_rejects_native_roots_from_different_r1_before_mutation(self):
+        """Batch admission binds every physical point to the supplied R1 root."""
+        import workflow.r2.run_paired_sweep as paired
+
+        def snapshot(root: Path) -> dict[str, bytes]:
+            return {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+
+        fixed_root, clip_root = self._write_layout_roots()
+        alternate_r1_root = self.root / "alternate-r1"
+        shutil.copytree(self.root / "native-r1", alternate_r1_root)
+        status_root = self.root / "paired-status"
+        before = {
+            "fixed": snapshot(fixed_root),
+            "clip": snapshot(clip_root),
+        }
+
+        with patch.object(
+            paired, "ProcessPoolExecutor",
+            side_effect=AssertionError("wrong-R1 roots must not submit workers"),
+        ) as executor, patch.object(
+            paired.run_r2, "run",
+            side_effect=AssertionError("wrong-R1 roots must not execute R2"),
+        ), patch.object(
+            paired.attach_result, "attach",
+            side_effect=AssertionError("wrong-R1 roots must not attach R2"),
+        ), self.assertRaisesRegex(ValueError, "R1"):
+            paired.run_sweep(
+                alternate_r1_root, fixed_root, clip_root, self.manifest_path,
+                self.config_path, status_root,
+            )
+
+        executor.assert_not_called()
+        self.assertEqual(snapshot(fixed_root), before["fixed"])
+        self.assertEqual(snapshot(clip_root), before["clip"])
+        self.assertFalse(status_root.exists())
+
     def test_preflight_rejects_a_missing_unselected_canonical_point(self):
         """Checking only the selected 50 would hide an incomplete layout generation."""
         from workflow.experiments.balanced50 import validate_layout_roots

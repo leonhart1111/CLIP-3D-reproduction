@@ -87,6 +87,27 @@ def _sweep_lock_paths(fixed_root: Path, clip_root: Path) -> list[Path]:
     ]
 
 
+def _require_existing_locks_available(paths: list[Path],
+                                      conflict_message: str) -> None:
+    """Probe existing lock files without creating filesystem state."""
+    for path in _ordered_lock_paths(paths):
+        try:
+            descriptor = os.open(path, os.O_RDWR)
+        except FileNotFoundError:
+            continue
+        acquired = False
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError(conflict_message) from error
+            acquired = True
+        finally:
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
 def _pair_lock_paths(key: ArchitectureKey, fixed_root: Path,
                      clip_root: Path) -> list[Path]:
     relative = key.relative_path()
@@ -928,19 +949,46 @@ def run_sweep(r1_root: Path, fixed_root: Path, clip_root: Path,
         raise ValueError("jobs must be positive")
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
+    r1_root = Path(r1_root).resolve()
     fixed_root = Path(fixed_root).resolve()
     clip_root = Path(clip_root).resolve()
+    selection_path = Path(selection_path).resolve()
+    config_path = Path(config_path).resolve()
     status_root = Path(status_root).resolve()
     sweep_locks = _sweep_lock_paths(fixed_root, clip_root)
+    conflict_message = "paired R2 sweep is already active on a physical root"
+    _require_existing_locks_available(sweep_locks, conflict_message)
+    _validate_sweep_preflight(
+        r1_root, fixed_root, clip_root, selection_path, config_path, rerun,
+    )
     with _execution_locks(
             sweep_locks, blocking=False,
-            conflict_message=(
-                "paired R2 sweep is already active on a physical root"
-            )):
+            conflict_message=conflict_message):
         return _run_sweep_locked(
             r1_root, fixed_root, clip_root, selection_path, config_path,
             status_root, jobs=jobs, rerun=rerun, limit=limit,
         )
+
+
+def _validate_sweep_preflight(
+        r1_root: Path, fixed_root: Path, clip_root: Path,
+        selection_path: Path, config_path: Path, rerun: bool,
+) -> tuple[list[ArchitectureKey], dict]:
+    """Validate one batch snapshot without publishing scheduler state."""
+    selection = load_selection(Path(selection_path).resolve())
+    all_keys = selection_keys(selection)
+    preflight = _require_native_preflight(validate_layout_roots(
+        Path(fixed_root).resolve(), Path(clip_root).resolve(), all_keys,
+        Path(config_path).resolve(), selection=selection,
+        require_layout_only=False,
+        existing_r2_validator=_existing_r2_validator(
+            Path(r1_root).resolve(), Path(fixed_root).resolve(),
+            Path(clip_root).resolve(), Path(config_path).resolve(),
+            rerun_requested=rerun,
+        ),
+        expected_r1_root=Path(r1_root).resolve(),
+    ))
+    return all_keys, preflight
 
 
 def _run_sweep_locked(r1_root: Path, fixed_root: Path, clip_root: Path,
@@ -958,16 +1006,9 @@ def _run_sweep_locked(r1_root: Path, fixed_root: Path, clip_root: Path,
     selection_path = Path(selection_path).resolve()
     config_path = Path(config_path).resolve()
     status_root = Path(status_root).resolve()
-    selection = load_selection(selection_path)
-    all_keys = selection_keys(selection)
-    preflight = _require_native_preflight(validate_layout_roots(
-        fixed_root, clip_root, all_keys, config_path,
-        selection=selection, require_layout_only=False,
-        existing_r2_validator=_existing_r2_validator(
-            r1_root, fixed_root, clip_root, config_path,
-            rerun_requested=rerun,
-        ),
-    ))
+    all_keys, preflight = _validate_sweep_preflight(
+        r1_root, fixed_root, clip_root, selection_path, config_path, rerun,
+    )
     keys = all_keys if limit is None else all_keys[:limit]
     limited_run = limit is not None
     started = time.time()

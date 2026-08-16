@@ -224,9 +224,13 @@ def validate_layout_point(
 
 def _validate_root(root: Path, method: str, canonical: list[ArchitectureKey],
                    config: dict, config_path: Path, require_layout_only: bool,
-                   existing_r2_validator: Callable[[str, ArchitectureKey, Path], dict] | None
+                   existing_r2_validator: Callable[[str, ArchitectureKey, Path], dict] | None,
+                   expected_r1_root: Path | None = None,
                    ) -> dict:
     root = root.resolve()
+    expected_r1_root = (
+        None if expected_r1_root is None else Path(expected_r1_root).resolve()
+    )
     expected_paths = {key.relative_path().as_posix() for key in canonical}
     found_paths = {
         path.parent.relative_to(root).as_posix()
@@ -248,6 +252,10 @@ def _validate_root(root: Path, method: str, canonical: list[ArchitectureKey],
             point, method, key, config, config_path,
             require_layout_only=require_layout_only,
             existing_r2_validator=existing_r2_validator,
+            expected_r1=(
+                None if expected_r1_root is None
+                else expected_r1_root / key.relative_path()
+            ),
         )
         physical_authority = decision["cache_authority"]
         existing_r2 += int(decision["has_r2"])
@@ -264,6 +272,7 @@ def validate_layout_roots(
         *, selection: dict,
         require_layout_only: bool = True,
         existing_r2_validator: Callable[[str, ArchitectureKey, Path], dict] | None = None,
+        expected_r1_root: Path | None = None,
 ) -> dict:
     """Validate complete paired layout roots before layout-only or resumable R2 work."""
     config_path = Path(config_path).resolve()
@@ -292,11 +301,11 @@ def validate_layout_roots(
         raise ValueError("resume preflight requires existing_r2_validator")
     fixed = _validate_root(
         Path(fixed_root), "fixed-bin", canonical, config, config_path,
-        require_layout_only, existing_r2_validator,
+        require_layout_only, existing_r2_validator, expected_r1_root,
     )
     clip3d = _validate_root(
         Path(clip_root), "clip3d", canonical, config, config_path,
-        require_layout_only, existing_r2_validator,
+        require_layout_only, existing_r2_validator, expected_r1_root,
     )
     return {
         "schema_version": 1,
