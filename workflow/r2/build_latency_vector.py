@@ -39,7 +39,13 @@ def access_cycles(access_time_s: float,
     raw = access * frequency
     if not math.isfinite(raw):
         raise ValueError("McPAT CACTI-P raw access cycles must be finite")
-    return raw, max(1, math.ceil(raw))
+    nearest_integer = round(raw)
+    ceiling_input = (
+        float(nearest_integer)
+        if math.isclose(raw, nearest_integer, rel_tol=0.0, abs_tol=1e-12)
+        else raw
+    )
+    return raw, max(1, math.ceil(ceiling_input))
 
 
 def _validated_hashes(model: dict) -> dict[str, str]:

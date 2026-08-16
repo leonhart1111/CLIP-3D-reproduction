@@ -11,6 +11,7 @@ from workflow.cache_contract import (
     build_cache_contract,
     cache_access_cycles,
     characterization_identity,
+    mcpat_embedded_cache_record_identity,
     stable_identity,
     validate_characterization,
 )
@@ -242,6 +243,55 @@ class CharacterizationIdentityTests(unittest.TestCase):
         result["characterization_id"] = characterization_identity(result)
         return result
 
+    def native_model(self):
+        metadata = {
+            **CacheContractTests().metadata(), "cpu_clock": "2GHz",
+        }
+        timing = {
+            "l1i": (0.5e-9, 0.75e-9),
+            "l1d": (1.5e-9, 1.75e-9),
+            "l2": (2.5e-9, 2.75e-9),
+        }
+        records = []
+        for cache, core in (
+            *(("l1i", core) for core in range(4)),
+            *(("l1d", core) for core in range(4)),
+            ("l2", None),
+        ):
+            access, cycle = timing[cache]
+            record = {
+                "cache": cache, "core": core,
+                "access_time_s": access, "cycle_time_s": cycle,
+                "height_mm": 0.5, "width_mm": 1.0,
+                "mcpat_version": "1.3", "model": "embedded-cacti-p",
+            }
+            record["record_id"] = mcpat_embedded_cache_record_identity(record)
+            records.append(record)
+        return {
+            "schema_version": 3,
+            "architecture": metadata,
+            "cache_contract": self.contract(),
+            "cache_authority": "McPAT 1.3 embedded CACTI-P",
+            "embedded_cacti_p": {
+                "schema_version": 1,
+                "authority": "McPAT 1.3 embedded CACTI-P",
+                "records": records,
+            },
+            "mcpat_provenance": {
+                "schema_version": 1,
+                "authority": "CLIP strict patched McPAT 1.3 runner",
+                "hashes": {
+                    "xml_sha256": "1" * 64,
+                    "mapping_sha256": "2" * 64,
+                    "output_sha256": "3" * 64,
+                    "binary_sha256": "4" * 64,
+                    "patch_sha256": "5" * 64,
+                },
+            },
+            "communication_profile": {"status": "unavailable"},
+            "modules": [],
+        }
+
     def test_valid_characterization_returns_distinct_level_records(self):
         selected = validate_characterization(
             self.characterization(), self.contract()
@@ -296,60 +346,37 @@ class CharacterizationIdentityTests(unittest.TestCase):
             characterization_identity(first), characterization_identity(second)
         )
 
-    def test_r2_records_the_same_characterization_and_record_identities(self):
+    def test_r2_records_native_record_and_runner_identities(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            contract = self.contract()
-            cacti = self.characterization()
-            model = {
-                "architecture": {
-                    **CacheContractTests().metadata(), "num_cores": 4,
-                },
-                "cache_contract": contract,
-                "cacti_characterization_id": cacti["characterization_id"],
-                "communication_profile": {"status": "unavailable"},
-                "modules": [],
-            }
+            model = self.native_model()
             modules = root / "modules.json"
-            cacti_path = root / "cacti.json"
             write_json(modules, model)
-            write_json(cacti_path, cacti)
 
             vector = build_vector(
-                modules, cacti_path, root / "latency.json",
+                modules, root / "latency.json",
                 tsv_hops=1, wire_cycles=0,
             )
 
-            provenance = vector["cacti_provenance"]
+            provenance = vector["mcpat_cacti_p_provenance"]
             self.assertEqual(
-                provenance["characterization_id"], cacti["characterization_id"]
+                provenance["records"]["l2"]["record_ids"],
+                [model["embedded_cacti_p"]["records"][-1]["record_id"]],
             )
-            self.assertEqual(
-                provenance["records"]["l2"],
-                cacti["records"][2]["cacti_record_id"],
-            )
+            self.assertEqual(provenance["mcpat_output_sha256"], "3" * 64)
+            self.assertEqual(provenance["mcpat_binary_sha256"], "4" * 64)
+            self.assertNotIn("cacti_provenance", vector)
 
-    def test_r2_rejects_characterization_identity_different_from_geometry(self):
+    def test_r2_rejects_native_record_identity_different_from_content(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            contract = self.contract()
-            cacti = self.characterization()
-            model = {
-                "architecture": {
-                    **CacheContractTests().metadata(), "num_cores": 4,
-                },
-                "cache_contract": contract,
-                "cacti_characterization_id": "0" * 64,
-                "communication_profile": {"status": "unavailable"},
-                "modules": [],
-            }
+            model = self.native_model()
+            model["embedded_cacti_p"]["records"][-1]["access_time_s"] = 3e-9
             modules = root / "modules.json"
-            cacti_path = root / "cacti.json"
             write_json(modules, model)
-            write_json(cacti_path, cacti)
-            with self.assertRaisesRegex(ValueError, "geometry.*identity"):
+            with self.assertRaisesRegex(ValueError, "record_id"):
                 build_vector(
-                    modules, cacti_path, root / "latency.json",
+                    modules, root / "latency.json",
                     tsv_hops=1, wire_cycles=0,
                 )
 

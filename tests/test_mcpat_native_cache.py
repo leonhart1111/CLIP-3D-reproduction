@@ -702,6 +702,19 @@ class McPATLatencyTests(unittest.TestCase):
         # Break caught: unconditional integer-boundary adjustment makes 2 become 3.
         self.assertEqual(access_cycles(1.0e-9, 2.0e9), (2.0, 2))
 
+    def test_binary_float_boundary_keeps_exact_mathematical_cycle(self):
+        # Break caught: the stored product is one ulp above seven even though
+        # the input values represent an exact seven-cycle boundary.
+        raw, cycles = access_cycles(4.375e-9, 1.6e9)
+        self.assertEqual(raw, 7.000000000000001)
+        self.assertEqual(cycles, 7)
+
+    def test_genuine_fraction_above_integer_still_ceils_upward(self):
+        # Break caught: a broad boundary tolerance can erase real cache delay.
+        raw, cycles = access_cycles(4.375000000625e-9, 1.6e9)
+        self.assertGreater(raw, 7.0000000009)
+        self.assertEqual(cycles, 8)
+
     def test_vector_uses_native_records_and_keeps_latency_terms_separate(self):
         # Break caught: standalone CACTI or folded topology terms can silently
         # replace the McPAT-native cache latency represented in gem5.
