@@ -38,7 +38,10 @@ def build_sensitivity_vectors(base_vector: dict, cycles: list[int]) -> dict[int,
     requested = _validated_cycles(cycles)
 
     components = base_vector.get("components_cycles", {})
-    required = ("l1d_cacti", "l1_pipeline", "l2_cacti", "l2_arbitration", "tsv")
+    required = (
+        "l1d_mcpat_cacti_p", "l1_pipeline", "l2_mcpat_cacti_p",
+        "l2_arbitration", "tsv",
+    )
     missing = [field for field in required if field not in components]
     if missing:
         raise ValueError(f"base latency vector is missing components: {', '.join(missing)}")
@@ -51,7 +54,8 @@ def build_sensitivity_vectors(base_vector: dict, cycles: list[int]) -> dict[int,
         parts = vector["components_cycles"]
         parts["layout_wire"] = cycle
         vector["critical_l1d_to_l2_cycles"] = (
-            parts["l1d_cacti"] + parts["l1_pipeline"] + parts["l2_cacti"]
+            parts["l1d_mcpat_cacti_p"] + parts["l1_pipeline"]
+            + parts["l2_mcpat_cacti_p"]
             + parts["l2_arbitration"] + parts["tsv"] + cycle
         )
         vector["gem5_overrides"]["xbar_forward_latency"] = max(
@@ -122,14 +126,13 @@ def _base_vector(r1_dir: Path, point_dir: Path, output_dir: Path,
     if point_config != candidate_config:
         raise ValueError("candidate config does not match the completed lifting point")
     modules = _required_file(point_dir / "modules.json", "lifted modules")
-    cacti = _required_file(point_dir / "cacti/cacti_characterization.json", "CACTI result")
     layout = _required_file(point_dir / "hotspot/layout.json", "lifted layout")
     _required_file(point_dir / "performance.json", "lifting performance")
     _required_file(point_dir / "pipeline_summary.json", "lifting summary")
     delay = candidate_config.get("delay", {})
     base_path = output_dir / "base_latency.json"
     vector = build_vector(
-        modules, cacti, base_path, layout_path=layout,
+        modules, base_path, layout_path=layout,
         wire_rounding=delay.get("wire_rounding", "nearest"),
         cycles_per_tsv=int(delay.get("cycles_per_tsv", 2)),
         l1_pipeline_cycles=int(delay.get("l1_pipeline_cycles", 1)),
@@ -152,8 +155,6 @@ def _input_hashes(r1_dir: Path, point_dir: Path, config_path: Path,
         "r1_stats": _sha256(_required_file(r1_dir / "stats.txt", "R1 stats")),
         "r1_metadata": _sha256(_required_file(r1_dir / "r1_metadata.json", "R1 metadata")),
         "modules": _sha256(_required_file(point_dir / "modules.json", "lifted modules")),
-        "cacti": _sha256(_required_file(
-            point_dir / "cacti/cacti_characterization.json", "CACTI result")),
         "performance": _sha256(_required_file(
             point_dir / "performance.json", "lifting performance")),
         "candidate_config": _sha256(_required_file(config_path, "candidate config")),

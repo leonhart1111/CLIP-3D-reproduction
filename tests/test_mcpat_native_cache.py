@@ -15,6 +15,7 @@ from workflow.cache_contract import (
     mcpat_embedded_cache_record_identity,
     stable_identity,
 )
+from workflow.common import write_json
 from workflow.floorplan.build_module_model import (
     apply_mcpat_cache_geometry,
     build_model,
@@ -28,6 +29,7 @@ from workflow.mcpat.gem5_to_mcpat import (
 )
 from workflow.mcpat.run_mcpat import run_mcpat
 from workflow.mcpat.parse_mcpat import parse_mcpat_text
+from workflow.r2.build_latency_vector import access_cycles, build_vector
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -642,6 +644,147 @@ class McPATGeometryTests(unittest.TestCase):
                 mcpat_path.write_text(json.dumps(payload))
                 with self.assertRaisesRegex(ValueError, "parent"):
                     build_model(r1, mcpat_path, root / "modules.json")
+
+
+class McPATLatencyTests(unittest.TestCase):
+    def model(self, timings=None) -> dict:
+        metadata = {
+            "num_cores": 4, "cpu_clock": "2GHz",
+            "l1i_size": "16kB", "l1d_size": "32kB", "l2_size": "512kB",
+            "l1_associativity": 2, "l2_associativity": 8,
+            "cache_line_bytes": 64,
+        }
+        records = embedded_records()
+        timings = timings or {
+            "l1i": (1.01e-9, 2.0e-9),
+            "l1d": (1.50e-9, 2.5e-9),
+            "l2": (2.01e-9, 3.0e-9),
+        }
+        for record in records:
+            access, cycle = timings[record["cache"]]
+            record["access_time_s"] = access
+            record["cycle_time_s"] = cycle
+            record["record_id"] = mcpat_embedded_cache_record_identity(record)
+        return {
+            "schema_version": 3,
+            "architecture": metadata,
+            "cache_contract": build_cache_contract(
+                metadata, technology_nm=45, temperature_k=320,
+                device_type=0, interconnect_projection_type=1,
+            ),
+            "cache_authority": "McPAT 1.3 embedded CACTI-P",
+            "embedded_cacti_p": {
+                "schema_version": 1,
+                "authority": "McPAT 1.3 embedded CACTI-P",
+                "records": records,
+            },
+            "mcpat_provenance": {
+                "schema_version": 1,
+                "authority": "CLIP strict patched McPAT 1.3 runner",
+                "hashes": {
+                    "xml_sha256": "1" * 64,
+                    "mapping_sha256": "2" * 64,
+                    "output_sha256": "3" * 64,
+                    "binary_sha256": "4" * 64,
+                    "patch_sha256": "5" * 64,
+                },
+            },
+            "communication_profile": {"status": "unavailable"},
+        }
+
+    def test_access_seconds_are_ceiled_at_nominal_frequency(self):
+        # Break caught: rounding 2.02 cycles to nearest understates latency.
+        raw, cycles = access_cycles(1.01e-9, 2.0e9)
+        self.assertAlmostEqual(raw, 2.02)
+        self.assertEqual(cycles, 3)
+
+    def test_exact_integer_boundary_does_not_add_a_cycle(self):
+        # Break caught: unconditional integer-boundary adjustment makes 2 become 3.
+        self.assertEqual(access_cycles(1.0e-9, 2.0e9), (2.0, 2))
+
+    def test_vector_uses_native_records_and_keeps_latency_terms_separate(self):
+        # Break caught: standalone CACTI or folded topology terms can silently
+        # replace the McPAT-native cache latency represented in gem5.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            modules = root / "modules.json"
+            write_json(modules, model)
+            vector = build_vector(
+                modules, root / "latency.json", tsv_hops=2, wire_cycles=4,
+                cycles_per_tsv=3, l1_pipeline_cycles=2,
+            )
+
+        self.assertEqual(vector["components_cycles"], {
+            "l1i_mcpat_cacti_p": 3,
+            "l1d_mcpat_cacti_p": 3,
+            "l2_mcpat_cacti_p": 5,
+            "l2_arbitration": 3,
+            "tsv": 6,
+            "l1_pipeline": 2,
+            "layout_wire": 4,
+        })
+        self.assertEqual(vector["critical_l1d_to_l2_cycles"], 23)
+        provenance = vector["mcpat_cacti_p_provenance"]
+        self.assertEqual(provenance["authority"], "McPAT 1.3 embedded CACTI-P")
+        self.assertEqual(provenance["frequency_hz"], 2.0e9)
+        self.assertEqual(provenance["mcpat_output_sha256"], "3" * 64)
+        self.assertEqual(provenance["mcpat_binary_sha256"], "4" * 64)
+        expected_ids = {
+            level: [
+                record["record_id"] for record in model["embedded_cacti_p"]["records"]
+                if record["cache"] == level
+            ]
+            for level in ("l1i", "l1d", "l2")
+        }
+        for level, expected_cycles in (("l1i", 3), ("l1d", 3), ("l2", 5)):
+            timing = provenance["records"][level]
+            self.assertEqual(timing["record_ids"], expected_ids[level])
+            self.assertEqual(timing["rounding_policy"], "ceil")
+            self.assertEqual(timing["access_cycles"], expected_cycles)
+        self.assertAlmostEqual(
+            provenance["records"]["l1i"]["access_cycles_raw"], 2.02,
+        )
+
+    def test_vector_rejects_divergent_same_level_l1_timing(self):
+        # Break caught: selecting or averaging per-core L1 timing hides a
+        # physically inconsistent McPAT result.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            record = next(
+                item for item in model["embedded_cacti_p"]["records"]
+                if item["cache"] == "l1d" and item["core"] == 3
+            )
+            record["access_time_s"] = 1.51e-9
+            record["record_id"] = mcpat_embedded_cache_record_identity(record)
+            modules = root / "modules.json"
+            write_json(modules, model)
+            with self.assertRaisesRegex(ValueError, "L1D.*agree"):
+                build_vector(modules, root / "latency.json")
+
+    def test_vector_rejects_unvalidated_native_authority_and_provenance(self):
+        # Break caught: self-described timing without the strict schema and
+        # runner hashes must not become an R2 timing authority.
+        mutations = (
+            lambda model: model.update({"schema_version": 2}),
+            lambda model: model["cache_contract"].update({"schema_version": 1}),
+            lambda model: model["embedded_cacti_p"].update({"authority": "forged"}),
+            lambda model: model["mcpat_provenance"]["hashes"].update({
+                "binary_sha256": "0" * 64,
+            }),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                model = self.model()
+                mutate(model)
+                modules = root / "modules.json"
+                write_json(modules, model)
+                with self.assertRaisesRegex(
+                    ValueError, "schema|contract|authority|provenance|hash",
+                ):
+                    build_vector(modules, root / "latency.json")
 
 
 class McPATPatchTests(unittest.TestCase):

@@ -611,7 +611,8 @@ class FrequencyTests(unittest.TestCase):
         base = {
             "schema_version": 1,
             "components_cycles": {
-                "l1i_cacti": 2, "l1d_cacti": 3, "l2_cacti": 4,
+                "l1i_mcpat_cacti_p": 2, "l1d_mcpat_cacti_p": 3,
+                "l2_mcpat_cacti_p": 4,
                 "l2_arbitration": 3, "tsv": 2, "l1_pipeline": 1,
                 "layout_wire": 9,
             },
@@ -1170,6 +1171,55 @@ class GridTests(unittest.TestCase):
                 "modules": modules, "totals": {"total_power_w": 4.61,
                 "dynamic_power_w": 3.7, "leakage_power_w": 0.91}}
 
+    def r2_model(self):
+        model = self.model()
+        metadata = {
+            "num_cores": 4, "cpu_clock": "2GHz",
+            "l1i_size": "32kB", "l1d_size": "32kB", "l2_size": "512kB",
+            "l1_associativity": 2, "l2_associativity": 8,
+            "cache_line_bytes": 64,
+        }
+        records = []
+        for cache, core, access in (
+            *(("l1i", core, 1.0e-9) for core in range(4)),
+            *(("l1d", core, 1.0e-9) for core in range(4)),
+            ("l2", None, 2.0e-9),
+        ):
+            record = {
+                "cache": cache, "core": core,
+                "access_time_s": access, "cycle_time_s": access * 2.0,
+                "height_mm": 0.5, "width_mm": 1.0,
+                "mcpat_version": "1.3", "model": "embedded-cacti-p",
+            }
+            record["record_id"] = mcpat_embedded_cache_record_identity(record)
+            records.append(record)
+        model.update({
+            "schema_version": 3,
+            "architecture": metadata,
+            "cache_contract": build_cache_contract(
+                metadata, technology_nm=45, temperature_k=320,
+                device_type=0, interconnect_projection_type=1,
+            ),
+            "cache_authority": "McPAT 1.3 embedded CACTI-P",
+            "embedded_cacti_p": {
+                "schema_version": 1,
+                "authority": "McPAT 1.3 embedded CACTI-P",
+                "records": records,
+            },
+            "mcpat_provenance": {
+                "schema_version": 1,
+                "authority": "CLIP strict patched McPAT 1.3 runner",
+                "hashes": {
+                    "xml_sha256": "1" * 64,
+                    "mapping_sha256": "2" * 64,
+                    "output_sha256": "3" * 64,
+                    "binary_sha256": "4" * 64,
+                    "patch_sha256": "5" * 64,
+                },
+            },
+        })
+        return model
+
     def test_discrete_wire_score_blocks_harmful_rounding_boundary(self):
         ipc1 = 4.31314420772608
         lambda_wire = 0.0020119160767721133
@@ -1712,13 +1762,7 @@ class GridTests(unittest.TestCase):
     def test_optimizer_and_r2_use_the_same_traffic_weighted_aggregate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            model = self.model()
-            model["architecture"] = {
-                "num_cores": 4,
-                "l1i_size": "32kB",
-                "l1d_size": "32kB",
-                "l2_size": "512kB",
-            }
+            model = self.r2_model()
             weights = {0: 0.7, 1: 0.1, 2: 0.1, 3: 0.1}
             model["communication_profile"] = {
                 "status": "available",
@@ -1747,18 +1791,8 @@ class GridTests(unittest.TestCase):
                 allowed_l2_tiers=[1], require_scipy=False,
                 wire_aggregation="traffic-weighted",
             )
-            cacti_path = root / "cacti.json"
-            write_json(cacti_path, {
-                "frequency_ghz": 2.0,
-                "records": [
-                    {"level": "l1d", "size": "32kB",
-                     "size_bytes": 32 * 1024, "access_cycles": 2},
-                    {"level": "l2", "size": "512kB",
-                     "size_bytes": 512 * 1024, "access_cycles": 4},
-                ],
-            })
             vector = build_vector(
-                modules_path, cacti_path, root / "latency.json",
+                modules_path, root / "latency.json",
                 layout_path=layout_path, wire_aggregation="traffic-weighted",
             )
             optimized_delays = report["observability_diagnostics"][
@@ -1795,13 +1829,7 @@ class GridTests(unittest.TestCase):
     def test_traffic_weighted_r2_rejects_missing_layout_and_manual_override(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            model = self.model()
-            model["architecture"] = {
-                "num_cores": 4,
-                "l1i_size": "32kB",
-                "l1d_size": "32kB",
-                "l2_size": "512kB",
-            }
+            model = self.r2_model()
             model["communication_profile"] = {
                 "status": "available",
                 "per_core": {
@@ -1811,19 +1839,9 @@ class GridTests(unittest.TestCase):
             }
             modules_path = root / "modules.json"
             write_json(modules_path, model)
-            cacti_path = root / "cacti.json"
-            write_json(cacti_path, {
-                "frequency_ghz": 2.0,
-                "records": [
-                    {"level": "l1d", "size": "32kB",
-                     "size_bytes": 32 * 1024, "access_cycles": 2},
-                    {"level": "l2", "size": "512kB",
-                     "size_bytes": 512 * 1024, "access_cycles": 4},
-                ],
-            })
             with self.assertRaisesRegex(ValueError, "requires a final layout"):
                 build_vector(
-                    modules_path, cacti_path, root / "missing_layout.json",
+                    modules_path, root / "missing_layout.json",
                     wire_aggregation="traffic-weighted",
                 )
 
@@ -1831,7 +1849,7 @@ class GridTests(unittest.TestCase):
             write_json(layout_path, baseline_layout(model))
             with self.assertRaisesRegex(ValueError, "cannot override"):
                 build_vector(
-                    modules_path, cacti_path, root / "manual_override.json",
+                    modules_path, root / "manual_override.json",
                     wire_cycles=99, layout_path=layout_path,
                     wire_aggregation="traffic-weighted",
                 )
