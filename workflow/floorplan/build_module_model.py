@@ -133,8 +133,53 @@ def apply_physical_areas(modules: list[dict], metadata: dict,
     return result
 
 
-def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
+def apply_mcpat_cache_geometry(modules: list[dict], cache_records: list[dict]) -> list[dict]:
+    """Normalize embedded CACTI-P aspect ratios to McPAT aggregate areas."""
+    records = {
+        (record["cache"], record["core"]): record for record in cache_records
+    }
+    result = []
+    for source in modules:
+        module = dict(source)
+        if module.get("kind") not in {"l1i", "l1d", "l2"}:
+            module["area_source"] = "McPAT"
+            result.append(module)
+            continue
+        key = (module["kind"], None if module["kind"] == "l2" else module.get("core"))
+        try:
+            record = records[key]
+        except KeyError as error:
+            raise ValueError(f"McPAT embedded CACTI-P lacks cache geometry for {key}") from error
+        area = float(module["area_mm2"])
+        width, height = float(record["width_mm"]), float(record["height_mm"])
+        if not all(math.isfinite(value) and value > 0 for value in (area, width, height)):
+            raise ValueError(f"invalid McPAT cache geometry for {key}")
+        ratio = width / height
+        normalized_width = math.sqrt(area * ratio)
+        normalized_height = area / normalized_width
+        module.update({
+            "area_source": "McPAT aggregate Area",
+            "raw_array_dimensions_mm": {"width": width, "height": height},
+            "normalized_block_dimensions_mm": {
+                "width": normalized_width, "height": normalized_height,
+            },
+            "preferred_width_mm": normalized_width,
+            "preferred_height_mm": normalized_height,
+            "aspect_ratio": ratio,
+            "geometry_formula": "width=sqrt(McPAT_area_mm2*embedded_width_mm/embedded_height_mm)",
+            "embedded_cacti_record_id": record["record_id"],
+        })
+        result.append(module)
+    return result
+
+
+def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path,
+                output: Path | None = None,
                 require_communication_profile: bool = False) -> dict:
+    """Build a model from strict McPAT output, retaining legacy CACTI input support."""
+    native_cache_authority = output is None
+    if native_cache_authority:
+        output = Path(cacti_json)
     metadata = dict(read_json(r1_dir / "r1_metadata.json"))
     metadata["instruction_window_scope"] = instruction_window_scope(metadata)
     stats_path = r1_dir / "stats.txt"
@@ -147,17 +192,25 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
         require_communication_profile,
     )
     mcpat = read_json(mcpat_json)
-    cacti = read_json(cacti_json)
     cache_contract = mcpat.get("cache_contract")
     if cache_contract is None:
         raise ValueError("McPAT artifact lacks the shared cache_contract")
-    validate_characterization(cacti, cache_contract)
-    if mcpat.get("cacti_characterization_id") != cacti.get(
-            "characterization_id"):
-        raise ValueError(
-            "McPAT cache timing CACTI identity differs from module geometry"
+    if native_cache_authority:
+        embedded = mcpat.get("embedded_cacti_p") or {}
+        if embedded.get("authority") != "McPAT 1.3 embedded CACTI-P":
+            raise ValueError("McPAT artifact lacks embedded CACTI-P authority")
+        modules = apply_mcpat_cache_geometry(
+            mcpat["modules"], embedded.get("records") or [],
         )
-    modules = apply_physical_areas(mcpat["modules"], metadata, cacti)
+    else:
+        cacti = read_json(cacti_json)
+        validate_characterization(cacti, cache_contract)
+        if mcpat.get("cacti_characterization_id") != cacti.get(
+                "characterization_id"):
+            raise ValueError(
+                "McPAT cache timing CACTI identity differs from module geometry"
+            )
+        modules = apply_physical_areas(mcpat["modules"], metadata, cacti)
     totals = {
         "area_mm2": sum(module["area_mm2"] for module in modules),
         "dynamic_power_w": sum(module["dynamic_power_w"] for module in modules),
@@ -183,16 +236,21 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
         "schema_version": 2,
         "source_r1": str(r1_dir.resolve()),
         "source_mcpat": str(mcpat_json.resolve()),
-        "source_cacti": str(cacti_json.resolve()),
         "architecture": metadata,
         "ipc1": aggregate_ipc(stats, num_cores),
         "communication_profile": communication_profile,
         "power_provenance": mcpat["power_provenance"],
         "cache_contract": cache_contract,
-        "cacti_characterization_id": cacti["characterization_id"],
+        "cache_authority": (
+            "McPAT 1.3 embedded CACTI-P"
+            if native_cache_authority else "local CACTI characterization"
+        ),
         "area_provenance": {
             "core_logic_and_interconnect": "unmodified McPAT area",
-            "l1i_l1d_l2": "unmodified local CACTI area and dimensions",
+            "l1i_l1d_l2": (
+                "McPAT aggregate area with embedded CACTI-P aspect ratio"
+                if native_cache_authority else "unmodified local CACTI area and dimensions"
+            ),
             "global_scaling": "none",
         },
         "power_distribution": {
@@ -205,6 +263,9 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path, output: Path,
         "totals": totals,
         "gamma": totals["leakage_power_w"] / totals["total_power_w"],
     }
+    if not native_cache_authority:
+        result["source_cacti"] = str(Path(cacti_json).resolve())
+        result["cacti_characterization_id"] = cacti["characterization_id"]
     write_json(output, result)
     return result
 

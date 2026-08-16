@@ -25,6 +25,7 @@ from workflow.thermal.identify_alpha_lc import (
     grid_campaign_design,
     identification_plan,
     placement_design,
+    prepare_unscaled_model,
     real_power_design,
     run_hotspot_case,
     unit_power_model,
@@ -33,6 +34,7 @@ from workflow.thermal.identify_alpha_lc import (
     validate_identification_config,
     validate_model_contract,
 )
+from tests.test_mcpat_native_cache import native_text
 
 
 class AlphaLcKernelTests(unittest.TestCase):
@@ -821,6 +823,46 @@ class CampaignCliTests(unittest.TestCase):
         adjusted["power_provenance"]["postprocessing"] = "multiplied"
         with self.assertRaisesRegex(ValueError, "raw McPAT"):
             validate_model_contract(adjusted)
+
+    def test_model_preparation_uses_native_mcpat_artifact_without_cacti(self):
+        # Break caught: an identification model preparation path that restores
+        # its standalone CACTI/McPAT loop cannot produce runner provenance.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            r1 = root / "r1"
+            r1.mkdir()
+            metadata = {
+                "num_cores": 4, "cpu_clock": "2GHz", "issue_width": 4,
+                "rob_entries": 192, "cache_line_bytes": 64,
+                "l1i_size": "16kB", "l1d_size": "32kB", "l2_size": "512kB",
+                "l1_associativity": 2, "l2_associativity": 8,
+            }
+            (r1 / "r1_metadata.json").write_text(json.dumps(metadata))
+            (r1 / "stats.txt").write_text("".join(
+                f"system.cpu{core}.{name} {value}\n"
+                for core in range(4)
+                for name, value in (
+                    ("numCycles", 1000),
+                    ("commitStats0.numInsts", 100),
+                    ("commitStats0.numOps", 100),
+                )
+            ))
+
+            with patch(
+                "workflow.mcpat.run_mcpat.subprocess.run",
+                return_value=__import__("subprocess").CompletedProcess(
+                    [], 0, stdout=native_text(),
+                ),
+            ):
+                report = prepare_unscaled_model(r1, root / "prepared", self.valid_config())
+
+            mcpat = json.loads((root / "prepared/mcpat/mcpat.json").read_text())
+            self.assertFalse(report["reused"])
+            self.assertIn("provenance", mcpat)
+            self.assertEqual(
+                mcpat["embedded_cacti_p"]["authority"],
+                "McPAT 1.3 embedded CACTI-P",
+            )
 
     def test_plan_requires_all_45_completed_r1_points(self):
         config = self.valid_config()
