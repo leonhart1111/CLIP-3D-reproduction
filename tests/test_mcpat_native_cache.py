@@ -20,6 +20,7 @@ from workflow.common import read_json, sha256_file, write_json
 from workflow.floorplan.build_module_model import (
     apply_mcpat_cache_geometry,
     build_model,
+    construct_model,
     validate_mobility_contract,
 )
 from workflow.mcpat.cache_metrics import parse_embedded_cacti_records
@@ -213,34 +214,43 @@ def hand_derived_core_parent_metrics() -> dict:
     }
 
 
-def native_mcpat_artifact(binary: Path, output: Path) -> dict:
+def native_mcpat_artifact(binary: Path, output: Path,
+                          metadata: dict | None = None) -> dict:
     """Return a complete strict-runner artifact bound to live test files."""
-    metadata = {
+    metadata = dict(metadata or {
         "num_cores": 4, "cpu_clock": "2GHz",
         "l1i_size": "16kB", "l1d_size": "32kB", "l2_size": "512kB",
         "l1_associativity": 2, "l2_associativity": 8,
         "cache_line_bytes": 64,
-    }
+    })
     xml = output.parent / "input.xml"
     mapping = output.parent / "mapping_report.json"
-    native_records = parse_embedded_cacti_records(
+    parsed = parse_mcpat_text(
         output.read_text(encoding="utf-8"), expected_core_count=4,
+        require_granular_cores=True, require_embedded_cacti=True,
     )
-    return {
-        "schema_version": 1,
-        "cache_contract": build_cache_contract(
-            metadata, technology_nm=45, temperature_k=320,
-            device_type=0, interconnect_projection_type=1,
-        ),
-        "checks": {
-            "core_count": 4,
-            "core_logic_granularity": "McPAT top-level functional blocks",
+    cache_contract = build_cache_contract(
+        metadata, technology_nm=45, temperature_k=320,
+        device_type=0, interconnect_projection_type=1,
+    )
+    optimization_constraints = {
+        "cache_latency_throughput_cycles": {
+            "classification": "not a measurement",
+            "latency_cycles": 10,
+            "throughput_cycles": 10,
         },
-        "embedded_cacti_p": {
-            "schema_version": 1,
-            "authority": "McPAT 1.3 embedded CACTI-P",
-            "records": native_records,
-        },
+    }
+    write_json(mapping, {
+        "cache_contract": cache_contract,
+        "optimization_constraints": optimization_constraints,
+    })
+    parsed.update({
+        "command": [
+            str(binary.resolve()), "-infile", str(xml.resolve()),
+            "-print_level", "5", "-opt_for_clk", "0",
+        ],
+        "cache_contract": cache_contract,
+        "optimization_constraints": optimization_constraints,
         "provenance": {
             "schema_version": 1,
             "authority": "CLIP strict patched McPAT 1.3 runner",
@@ -252,8 +262,38 @@ def native_mcpat_artifact(binary: Path, output: Path) -> dict:
                 "patch_sha256": sha256_file(PATCH),
             },
         },
-        "command": [str(binary.resolve()), "-infile", "input.xml"],
-    }
+    })
+    return parsed
+
+
+def write_native_r1_fixture(r1: Path, metadata: dict) -> None:
+    """Publish deterministic live R1 inputs for completion/preflight tests."""
+    write_json(r1 / "r1_metadata.json", metadata)
+    (r1 / "stats.txt").write_text("".join(
+        f"system.cpu{core}.commitStats0.numInsts 100\n"
+        f"system.cpu{core}.numCycles 100\n"
+        f"system.l2.demandAccesses::cpu{core}.data {100 + core}\n"
+        for core in range(4)
+    ), encoding="utf-8")
+
+
+def write_native_physical_fixture(point: Path, r1: Path, binary: Path,
+                                  metadata: dict) -> tuple[dict, dict]:
+    """Publish a full strict McPAT artifact and its canonical module model."""
+    mcpat_dir = point / "mcpat"
+    mcpat_dir.mkdir(parents=True, exist_ok=True)
+    (mcpat_dir / "input.xml").write_text("<component/>", encoding="utf-8")
+    write_json(mcpat_dir / "mapping_report.json", {})
+    mcpat_output = mcpat_dir / "mcpat.out"
+    mcpat_output.write_text(native_text(), encoding="utf-8")
+    mcpat = native_mcpat_artifact(binary, mcpat_output, metadata)
+    mcpat_path = mcpat_dir / "mcpat.json"
+    write_json(mcpat_path, mcpat)
+    model = build_model(
+        r1, mcpat_path, point / "modules.json",
+        require_communication_profile=True,
+    )
+    return mcpat, model
 
 
 def granular_model(mcpat: dict) -> dict:
@@ -318,7 +358,11 @@ class SteadyPipelineTests(unittest.TestCase):
             "l1_associativity": 2, "l2_associativity": 8,
             "cache_line_bytes": 64,
         })
-        (self.r1 / "stats.txt").write_text("", encoding="utf-8")
+        (self.r1 / "stats.txt").write_text("".join(
+            f"system.cpu{core}.commitStats0.numInsts 100\n"
+            f"system.cpu{core}.numCycles 100\n"
+            for core in range(4)
+        ), encoding="utf-8")
         self.config = self.root / "config.json"
         write_json(self.config, {
             "schema_version": 1,
@@ -363,14 +407,17 @@ class SteadyPipelineTests(unittest.TestCase):
         def build_model_case(_r1, mcpat_path, output, **_kwargs):
             events.append("model")
             self.assertEqual(mcpat_path, self.out / "mcpat/mcpat.json")
-            model = granular_model(read_json(mcpat_path))
+            model = construct_model(_r1, mcpat_path)
             write_json(output, model)
             return model
 
         def materialize_case(modules_path, hotspot_dir, *_args, **_kwargs):
             events.append("materialize")
             model = read_json(modules_path)
-            write_json(hotspot_dir / "layout.json", {"modules": model["modules"]})
+            layout_modules = deepcopy(model["modules"])
+            for module in layout_modules:
+                module["tier"] = 1 if module["kind"] in ("l2", "interconnect") else 0
+            write_json(hotspot_dir / "layout.json", {"modules": layout_modules})
             write_json(hotspot_dir / "hotspot_manifest.json", {})
 
         def hotspot_case(hotspot_dir, _binary):
@@ -535,6 +582,164 @@ class SteadyPipelineTests(unittest.TestCase):
         write_json(modules_path, modules)
 
         summary = read_json(summary_path)
+        summary["artifact_sha256"]["mcpat_json"] = sha256_file(mcpat_path)
+        write_json(summary_path, summary)
+
+        self.assertFalse(completed(self.out, config, "fixed-bin", False))
+
+    def test_completion_rejects_wrong_top_level_mcpat_schema(self):
+        """Mutable hashes cannot authorize a non-runner McPAT artifact schema."""
+        self._run()
+        config = read_json(self.config)
+        mcpat_path = self.out / "mcpat/mcpat.json"
+        summary_path = self.out / "pipeline_summary.json"
+        mcpat = read_json(mcpat_path)
+        mcpat["schema_version"] = 99
+        write_json(mcpat_path, mcpat)
+        summary = read_json(summary_path)
+        summary["artifact_sha256"]["mcpat_json"] = sha256_file(mcpat_path)
+        write_json(summary_path, summary)
+
+        self.assertFalse(completed(self.out, config, "fixed-bin", False))
+
+    def test_completion_rejects_missing_strict_parsed_mcpat_fields(self):
+        """Every Task-3 parsed field remains mandatory at completion."""
+        for field in (
+                "modules", "module_totals", "core_parent_metrics",
+                "power_provenance", "processor", "checks"):
+            with self.subTest(field=field):
+                self._run()
+                mcpat_path = self.out / "mcpat/mcpat.json"
+                summary_path = self.out / "pipeline_summary.json"
+                mcpat = read_json(mcpat_path)
+                mcpat.pop(field)
+                write_json(mcpat_path, mcpat)
+                summary = read_json(summary_path)
+                summary["artifact_sha256"]["mcpat_json"] = sha256_file(mcpat_path)
+                write_json(summary_path, summary)
+                self.assertFalse(completed(
+                    self.out, read_json(self.config), "fixed-bin", False,
+                ))
+
+    def test_completion_rejects_mutated_module_scientific_payload(self):
+        """Schema-valid mobility metadata cannot legitimize changed area/power."""
+        self._run()
+        config = read_json(self.config)
+        modules_path = self.out / "modules.json"
+        modules = read_json(modules_path)
+        modules["modules"][0]["area_mm2"] += 1.0
+        write_json(modules_path, modules)
+
+        self.assertFalse(completed(self.out, config, "fixed-bin", False))
+
+    def test_completion_rejects_coordinated_module_power_rewrite(self):
+        """Rehashed, internally conserved modules still derive from live McPAT."""
+        self._run()
+        config = read_json(self.config)
+        modules_path = self.out / "modules.json"
+        summary_path = self.out / "pipeline_summary.json"
+        modules = read_json(modules_path)
+        l2 = next(module for module in modules["modules"]
+                  if module["name"] == "shared_l2")
+        delta = 0.25
+        l2["dynamic_power_w"] += delta
+        l2["total_power_w"] += delta
+        l2["power_density_w_per_mm2"] = l2["total_power_w"] / l2["area_mm2"]
+        modules["totals"]["dynamic_power_w"] += delta
+        modules["totals"]["total_power_w"] += delta
+        modules["gamma"] = (
+            modules["totals"]["leakage_power_w"]
+            / modules["totals"]["total_power_w"]
+        )
+        for field in ("dynamic_power_w", "total_power_w"):
+            modules["conservation"]["source_totals"][field] += delta
+        by_kind = modules["power_distribution"]["by_kind"]
+        by_kind["l2"]["total_power_w"] += delta
+        for values in by_kind.values():
+            values["power_fraction"] = (
+                values["total_power_w"] / modules["totals"]["total_power_w"]
+            )
+        modules["power_distribution"]["movable_power_w"] = by_kind["l2"][
+            "total_power_w"
+        ]
+        modules["power_distribution"]["movable_power_fraction"] = by_kind["l2"][
+            "power_fraction"
+        ]
+        write_json(modules_path, modules)
+
+        summary = read_json(summary_path)
+        summary["total_power_w"] = modules["totals"]["total_power_w"]
+        summary["gamma"] = modules["gamma"]
+        summary["power_distribution"] = modules["power_distribution"]
+        summary["artifact_sha256"]["modules"] = sha256_file(modules_path)
+        write_json(summary_path, summary)
+
+        self.assertFalse(completed(self.out, config, "fixed-bin", False))
+
+    def test_completion_binds_all_parsed_mcpat_science_to_live_output(self):
+        """Coherent JSON rewrites cannot replace raw module or parent metrics."""
+        def mutate_l2(mcpat: dict) -> None:
+            l2 = next(module for module in mcpat["modules"]
+                      if module["name"] == "shared_l2")
+            l2["area_mm2"] += 1.0
+            mcpat["module_totals"]["area_mm2"] += 1.0
+
+        def mutate_parent_bound_power(mcpat: dict) -> None:
+            execution = next(module for module in mcpat["modules"]
+                             if module["name"] == "core0_exec")
+            execution["dynamic_power_w"] += 0.25
+            execution["total_power_w"] += 0.25
+            mcpat["module_totals"]["dynamic_power_w"] += 0.25
+            mcpat["module_totals"]["total_power_w"] += 0.25
+            parent = mcpat["core_parent_metrics"]["records"][0]["core_total"]
+            parent["dynamic_power_w"] += 0.25
+            parent["total_power_w"] += 0.25
+
+        for label, mutate in (("module", mutate_l2), ("parent", mutate_parent_bound_power)):
+            with self.subTest(label=label):
+                self._run()
+                config = read_json(self.config)
+                mcpat_path = self.out / "mcpat/mcpat.json"
+                modules_path = self.out / "modules.json"
+                summary_path = self.out / "pipeline_summary.json"
+                mcpat = read_json(mcpat_path)
+                mutate(mcpat)
+                write_json(mcpat_path, mcpat)
+                model = construct_model(self.r1, mcpat_path)
+                write_json(modules_path, model)
+                summary = read_json(summary_path)
+                summary["artifact_sha256"]["mcpat_json"] = sha256_file(mcpat_path)
+                summary["total_power_w"] = model["totals"]["total_power_w"]
+                summary["gamma"] = model["gamma"]
+                write_json(summary_path, summary)
+
+                self.assertFalse(completed(self.out, config, "fixed-bin", False))
+
+    def test_completion_binds_cache_contract_to_live_r1_architecture(self):
+        """A self-consistent mapping cannot relabel the measured cache sizes."""
+        self._run()
+        config = read_json(self.config)
+        mcpat_path = self.out / "mcpat/mcpat.json"
+        mapping_path = self.out / "mcpat/mapping_report.json"
+        modules_path = self.out / "modules.json"
+        summary_path = self.out / "pipeline_summary.json"
+        mcpat = read_json(mcpat_path)
+        changed_metadata = read_json(self.r1 / "r1_metadata.json")
+        changed_metadata["l2_size"] = "1024kB"
+        forged_contract = build_cache_contract(
+            changed_metadata, technology_nm=45, temperature_k=320,
+            device_type=0, interconnect_projection_type=1,
+        )
+        mapping = read_json(mapping_path)
+        mapping["cache_contract"] = forged_contract
+        write_json(mapping_path, mapping)
+        mcpat["cache_contract"] = forged_contract
+        mcpat["provenance"]["hashes"]["mapping_sha256"] = sha256_file(mapping_path)
+        write_json(mcpat_path, mcpat)
+        model = construct_model(self.r1, mcpat_path)
+        write_json(modules_path, model)
+        summary = read_json(summary_path)
+        summary["mcpat_provenance"] = mcpat["provenance"]
         summary["artifact_sha256"]["mcpat_json"] = sha256_file(mcpat_path)
         write_json(summary_path, summary)
 

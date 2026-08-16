@@ -2365,9 +2365,8 @@ class FormalGuardTests(unittest.TestCase):
 
     def test_lifting_resume_rejects_stale_config(self):
         from tests.test_mcpat_native_cache import (
-            granular_model,
-            native_mcpat_artifact,
-            native_text,
+            write_native_physical_fixture,
+            write_native_r1_fixture,
         )
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -2382,14 +2381,20 @@ class FormalGuardTests(unittest.TestCase):
                     path.write_text("{}", encoding="utf-8")
             binary = root / "mcpat/test-binary"
             binary.write_bytes(b"strict McPAT test binary\n")
-            (root / "mcpat/input.xml").write_text("<component/>", encoding="utf-8")
-            write_json(root / "mcpat/mapping_report.json", {})
+            r1 = root / "source-r1"
+            metadata = {
+                "workload": "fft", "num_cores": 4, "cpu_clock": "2GHz",
+                "l1i_size": "32kB", "l1d_size": "32kB",
+                "l2_size": "512kB", "l1_associativity": 2,
+                "l2_associativity": 8, "cache_line_bytes": 64,
+            }
+            write_native_r1_fixture(r1, metadata)
+            mcpat, _model = write_native_physical_fixture(
+                root, r1, binary, metadata,
+            )
             mcpat_output = root / "mcpat/mcpat.out"
-            mcpat_output.write_text(native_text(), encoding="utf-8")
-            mcpat = native_mcpat_artifact(binary, mcpat_output)
-            write_json(root / "mcpat/mcpat.json", mcpat)
-            write_json(root / "modules.json", granular_model(mcpat))
             write_json(root / "pipeline_summary.json", {
+                "r1": str(r1.resolve()),
                 "layout_method": "fixed-bin", "cooling": {"r_convec_k_per_w": 5.0},
                 "ipc2": 1.0, "bips2": 1.0,
                 "stage_seconds": {},

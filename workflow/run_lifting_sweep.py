@@ -12,8 +12,18 @@ from workflow.cache_contract import (
     mcpat_embedded_cache_record_identity,
     validate_cache_contract,
 )
-from workflow.common import PROJECT_ROOT, read_json, sha256_file, write_json
-from workflow.floorplan.build_module_model import validate_mobility_contract
+from workflow.common import (
+    PROJECT_ROOT,
+    parse_frequency_ghz,
+    parse_size_bytes,
+    read_json,
+    sha256_file,
+    write_json,
+)
+from workflow.floorplan.build_module_model import (
+    construct_model,
+    validate_mobility_contract,
+)
 from workflow.mcpat.parse_mcpat import parse_mcpat_text
 from workflow.mcpat.run_mcpat import (
     BUILD_PROVENANCE,
@@ -55,6 +65,14 @@ _AREA_PROVENANCE = {
     "l1i_l1d_l2": "McPAT aggregate area with embedded CACTI-P aspect ratio",
     "global_scaling": "none",
 }
+_PARSED_MCPAT_FIELDS = {
+    "schema_version", "technology_nm", "clock_mhz", "power_provenance",
+    "processor", "modules", "module_totals", "core_parent_metrics", "checks",
+    "embedded_cacti_p",
+}
+_RUNNER_MCPAT_FIELDS = _PARSED_MCPAT_FIELDS | {
+    "command", "cache_contract", "optimization_constraints", "provenance",
+}
 
 
 def _nonzero_sha256(value: object) -> bool:
@@ -67,7 +85,42 @@ def _nonzero_sha256(value: object) -> bool:
         return False
 
 
+def _validate_cache_architecture(contract: dict, architecture: dict,
+                                 mcpat: dict) -> None:
+    """Bind the input mapping to the live R1 architecture it describes."""
+    records = {record["level"]: record for record in contract["records"]}
+    for level, size_key, associativity_key in (
+            ("l1i", "l1i_size", "l1_associativity"),
+            ("l1d", "l1d_size", "l1_associativity"),
+            ("l2", "l2_size", "l2_associativity")):
+        record = records[level]
+        try:
+            agrees = (
+                record["size_bytes"] == parse_size_bytes(architecture[size_key])
+                and record["associativity"] == int(architecture[associativity_key])
+                and record["line_size_bytes"] == int(
+                    architecture.get("cache_line_bytes", 64)
+                )
+                and record["core_count"] == int(architecture["num_cores"])
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("live R1 cache architecture is incomplete") from error
+        if not agrees:
+            raise ValueError(f"McPAT cache contract differs from live R1 {level}")
+    clock = architecture.get("cpu_clock", architecture.get("clock"))
+    try:
+        clock_mhz = parse_frequency_ghz(clock) * 1000.0
+    except (TypeError, ValueError) as error:
+        raise ValueError("live R1 clock identity is invalid") from error
+    if clock_mhz != float(mcpat.get("clock_mhz")) \
+            or any(float(record["technology_nm"]) != float(mcpat.get("technology_nm"))
+                   for record in records.values()):
+        raise ValueError("McPAT clock/technology differs from live R1 mapping")
+
+
 def _validate_native_mcpat(mcpat: dict, output: Path) -> dict:
+    if set(mcpat) != _RUNNER_MCPAT_FIELDS or mcpat.get("schema_version") != 1:
+        raise ValueError("McPAT artifact top-level runner schema is invalid")
     embedded = mcpat.get("embedded_cacti_p")
     if not isinstance(embedded, dict) or set(embedded) != {
             "schema_version", "authority", "records"}:
@@ -118,12 +171,19 @@ def _validate_native_mcpat(mcpat: dict, output: Path) -> dict:
 
     mcpat_output = output / "mcpat/mcpat.out"
     command = mcpat.get("command")
-    if not isinstance(command, list) or not command \
-            or not isinstance(command[0], str):
-        raise ValueError("McPAT artifact lacks the executed binary identity")
+    if not isinstance(command, list) or len(command) != 7 \
+            or not all(isinstance(value, str) for value in command) \
+            or command[1] != "-infile" or command[3:6] != [
+                "-print_level", "5", "-opt_for_clk",
+            ] or command[6] not in {"0", "1"}:
+        raise ValueError("McPAT artifact lacks the strict executed command")
     binary = Path(command[0])
     if not binary.is_absolute():
         raise ValueError("McPAT executed binary path must be absolute")
+    xml_path = output / "mcpat/input.xml"
+    if not Path(command[2]).is_absolute() \
+            or Path(command[2]).resolve() != xml_path.resolve():
+        raise ValueError("McPAT command input does not match live XML")
     if sha256_file(mcpat_output) != hashes["output_sha256"]:
         raise ValueError("McPAT output hash does not match live output")
     live_mcpat = parse_mcpat_text(
@@ -132,15 +192,22 @@ def _validate_native_mcpat(mcpat: dict, output: Path) -> dict:
         require_granular_cores=True,
         require_embedded_cacti=True,
     )
-    if live_mcpat["embedded_cacti_p"] != embedded:
-        raise ValueError("McPAT native records do not match live output")
+    if any(mcpat[field] != live_mcpat[field]
+           for field in _PARSED_MCPAT_FIELDS):
+        raise ValueError("McPAT parsed scientific payload does not match live output")
     if sha256_file(binary) != hashes["binary_sha256"]:
         raise ValueError("McPAT binary hash does not match live executable")
-    if sha256_file(output / "mcpat/input.xml") != hashes["xml_sha256"]:
+    if sha256_file(xml_path) != hashes["xml_sha256"]:
         raise ValueError("McPAT XML hash does not match live input")
-    if sha256_file(output / "mcpat/mapping_report.json") != hashes[
-            "mapping_sha256"]:
+    mapping_path = output / "mcpat/mapping_report.json"
+    if sha256_file(mapping_path) != hashes["mapping_sha256"]:
         raise ValueError("McPAT mapping hash does not match live report")
+    mapping = read_json(mapping_path)
+    if not isinstance(mapping, dict) \
+            or mapping.get("cache_contract") != mcpat["cache_contract"] \
+            or mapping.get("optimization_constraints") != mcpat[
+                "optimization_constraints"]:
+        raise ValueError("McPAT artifact differs from live input mapping")
     if sha256_file(PATCH_FILE) != hashes["patch_sha256"]:
         raise ValueError("McPAT patch hash does not match audited patch")
     if "build_provenance_sha256" in hashes and sha256_file(
@@ -203,6 +270,17 @@ def validate_corrected_physical_artifacts(output: Path) -> dict:
         raise ValueError("module mobility contract does not match modules")
     if modules.get("area_provenance") != _AREA_PROVENANCE:
         raise ValueError("module area provenance is not McPAT-native")
+
+    source_r1 = modules.get("source_r1")
+    source_mcpat = modules.get("source_mcpat")
+    if not isinstance(source_r1, str) or not Path(source_r1).is_absolute() \
+            or source_mcpat != str(mcpat_path.resolve()) \
+            or summary.get("r1") != str(Path(source_r1).resolve()):
+        raise ValueError("module source identity does not match live R1/McPAT inputs")
+    reconstructed = construct_model(Path(source_r1), mcpat_path)
+    if modules != reconstructed:
+        raise ValueError("module scientific payload differs from live R1/McPAT reconstruction")
+    _validate_cache_architecture(module_cache_contract, modules["architecture"], mcpat)
 
     if summary.get("cache_authority") != _CACHE_AUTHORITY \
             or summary.get("mcpat_provenance") != native["provenance"]:

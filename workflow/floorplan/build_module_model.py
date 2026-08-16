@@ -490,13 +490,12 @@ def _validate_module_power(module: dict) -> None:
             raise ValueError(f"McPAT module {name} does not conserve leakage power")
 
 
-def build_model(r1_dir: Path, mcpat_json: Path, output: Path,
-                require_communication_profile: bool = False,
-                require_granular_cores: bool = True) -> dict:
-    """Build one McPAT-authoritative physical module model."""
+def construct_model(r1_dir: Path, mcpat_json: Path,
+                    require_communication_profile: bool = False,
+                    require_granular_cores: bool = True) -> dict:
+    """Construct one McPAT-authoritative model without publishing it."""
     r1_dir = Path(r1_dir)
     mcpat_json = Path(mcpat_json)
-    output = Path(output)
     metadata = dict(read_json(r1_dir / "r1_metadata.json"))
     metadata["instruction_window_scope"] = instruction_window_scope(metadata)
     stats_path = r1_dir / "stats.txt"
@@ -629,7 +628,19 @@ def build_model(r1_dir: Path, mcpat_json: Path, output: Path,
         "totals": totals,
         "gamma": totals["leakage_power_w"] / totals["total_power_w"],
     }
-    write_json(output, result)
+    return result
+
+
+def build_model(r1_dir: Path, mcpat_json: Path, output: Path,
+                require_communication_profile: bool = False,
+                require_granular_cores: bool = True) -> dict:
+    """Construct and publish one McPAT-authoritative physical module model."""
+    result = construct_model(
+        r1_dir, mcpat_json,
+        require_communication_profile=require_communication_profile,
+        require_granular_cores=require_granular_cores,
+    )
+    write_json(Path(output), result)
     return result
 
 

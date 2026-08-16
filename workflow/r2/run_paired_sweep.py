@@ -19,6 +19,7 @@ from workflow.common import read_json, sha256_file, write_json
 from workflow.experiments.balanced50 import (
     load_selection,
     selection_keys,
+    validate_layout_point,
     validate_layout_roots,
 )
 from workflow.r1_catalog import ArchitectureKey
@@ -116,6 +117,37 @@ def _require_native_preflight(preflight: dict) -> dict:
             "paired R2 requires McPAT-native physical preflight authority"
         )
     return preflight
+
+
+def _validate_direct_native_pair(
+        key: ArchitectureKey, r1_root: Path, fixed_root: Path, clip_root: Path,
+        config_path: Path, rerun: bool,
+) -> None:
+    """Apply the shared root contract before direct-pair mutation."""
+    config_path = Path(config_path).resolve()
+    config = read_json(config_path)
+    if not isinstance(config, dict):
+        raise ValueError("direct paired R2 config must contain an object")
+    existing_validator = _existing_r2_validator(
+        Path(r1_root).resolve(), Path(fixed_root).resolve(),
+        Path(clip_root).resolve(), config_path, rerun_requested=rerun,
+    )
+    for label, root in (("fixed", fixed_root), ("clip3d", clip_root)):
+        point = Path(root).resolve() / key.relative_path()
+        try:
+            decision = validate_layout_point(
+                point, "fixed-bin" if label == "fixed" else "clip3d",
+                key, config, config_path, require_layout_only=False,
+                existing_r2_validator=existing_validator,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"direct paired R2 requires McPAT-native {label} artifacts: {error}"
+            ) from error
+        if decision.get("cache_authority") != _NATIVE_CACHE_AUTHORITY:
+            raise ValueError(
+                f"direct paired R2 requires McPAT-native {label} authority"
+            )
 
 
 def _paths(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
@@ -399,10 +431,18 @@ def run_pair(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
         resolved_fixed_root.parent / "paired_r2_status"
         if status_root is None else Path(status_root).resolve()
     )
+    _validate_direct_native_pair(
+        normalized_key, r1_root, resolved_fixed_root, resolved_clip_root,
+        config_path, rerun,
+    )
     sweep_locks = _sweep_lock_paths(resolved_fixed_root, resolved_clip_root)
     with _execution_locks(
             sweep_locks, blocking=True, shared=True,
             conflict_message="physical R2 sweep lock is unavailable"):
+        _validate_direct_native_pair(
+            normalized_key, r1_root, resolved_fixed_root, resolved_clip_root,
+            config_path, rerun,
+        )
         return _run_pair_under_sweep(
             normalized_key, r1_root, resolved_fixed_root, resolved_clip_root,
             config_path,

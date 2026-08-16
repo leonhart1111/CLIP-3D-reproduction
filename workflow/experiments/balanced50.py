@@ -172,6 +172,52 @@ def _validate_physical_model(point: Path) -> dict:
         ) from error
 
 
+def validate_layout_point(
+        point: Path, method: str, key: ArchitectureKey, config: dict,
+        config_path: Path, *, require_layout_only: bool,
+        existing_r2_validator: Callable[[str, ArchitectureKey, Path], dict] | None,
+) -> dict:
+    """Apply the root preflight contract to one selected physical point."""
+    point = Path(point).resolve()
+    config_path = Path(config_path).resolve()
+    artifacts = required_artifacts + (
+        CLIP3D_REQUIRED_ARTIFACTS if method == "clip3d" else ()
+    )
+    for artifact in artifacts:
+        if not (point / artifact).is_file():
+            raise ValueError(f"{method} root is incomplete at {point}: missing {artifact}")
+    run_config = _read_object(point / "run_config.json", "run_config.json")
+    summary = _read_object(point / "pipeline_summary.json", "pipeline_summary.json")
+    physical = _validate_physical_model(point)
+    if run_config.get("layout_method") != method:
+        raise ValueError(f"{method} layout method mismatch in run_config at {point}")
+    if summary.get("layout_method", summary.get("layout_mode")) != method:
+        raise ValueError(f"{method} layout method mismatch in pipeline summary at {point}")
+    if run_config.get("config") != config:
+        raise ValueError(f"{method} embedded config does not match {config_path} at {point}")
+    source = run_config.get("source")
+    if not isinstance(source, str) or Path(source).resolve() != config_path:
+        raise ValueError(f"{method} run_config source does not match {config_path} at {point}")
+    if config.get("delay", {}).get("wire_aggregation") == "traffic-weighted":
+        _validate_communication_profile(summary, point)
+    has_r2 = summary.get("ipc2") is not None or summary.get("bips2") is not None
+    if has_r2:
+        if require_layout_only:
+            raise ValueError(f"layout-only preflight found R2 results in {method} at {point}")
+        if existing_r2_validator is None:
+            raise ValueError(
+                "resume preflight found existing R2 results but "
+                "existing_r2_validator is required"
+            )
+        decision = existing_r2_validator(method, key, point)
+        if not isinstance(decision, dict) or decision.get("accepted") is not True:
+            raise ValueError(f"existing_r2_validator did not accept {method} R2 at {point}")
+    return {
+        "cache_authority": physical["cache_authority"],
+        "has_r2": has_r2,
+    }
+
+
 def _validate_root(root: Path, method: str, canonical: list[ArchitectureKey],
                    config: dict, config_path: Path, require_layout_only: bool,
                    existing_r2_validator: Callable[[str, ArchitectureKey, Path], dict] | None
@@ -190,42 +236,17 @@ def _validate_root(root: Path, method: str, canonical: list[ArchitectureKey],
             f"found {len(found_paths)}, missing={missing[:1]}, extra={extra[:1]}"
         )
 
-    artifacts = required_artifacts + (CLIP3D_REQUIRED_ARTIFACTS if method == "clip3d" else ())
     existing_r2 = 0
     physical_authority = None
     for key in canonical:
         point = root / key.relative_path()
-        for artifact in artifacts:
-            if not (point / artifact).is_file():
-                raise ValueError(f"{method} root is incomplete at {point}: missing {artifact}")
-        run_config = _read_object(point / "run_config.json", "run_config.json")
-        summary = _read_object(point / "pipeline_summary.json", "pipeline_summary.json")
-        physical = _validate_physical_model(point)
-        physical_authority = physical["cache_authority"]
-        if run_config.get("layout_method") != method:
-            raise ValueError(f"{method} layout method mismatch in run_config at {point}")
-        if summary.get("layout_method", summary.get("layout_mode")) != method:
-            raise ValueError(f"{method} layout method mismatch in pipeline summary at {point}")
-        if run_config.get("config") != config:
-            raise ValueError(f"{method} embedded config does not match {config_path} at {point}")
-        source = run_config.get("source")
-        if not isinstance(source, str) or Path(source).resolve() != config_path:
-            raise ValueError(f"{method} run_config source does not match {config_path} at {point}")
-        if config.get("delay", {}).get("wire_aggregation") == "traffic-weighted":
-            _validate_communication_profile(summary, point)
-        has_r2 = summary.get("ipc2") is not None or summary.get("bips2") is not None
-        if not has_r2:
-            continue
-        if require_layout_only:
-            raise ValueError(f"layout-only preflight found R2 results in {method} at {point}")
-        if existing_r2_validator is None:
-            raise ValueError(
-                "resume preflight found existing R2 results but existing_r2_validator is required"
-            )
-        decision = existing_r2_validator(method, key, point)
-        if not isinstance(decision, dict) or decision.get("accepted") is not True:
-            raise ValueError(f"existing_r2_validator did not accept {method} R2 at {point}")
-        existing_r2 += 1
+        decision = validate_layout_point(
+            point, method, key, config, config_path,
+            require_layout_only=require_layout_only,
+            existing_r2_validator=existing_r2_validator,
+        )
+        physical_authority = decision["cache_authority"]
+        existing_r2 += int(decision["has_r2"])
     return {
         "root": str(root),
         "canonical_count": len(canonical),

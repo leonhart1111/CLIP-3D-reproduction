@@ -549,9 +549,8 @@ class CanonicalLiftingTests(CanonicalFixtureTests):
     def _write_completed_layout_output(self, output: Path, config: dict,
                                        layout_method: str = "fixed-bin") -> None:
         from tests.test_mcpat_native_cache import (
-            granular_model,
-            native_mcpat_artifact,
-            native_text,
+            write_native_physical_fixture,
+            write_native_r1_fixture,
         )
         from workflow.run_lifting_sweep import required_artifacts
 
@@ -559,15 +558,33 @@ class CanonicalLiftingTests(CanonicalFixtureTests):
             write_json(output / artifact, {})
         binary = output / "mcpat/test-binary"
         binary.write_bytes(b"strict McPAT test binary\n")
-        (output / "mcpat/input.xml").write_text("<component/>", encoding="utf-8")
-        write_json(output / "mcpat/mapping_report.json", {})
+        r1 = output / ".source-r1"
+        l1d_part = next(
+            (part for part in reversed(output.parts) if part.startswith("l1d_")),
+            "l1d_32kB",
+        )
+        l2_part = next(
+            (part for part in reversed(output.parts) if part.startswith("l2_")),
+            "l2_512kB",
+        )
+        l1d_index = output.parts.index(l1d_part) if l1d_part in output.parts else -1
+        metadata = {
+            "workload": output.parts[l1d_index - 1] if l1d_index > 0 else "fft",
+            "num_cores": 4,
+            "cpu_clock": "2GHz", "l1i_size": "32kB",
+            "l1d_size": l1d_part.removeprefix("l1d_"),
+            "l2_size": l2_part.removeprefix("l2_"),
+            "l1_associativity": 2, "l2_associativity": 8,
+            "cache_line_bytes": 64,
+        }
+        write_native_r1_fixture(r1, metadata)
+        mcpat, _model = write_native_physical_fixture(
+            output, r1, binary, metadata,
+        )
         mcpat_output = output / "mcpat/mcpat.out"
-        mcpat_output.write_text(native_text(), encoding="utf-8")
-        mcpat = native_mcpat_artifact(binary, mcpat_output)
-        write_json(output / "mcpat/mcpat.json", mcpat)
-        write_json(output / "modules.json", granular_model(mcpat))
         write_json(output / "run_config.json", {"config": config})
         write_json(output / "pipeline_summary.json", {
+            "r1": str(r1.resolve()),
             "layout_method": layout_method,
             "cooling": {"r_convec_k_per_w": 5.0},
             "ipc2": None,
@@ -817,9 +834,8 @@ class BalancedSelectionTests(unittest.TestCase):
                             config: dict | None = None) -> tuple[Path, Path]:
         """Create real, complete 100-point roots with layout-only artifacts."""
         from tests.test_mcpat_native_cache import (
-            granular_model,
-            native_mcpat_artifact,
-            native_text,
+            write_native_physical_fixture,
+            write_native_r1_fixture,
         )
         from workflow.r1_catalog import expected_keys
         from workflow.run_lifting_sweep import (
@@ -854,28 +870,31 @@ class BalancedSelectionTests(unittest.TestCase):
                     "ipc2": None,
                     "bips2": None,
                     "stage_seconds": {},
-                    "communication_profile": {
-                        "status": "available",
-                        "per_core": {
-                            str(core): {"normalized_weight": 0.25}
-                            for core in range(4)
-                        },
-                    },
                 })
-                mcpat_output = point / "mcpat/mcpat.out"
-                mcpat_output.parent.mkdir(parents=True, exist_ok=True)
-                (point / "mcpat/input.xml").write_text(
-                    "<component/>", encoding="utf-8"
+                fixed = self.grid["fixed_architecture"]
+                r1 = self.root / "native-r1" / key.relative_path()
+                metadata = {
+                    "workload": key.workload,
+                    "num_cores": fixed["cores"],
+                    "cpu_clock": fixed["clock"],
+                    "l1i_size": fixed["l1i_size"],
+                    "l1d_size": key.l1d_size,
+                    "l2_size": key.l2_size,
+                    "l1_associativity": fixed["l1_associativity"],
+                    "l2_associativity": fixed["l2_associativity"],
+                    "cache_line_bytes": fixed["cache_line_bytes"],
+                }
+                write_native_r1_fixture(r1, metadata)
+                mcpat, model = write_native_physical_fixture(
+                    point, r1, mcpat_binary, metadata,
                 )
-                write_json(point / "mcpat/mapping_report.json", {})
-                mcpat_output.write_text(native_text(), encoding="utf-8")
-                mcpat = native_mcpat_artifact(mcpat_binary, mcpat_output)
-                write_json(point / "mcpat/mcpat.json", mcpat)
-                write_json(point / "modules.json", granular_model(mcpat))
+                mcpat_output = point / "mcpat/mcpat.out"
                 summary = read_json(point / "pipeline_summary.json")
                 summary.update({
+                    "r1": str(r1.resolve()),
                     "cache_authority": "McPAT 1.3 embedded CACTI-P",
                     "mcpat_provenance": mcpat["provenance"],
+                    "communication_profile": model["communication_profile"],
                     "artifacts": {
                         "mcpat_json": str((point / "mcpat/mcpat.json").resolve()),
                         "mcpat_output": str(mcpat_output.resolve()),
@@ -2807,6 +2826,108 @@ class PairedR2RunnerTests(unittest.TestCase):
         self.status_root = self.root / "paired-status"
         from workflow.r1_catalog import ArchitectureKey
         self.key = ArchitectureKey("fft", "32kB", "512kB")
+        self._upgrade_to_native_physical_points()
+
+    def _upgrade_to_native_physical_points(self) -> None:
+        """Give direct-pair tests real Task-3/4 physical authority."""
+        from tests.test_mcpat_native_cache import (
+            native_mcpat_artifact,
+            native_text,
+        )
+        from workflow.floorplan.build_module_model import build_model
+        from workflow.r2 import attach_result
+        from workflow.thermal.sustainable_frequency import derive
+
+        metadata = read_json(self.fixture.r1 / "r1_metadata.json")
+        metadata.update({
+            "cpu_clock": metadata["clock"],
+            "l1_associativity": 2,
+            "l2_associativity": 8,
+            "cache_line_bytes": 64,
+        })
+        write_json(self.fixture.r1 / "r1_metadata.json", metadata)
+        with (self.fixture.r1 / "stats.txt").open("a", encoding="utf-8") as stream:
+            for core in range(4):
+                stream.write(
+                    f"system.l2.demandAccesses::cpu{core}.data {100 + core}\n"
+                )
+
+        binary = self.root / "tools/mcpat"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_bytes(b"strict patched McPAT fixture\n")
+        for point, method in (
+                (self.fixture.fixed, "fixed-bin"),
+                (self.fixture.clip, "clip3d")):
+            mcpat_dir = point / "mcpat"
+            mcpat_dir.mkdir(parents=True, exist_ok=True)
+            (mcpat_dir / "input.xml").write_text(
+                "<component/>", encoding="utf-8",
+            )
+            write_json(mcpat_dir / "mapping_report.json", {})
+            mcpat_output = mcpat_dir / "mcpat.out"
+            mcpat_output.write_text(native_text(), encoding="utf-8")
+            mcpat = native_mcpat_artifact(binary, mcpat_output, metadata)
+            mcpat_path = mcpat_dir / "mcpat.json"
+            write_json(mcpat_path, mcpat)
+            model = build_model(
+                self.fixture.r1, mcpat_path, point / "modules.json",
+                require_communication_profile=True,
+            )
+            layout_modules = deepcopy(model["modules"])
+            for module in layout_modules:
+                module["tier"] = (
+                    1 if module["kind"] in ("l2", "interconnect") else 0
+                )
+            write_json(point / "hotspot/layout.json", {
+                "modules": layout_modules,
+            })
+            if method == "clip3d":
+                write_json(point / "optimizer_report.json", {})
+                write_json(point / "layout_selection.json", {})
+
+            frequency = self.fixture.config["frequency"]
+            thermal = read_json(point / "hotspot/thermal_result.json")
+            performance = derive(
+                model, thermal, frequency["f0_ghz"], frequency["fmin_ghz"],
+                frequency["tsafe_c"], frequency["ambient_c"],
+            )
+            write_json(point / "performance.json", performance)
+
+            summary_path = point / "pipeline_summary.json"
+            summary = read_json(summary_path)
+            summary.update({
+                "r1": str(self.fixture.r1.resolve()),
+                "module_count": len(model["modules"]),
+                "total_power_w": model["totals"]["total_power_w"],
+                "power_provenance": model["power_provenance"],
+                "area_provenance": model["area_provenance"],
+                "cache_authority": model["cache_authority"],
+                "mcpat_provenance": model["mcpat_provenance"],
+                "communication_profile": model["communication_profile"],
+                "gamma": model["gamma"],
+                "tmax_c": performance["tmax_f0_c"],
+                "sustainable_frequency_ghz": performance[
+                    "sustainable_frequency_ghz"
+                ],
+                "ipc1": performance["ipc1"],
+                "bips1_thermal": performance["bips1_thermal"],
+            })
+            summary["stage_seconds"].pop("cacti", None)
+            summary["artifacts"].update({
+                "mcpat_xml": str((mcpat_dir / "input.xml").resolve()),
+                "mcpat_json": str(mcpat_path.resolve()),
+                "mcpat_output": str(mcpat_output.resolve()),
+                "mcpat_binary": str(binary.resolve()),
+            })
+            summary["artifact_sha256"] = {
+                "mcpat_json": sha256_file(mcpat_path),
+                "mcpat_output": mcpat["provenance"]["hashes"]["output_sha256"],
+                "mcpat_binary": mcpat["provenance"]["hashes"]["binary_sha256"],
+            }
+            write_json(summary_path, summary)
+
+        self.fixture._write_source_result()
+        attach_result.attach(self.fixture.fixed)
 
     def test_paired_sweep_requires_native_physical_preflight_authority(self):
         """A historical preflight result cannot authorize corrected R2 pairing."""
@@ -2824,6 +2945,44 @@ class PairedR2RunnerTests(unittest.TestCase):
             },
         }
         self.assertIs(_require_native_preflight(accepted), accepted)
+
+    def test_direct_pair_rejects_legacy_roots_before_any_mutation(self):
+        """A public single-pair call cannot bypass native physical preflight."""
+        from workflow.r2.run_paired_sweep import run_pair
+
+        def snapshot(root: Path) -> dict[str, bytes]:
+            return {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+
+        for point in (self.fixture.fixed, self.fixture.clip):
+            modules = read_json(point / "modules.json")
+            modules["schema_version"] = 2
+            write_json(point / "modules.json", modules)
+            summary = read_json(point / "pipeline_summary.json")
+            summary["stage_seconds"]["cacti"] = 1.0
+            write_json(point / "pipeline_summary.json", summary)
+
+        before = {
+            "fixed": snapshot(self.fixed_root),
+            "clip": snapshot(self.clip_root),
+        }
+        with patch(
+            "workflow.r2.run_paired_sweep.run_r2.run",
+            side_effect=AssertionError("legacy roots must not execute R2"),
+        ), patch(
+            "workflow.r2.run_paired_sweep.attach_result.attach",
+            side_effect=AssertionError("legacy roots must not attach R2"),
+        ), self.assertRaisesRegex(ValueError, "McPAT-native"):
+            run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        self.assertEqual(snapshot(self.fixed_root), before["fixed"])
+        self.assertEqual(snapshot(self.clip_root), before["clip"])
+        self.assertFalse(self.status_root.exists())
 
     @staticmethod
     def _complete_gem5(command, **_kwargs):
@@ -2992,14 +3151,16 @@ class PairedR2RunnerTests(unittest.TestCase):
         run_config = read_json(run_config_path)
         run_config["source"] = str((self.root / "different-config.json").resolve())
         write_json(run_config_path, run_config)
+        status_path = self.status_root / self.key.relative_path() / "pair_status.json"
+        status_before = status_path.read_bytes()
 
-        second = run_pair(
-            self.key, self.r1_root, self.fixed_root, self.clip_root,
-            self.config_path, status_root=self.status_root,
-        )
+        with self.assertRaisesRegex(ValueError, "run_config source"):
+            run_pair(
+                self.key, self.r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
 
-        self.assertEqual(second["state"], "failed")
-        self.assertIn("validation", second["error"])
+        self.assertEqual(status_path.read_bytes(), status_before)
 
     def test_completed_pair_with_tampered_reuse_marker_is_reattached(self):
         """Marker existence alone must not make a damaged reused pair skippable."""
@@ -3303,7 +3464,12 @@ class PairedR2RunnerTests(unittest.TestCase):
 
         self.assertEqual(repaired["state"], "success")
         self.assertEqual(events, ["clip-run", "clip-attach"])
-        self.assertAlmostEqual(read_json(performance_path)["bips2"], 3.575)
+        repaired_performance = read_json(performance_path)
+        self.assertAlmostEqual(
+            repaired_performance["bips2"],
+            repaired_performance["ipc2"]
+            * repaired_performance["sustainable_frequency_ghz"],
+        )
 
     def test_sweep_lock_fails_fast_before_preflight_or_worker_launch(self):
         """A second sweep cannot inspect or mutate roots owned by an active sweep."""
