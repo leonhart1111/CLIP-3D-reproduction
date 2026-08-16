@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+from copy import deepcopy
 from pathlib import Path
 import subprocess
 import tempfile
@@ -15,7 +16,7 @@ from workflow.cache_contract import (
     mcpat_embedded_cache_record_identity,
     stable_identity,
 )
-from workflow.common import write_json
+from workflow.common import read_json, sha256_file, write_json
 from workflow.floorplan.build_module_model import (
     apply_mcpat_cache_geometry,
     build_model,
@@ -30,6 +31,8 @@ from workflow.mcpat.gem5_to_mcpat import (
 from workflow.mcpat.run_mcpat import run_mcpat
 from workflow.mcpat.parse_mcpat import parse_mcpat_text
 from workflow.r2.build_latency_vector import access_cycles, build_vector
+from workflow.run_lifting_pipeline import run_pipeline
+from workflow.run_lifting_sweep import completed
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -92,7 +95,11 @@ def native_text() -> str:
 
 
 def duplicate_l1i() -> str:
-    return native_text() + native_text().splitlines()[0] + "\n"
+    duplicate = next(
+        line for line in native_text().splitlines()
+        if line.startswith(f"{MARKER} cache=l1i core=0 ")
+    )
+    return native_text() + duplicate + "\n"
 
 
 def nan_l2() -> str:
@@ -204,6 +211,347 @@ def hand_derived_core_parent_metrics() -> dict:
             for core in range(4)
         ],
     }
+
+
+def native_mcpat_artifact(binary: Path, output: Path) -> dict:
+    """Return a complete strict-runner artifact bound to live test files."""
+    metadata = {
+        "num_cores": 4, "cpu_clock": "2GHz",
+        "l1i_size": "16kB", "l1d_size": "32kB", "l2_size": "512kB",
+        "l1_associativity": 2, "l2_associativity": 8,
+        "cache_line_bytes": 64,
+    }
+    xml = output.parent / "input.xml"
+    mapping = output.parent / "mapping_report.json"
+    native_records = parse_embedded_cacti_records(
+        output.read_text(encoding="utf-8"), expected_core_count=4,
+    )
+    return {
+        "schema_version": 1,
+        "cache_contract": build_cache_contract(
+            metadata, technology_nm=45, temperature_k=320,
+            device_type=0, interconnect_projection_type=1,
+        ),
+        "checks": {
+            "core_count": 4,
+            "core_logic_granularity": "McPAT top-level functional blocks",
+        },
+        "embedded_cacti_p": {
+            "schema_version": 1,
+            "authority": "McPAT 1.3 embedded CACTI-P",
+            "records": native_records,
+        },
+        "provenance": {
+            "schema_version": 1,
+            "authority": "CLIP strict patched McPAT 1.3 runner",
+            "hashes": {
+                "xml_sha256": sha256_file(xml),
+                "mapping_sha256": sha256_file(mapping),
+                "output_sha256": sha256_file(output),
+                "binary_sha256": sha256_file(binary),
+                "patch_sha256": sha256_file(PATCH),
+            },
+        },
+        "command": [str(binary.resolve()), "-infile", "input.xml"],
+    }
+
+
+def granular_model(mcpat: dict) -> dict:
+    """Return the strict module contract consumed by corrected orchestration."""
+    modules = granular_34_modules()
+    mobility = validate_mobility_contract(modules)
+    for index, module in enumerate(modules):
+        module["tier"] = index % 2
+    return {
+        "schema_version": 3,
+        "architecture": {"num_cores": 4, "cpu_clock": "2GHz"},
+        "cache_contract": mcpat["cache_contract"],
+        "cache_authority": "McPAT 1.3 embedded CACTI-P",
+        "embedded_cacti_p": mcpat["embedded_cacti_p"],
+        "mcpat_provenance": mcpat["provenance"],
+        "module_schema": {
+            "schema_version": 1,
+            "module_count": len(modules),
+            "core_count": 4,
+            "core_logic_granularity": "McPAT top-level functional blocks",
+            "requires_granular_cores": True,
+            "cache_area_authority": "McPAT aggregate Area",
+            "cache_shape_authority": "McPAT 1.3 embedded CACTI-P aspect ratio",
+        },
+        "mobility_contract": mobility,
+        "modules": modules,
+        "totals": {"total_power_w": sum(
+            module["total_power_w"] for module in modules
+        )},
+        "gamma": 0.2,
+        "power_provenance": {"postprocessing": "none"},
+        "area_provenance": {
+            "core_logic_and_interconnect": "unmodified McPAT area",
+            "l1i_l1d_l2": (
+                "McPAT aggregate area with embedded CACTI-P aspect ratio"
+            ),
+            "global_scaling": "none",
+        },
+        "power_distribution": {
+            "movable_kinds": ["l2"],
+            "movable_power_w": 1.2,
+            "movable_power_fraction": 1.2 / 21.0,
+        },
+        "communication_profile": {"status": "unavailable"},
+    }
+
+
+class SteadyPipelineTests(unittest.TestCase):
+    """Exercise corrected orchestration while mocking only tool boundaries."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.project = self.root / "project"
+        self.r1 = self.root / "r1"
+        self.out = self.root / "out"
+        self.r1.mkdir()
+        write_json(self.r1 / "r1_metadata.json", {
+            "workload": "fixture", "num_cores": 4, "cpu_clock": "2GHz",
+            "l1i_size": "16kB", "l1d_size": "32kB", "l2_size": "512kB",
+            "l1_associativity": 2, "l2_associativity": 8,
+            "cache_line_bytes": 64,
+        })
+        (self.r1 / "stats.txt").write_text("", encoding="utf-8")
+        self.config = self.root / "config.json"
+        write_json(self.config, {
+            "schema_version": 1,
+            "technology_nm": 45,
+            "frequency": {
+                "ambient_c": 25.0, "f0_ghz": 2.0, "fmin_ghz": 0.4,
+                "tsafe_c": 95.0,
+            },
+            "physical": {
+                "grid_size": 64, "tiers": 2, "utilization": 0.70,
+                "r_convec_k_per_w": 5.0,
+            },
+            "layout_optimizer": {
+                "alpha": 0.3, "beta": 0.0, "cross_tier_weight": 0.65,
+                "lambda_wire": 0.01, "r_convec_k_per_w": 5.0,
+                "validation_policy": "paper-single",
+            },
+            "delay": {},
+            "mcpat": {},
+        })
+        for relative in ("tools/src/mcpat/mcpat", "tools/src/hotspot/hotspot"):
+            path = self.project / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(relative.encode("utf-8"))
+
+    def _run(self) -> tuple[dict, list[str], object]:
+        events = []
+        mcpat_binary = self.project / "tools/src/mcpat/mcpat"
+
+        def run_mcpat_case(_r1, output, _settings, executable):
+            events.append("mcpat")
+            self.assertEqual(Path(executable), mcpat_binary)
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "input.xml").write_text("<component/>", encoding="utf-8")
+            write_json(output / "mapping_report.json", {})
+            mcpat_output = output / "mcpat.out"
+            mcpat_output.write_text(native_text(), encoding="utf-8")
+            artifact = native_mcpat_artifact(mcpat_binary, mcpat_output)
+            write_json(output / "mcpat.json", artifact)
+            return artifact
+
+        def build_model_case(_r1, mcpat_path, output, **_kwargs):
+            events.append("model")
+            self.assertEqual(mcpat_path, self.out / "mcpat/mcpat.json")
+            model = granular_model(read_json(mcpat_path))
+            write_json(output, model)
+            return model
+
+        def materialize_case(modules_path, hotspot_dir, *_args, **_kwargs):
+            events.append("materialize")
+            model = read_json(modules_path)
+            write_json(hotspot_dir / "layout.json", {"modules": model["modules"]})
+            write_json(hotspot_dir / "hotspot_manifest.json", {})
+
+        def hotspot_case(hotspot_dir, _binary):
+            events.append("hotspot")
+            result = {"tmax_c": 80.0}
+            write_json(hotspot_dir / "thermal_result.json", result)
+            return result
+
+        def evaluate_case(_modules, _thermal, output, *_args):
+            result = {
+                "sustainable_frequency_ghz": 1.0, "ipc1": 1.0,
+                "bips1_thermal": 1.0,
+            }
+            write_json(output, result)
+            return result
+
+        def vector_case(_modules, output, *_args, **_kwargs):
+            events.append("vector")
+            vector = {
+                "wire_cycle_aggregation_for_r2": "mean",
+                "critical_l1d_to_l2_cycles": 1,
+                "layout_delays": {
+                    "wire_cycles_unrounded": 1.0,
+                    "maximum_wire_cycles_unrounded": 1.0,
+                    "wire_cycles": 1, "maximum_wire_cycles": 1,
+                },
+            }
+            write_json(output, vector)
+            return vector
+
+        with patch(
+            "workflow.run_lifting_pipeline.PROJECT_ROOT", self.project,
+        ), patch(
+            "workflow.run_lifting_pipeline.run_mcpat", side_effect=run_mcpat_case,
+        ) as mcpat_call, patch(
+            "workflow.run_lifting_pipeline.build_model", side_effect=build_model_case,
+        ), patch(
+            "workflow.run_lifting_pipeline.materialize", side_effect=materialize_case,
+        ), patch(
+            "workflow.run_lifting_pipeline.run_hotspot", side_effect=hotspot_case,
+        ), patch(
+            "workflow.run_lifting_pipeline.evaluate", side_effect=evaluate_case,
+        ), patch(
+            "workflow.run_lifting_pipeline.build_vector", side_effect=vector_case,
+        ), patch(
+            "workflow.run_lifting_pipeline.characterize", create=True,
+            side_effect=AssertionError("standalone CACTI must not run"),
+        ):
+            summary = run_pipeline(self.r1, self.out, self.config)
+        self.assertEqual(mcpat_call.call_count, 1)
+        return summary, events, mcpat_call
+
+    def test_corrected_pipeline_never_checks_or_invokes_standalone_cacti(self):
+        # Break caught: restoring a CACTI executable/config check or call makes
+        # the corrected pipeline fail because this project fixture has neither.
+        summary, _events, _mcpat = self._run()
+
+        self.assertFalse((self.out / "cacti").exists())
+        self.assertNotIn("cacti", summary["artifacts"])
+        self.assertNotIn("cacti", summary["artifact_sha256"])
+        self.assertNotIn("cacti", summary["stage_seconds"])
+
+    def test_corrected_pipeline_uses_native_stage_order_and_provenance(self):
+        # Break caught: running layout/vector before the authoritative McPAT
+        # model, or generating cache latency before final HotSpot/layout.
+        summary, events, _mcpat = self._run()
+
+        self.assertEqual(events, ["mcpat", "model", "materialize", "hotspot", "vector"])
+        self.assertEqual(summary["cache_authority"], "McPAT 1.3 embedded CACTI-P")
+        self.assertEqual(
+            summary["mcpat_provenance"], read_json(self.out / "mcpat/mcpat.json")["provenance"]
+        )
+        self.assertEqual(
+            summary["artifact_sha256"]["mcpat_json"],
+            sha256_file(self.out / "mcpat/mcpat.json"),
+        )
+
+    def test_batch_completion_requires_live_native_hashes_and_strict_model(self):
+        # Break caught: file-existence-only resume accepts historical or
+        # tampered physical evidence as a corrected point.
+        self._run()
+        config = read_json(self.config)
+        self.assertTrue(completed(self.out, config, "fixed-bin", False))
+
+        mcpat_output = self.out / "mcpat/mcpat.out"
+        original_output = mcpat_output.read_bytes()
+        mcpat_output.write_bytes(original_output + b"tampered\n")
+        self.assertFalse(completed(self.out, config, "fixed-bin", False))
+        mcpat_output.write_bytes(original_output)
+
+        binary = self.project / "tools/src/mcpat/mcpat"
+        original_binary = binary.read_bytes()
+        binary.write_bytes(original_binary + b"tampered\n")
+        self.assertFalse(completed(self.out, config, "fixed-bin", False))
+        binary.write_bytes(original_binary)
+
+        xml = self.out / "mcpat/input.xml"
+        original_xml = xml.read_bytes()
+        xml.write_bytes(original_xml + b"tampered\n")
+        self.assertFalse(completed(self.out, config, "fixed-bin", False))
+        xml.write_bytes(original_xml)
+
+        modules_path = self.out / "modules.json"
+        model = read_json(modules_path)
+        model["cache_contract"] = build_cache_contract(
+            {
+                "num_cores": 4, "l1i_size": "16kB", "l1d_size": "32kB",
+                "l2_size": "512kB", "l1_associativity": 2,
+                "l2_associativity": 8, "cache_line_bytes": 64,
+            },
+            technology_nm=32, temperature_k=320, device_type=0,
+            interconnect_projection_type=1,
+        )
+        write_json(modules_path, model)
+        self.assertFalse(completed(self.out, config, "fixed-bin", False))
+
+        model = granular_model(read_json(self.out / "mcpat/mcpat.json"))
+        model["modules"][0]["movable"] = True
+        write_json(modules_path, model)
+        self.assertFalse(completed(self.out, config, "fixed-bin", False))
+
+        model = granular_model(read_json(self.out / "mcpat/mcpat.json"))
+        model["module_schema"]["requires_granular_cores"] = False
+        write_json(modules_path, model)
+        self.assertFalse(completed(self.out, config, "fixed-bin", False))
+
+    def test_completion_rejects_legacy_cacti_summary_identity(self):
+        # Break caught: a corrected-looking summary must not retain a second,
+        # standalone cache authority in artifacts, hashes, or stage timing.
+        self._run()
+        summary_path = self.out / "pipeline_summary.json"
+        summary = read_json(summary_path)
+        summary["artifacts"]["cacti"] = str(
+            (self.out / "cacti/cacti_characterization.json").resolve()
+        )
+        summary["artifact_sha256"]["cacti"] = "c" * 64
+        summary["stage_seconds"]["cacti"] = 1.0
+        write_json(summary_path, summary)
+
+        self.assertFalse(completed(
+            self.out, read_json(self.config), "fixed-bin", False,
+        ))
+
+    def test_completion_binds_native_json_records_to_live_mcpat_output(self):
+        # Break caught: coordinated edits to all mutable JSON copies cannot
+        # redefine records that are absent from the hash-bound raw output.
+        self._run()
+        config = read_json(self.config)
+        self.assertTrue(completed(self.out, config, "fixed-bin", False))
+
+        mcpat_path = self.out / "mcpat/mcpat.json"
+        modules_path = self.out / "modules.json"
+        summary_path = self.out / "pipeline_summary.json"
+        mcpat = read_json(mcpat_path)
+        forged = mcpat["embedded_cacti_p"]["records"][0]
+        forged["width_mm"] *= 2.0
+        forged["record_id"] = mcpat_embedded_cache_record_identity(forged)
+        write_json(mcpat_path, mcpat)
+
+        modules = read_json(modules_path)
+        modules["embedded_cacti_p"] = deepcopy(mcpat["embedded_cacti_p"])
+        write_json(modules_path, modules)
+
+        summary = read_json(summary_path)
+        summary["artifact_sha256"]["mcpat_json"] = sha256_file(mcpat_path)
+        write_json(summary_path, summary)
+
+        self.assertFalse(completed(self.out, config, "fixed-bin", False))
+
+    def test_historical_cacti_directory_cannot_masquerade_as_complete(self):
+        # Break caught: accepting standalone characterization after native
+        # mcpat.json disappears silently resumes a historical output.
+        self._run()
+        write_json(self.out / "cacti/cacti_characterization.json", {
+            "schema_version": 2, "characterization_id": "c" * 64,
+        })
+        (self.out / "mcpat/mcpat.json").unlink()
+
+        self.assertFalse(completed(
+            self.out, read_json(self.config), "fixed-bin", False,
+        ))
 
 
 class EmbeddedCACTIParserTests(unittest.TestCase):

@@ -22,7 +22,7 @@ from workflow.analysis.summarize_sweep import summarize
 from workflow.analysis.prepare_raw_power_validation import prepare
 from workflow.analysis.evaluate_operational_proxy import evaluate as evaluate_operational_proxy
 from workflow.analysis.promote_validated_config import promote
-from workflow.common import parse_gem5_stats, read_json, write_json
+from workflow.common import parse_gem5_stats, read_json, sha256_file, write_json
 from workflow.floorplan.comparison_layouts import generate as generate_comparison_layouts
 from workflow.floorplan.build_module_model import (
     apply_physical_areas,
@@ -118,6 +118,12 @@ class WorkflowTests(unittest.TestCase):
                         {"name": "top", "tier": 1, "total_power_w": 1.0}],
             "totals": {"total_power_w": 2.0}, "gamma": 0.2,
             "power_provenance": {}, "area_provenance": {},
+            "cache_authority": "McPAT 1.3 embedded CACTI-P",
+            "mcpat_provenance": {
+                "schema_version": 1,
+                "authority": "CLIP strict patched McPAT 1.3 runner",
+                "hashes": {},
+            },
             "power_distribution": {
                 "movable_kinds": [], "movable_power_w": 0.0,
                 "movable_power_fraction": 0.0,
@@ -144,18 +150,27 @@ class WorkflowTests(unittest.TestCase):
             config_path = root / "config.json"
             write_json(config_path, config)
 
-            def characterize_case(*args, **_kwargs):
-                output_dir = args[2]
-                output_dir.mkdir(parents=True, exist_ok=True)
-                write_json(output_dir / "cacti_characterization.json", {})
-
             def build_module_case(*args, **_kwargs):
-                write_json(args[3], model)
+                write_json(args[2], model)
                 return model
 
-            def convert_case(*args, **_kwargs):
-                args[1].parent.mkdir(parents=True, exist_ok=True)
-                return {"cache_contract": {}, "cacti_characterization_id": "id"}
+            def run_mcpat_case(_r1, output_dir, _settings, executable):
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "input.xml").write_text("<component/>", encoding="utf-8")
+                (output_dir / "mcpat.out").write_text("native\n", encoding="utf-8")
+                artifact = {
+                    "provenance": {
+                        "schema_version": 1,
+                        "authority": "CLIP strict patched McPAT 1.3 runner",
+                        "hashes": {
+                            "output_sha256": sha256_file(output_dir / "mcpat.out"),
+                            "binary_sha256": sha256_file(executable),
+                        },
+                    },
+                }
+                model["mcpat_provenance"] = artifact["provenance"]
+                write_json(output_dir / "mcpat.json", artifact)
+                return artifact
 
             def materialize_case(_modules, hotspot_dir, *_args, **_kwargs):
                 hotspot_dir.mkdir(parents=True, exist_ok=True)
@@ -173,19 +188,8 @@ class WorkflowTests(unittest.TestCase):
                 "workflow.run_lifting_pipeline.materialize",
                 side_effect=materialize_case,
             ) as materialize_mock, patch(
-                "workflow.run_lifting_pipeline.build_cache_contract",
-                return_value={"records": []},
-            ), patch(
-                "workflow.run_lifting_pipeline.characterize",
-                side_effect=characterize_case,
-            ), patch(
-                "workflow.run_lifting_pipeline.convert",
-                side_effect=convert_case,
-            ), patch(
-                "workflow.run_lifting_pipeline.subprocess.run",
-                return_value=subprocess.CompletedProcess([], 0, "McPAT (version 1.3 results"),
-            ), patch(
-                "workflow.run_lifting_pipeline.parse_mcpat_text", return_value={},
+                "workflow.run_lifting_pipeline.run_mcpat",
+                side_effect=run_mcpat_case,
             ), patch(
                 "workflow.run_lifting_pipeline.build_model", side_effect=build_module_case,
             ), patch(
@@ -2360,12 +2364,14 @@ class FormalGuardTests(unittest.TestCase):
         self.assertIn("wire latency", reason)
 
     def test_lifting_resume_rejects_stale_config(self):
+        from tests.test_mcpat_native_cache import (
+            granular_model,
+            native_mcpat_artifact,
+            native_text,
+        )
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            write_json(root / "pipeline_summary.json", {
-                "layout_method": "fixed-bin", "cooling": {"r_convec_k_per_w": 5.0},
-                "ipc2": 1.0, "bips2": 1.0,
-            })
             old = {"physical": {"r_convec_k_per_w": 5.0}, "mcpat": {"temperature_k": 370}}
             new = {"physical": {"r_convec_k_per_w": 5.0}, "mcpat": {"temperature_k": 320}}
             write_json(root / "run_config.json", {"config": old})
@@ -2374,6 +2380,32 @@ class FormalGuardTests(unittest.TestCase):
                 if not path.exists():
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text("{}", encoding="utf-8")
+            binary = root / "mcpat/test-binary"
+            binary.write_bytes(b"strict McPAT test binary\n")
+            (root / "mcpat/input.xml").write_text("<component/>", encoding="utf-8")
+            write_json(root / "mcpat/mapping_report.json", {})
+            mcpat_output = root / "mcpat/mcpat.out"
+            mcpat_output.write_text(native_text(), encoding="utf-8")
+            mcpat = native_mcpat_artifact(binary, mcpat_output)
+            write_json(root / "mcpat/mcpat.json", mcpat)
+            write_json(root / "modules.json", granular_model(mcpat))
+            write_json(root / "pipeline_summary.json", {
+                "layout_method": "fixed-bin", "cooling": {"r_convec_k_per_w": 5.0},
+                "ipc2": 1.0, "bips2": 1.0,
+                "stage_seconds": {},
+                "cache_authority": "McPAT 1.3 embedded CACTI-P",
+                "mcpat_provenance": mcpat["provenance"],
+                "artifacts": {
+                    "mcpat_json": str((root / "mcpat/mcpat.json").resolve()),
+                    "mcpat_output": str(mcpat_output.resolve()),
+                    "mcpat_binary": str(binary.resolve()),
+                },
+                "artifact_sha256": {
+                    "mcpat_json": sha256_file(root / "mcpat/mcpat.json"),
+                    "mcpat_output": mcpat["provenance"]["hashes"]["output_sha256"],
+                    "mcpat_binary": mcpat["provenance"]["hashes"]["binary_sha256"],
+                },
+            })
             self.assertFalse(lifting_completed(root, new, "fixed-bin", True))
             self.assertTrue(lifting_completed(root, old, "fixed-bin", True))
 

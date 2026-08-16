@@ -7,12 +7,9 @@ import argparse
 import hashlib
 import math
 import shutil
-import subprocess
 import time
 from pathlib import Path
 
-from workflow.cacti.characterize_cache import characterize
-from workflow.cache_contract import build_cache_contract
 from workflow.common import PROJECT_ROOT, format_temperature_c, read_json, write_json
 from workflow.floorplan.build_module_model import build_model
 from workflow.floorplan.comparison_layouts import METHODS as COMPARISON_METHODS
@@ -24,8 +21,7 @@ from workflow.floorplan.layout_metrics import (
     select_rounded_wire_cycles,
 )
 from workflow.floorplan.optimize_layout import optimize
-from workflow.mcpat.gem5_to_mcpat import convert
-from workflow.mcpat.parse_mcpat import parse_mcpat_text
+from workflow.mcpat.run_mcpat import run_mcpat
 from workflow.r2.build_latency_vector import build_vector
 from workflow.r2.run_r2 import run as run_r2, strict_latency_vectors_equal
 from workflow.thermal.run_hotspot import run_hotspot
@@ -179,11 +175,11 @@ def validate_config(config: dict, layout_method: str) -> None:
         raise ValueError("unsupported CLIP-3D pipeline config schema")
     if layout_method not in LAYOUT_METHODS:
         raise ValueError(f"unknown layout method: {layout_method}")
-    cacti_config = config.get("cacti", {})
-    if "use_paper_table_ii" in cacti_config:
+    legacy_cache_config = config.get("cacti", {})
+    if "use_paper_table_ii" in legacy_cache_config:
         raise ValueError(
             "cacti.use_paper_table_ii has been removed; cache area and latency "
-            "must come from the local CACTI run"
+            "must come from patched McPAT's embedded cache model"
         )
     forbidden_area_controls = {
         "area_reference_mm2", "area_reference_raw_mm2",
@@ -603,8 +599,6 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     metadata = read_json(r1_dir / "r1_metadata.json")
     tools = {
         "mcpat": PROJECT_ROOT / "tools/src/mcpat/mcpat",
-        "cacti": PROJECT_ROOT / "tools/src/cacti/cacti",
-        "cacti_config": PROJECT_ROOT / "tools/src/cacti/cache.cfg",
         "hotspot": PROJECT_ROOT / "tools/src/hotspot/hotspot",
     }
     for name, path in tools.items():
@@ -618,58 +612,17 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     stage_seconds = {}
 
     started = time.perf_counter()
-    cache_contract = build_cache_contract(
-        metadata, technology_nm=int(config["technology_nm"]),
-        temperature_k=int(mcpat_config.get("temperature_k", 320)),
-        device_type=int(mcpat_config.get("device_type", 0)),
-        interconnect_projection_type=int(
-            mcpat_config.get("interconnect_projection_type", 1)
-        ),
-    )
-    characterize(
-        tools["cacti"], tools["cacti_config"], output_dir / "cacti",
-        None, None, frequency["f0_ghz"],
-        contracts=cache_contract["records"],
-    )
-    cacti_json = output_dir / "cacti/cacti_characterization.json"
-    cacti_characterization = read_json(cacti_json)
-    stage_seconds["cacti"] = time.perf_counter() - started
-
-    started = time.perf_counter()
     mcpat_dir = output_dir / "mcpat"
     mcpat_xml = mcpat_dir / "input.xml"
-    mapping_report = convert(
-        r1_dir, mcpat_xml,
-        settings={
-            key: mcpat_config[key] for key in (
-                "temperature_k", "device_type", "longer_channel_device",
-                "interconnect_projection_type",
-            ) if key in mcpat_config
-        },
-        cache_characterization=cacti_characterization,
+    mcpat_artifact = run_mcpat(
+        r1_dir, mcpat_dir, mcpat_config, tools["mcpat"]
     )
-    opt_for_clk = int(mcpat_config.get("opt_for_clk", 0))
-    command = [str(tools["mcpat"]), "-infile", str(mcpat_xml),
-               "-print_level", "5", "-opt_for_clk", str(opt_for_clk)]
-    process = subprocess.run(command, cwd=tools["mcpat"].parent, text=True,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    mcpat_text = process.stdout
-    (mcpat_dir / "mcpat.out").write_text(mcpat_text, encoding="utf-8")
-    if process.returncode != 0 or "McPAT (version 1.3" not in mcpat_text or "results" not in mcpat_text:
-        raise RuntimeError(f"McPAT failed; see {mcpat_dir / 'mcpat.out'}")
-    parsed_mcpat = parse_mcpat_text(mcpat_text)
-    parsed_mcpat["command"] = command
-    parsed_mcpat["cache_contract"] = mapping_report["cache_contract"]
-    parsed_mcpat["cacti_characterization_id"] = mapping_report[
-        "cacti_characterization_id"
-    ]
-    write_json(mcpat_dir / "mcpat.json", parsed_mcpat)
     stage_seconds["mcpat"] = time.perf_counter() - started
 
     started = time.perf_counter()
     modules_path = output_dir / "modules.json"
     model = build_model(
-        r1_dir, mcpat_dir / "mcpat.json", cacti_json, modules_path,
+        r1_dir, mcpat_dir / "mcpat.json", modules_path,
         require_communication_profile=(
             config["delay"].get("wire_aggregation", "mean") == "traffic-weighted"
         ),
@@ -720,8 +673,8 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     delay = config["delay"]
     latency_path = output_dir / "r2_latency.json"
     vector = build_vector(
-        modules_path, output_dir / "cacti/cacti_characterization.json", latency_path,
-        None, None, hotspot_dir / "layout.json", delay.get("wire_rounding", "nearest"),
+        modules_path, latency_path, None, None,
+        hotspot_dir / "layout.json", delay.get("wire_rounding", "nearest"),
         int(delay.get("cycles_per_tsv", 2)), int(delay.get("l1_pipeline_cycles", 1)),
         delay.get("wire_aggregation", "mean"),
     )
@@ -822,6 +775,8 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
         "module_count": len(model["modules"]), "total_power_w": model["totals"]["total_power_w"],
         "power_provenance": model["power_provenance"],
         "area_provenance": model.get("area_provenance"),
+        "cache_authority": model["cache_authority"],
+        "mcpat_provenance": model["mcpat_provenance"],
         "power_distribution": model.get("power_distribution"),
         "communication_profile": model.get("communication_profile"),
         "gamma": model["gamma"], "tmax_c": thermal["tmax_c"],
@@ -839,7 +794,8 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
         "artifacts": {
             "config": str((output_dir / "run_config.json").resolve()),
             "mcpat_xml": str(mcpat_xml), "mcpat_json": str(mcpat_dir / "mcpat.json"),
-            "cacti": str(output_dir / "cacti/cacti_characterization.json"),
+            "mcpat_output": str(mcpat_dir / "mcpat.out"),
+            "mcpat_binary": str(tools["mcpat"].resolve()),
             "modules": str(modules_path), "layout": str((hotspot_dir / "layout.json").resolve()),
             "hotspot_manifest": str(hotspot_dir / "hotspot_manifest.json"),
             "thermal": str(hotspot_dir / "thermal_result.json"),
@@ -851,7 +807,9 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
             ),
         },
         "artifact_sha256": {
-            "cacti": sha256(cacti_json),
+            "mcpat_json": sha256(mcpat_dir / "mcpat.json"),
+            "mcpat_output": mcpat_artifact["provenance"]["hashes"]["output_sha256"],
+            "mcpat_binary": mcpat_artifact["provenance"]["hashes"]["binary_sha256"],
         },
     }
     write_json(output_dir / "pipeline_summary.json", summary)

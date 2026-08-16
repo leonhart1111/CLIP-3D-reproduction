@@ -25,6 +25,13 @@ def _paired_process_smoke(key, status_root):
     return _pending_pair(key, status_root)
 
 
+NATIVE_PREFLIGHT = {
+    "mode": "resume",
+    "fixed": {"physical_model_authority": "McPAT 1.3 embedded CACTI-P"},
+    "clip3d": {"physical_model_authority": "McPAT 1.3 embedded CACTI-P"},
+}
+
+
 class AtomicJsonPublicationTests(unittest.TestCase):
     """Shared JSON publication must not collide or leave partial state."""
 
@@ -541,16 +548,43 @@ class CanonicalLiftingTests(CanonicalFixtureTests):
 
     def _write_completed_layout_output(self, output: Path, config: dict,
                                        layout_method: str = "fixed-bin") -> None:
+        from tests.test_mcpat_native_cache import (
+            granular_model,
+            native_mcpat_artifact,
+            native_text,
+        )
         from workflow.run_lifting_sweep import required_artifacts
 
         for artifact in required_artifacts:
             write_json(output / artifact, {})
+        binary = output / "mcpat/test-binary"
+        binary.write_bytes(b"strict McPAT test binary\n")
+        (output / "mcpat/input.xml").write_text("<component/>", encoding="utf-8")
+        write_json(output / "mcpat/mapping_report.json", {})
+        mcpat_output = output / "mcpat/mcpat.out"
+        mcpat_output.write_text(native_text(), encoding="utf-8")
+        mcpat = native_mcpat_artifact(binary, mcpat_output)
+        write_json(output / "mcpat/mcpat.json", mcpat)
+        write_json(output / "modules.json", granular_model(mcpat))
         write_json(output / "run_config.json", {"config": config})
         write_json(output / "pipeline_summary.json", {
             "layout_method": layout_method,
             "cooling": {"r_convec_k_per_w": 5.0},
             "ipc2": None,
             "bips2": None,
+            "stage_seconds": {},
+            "cache_authority": "McPAT 1.3 embedded CACTI-P",
+            "mcpat_provenance": mcpat["provenance"],
+            "artifacts": {
+                "mcpat_json": str((output / "mcpat/mcpat.json").resolve()),
+                "mcpat_output": str(mcpat_output.resolve()),
+                "mcpat_binary": str(binary.resolve()),
+            },
+            "artifact_sha256": {
+                "mcpat_json": sha256_file(output / "mcpat/mcpat.json"),
+                "mcpat_output": mcpat["provenance"]["hashes"]["output_sha256"],
+                "mcpat_binary": mcpat["provenance"]["hashes"]["binary_sha256"],
+            },
         })
 
     def _cli_argv(self, root: Path, experiment: Path, output: Path,
@@ -782,6 +816,11 @@ class BalancedSelectionTests(unittest.TestCase):
     def _write_layout_roots(self, config_path: Path | None = None,
                             config: dict | None = None) -> tuple[Path, Path]:
         """Create real, complete 100-point roots with layout-only artifacts."""
+        from tests.test_mcpat_native_cache import (
+            granular_model,
+            native_mcpat_artifact,
+            native_text,
+        )
         from workflow.r1_catalog import expected_keys
         from workflow.run_lifting_sweep import (
             CLIP3D_REQUIRED_ARTIFACTS,
@@ -792,6 +831,9 @@ class BalancedSelectionTests(unittest.TestCase):
         config = config if config is not None else self.config
         fixed_root = self.root / "fixed"
         clip_root = self.root / "clip"
+        mcpat_binary = self.root / "tools/mcpat"
+        mcpat_binary.parent.mkdir(parents=True, exist_ok=True)
+        mcpat_binary.write_bytes(b"strict patched McPAT fixture\n")
         for root, method in ((fixed_root, "fixed-bin"), (clip_root, "clip3d")):
             for key in expected_keys(self.grid):
                 point = root / key.relative_path()
@@ -811,6 +853,7 @@ class BalancedSelectionTests(unittest.TestCase):
                     "layout_mode": method,
                     "ipc2": None,
                     "bips2": None,
+                    "stage_seconds": {},
                     "communication_profile": {
                         "status": "available",
                         "per_core": {
@@ -819,20 +862,32 @@ class BalancedSelectionTests(unittest.TestCase):
                         },
                     },
                 })
-                characterization_id = "c" * 64
-                write_json(point / "cacti/cacti_characterization.json", {
-                    "schema_version": 2,
-                    "characterization_id": characterization_id,
-                })
-                write_json(point / "modules.json", {
-                    "schema_version": 2,
-                    "cacti_characterization_id": characterization_id,
-                    "area_provenance": {
-                        "core_logic_and_interconnect": "unmodified McPAT area",
-                        "l1i_l1d_l2": "unmodified local CACTI area and dimensions",
-                        "global_scaling": "none",
+                mcpat_output = point / "mcpat/mcpat.out"
+                mcpat_output.parent.mkdir(parents=True, exist_ok=True)
+                (point / "mcpat/input.xml").write_text(
+                    "<component/>", encoding="utf-8"
+                )
+                write_json(point / "mcpat/mapping_report.json", {})
+                mcpat_output.write_text(native_text(), encoding="utf-8")
+                mcpat = native_mcpat_artifact(mcpat_binary, mcpat_output)
+                write_json(point / "mcpat/mcpat.json", mcpat)
+                write_json(point / "modules.json", granular_model(mcpat))
+                summary = read_json(point / "pipeline_summary.json")
+                summary.update({
+                    "cache_authority": "McPAT 1.3 embedded CACTI-P",
+                    "mcpat_provenance": mcpat["provenance"],
+                    "artifacts": {
+                        "mcpat_json": str((point / "mcpat/mcpat.json").resolve()),
+                        "mcpat_output": str(mcpat_output.resolve()),
+                        "mcpat_binary": str(mcpat_binary.resolve()),
+                    },
+                    "artifact_sha256": {
+                        "mcpat_json": sha256_file(point / "mcpat/mcpat.json"),
+                        "mcpat_output": mcpat["provenance"]["hashes"]["output_sha256"],
+                        "mcpat_binary": mcpat["provenance"]["hashes"]["binary_sha256"],
                     },
                 })
+                write_json(point / "pipeline_summary.json", summary)
         return fixed_root, clip_root
 
     def _selection(self):
@@ -937,22 +992,38 @@ class BalancedSelectionTests(unittest.TestCase):
         modules["area_provenance"]["global_scaling"] = "legacy 150 mm2 calibration"
         write_json(point / "modules.json", modules)
 
-        with self.assertRaisesRegex(ValueError, "unscaled physical model"):
+        with self.assertRaisesRegex(ValueError, "area provenance.*McPAT-native"):
             validate_layout_roots(fixed_root, clip_root, keys, self.config_path,
                                   selection=manifest)
 
-    def test_preflight_rejects_mismatched_cacti_characterization_identity(self):
-        """Geometry and local CACTI evidence must describe one characterization."""
+    def test_preflight_rejects_non_granular_native_module_model(self):
+        """A native McPAT artifact cannot legitimize an aggregate module model."""
         from workflow.experiments.balanced50 import validate_layout_roots
 
         manifest, keys = self._selection()
         fixed_root, clip_root = self._write_layout_roots()
         point = clip_root / keys[0].relative_path()
         modules = read_json(point / "modules.json")
-        modules["cacti_characterization_id"] = "d" * 64
+        modules["module_schema"]["requires_granular_cores"] = False
         write_json(point / "modules.json", modules)
 
-        with self.assertRaisesRegex(ValueError, "CACTI characterization identity"):
+        with self.assertRaisesRegex(ValueError, "strict granular"):
+            validate_layout_roots(fixed_root, clip_root, keys, self.config_path,
+                                  selection=manifest)
+
+    def test_preflight_rejects_historical_cacti_only_point(self):
+        """Standalone characterization cannot replace missing native McPAT evidence."""
+        from workflow.experiments.balanced50 import validate_layout_roots
+
+        manifest, keys = self._selection()
+        fixed_root, clip_root = self._write_layout_roots()
+        point = fixed_root / keys[0].relative_path()
+        (point / "mcpat/mcpat.json").unlink()
+        write_json(point / "cacti/cacti_characterization.json", {
+            "schema_version": 2, "characterization_id": "c" * 64,
+        })
+
+        with self.assertRaisesRegex(ValueError, "missing mcpat/mcpat.json"):
             validate_layout_roots(fixed_root, clip_root, keys, self.config_path,
                                   selection=manifest)
 
@@ -2737,6 +2808,23 @@ class PairedR2RunnerTests(unittest.TestCase):
         from workflow.r1_catalog import ArchitectureKey
         self.key = ArchitectureKey("fft", "32kB", "512kB")
 
+    def test_paired_sweep_requires_native_physical_preflight_authority(self):
+        """A historical preflight result cannot authorize corrected R2 pairing."""
+        from workflow.r2.run_paired_sweep import _require_native_preflight
+
+        with self.assertRaisesRegex(ValueError, "McPAT-native"):
+            _require_native_preflight({"mode": "resume"})
+        accepted = {
+            "mode": "resume",
+            "fixed": {
+                "physical_model_authority": "McPAT 1.3 embedded CACTI-P",
+            },
+            "clip3d": {
+                "physical_model_authority": "McPAT 1.3 embedded CACTI-P",
+            },
+        }
+        self.assertIs(_require_native_preflight(accepted), accepted)
+
     @staticmethod
     def _complete_gem5(command, **_kwargs):
         output = Path(next(arg.split("=", 1)[1] for arg in command
@@ -3230,7 +3318,7 @@ class PairedR2RunnerTests(unittest.TestCase):
             with patch.object(paired, "load_selection", return_value={}), \
                     patch.object(paired, "selection_keys", return_value=[]), \
                     patch.object(paired, "validate_layout_roots",
-                                 return_value={"mode": "resume"}), \
+                                 return_value=NATIVE_PREFLIGHT), \
                     self.assertRaisesRegex(RuntimeError, "sweep.*active|lock"):
                 paired.run_sweep(
                     self.r1_root, self.fixed_root, self.clip_root,
@@ -3309,7 +3397,7 @@ class PairedR2RunnerTests(unittest.TestCase):
         with patch.object(paired, "load_selection", return_value={}), \
                 patch.object(paired, "selection_keys", return_value=[self.key]), \
                 patch.object(paired, "validate_layout_roots",
-                             return_value={"mode": "resume"}), \
+                             return_value=NATIVE_PREFLIGHT), \
                 patch.object(paired, "ProcessPoolExecutor", InspectingExecutor), \
                 patch.object(paired, "write_json", side_effect=observe_publication), \
                 redirect_stdout(StringIO()):
@@ -3578,7 +3666,7 @@ class PairedR2RunnerTests(unittest.TestCase):
         with patch.object(paired, "load_selection", return_value={}), \
                 patch.object(paired, "selection_keys", return_value=[self.key]), \
                 patch.object(paired, "validate_layout_roots",
-                             return_value={"mode": "resume"}), \
+                             return_value=NATIVE_PREFLIGHT), \
                 patch.object(paired, "ProcessPoolExecutor", TamperingExecutor), \
                 redirect_stdout(StringIO()):
             result = paired.run_sweep(
@@ -3648,7 +3736,7 @@ class PairedR2RunnerTests(unittest.TestCase):
 
         with patch.object(paired, "ProcessPoolExecutor", ImmediateExecutor), \
                 patch.object(paired, "validate_layout_roots",
-                             return_value={"mode": "resume"}), \
+                             return_value=NATIVE_PREFLIGHT), \
                 patch.object(
                     paired, "_validate_completed",
                     side_effect=lambda record, *_args: (
@@ -3722,7 +3810,7 @@ class PairedR2RunnerTests(unittest.TestCase):
 
         with patch.object(paired, "ProcessPoolExecutor", ImmediateExecutor), \
                 patch.object(paired, "validate_layout_roots",
-                             return_value={"mode": "resume"}), \
+                             return_value=NATIVE_PREFLIGHT), \
                 patch.object(
                     paired, "_validate_completed",
                     side_effect=lambda record, *_args: (
@@ -3935,7 +4023,7 @@ class PairedR2RunnerTests(unittest.TestCase):
             decisions.append(decision)
             if decision.get("accepted") is not True:
                 raise ValueError("repairable reuse was rejected")
-            return {"mode": "resume"}
+            return NATIVE_PREFLIGHT
 
         with patch.object(paired, "load_selection", return_value={}), \
                 patch.object(paired, "selection_keys", return_value=[self.key]), \
@@ -3988,7 +4076,7 @@ class PairedR2RunnerTests(unittest.TestCase):
             decisions.append(decision)
             if decision.get("accepted") is not True:
                 raise ValueError("rerun replacement was rejected")
-            return {"mode": "resume"}
+            return NATIVE_PREFLIGHT
 
         with patch.object(paired, "load_selection", return_value={}), \
                 patch.object(paired, "selection_keys", return_value=[self.key]), \
@@ -4093,7 +4181,7 @@ class PairedR2RunnerTests(unittest.TestCase):
 
         with patch.object(paired, "ProcessPoolExecutor", ImmediateExecutor), \
                 patch.object(paired, "validate_layout_roots",
-                             return_value={"mode": "resume"}), \
+                             return_value=NATIVE_PREFLIGHT), \
                 patch.object(
                     paired, "_validate_completed",
                     side_effect=lambda record, *_args: (
@@ -4215,7 +4303,7 @@ class PairedR2RunnerTests(unittest.TestCase):
 
         with patch.object(paired, "ProcessPoolExecutor", ImmediateExecutor), \
                 patch.object(paired, "validate_layout_roots",
-                             return_value={"mode": "resume"}), \
+                             return_value=NATIVE_PREFLIGHT), \
                 patch.object(paired, "_validate_completed",
                              side_effect=validate_persisted) as validate_completed, \
                 patch.object(paired, "write_json",

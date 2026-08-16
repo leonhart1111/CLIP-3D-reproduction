@@ -5,9 +5,22 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+from copy import deepcopy
 from pathlib import Path
 
+from workflow.cache_contract import (
+    mcpat_embedded_cache_record_identity,
+    validate_cache_contract,
+)
 from workflow.common import PROJECT_ROOT, read_json, sha256_file, write_json
+from workflow.floorplan.build_module_model import validate_mobility_contract
+from workflow.mcpat.parse_mcpat import parse_mcpat_text
+from workflow.mcpat.run_mcpat import (
+    BUILD_PROVENANCE,
+    MCPAT_PROVENANCE_AUTHORITY,
+    MCPAT_PROVENANCE_SCHEMA_VERSION,
+    PATCH_FILE,
+)
 from workflow.r1_catalog import build_catalogue, canonical_directories
 from workflow.run_lifting_pipeline import LAYOUT_METHODS, run_pipeline
 
@@ -24,7 +37,6 @@ DEFAULT_SWEEP_CONFIG = PROJECT_ROOT / (
 required_artifacts = (
     "run_config.json",
     "mcpat/mcpat.json",
-    "cacti/cacti_characterization.json",
     "modules.json",
     "hotspot/layout.json",
     "hotspot/thermal_result.json",
@@ -33,6 +45,196 @@ required_artifacts = (
     "pipeline_summary.json",
 )
 CLIP3D_REQUIRED_ARTIFACTS = ("optimizer_report.json", "layout_selection.json")
+_CACHE_AUTHORITY = "McPAT 1.3 embedded CACTI-P"
+_MCPAT_HASH_FIELDS = {
+    "xml_sha256", "mapping_sha256", "output_sha256", "binary_sha256",
+    "patch_sha256",
+}
+_AREA_PROVENANCE = {
+    "core_logic_and_interconnect": "unmodified McPAT area",
+    "l1i_l1d_l2": "McPAT aggregate area with embedded CACTI-P aspect ratio",
+    "global_scaling": "none",
+}
+
+
+def _nonzero_sha256(value: object) -> bool:
+    try:
+        return (
+            isinstance(value, str) and len(value) == 64
+            and int(value, 16) >= 0 and set(value) != {"0"}
+        )
+    except ValueError:
+        return False
+
+
+def _validate_native_mcpat(mcpat: dict, output: Path) -> dict:
+    embedded = mcpat.get("embedded_cacti_p")
+    if not isinstance(embedded, dict) or set(embedded) != {
+            "schema_version", "authority", "records"}:
+        raise ValueError("McPAT artifact lacks the embedded_cacti_p schema")
+    if embedded.get("schema_version") != 1 \
+            or embedded.get("authority") != _CACHE_AUTHORITY:
+        raise ValueError("McPAT embedded_cacti_p authority is invalid")
+    records = embedded.get("records")
+    if not isinstance(records, list):
+        raise ValueError("McPAT embedded_cacti_p records must be an array")
+    expected = {
+        *(("l1i", core) for core in range(4)),
+        *(("l1d", core) for core in range(4)),
+        ("l2", None),
+    }
+    observed = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("McPAT embedded_cacti_p record must be an object")
+        identity = (record.get("cache"), record.get("core"))
+        observed.append(identity)
+        if record.get("record_id") != mcpat_embedded_cache_record_identity(record):
+            raise ValueError("McPAT embedded_cacti_p record identity is invalid")
+    if len(observed) != len(set(observed)) or set(observed) != expected:
+        raise ValueError("McPAT embedded_cacti_p record set is incomplete")
+
+    checks = mcpat.get("checks")
+    if not isinstance(checks, dict) or checks.get("core_count") != 4 \
+            or checks.get("core_logic_granularity") != (
+                "McPAT top-level functional blocks"):
+        raise ValueError("McPAT artifact lacks strict granular parser checks")
+    validate_cache_contract(mcpat.get("cache_contract"), expected_core_count=4)
+
+    provenance = mcpat.get("provenance")
+    if not isinstance(provenance, dict) or set(provenance) != {
+            "schema_version", "authority", "hashes"}:
+        raise ValueError("McPAT artifact lacks strict provenance")
+    if provenance.get("schema_version") != MCPAT_PROVENANCE_SCHEMA_VERSION \
+            or provenance.get("authority") != MCPAT_PROVENANCE_AUTHORITY:
+        raise ValueError("McPAT provenance authority is invalid")
+    hashes = provenance.get("hashes")
+    allowed_hashes = (_MCPAT_HASH_FIELDS, _MCPAT_HASH_FIELDS | {
+        "build_provenance_sha256",
+    })
+    if not isinstance(hashes, dict) or set(hashes) not in allowed_hashes \
+            or not all(_nonzero_sha256(value) for value in hashes.values()):
+        raise ValueError("McPAT provenance hash schema is invalid")
+
+    mcpat_output = output / "mcpat/mcpat.out"
+    command = mcpat.get("command")
+    if not isinstance(command, list) or not command \
+            or not isinstance(command[0], str):
+        raise ValueError("McPAT artifact lacks the executed binary identity")
+    binary = Path(command[0])
+    if not binary.is_absolute():
+        raise ValueError("McPAT executed binary path must be absolute")
+    if sha256_file(mcpat_output) != hashes["output_sha256"]:
+        raise ValueError("McPAT output hash does not match live output")
+    live_mcpat = parse_mcpat_text(
+        mcpat_output.read_text(encoding="utf-8"),
+        expected_core_count=4,
+        require_granular_cores=True,
+        require_embedded_cacti=True,
+    )
+    if live_mcpat["embedded_cacti_p"] != embedded:
+        raise ValueError("McPAT native records do not match live output")
+    if sha256_file(binary) != hashes["binary_sha256"]:
+        raise ValueError("McPAT binary hash does not match live executable")
+    if sha256_file(output / "mcpat/input.xml") != hashes["xml_sha256"]:
+        raise ValueError("McPAT XML hash does not match live input")
+    if sha256_file(output / "mcpat/mapping_report.json") != hashes[
+            "mapping_sha256"]:
+        raise ValueError("McPAT mapping hash does not match live report")
+    if sha256_file(PATCH_FILE) != hashes["patch_sha256"]:
+        raise ValueError("McPAT patch hash does not match audited patch")
+    if "build_provenance_sha256" in hashes and sha256_file(
+            BUILD_PROVENANCE) != hashes["build_provenance_sha256"]:
+        raise ValueError("McPAT build provenance hash does not match live record")
+    return {"embedded_cacti_p": embedded, "provenance": provenance,
+            "binary": binary, "output": mcpat_output}
+
+
+def validate_corrected_physical_artifacts(output: Path) -> dict:
+    """Validate corrected McPAT-native evidence before resume or pairing."""
+    output = Path(output).resolve()
+    mcpat_path = output / "mcpat/mcpat.json"
+    modules_path = output / "modules.json"
+    summary_path = output / "pipeline_summary.json"
+    mcpat = read_json(mcpat_path)
+    modules = read_json(modules_path)
+    summary = read_json(summary_path)
+    if not all(isinstance(value, dict) for value in (mcpat, modules, summary)):
+        raise ValueError("corrected physical artifacts must contain objects")
+    native = _validate_native_mcpat(mcpat, output)
+
+    if modules.get("schema_version") != 3:
+        raise ValueError("modules.json is not strict schema version 3")
+    # Negative compatibility gate only: these legacy identities are rejected,
+    # never consumed as corrected evidence.
+    legacy_identity_fields = {"source_cacti", "cacti_characterization_id"}
+    if legacy_identity_fields.intersection(mcpat) \
+            or legacy_identity_fields.intersection(modules) \
+            or any(legacy_identity_fields.intersection(module)
+                   for module in modules.get("modules", [])
+                   if isinstance(module, dict)):
+        raise ValueError("corrected physical artifacts retain standalone cache identity")
+    if modules.get("cache_authority") != _CACHE_AUTHORITY \
+            or modules.get("embedded_cacti_p") != native["embedded_cacti_p"] \
+            or modules.get("mcpat_provenance") != native["provenance"]:
+        raise ValueError("module model does not preserve McPAT-native authority")
+    module_cache_contract = validate_cache_contract(
+        modules.get("cache_contract"), expected_core_count=4,
+    )
+    if module_cache_contract != mcpat.get("cache_contract"):
+        raise ValueError("module cache contract differs from McPAT input mapping")
+    module_schema = modules.get("module_schema")
+    module_records = modules.get("modules")
+    if not isinstance(module_schema, dict) or not isinstance(module_records, list) \
+            or module_schema.get("schema_version") != 1 \
+            or module_schema.get("module_count") != len(module_records) \
+            or module_schema.get("core_count") != 4 \
+            or module_schema.get("core_logic_granularity") != (
+                "McPAT top-level functional blocks") \
+            or module_schema.get("requires_granular_cores") is not True:
+        raise ValueError("module model lacks the strict granular schema")
+    if any(not isinstance(module, dict) for module in module_records):
+        raise ValueError("module records must contain objects")
+    if any(module.get("movable") is not (module.get("name") == "shared_l2")
+           for module in module_records):
+        raise ValueError("serialized module mobility flags are invalid")
+    observed_mobility = validate_mobility_contract(deepcopy(module_records), 4)
+    if modules.get("mobility_contract") != observed_mobility:
+        raise ValueError("module mobility contract does not match modules")
+    if modules.get("area_provenance") != _AREA_PROVENANCE:
+        raise ValueError("module area provenance is not McPAT-native")
+
+    if summary.get("cache_authority") != _CACHE_AUTHORITY \
+            or summary.get("mcpat_provenance") != native["provenance"]:
+        raise ValueError("pipeline summary lacks McPAT-native provenance")
+    artifacts = summary.get("artifacts")
+    artifact_hashes = summary.get("artifact_sha256")
+    stage_seconds = summary.get("stage_seconds")
+    if not isinstance(stage_seconds, dict) or "cacti" in stage_seconds \
+            or not isinstance(artifacts, dict) or "cacti" in artifacts \
+            or not isinstance(artifact_hashes, dict) or "cacti" in artifact_hashes:
+        raise ValueError("pipeline summary retains standalone cache evidence")
+    expected_artifacts = {
+        "mcpat_json": str(mcpat_path.resolve()),
+        "mcpat_output": str(native["output"].resolve()),
+        "mcpat_binary": str(native["binary"].resolve()),
+    }
+    expected_hashes = {
+        "mcpat_json": sha256_file(mcpat_path),
+        "mcpat_output": native["provenance"]["hashes"]["output_sha256"],
+        "mcpat_binary": native["provenance"]["hashes"]["binary_sha256"],
+    }
+    if any(artifacts.get(name) != value
+           for name, value in expected_artifacts.items()):
+        raise ValueError("pipeline summary McPAT artifact paths are invalid")
+    if any(artifact_hashes.get(name) != value
+           for name, value in expected_hashes.items()):
+        raise ValueError("pipeline summary McPAT artifact hashes are invalid")
+    return {
+        "cache_authority": _CACHE_AUTHORITY,
+        "mcpat_provenance": native["provenance"],
+        "module_count": len(module_records),
+    }
 
 
 def require_nonformal_classification(config: dict) -> dict:
@@ -75,10 +277,11 @@ def completed(output: Path, config: dict, layout_method: str,
     try:
         summary = read_json(path)
         recorded_config = read_json(run_config_path).get("config")
+        validate_corrected_physical_artifacts(output)
     except (AttributeError, OSError, TypeError, ValueError):
         return False
     # Cooling alone is not a sufficient cache key: McPAT activity mapping,
-    # local CACTI geometry, area calibration, or layer materials may change
+    # embedded cache records, module geometry, or layer materials may change
     # while R_conv stays identical.
     if recorded_config != config:
         return False

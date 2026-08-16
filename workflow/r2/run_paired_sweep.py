@@ -29,6 +29,7 @@ from workflow.r2.attachment_validation import exclusive_point_lock
 SCHEMA_VERSION = 1
 SWEEP_LOCK_NAME = ".paired-r2-sweep.lock"
 PAIR_LOCK_NAME = ".paired-r2-pair.lock"
+_NATIVE_CACHE_AUTHORITY = "McPAT 1.3 embedded CACTI-P"
 
 # Global acquisition order: physical-root sweep -> physical-point pair ->
 # physical point attachment. Locks within one level use resolved path order.
@@ -102,6 +103,19 @@ def _positive_int(text: str) -> int:
     if value <= 0:
         raise argparse.ArgumentTypeError("must be positive")
     return value
+
+
+def _require_native_preflight(preflight: dict) -> dict:
+    """Reject paired execution unless both roots passed native validation."""
+    if not isinstance(preflight, dict) or any(
+            not isinstance(preflight.get(branch), dict)
+            or preflight[branch].get("physical_model_authority") != (
+                _NATIVE_CACHE_AUTHORITY)
+            for branch in ("fixed", "clip3d")):
+        raise ValueError(
+            "paired R2 requires McPAT-native physical preflight authority"
+        )
+    return preflight
 
 
 def _paths(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
@@ -905,14 +919,14 @@ def _run_sweep_locked(r1_root: Path, fixed_root: Path, clip_root: Path,
     status_root = Path(status_root).resolve()
     selection = load_selection(selection_path)
     all_keys = selection_keys(selection)
-    preflight = validate_layout_roots(
+    preflight = _require_native_preflight(validate_layout_roots(
         fixed_root, clip_root, all_keys, config_path,
         selection=selection, require_layout_only=False,
         existing_r2_validator=_existing_r2_validator(
             r1_root, fixed_root, clip_root, config_path,
             rerun_requested=rerun,
         ),
-    )
+    ))
     keys = all_keys if limit is None else all_keys[:limit]
     limited_run = limit is not None
     started = time.time()
