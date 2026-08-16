@@ -15,7 +15,7 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from workflow.cache_contract import build_cache_contract, validate_characterization
+from workflow.cache_contract import build_cache_contract
 from workflow.common import (
     PROJECT_ROOT,
     parse_frequency_ghz,
@@ -104,8 +104,7 @@ def cache_counts(stats: dict[str, float], core: int, cache: str) -> dict[str, in
 
 
 def update_core(core_xml: ET.Element, core: int, metadata: dict, stats: dict,
-                cache_contract: dict | None = None,
-                cache_characterization: dict | None = None) -> dict:
+                cache_contract: dict | None = None) -> dict:
     cycles = int(stat(stats, f"system.cpu{core}.numCycles"))
     committed = int(stat(stats, f"system.cpu{core}.commitStats0.numInsts"))
     # gem5 v23 calls this counter numOps.  The old opsCommitted spelling never
@@ -212,8 +211,8 @@ def update_core(core_xml: ET.Element, core: int, metadata: dict, stats: dict,
         set_named(core_xml, "stat", name, value)
 
     # McPAT's CACTI-P rejects a one-cycle 45-nm cache organization at 2 GHz.
-    # These fields constrain physical synthesis, not the R1 ideal gem5 timing;
-    # CACTI supplies the timing that is later back-annotated into R2.
+    # These are XML optimization constraints, not cache measurements.  The
+    # patched McPAT execution boundary emits the authoritative CACTI-P data.
     throughput_cycles, latency_cycles = 10, 10
     cache_records = {
         record["level"]: record for record in (
@@ -227,10 +226,6 @@ def update_core(core_xml: ET.Element, core: int, metadata: dict, stats: dict,
             )
         )["records"]
     }
-    measured_records = (
-        validate_characterization(cache_characterization, cache_contract)
-        if cache_characterization is not None else None
-    )
     for cache_name, level, xml_id in (
         ("icache", "l1i", "icache"),
         ("dcache", "l1d", "dcache"),
@@ -238,14 +233,6 @@ def update_core(core_xml: ET.Element, core: int, metadata: dict, stats: dict,
         cache = component_by_id(core_xml, f"system.core{core}.{xml_id}")
         cfg_name = f"{xml_id}_config"
         organization = cache_records[level]
-        latency_cycles = (
-            int(measured_records[level]["access_cycles"])
-            if measured_records is not None else 10
-        )
-        throughput_cycles = (
-            int(measured_records[level]["cycle_cycles"])
-            if measured_records is not None else 10
-        )
         policy = 0 if cache_name == "icache" else 1
         set_named(cache, "param", cfg_name,
                   f'{organization["size_bytes"]},'
@@ -307,8 +294,7 @@ def l2_counts(stats: dict[str, float]) -> dict[str, int]:
 
 
 def convert(r1_dir: Path, output_xml: Path, template: Path = DEFAULT_TEMPLATE,
-            report_path: Path | None = None, settings: dict | None = None,
-            cache_characterization: dict | None = None) -> dict:
+            report_path: Path | None = None, settings: dict | None = None) -> dict:
     mcpat_settings = {**DEFAULT_MCPAT_SETTINGS, **(settings or {})}
     temperature = int(mcpat_settings["temperature_k"])
     if temperature % 10 or not 300 <= temperature <= 400:
@@ -328,10 +314,6 @@ def convert(r1_dir: Path, output_xml: Path, template: Path = DEFAULT_TEMPLATE,
     cache_records = {
         record["level"]: record for record in cache_contract["records"]
     }
-    measured_records = (
-        validate_characterization(cache_characterization, cache_contract)
-        if cache_characterization is not None else None
-    )
     tree = ET.parse(template)
     root = tree.getroot()
     system = component_by_id(root, "system")
@@ -365,20 +347,12 @@ def convert(r1_dir: Path, output_xml: Path, template: Path = DEFAULT_TEMPLATE,
         replace_core_identity(core_xml, core_index)
         mappings.append(update_core(
             core_xml, core_index, metadata, stats, cache_contract,
-            cache_characterization,
         ))
         system.insert(insertion_index + core_index, core_xml)
 
     l2 = component_by_id(system, "system.L20")
     l2_organization = cache_records["l2"]
-    latency_cycles = (
-        int(measured_records["l2"]["access_cycles"])
-        if measured_records is not None else 10
-    )
-    throughput_cycles = (
-        int(measured_records["l2"]["cycle_cycles"])
-        if measured_records is not None else 10
-    )
+    latency_cycles = throughput_cycles = 10
     set_named(l2, "param", "L2_config",
               f'{l2_organization["size_bytes"]},'
               f'{l2_organization["line_size_bytes"]},'
@@ -409,10 +383,15 @@ def convert(r1_dir: Path, output_xml: Path, template: Path = DEFAULT_TEMPLATE,
         "technology_nm": 45,
         "mcpat_settings": mcpat_settings,
         "cache_contract": cache_contract,
-        "cacti_characterization_id": (
-            cache_characterization["characterization_id"]
-            if cache_characterization is not None else None
-        ),
+        "optimization_constraints": {
+            "cache_latency_throughput_cycles": {
+                "throughput_cycles": 10,
+                "latency_cycles": 10,
+                "classification": "not a measurement",
+                "purpose": "McPAT CACTI-P physical-organization optimization constraint",
+                "measurement_authority": "McPAT 1.3 embedded CACTI-P execution",
+            },
+        },
         "cores": mappings,
         "l2": counts,
         "paper_parameters": ["4 cores", "2 GHz", "45 nm", "L1 assoc=2", "L2 assoc=8"],
@@ -424,7 +403,8 @@ def convert(r1_dir: Path, output_xml: Path, template: Path = DEFAULT_TEMPLATE,
             "TLB misses are zero because the current SE statistics do not expose a stable per-TLB miss counter.",
             "The schema's 32-bit address widths are retained: this McPAT/CACTI-P build reports no valid array organization with 64-bit widths.",
             "McPAT temperature is an explicitly configured power-model operating point and is not T_safe.",
-            "When a local CACTI characterization is supplied, its ceiling-rounded access cycles are written into McPAT throughput and latency fields; standalone CLI conversion without it retains a documented compatibility fallback.",
+            "Cache throughput and latency XML fields are fixed 10-cycle optimization constraints, not measured cache results.",
+            "Cache measurements are authoritative only when emitted by the patched McPAT 1.3 embedded CACTI-P execution.",
         ],
     }
     write_json(report_path or output_xml.with_name("mapping_report.json"), report)

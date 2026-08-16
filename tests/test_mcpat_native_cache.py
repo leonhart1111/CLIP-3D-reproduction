@@ -7,8 +7,16 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
+from unittest.mock import patch
 
 from workflow.mcpat.cache_metrics import parse_embedded_cacti_records
+from workflow.mcpat.gem5_to_mcpat import (
+    component_by_id,
+    convert,
+    named_child,
+)
+from workflow.mcpat.run_mcpat import run_mcpat
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +27,14 @@ MARKER = "CLIP_MCPAT_CACTI_P_V1"
 
 
 def native_text() -> str:
+    def metrics(area: float, dynamic: float, indent: str = "  ") -> str:
+        return (
+            f"{indent}Area = {area} mm^2\n"
+            f"{indent}Runtime Dynamic = {dynamic} W\n"
+            f"{indent}Subthreshold Leakage = 0.1 W\n"
+            f"{indent}Gate Leakage = 0.01 W\n"
+        )
+
     records = []
     for cache, core in (
         *(("l1i", index) for index in range(4)),
@@ -33,7 +49,26 @@ def native_text() -> str:
             "width_mm=8.00000000000000000e-01 "
             "mcpat_version=1.3 model=embedded-cacti-p"
         )
-    return "\n".join(records) + "\n"
+    sections = [
+        "McPAT (version 1.3) results\n"
+        "Technology 45 nm\nCore clock Rate(MHz) 2000\nProcessor:\n"
+        + metrics(100.0, 10.0)
+    ]
+    separator = "*" * 40
+    for _core in range(4):
+        sections.append(
+            "Core:\n" + metrics(20.0, 2.0)
+            + "Instruction Fetch Unit:\n" + metrics(4.0, 0.4, "    ")
+            + "Instruction Cache:\n" + metrics(1.0, 0.1, "      ")
+            + "Renaming Unit:\n" + metrics(2.0, 0.2, "    ")
+            + "Load Store Unit:\n" + metrics(4.0, 0.4, "    ")
+            + "Data Cache:\n" + metrics(1.0, 0.1, "      ")
+            + "Memory Management Unit:\n" + metrics(2.0, 0.2, "    ")
+            + "Execution Unit:\n" + metrics(5.0, 0.5, "    ")
+        )
+    sections.append("L2\n" + metrics(8.0, 0.8))
+    return (f"\n{separator}\n".join(sections) + "\n"
+            + "\n".join(records) + "\n")
 
 
 def duplicate_l1i() -> str:
@@ -178,6 +213,83 @@ class McPATPatchTests(unittest.TestCase):
         )
         self.assertEqual(marker.returncode, 0, marker.stdout)
         self.assertIn(MARKER, marker.stdout)
+
+
+class McPATRunnerTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.r1 = self.root / "r1"
+        self.out = self.root / "mcpat"
+        self.r1.mkdir()
+        metadata = {
+            "num_cores": 4,
+            "cpu_clock": "2GHz",
+            "issue_width": 4,
+            "rob_entries": 192,
+            "cache_line_bytes": 64,
+            "l1i_size": "16kB",
+            "l1d_size": "32kB",
+            "l2_size": "512kB",
+            "l1_associativity": 2,
+            "l2_associativity": 8,
+        }
+        (self.r1 / "r1_metadata.json").write_text(json.dumps(metadata))
+        stats = []
+        for core in range(4):
+            stats.extend((
+                f"system.cpu{core}.numCycles 1000\n",
+                f"system.cpu{core}.commitStats0.numInsts 100\n",
+                f"system.cpu{core}.commitStats0.numOps 100\n",
+            ))
+        (self.r1 / "stats.txt").write_text("".join(stats))
+        self.binary = self.root / "bin" / "mcpat"
+        self.binary.parent.mkdir()
+        self.binary.write_text(MARKER + "\n")
+        self.binary.chmod(0o755)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_runner_invokes_mcpat_once_and_writes_native_artifact(self):
+        # Break caught: bypassing the one strict runner loses its canonical
+        # native artifact or runs McPAT more than once.
+        with patch(
+            "workflow.mcpat.run_mcpat.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, stdout=native_text()),
+        ) as run:
+            result = run_mcpat(self.r1, self.out, {}, self.binary)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(
+            result["embedded_cacti_p"]["authority"],
+            "McPAT 1.3 embedded CACTI-P",
+        )
+        self.assertTrue((self.out / "input.xml").is_file())
+        self.assertTrue((self.out / "mcpat.out").is_file())
+        self.assertTrue((self.out / "mcpat.json").is_file())
+        self.assertEqual(
+            result["provenance"]["output_sha256"],
+            hashlib.sha256((self.out / "mcpat.out").read_bytes()).hexdigest(),
+        )
+
+    def test_xml_cache_timings_are_only_optimization_constraints(self):
+        # Break caught: accepting a standalone cache measurement and silently
+        # presenting its timing as an XML-derived physical measurement.
+        report = convert(self.r1, self.out / "input.xml")
+        constraints = report["optimization_constraints"][
+            "cache_latency_throughput_cycles"
+        ]
+        self.assertEqual(constraints["classification"], "not a measurement")
+        self.assertEqual(constraints["throughput_cycles"], 10)
+        self.assertEqual(constraints["latency_cycles"], 10)
+        self.assertNotIn("cache_measurements", report)
+        tree = ET.parse(self.out / "input.xml")
+        system = component_by_id(tree.getroot(), "system")
+        value = named_child(
+            component_by_id(system, "system.core0.icache"),
+            "param", "icache_config",
+        ).get("value")
+        self.assertEqual(value.split(",")[4:6], ["10", "10"])
 
 
 if __name__ == "__main__":
