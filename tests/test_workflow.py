@@ -13,7 +13,11 @@ from types import ModuleType
 from unittest.mock import patch
 
 from workflow.cacti.characterize_cache import parse_cacti_output
-from workflow.cache_contract import build_cache_contract, stable_identity
+from workflow.cache_contract import (
+    build_cache_contract,
+    mcpat_embedded_cache_record_identity,
+    stable_identity,
+)
 from workflow.analysis.summarize_sweep import summarize
 from workflow.analysis.prepare_raw_power_validation import prepare
 from workflow.analysis.evaluate_operational_proxy import evaluate as evaluate_operational_proxy
@@ -835,7 +839,7 @@ class ParserTests(unittest.TestCase):
             r1_dir = root / "r1"
             r1_dir.mkdir()
             metadata = {
-                "num_cores": 2,
+                "num_cores": 4,
                 "l1i_size": "32kB",
                 "l1d_size": "32kB",
                 "l2_size": "512kB",
@@ -848,10 +852,16 @@ class ParserTests(unittest.TestCase):
             (r1_dir / "stats.txt").write_text(
                 "system.cpu0.commitStats0.numInsts 100\n"
                 "system.cpu1.commitStats0.numInsts 100\n"
+                "system.cpu2.commitStats0.numInsts 100\n"
+                "system.cpu3.commitStats0.numInsts 100\n"
                 "system.cpu0.numCycles 100\n"
                 "system.cpu1.numCycles 100\n"
+                "system.cpu2.numCycles 100\n"
+                "system.cpu3.numCycles 100\n"
                 "system.l2.demandAccesses::cpu0.data 25\n"
-                "system.l2.demandAccesses::cpu1.data 75\n",
+                "system.l2.demandAccesses::cpu1.data 75\n"
+                "system.l2.demandAccesses::cpu2.data 0\n"
+                "system.l2.demandAccesses::cpu3.data 0\n",
                 encoding="utf-8",
             )
             mcpat_path = root / "mcpat.json"
@@ -859,54 +869,71 @@ class ParserTests(unittest.TestCase):
                 metadata, technology_nm=45, temperature_k=320,
                 device_type=0, interconnect_projection_type=1,
             )
+            modules = []
+            for core in range(4):
+                modules.extend((
+                    {"name": f"core{core}_logic", "kind": "core_logic", "core": core,
+                     "area_mm2": 1.0, "dynamic_power_w": 1.0,
+                     "leakage_power_w": 0.1, "total_power_w": 1.1},
+                    {"name": f"core{core}_l1i", "kind": "l1i", "core": core,
+                     "area_mm2": 0.2, "dynamic_power_w": 0.1,
+                     "leakage_power_w": 0.02, "total_power_w": 0.12},
+                    {"name": f"core{core}_l1d", "kind": "l1d", "core": core,
+                     "area_mm2": 0.3, "dynamic_power_w": 0.1,
+                     "leakage_power_w": 0.02, "total_power_w": 0.12},
+                ))
+            modules.append({
+                "name": "shared_l2", "kind": "l2", "area_mm2": 1.0,
+                "dynamic_power_w": 0.1, "leakage_power_w": 0.1,
+                "total_power_w": 0.2,
+            })
+            records = []
+            for cache, core in (
+                *(("l1i", core) for core in range(4)),
+                *(("l1d", core) for core in range(4)),
+                ("l2", None),
+            ):
+                record = {
+                    "cache": cache, "core": core,
+                    "access_time_s": 1e-9, "cycle_time_s": 2e-9,
+                    "height_mm": 0.5, "width_mm": 1.0,
+                    "mcpat_version": "1.3", "model": "embedded-cacti-p",
+                }
+                record["record_id"] = mcpat_embedded_cache_record_identity(record)
+                records.append(record)
+            module_totals = {
+                field: sum(module[field] for module in modules)
+                for field in (
+                    "area_mm2", "dynamic_power_w", "leakage_power_w",
+                    "total_power_w",
+                )
+            }
             write_json(mcpat_path, {
-                "modules": [
-                    {"name": "core0_logic", "kind": "core_logic", "core": 0,
-                     "area_mm2": 1.0, "dynamic_power_w": 1.0,
-                     "leakage_power_w": 0.1, "total_power_w": 1.1},
-                    {"name": "core1_logic", "kind": "core_logic", "core": 1,
-                     "area_mm2": 1.0, "dynamic_power_w": 1.0,
-                     "leakage_power_w": 0.1, "total_power_w": 1.1},
-                    {"name": "shared_l2", "kind": "l2", "area_mm2": 1.0,
-                     "dynamic_power_w": 0.1, "leakage_power_w": 0.1,
-                     "total_power_w": 0.2},
-                ],
+                "modules": modules, "module_totals": module_totals,
+                "checks": {
+                    "core_count": 4,
+                    "core_logic_granularity": "legacy aggregate core_logic fallback",
+                },
                 "power_provenance": {"postprocessing": "none"},
                 "cache_contract": contract,
+                "embedded_cacti_p": {
+                    "schema_version": 1,
+                    "authority": "McPAT 1.3 embedded CACTI-P",
+                    "records": records,
+                },
+                "provenance": {
+                    "xml_sha256": "1" * 64, "mapping_sha256": "2" * 64,
+                    "output_sha256": "3" * 64, "binary_sha256": "4" * 64,
+                    "patch_sha256": "5" * 64,
+                },
             })
-            cacti_path = root / "cacti.json"
-            records = []
-            for index, organization in enumerate(contract["records"]):
-                record = {
-                    **organization, "access_time_ns": 0.5 + index * 0.5,
-                    "cycle_time_ns": 0.5 + index * 0.5,
-                    "access_cycles": 1 + index, "cycle_cycles": 1 + index,
-                    "area_mm2": 0.2 + index * 0.4,
-                    "width_mm": 0.5 + index * 0.25,
-                    "height_mm": (0.2 + index * 0.4) / (0.5 + index * 0.25),
-                    "config_sha256": "a" * 64, "raw_output_sha256": "b" * 64,
-                }
-                record["cacti_record_id"] = stable_identity(record)
-                records.append(record)
-            characterization = {
-                "schema_version": 2, "frequency_ghz": 2.0,
-                "rounding": "ceiling, minimum one cycle; 1e-12 tolerance at exact integer boundaries",
-                "records": records,
-                "provenance": {"cacti_executable_sha256": "c" * 64},
-            }
-            characterization["characterization_id"] = stable_identity(characterization)
-            write_json(cacti_path, characterization)
-            mcpat_payload = read_json(mcpat_path)
-            mcpat_payload["cacti_characterization_id"] = characterization[
-                "characterization_id"
-            ]
-            write_json(mcpat_path, mcpat_payload)
             output = root / "modules.json"
             metadata.pop("instruction_window_scope")
             write_json(r1_dir / "r1_metadata.json", metadata)
             model = build_model(
-                r1_dir, mcpat_path, cacti_path, output,
+                r1_dir, mcpat_path, output,
                 require_communication_profile=True,
+                require_granular_cores=False,
             )
             self.assertEqual(model, read_json(output))
             self.assertEqual(model["architecture"]["instruction_window_scope"], "cpu0")
@@ -1041,7 +1068,8 @@ Cache height x width (mm): 2 x 4
         with self.assertRaises(ValueError):
             parse_mcpat_text(text, expected_core_count=1, require_embedded_cacti=True)
 
-    def test_module_model_consumes_cacti_cache_geometry(self):
+    def test_legacy_diagnostic_helper_consumes_cacti_cache_geometry(self):
+        """Standalone CACTI geometry remains diagnostic, not a corrected artifact."""
         modules = [
             {"name": "core0_logic", "kind": "core_logic", "area_mm2": 10.0,
              "dynamic_power_w": 1.0, "leakage_power_w": 0.1, "total_power_w": 1.1},

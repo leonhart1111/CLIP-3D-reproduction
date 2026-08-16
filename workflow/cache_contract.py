@@ -12,6 +12,10 @@ from workflow.common import parse_size_bytes
 
 DEVICE_TYPES = {0: "itrs-hp", 1: "itrs-lstp", 2: "itrs-lop"}
 INTERCONNECT_PROJECTIONS = {0: "aggressive", 1: "conservative"}
+MCPAT_EMBEDDED_CACTI_IDENTITY_FIELDS = (
+    "access_time_s", "cache", "core", "cycle_time_s", "height_mm",
+    "mcpat_version", "model", "width_mm",
+)
 
 
 def stable_identity(value: object) -> str:
@@ -19,6 +23,41 @@ def stable_identity(value: object) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def mcpat_embedded_cache_record_identity(record: dict) -> str:
+    """Rebuild the content identity emitted for one embedded CACTI-P record."""
+    try:
+        numeric = {
+            key: float(record[key]) for key in (
+                "access_time_s", "cycle_time_s", "height_mm", "width_mm",
+            )
+        }
+        cache = record["cache"]
+        core = record["core"]
+        mcpat_version = record["mcpat_version"]
+        model = record["model"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("incomplete McPAT embedded CACTI-P record") from error
+    if not all(math.isfinite(value) and value > 0 for value in numeric.values()):
+        raise ValueError("nonphysical McPAT embedded CACTI-P record")
+    if cache not in {"l1i", "l1d", "l2"}:
+        raise ValueError("invalid McPAT embedded CACTI-P cache identity")
+    if cache == "l2":
+        if core is not None:
+            raise ValueError("McPAT embedded CACTI-P L2 must be shared")
+    elif isinstance(core, bool) or not isinstance(core, int) or core < 0:
+        raise ValueError("McPAT embedded CACTI-P L1 requires a core index")
+    if mcpat_version != "1.3" or model != "embedded-cacti-p":
+        raise ValueError("invalid McPAT embedded CACTI-P model identity")
+    canonical = {
+        key: (
+            format(numeric[key], ".17e")
+            if key in numeric else record[key]
+        )
+        for key in MCPAT_EMBEDDED_CACTI_IDENTITY_FIELDS
+    }
+    return stable_identity(canonical)
 
 
 def characterization_identity(characterization: dict) -> str:

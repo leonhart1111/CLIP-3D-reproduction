@@ -15,7 +15,9 @@ from workflow.common import (
     read_json,
     write_json,
 )
-from workflow.cache_contract import validate_characterization
+from workflow.cache_contract import (
+    mcpat_embedded_cache_record_identity,
+)
 
 
 def extract_communication_profile(stats: dict[str, float], num_cores: int,
@@ -135,12 +137,30 @@ def apply_physical_areas(modules: list[dict], metadata: dict,
 
 def apply_mcpat_cache_geometry(modules: list[dict], cache_records: list[dict]) -> list[dict]:
     """Normalize embedded CACTI-P aspect ratios to McPAT aggregate areas."""
-    records = {
-        (record["cache"], record["core"]): record for record in cache_records
-    }
+    records = {}
+    for record in cache_records:
+        if not isinstance(record, dict):
+            raise ValueError("McPAT embedded CACTI-P record must be an object")
+        try:
+            key = (record["cache"], record["core"])
+        except KeyError as error:
+            raise ValueError("incomplete McPAT embedded CACTI-P record") from error
+        if key in records:
+            raise ValueError(f"duplicate McPAT embedded CACTI-P cache geometry for {key}")
+        identity = mcpat_embedded_cache_record_identity(record)
+        if not identity or record.get("record_id") != identity:
+            raise ValueError(
+                f"McPAT embedded CACTI-P record identity differs for {key}"
+            )
+        records[key] = record
     result = []
     for source in modules:
         module = dict(source)
+        for legacy_field in (
+            "source_cacti", "cacti_characterization_id",
+            "mcpat_reported_area_mm2",
+        ):
+            module.pop(legacy_field, None)
         if module.get("kind") not in {"l1i", "l1d", "l2"}:
             module["area_source"] = "McPAT"
             result.append(module)
@@ -166,20 +186,178 @@ def apply_mcpat_cache_geometry(modules: list[dict], cache_records: list[dict]) -
             "preferred_width_mm": normalized_width,
             "preferred_height_mm": normalized_height,
             "aspect_ratio": ratio,
-            "geometry_formula": "width=sqrt(McPAT_area_mm2*embedded_width_mm/embedded_height_mm)",
+            "geometry_formula": (
+                "width=sqrt(McPAT_area_mm2*embedded_width_mm/embedded_height_mm); "
+                "height=McPAT_area_mm2/width"
+            ),
             "embedded_cacti_record_id": record["record_id"],
         })
         result.append(module)
     return result
 
 
-def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path,
-                output: Path | None = None,
-                require_communication_profile: bool = False) -> dict:
-    """Build a model from strict McPAT output, retaining legacy CACTI input support."""
-    native_cache_authority = output is None
-    if native_cache_authority:
-        output = Path(cacti_json)
+def validate_mobility_contract(modules: list[dict], expected_cores: int = 4) -> dict:
+    """Validate granular fixed modules and identify the sole movable shared L2."""
+    if isinstance(expected_cores, bool) or not isinstance(expected_cores, int) \
+            or expected_cores <= 0:
+        raise ValueError("expected core count must be a positive integer")
+    if not isinstance(modules, list) or not modules:
+        raise ValueError("module model must contain physical modules")
+
+    names = [str(module.get("name", "")) for module in modules]
+    if any(not name for name in names) or len(names) != len(set(names)):
+        raise ValueError("physical module names must be non-empty and unique")
+    if any(module.get("kind") == "core_logic" for module in modules):
+        raise ValueError("aggregate core_logic fallback is not a granular module")
+
+    required_kinds = {
+        "core_ifu", "core_rename", "core_lsu", "core_mmu", "core_exec",
+        "l1i", "l1d",
+    }
+    observed_cores = {
+        module.get("core") for module in modules if module.get("core") is not None
+    }
+    required_cores = set(range(expected_cores))
+    if observed_cores != required_cores:
+        raise ValueError(
+            "granular module core count mismatch: "
+            f"expected {sorted(required_cores)}, observed {sorted(observed_cores)}"
+        )
+    for core in sorted(required_cores):
+        core_modules = [module for module in modules if module.get("core") == core]
+        counts = {
+            kind: sum(module.get("kind") == kind for module in core_modules)
+            for kind in required_kinds
+        }
+        invalid = {
+            kind: count for kind, count in counts.items() if count != 1
+        }
+        if invalid:
+            raise ValueError(
+                f"granular core {core} required-kind count mismatch: {invalid}"
+            )
+        other_count = sum(
+            module.get("kind") == "core_other" for module in core_modules
+        )
+        if other_count > 1:
+            raise ValueError(f"granular core {core} has multiple residual blocks")
+
+    l2_modules = [module for module in modules if module.get("kind") == "l2"]
+    if len(l2_modules) != 1 or l2_modules[0].get("name") != "shared_l2":
+        raise ValueError("module model requires exactly one shared_l2 cache")
+
+    movable_names = ["shared_l2"]
+    fixed_names = [name for name in names if name != "shared_l2"]
+    for module in modules:
+        module["movable"] = module["name"] == "shared_l2"
+    return {
+        "schema_version": 1,
+        "policy": "fixed granular core/NoC modules; movable shared L2 only",
+        "expected_core_count": expected_cores,
+        "observed_core_indices": sorted(observed_cores),
+        "movable_names": movable_names,
+        "fixed_names": fixed_names,
+    }
+
+
+_MCPAT_HASH_FIELDS = (
+    "xml_sha256", "mapping_sha256", "output_sha256", "binary_sha256",
+    "patch_sha256",
+)
+_CONSERVATION_FIELDS = (
+    "area_mm2", "dynamic_power_w", "leakage_power_w", "total_power_w",
+)
+
+
+def _validated_mcpat_provenance(mcpat: dict) -> dict:
+    provenance = mcpat.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("McPAT artifact lacks hash provenance")
+    for field in _MCPAT_HASH_FIELDS:
+        value = provenance.get(field)
+        try:
+            valid = (
+                isinstance(value, str) and len(value) == 64
+                and int(value, 16) >= 0 and set(value) != {"0"}
+            )
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError(f"McPAT provenance {field} must be a nonzero SHA-256 hash")
+    return dict(provenance)
+
+
+def _validate_module_conservation(mcpat: dict, modules: list[dict]) -> tuple[dict, dict]:
+    totals = {
+        field: sum(float(module[field]) for module in modules)
+        for field in _CONSERVATION_FIELDS
+    }
+    expected = mcpat.get("module_totals")
+    if not isinstance(expected, dict):
+        raise ValueError("McPAT artifact lacks module_totals conservation evidence")
+    residuals = {}
+    for field, observed in totals.items():
+        try:
+            source_value = float(expected[field])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"McPAT module_totals lacks finite {field}") from error
+        if not math.isfinite(source_value):
+            raise ValueError(f"McPAT module_totals lacks finite {field}")
+        residuals[field] = observed - source_value
+        if not math.isclose(observed, source_value, rel_tol=1e-12, abs_tol=1e-12):
+            raise ValueError(
+                f"McPAT module conservation failed for {field}: "
+                f"source={source_value}, serialized={observed}"
+            )
+    return totals, {
+        "status": "passed",
+        "source": "McPAT parsed module_totals",
+        "relative_tolerance": 1e-12,
+        "absolute_tolerance": 1e-12,
+        "source_totals": {field: float(expected[field]) for field in _CONSERVATION_FIELDS},
+        "serialized_minus_source": residuals,
+    }
+
+
+def _validate_module_power(module: dict) -> None:
+    name = module.get("name", "<unnamed>")
+    for field in _CONSERVATION_FIELDS:
+        try:
+            value = float(module[field])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"McPAT module {name}.{field} must be finite") from error
+        if not math.isfinite(value) or value < 0 or (field == "area_mm2" and value <= 0):
+            raise ValueError(f"McPAT module {name}.{field} must be finite and nonnegative")
+    if not math.isclose(
+        float(module["total_power_w"]),
+        float(module["dynamic_power_w"]) + float(module["leakage_power_w"]),
+        rel_tol=1e-12, abs_tol=1e-12,
+    ):
+        raise ValueError(f"McPAT module {name} does not conserve total power")
+    if "subthreshold_leakage_w" in module or "gate_leakage_w" in module:
+        try:
+            primitive_leakage = (
+                float(module["subthreshold_leakage_w"])
+                + float(module["gate_leakage_w"])
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"McPAT module {name} has incomplete leakage components"
+            ) from error
+        if not math.isclose(
+            float(module["leakage_power_w"]), primitive_leakage,
+            rel_tol=1e-12, abs_tol=1e-12,
+        ):
+            raise ValueError(f"McPAT module {name} does not conserve leakage power")
+
+
+def build_model(r1_dir: Path, mcpat_json: Path, output: Path,
+                require_communication_profile: bool = False,
+                require_granular_cores: bool = True) -> dict:
+    """Build one McPAT-authoritative physical module model."""
+    r1_dir = Path(r1_dir)
+    mcpat_json = Path(mcpat_json)
+    output = Path(output)
     metadata = dict(read_json(r1_dir / "r1_metadata.json"))
     metadata["instruction_window_scope"] = instruction_window_scope(metadata)
     stats_path = r1_dir / "stats.txt"
@@ -195,28 +373,66 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path,
     cache_contract = mcpat.get("cache_contract")
     if cache_contract is None:
         raise ValueError("McPAT artifact lacks the shared cache_contract")
-    if native_cache_authority:
-        embedded = mcpat.get("embedded_cacti_p") or {}
-        if embedded.get("authority") != "McPAT 1.3 embedded CACTI-P":
-            raise ValueError("McPAT artifact lacks embedded CACTI-P authority")
-        modules = apply_mcpat_cache_geometry(
-            mcpat["modules"], embedded.get("records") or [],
-        )
-    else:
-        cacti = read_json(cacti_json)
-        validate_characterization(cacti, cache_contract)
-        if mcpat.get("cacti_characterization_id") != cacti.get(
-                "characterization_id"):
-            raise ValueError(
-                "McPAT cache timing CACTI identity differs from module geometry"
-            )
-        modules = apply_physical_areas(mcpat["modules"], metadata, cacti)
-    totals = {
-        "area_mm2": sum(module["area_mm2"] for module in modules),
-        "dynamic_power_w": sum(module["dynamic_power_w"] for module in modules),
-        "leakage_power_w": sum(module["leakage_power_w"] for module in modules),
-        "total_power_w": sum(module["total_power_w"] for module in modules),
+    embedded = mcpat.get("embedded_cacti_p") or {}
+    if embedded.get("schema_version") != 1 or embedded.get(
+            "authority") != "McPAT 1.3 embedded CACTI-P":
+        raise ValueError("McPAT artifact lacks embedded CACTI-P authority")
+    cache_records = embedded.get("records")
+    if not isinstance(cache_records, list):
+        raise ValueError("McPAT embedded CACTI-P records must be a list")
+    expected_record_keys = {
+        *(("l1i", core) for core in range(4)),
+        *(("l1d", core) for core in range(4)),
+        ("l2", None),
     }
+    observed_record_keys = [
+        (record.get("cache"), record.get("core"))
+        for record in cache_records if isinstance(record, dict)
+    ]
+    if len(observed_record_keys) != len(cache_records) \
+            or len(observed_record_keys) != len(set(observed_record_keys)) \
+            or set(observed_record_keys) != expected_record_keys:
+        raise ValueError("McPAT embedded CACTI-P record set is not the exact four-core set")
+    provenance = _validated_mcpat_provenance(mcpat)
+    modules = apply_mcpat_cache_geometry(mcpat.get("modules") or [], cache_records)
+    for module in modules:
+        _validate_module_power(module)
+        module["power_density_w_per_mm2"] = (
+            float(module["total_power_w"]) / float(module["area_mm2"])
+        )
+    if require_granular_cores:
+        if num_cores != 4:
+            raise ValueError(
+                f"formal granular model requires four cores, observed {num_cores}"
+            )
+        checks = mcpat.get("checks")
+        if not isinstance(checks, dict) or checks.get("core_count") != 4 \
+                or checks.get("core_logic_granularity") != (
+                    "McPAT top-level functional blocks"
+                ):
+            raise ValueError(
+                "strict McPAT artifact lacks four-core granular parser checks"
+            )
+        mobility_contract = validate_mobility_contract(modules, expected_cores=4)
+    else:
+        l2_names = [module["name"] for module in modules if module.get("kind") == "l2"]
+        if l2_names != ["shared_l2"]:
+            raise ValueError("module model requires exactly one shared_l2 cache")
+        for module in modules:
+            module["movable"] = module["name"] == "shared_l2"
+        mobility_contract = {
+            "schema_version": 1,
+            "policy": "legacy diagnostic; movable shared L2 only",
+            "expected_core_count": num_cores,
+            "observed_core_indices": sorted({
+                module["core"] for module in modules if module.get("core") is not None
+            }),
+            "movable_names": ["shared_l2"],
+            "fixed_names": [
+                module["name"] for module in modules if module["name"] != "shared_l2"
+            ],
+        }
+    totals, conservation = _validate_module_conservation(mcpat, modules)
     kinds = sorted({module["kind"] for module in modules})
     by_kind = {
         kind: {
@@ -233,7 +449,7 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path,
     for values in by_kind.values():
         values["power_fraction"] = values["total_power_w"] / totals["total_power_w"]
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source_r1": str(r1_dir.resolve()),
         "source_mcpat": str(mcpat_json.resolve()),
         "architecture": metadata,
@@ -241,16 +457,25 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path,
         "communication_profile": communication_profile,
         "power_provenance": mcpat["power_provenance"],
         "cache_contract": cache_contract,
-        "cache_authority": (
-            "McPAT 1.3 embedded CACTI-P"
-            if native_cache_authority else "local CACTI characterization"
-        ),
+        "cache_authority": "McPAT 1.3 embedded CACTI-P",
+        "embedded_cacti_p": embedded,
+        "mcpat_provenance": provenance,
+        "module_schema": {
+            "schema_version": 1,
+            "module_count": len(modules),
+            "core_count": num_cores,
+            "core_logic_granularity": mcpat.get("checks", {}).get(
+                "core_logic_granularity"
+            ),
+            "requires_granular_cores": require_granular_cores,
+            "cache_area_authority": "McPAT aggregate Area",
+            "cache_shape_authority": "McPAT 1.3 embedded CACTI-P aspect ratio",
+        },
+        "mobility_contract": mobility_contract,
+        "conservation": conservation,
         "area_provenance": {
             "core_logic_and_interconnect": "unmodified McPAT area",
-            "l1i_l1d_l2": (
-                "McPAT aggregate area with embedded CACTI-P aspect ratio"
-                if native_cache_authority else "unmodified local CACTI area and dimensions"
-            ),
+            "l1i_l1d_l2": "McPAT aggregate area with embedded CACTI-P aspect ratio",
             "global_scaling": "none",
         },
         "power_distribution": {
@@ -263,9 +488,6 @@ def build_model(r1_dir: Path, mcpat_json: Path, cacti_json: Path,
         "totals": totals,
         "gamma": totals["leakage_power_w"] / totals["total_power_w"],
     }
-    if not native_cache_authority:
-        result["source_cacti"] = str(Path(cacti_json).resolve())
-        result["cacti_characterization_id"] = cacti["characterization_id"]
     write_json(output, result)
     return result
 
@@ -274,12 +496,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--r1-dir", type=Path, required=True)
     parser.add_argument("--mcpat-json", type=Path, required=True)
-    parser.add_argument("--cacti-json", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--allow-aggregate-cores", action="store_true",
+                        help="legacy diagnostic only; formal models stay granular")
     args = parser.parse_args()
     result = build_model(
         args.r1_dir.resolve(), args.mcpat_json.resolve(),
-        args.cacti_json.resolve(), args.output.resolve()
+        args.output.resolve(),
+        require_granular_cores=not args.allow_aggregate_cores,
     )
     print(
         f"Module model: {len(result['modules'])} modules, "

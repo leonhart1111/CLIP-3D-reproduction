@@ -147,18 +147,16 @@ class McPATContractTests(unittest.TestCase):
                 "/home/zyjiang/Agenticflow/CLIP/tools/src/mcpat/"
                 "ProcessorDescriptionFiles/ARM_A9_2GHz.xml"
             )
-            characterization = CharacterizationIdentityTests().characterization()
             report = convert(
                 r1, xml_path, template=template, report_path=report_path,
-                cache_characterization=characterization,
             )
 
             tree = ET.parse(xml_path)
             system = component_by_id(tree.getroot(), "system")
             expected = {
-                "system.core0.icache": ("icache_config", "16384,64,2,1,2,1,512,0"),
-                "system.core0.dcache": ("dcache_config", "32768,64,2,1,4,3,512,1"),
-                "system.L20": ("L2_config", "524288,64,8,1,6,5,512,1"),
+                "system.core0.icache": ("icache_config", "16384,64,2,1,10,10,512,0"),
+                "system.core0.dcache": ("dcache_config", "32768,64,2,1,10,10,512,1"),
+                "system.L20": ("L2_config", "524288,64,8,1,10,10,512,1"),
             }
             for identifier, (name, value) in expected.items():
                 with self.subTest(identifier=identifier):
@@ -167,9 +165,12 @@ class McPATContractTests(unittest.TestCase):
             self.assertEqual(report["cache_contract"]["records"][2]["bank_count"], 1)
             self.assertEqual(report["cache_contract"]["records"][2]["output_width_bits"], 512)
             self.assertEqual(
-                report["cacti_characterization_id"],
-                characterization["characterization_id"],
+                report["optimization_constraints"][
+                    "cache_latency_throughput_cycles"
+                ]["classification"],
+                "not a measurement",
             )
+            self.assertNotIn("cacti_characterization_id", report)
 
 
 class UnscaledConfigurationTests(unittest.TestCase):

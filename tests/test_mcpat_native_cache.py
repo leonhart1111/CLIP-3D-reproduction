@@ -10,6 +10,12 @@ import unittest
 import xml.etree.ElementTree as ET
 from unittest.mock import patch
 
+from workflow.cache_contract import mcpat_embedded_cache_record_identity
+from workflow.floorplan.build_module_model import (
+    apply_mcpat_cache_geometry,
+    build_model,
+    validate_mobility_contract,
+)
 from workflow.mcpat.cache_metrics import parse_embedded_cacti_records
 from workflow.mcpat.gem5_to_mcpat import (
     component_by_id,
@@ -94,6 +100,72 @@ def noncanonical_l2_core() -> str:
     return native_text().replace("cache=l2 core=-1", "cache=l2 core=-2")
 
 
+def embedded_records(dimensions=None) -> list[dict]:
+    """Build real parser-validated records with independently chosen shapes."""
+    dimensions = dimensions or {}
+    lines = []
+    for cache, core in (
+        *(("l1i", index) for index in range(4)),
+        *(("l1d", index) for index in range(4)),
+        ("l2", -1),
+    ):
+        width, height = dimensions.get((cache, None if core == -1 else core), (4.0, 2.0))
+        lines.append(
+            f"{MARKER} cache={cache} core={core} "
+            "access_time_s=1.25000000000000000e-09 "
+            "cycle_time_s=2.50000000000000000e-09 "
+            f"height_mm={height:.17e} width_mm={width:.17e} "
+            "mcpat_version=1.3 model=embedded-cacti-p"
+        )
+    return parse_embedded_cacti_records("\n".join(lines), expected_core_count=4)
+
+
+def cache_module(kind="l2", core=None, area=6.0) -> dict:
+    result = {
+        "name": "shared_l2" if kind == "l2" else f"core{core}_{kind}",
+        "kind": kind,
+        "area_mm2": area,
+        "dynamic_power_w": 1.0,
+        "leakage_power_w": 0.25,
+        "total_power_w": 1.25,
+    }
+    if core is not None:
+        result["core"] = core
+    return result
+
+
+def granular_34_modules() -> list[dict]:
+    modules = []
+    for core in range(4):
+        for suffix, kind in (
+            ("ifu", "core_ifu"), ("rename", "core_rename"),
+            ("lsu", "core_lsu"), ("mmu", "core_mmu"),
+            ("exec", "core_exec"), ("other", "core_other"),
+            ("l1i", "l1i"), ("l1d", "l1d"),
+        ):
+            modules.append({
+                "name": f"core{core}_{suffix}", "kind": kind, "core": core,
+                "area_mm2": 1.0, "dynamic_power_w": 0.5,
+                "subthreshold_leakage_w": 0.08, "gate_leakage_w": 0.02,
+                "leakage_power_w": 0.1, "total_power_w": 0.6,
+            })
+    modules.extend((
+        {
+            "name": "shared_l2", "kind": "l2", "area_mm2": 4.0,
+            "dynamic_power_w": 1.0, "subthreshold_leakage_w": 0.16,
+            "gate_leakage_w": 0.04, "leakage_power_w": 0.2,
+            "total_power_w": 1.2,
+        },
+        {
+            "name": "noc", "kind": "interconnect", "area_mm2": 2.0,
+            "dynamic_power_w": 0.5, "subthreshold_leakage_w": 0.08,
+            "gate_leakage_w": 0.02, "leakage_power_w": 0.1,
+            "total_power_w": 0.6,
+        },
+    ))
+    return modules
+
+
 class EmbeddedCACTIParserTests(unittest.TestCase):
     def test_accepts_exact_four_core_record_set(self):
         records = parse_embedded_cacti_records(native_text(), expected_core_count=4)
@@ -117,6 +189,262 @@ class EmbeddedCACTIParserTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 parse_embedded_cacti_records(broken, expected_core_count=4)
+
+
+class McPATGeometryTests(unittest.TestCase):
+    def test_preserves_mcpat_area_and_embedded_aspect_ratio(self):
+        # Break caught: replacing aggregate McPAT cache area with raw array area.
+        result = apply_mcpat_cache_geometry(
+            [cache_module(area=6.0)], embedded_records()
+        )
+        block = result[0]
+        self.assertAlmostEqual(
+            block["preferred_width_mm"] * block["preferred_height_mm"], 6.0
+        )
+        self.assertAlmostEqual(
+            block["preferred_width_mm"] / block["preferred_height_mm"], 2.0
+        )
+        self.assertEqual(block["area_mm2"], 6.0)
+        self.assertEqual(block["area_source"], "McPAT aggregate Area")
+        self.assertEqual(
+            block["raw_array_dimensions_mm"], {"width": 4.0, "height": 2.0}
+        )
+        self.assertEqual(
+            block["normalized_block_dimensions_mm"],
+            {
+                "width": block["preferred_width_mm"],
+                "height": block["preferred_height_mm"],
+            },
+        )
+        self.assertEqual(block["aspect_ratio"], 2.0)
+        self.assertEqual(
+            block["geometry_formula"],
+            "width=sqrt(McPAT_area_mm2*embedded_width_mm/embedded_height_mm); "
+            "height=McPAT_area_mm2/width",
+        )
+        self.assertEqual(
+            block["embedded_cacti_record_id"], embedded_records()[-1]["record_id"]
+        )
+        self.assertNotIn("source_cacti", block)
+        self.assertNotIn("cacti_characterization_id", block)
+        self.assertNotIn("mcpat_reported_area_mm2", block)
+
+    def test_matches_l1_records_by_core_and_l2_to_the_shared_record(self):
+        # Break caught: selecting one level-wide L1 shape for every core.
+        records = embedded_records({
+            ("l1i", 0): (3.0, 3.0),
+            ("l1i", 1): (8.0, 2.0),
+            ("l1d", 3): (9.0, 1.0),
+            ("l2", None): (10.0, 2.0),
+        })
+        modules = [
+            cache_module("l1i", 0), cache_module("l1i", 1),
+            cache_module("l1d", 3), cache_module("l2"),
+        ]
+        result = apply_mcpat_cache_geometry(modules, records)
+        by_name = {module["name"]: module for module in result}
+        self.assertEqual(by_name["core0_l1i"]["aspect_ratio"], 1.0)
+        self.assertEqual(by_name["core1_l1i"]["aspect_ratio"], 4.0)
+        self.assertEqual(by_name["core3_l1d"]["aspect_ratio"], 9.0)
+        self.assertEqual(by_name["shared_l2"]["aspect_ratio"], 5.0)
+
+    def test_rejects_missing_duplicate_zero_and_divergent_records(self):
+        valid = embedded_records()
+        cases = []
+        cases.append([record for record in valid if record["cache"] != "l2"])
+        cases.append(valid + [dict(valid[-1])])
+        zero = [dict(record) for record in valid]
+        zero[-1]["width_mm"] = 0.0
+        cases.append(zero)
+        divergent = [dict(record) for record in valid]
+        divergent[-1]["width_mm"] = 8.0
+        cases.append(divergent)
+        empty_identity = [dict(record) for record in valid]
+        empty_identity[-1]["record_id"] = "0" * 64
+        cases.append(empty_identity)
+        for records in cases:
+            with self.subTest(records=records), self.assertRaises(ValueError):
+                apply_mcpat_cache_geometry([cache_module()], records)
+
+    def test_record_identity_rejects_nonphysical_or_noncanonical_values(self):
+        # Break caught: a self-consistent forged ID must not legitimize an
+        # invalid embedded timing, dimension, model, or cache/core identity.
+        source = embedded_records()[-1]
+        mutations = (
+            ("access_time_s", 0.0), ("cycle_time_s", float("inf")),
+            ("width_mm", 0.0), ("height_mm", -1.0),
+            ("mcpat_version", "2.0"), ("model", "standalone-cacti"),
+            ("core", 0),
+        )
+        for field, value in mutations:
+            record = {**source, field: value}
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                mcpat_embedded_cache_record_identity(record)
+
+    def test_contract_has_one_movable_l2_and_fixed_granular_cores(self):
+        # Break caught: exposing a core block or NoC as an optimizer variable.
+        modules = granular_34_modules()
+        contract = validate_mobility_contract(modules)
+        self.assertEqual(contract["movable_names"], ["shared_l2"])
+        self.assertEqual(len(contract["fixed_names"]), 33)
+        self.assertEqual(contract["expected_core_count"], 4)
+        self.assertEqual(contract["observed_core_indices"], [0, 1, 2, 3])
+        self.assertTrue(next(m for m in modules if m["name"] == "shared_l2")["movable"])
+        self.assertTrue(all(
+            not module["movable"]
+            for module in modules if module["name"] != "shared_l2"
+        ))
+
+    def test_contract_rejects_non_four_core_and_aggregate_fallback_models(self):
+        missing_core = [
+            module for module in granular_34_modules() if module.get("core") != 3
+        ]
+        aggregate = granular_34_modules()
+        aggregate[0] = {
+            **aggregate[0], "name": "core0_logic", "kind": "core_logic",
+        }
+        for modules in (missing_core, aggregate):
+            with self.subTest(modules=modules), self.assertRaises(ValueError):
+                validate_mobility_contract(modules)
+
+    def test_contract_rejects_missing_functional_kind_and_multiple_l2s(self):
+        missing_kind = [
+            module for module in granular_34_modules()
+            if module["name"] != "core2_mmu"
+        ]
+        multiple_l2s = granular_34_modules() + [{
+            **granular_34_modules()[-2], "name": "shared_l2_duplicate",
+        }]
+        for modules in (missing_kind, multiple_l2s):
+            with self.subTest(modules=modules), self.assertRaises(ValueError):
+                validate_mobility_contract(modules)
+
+    def write_native_model_inputs(self, root: Path, *, provenance=None,
+                                  module_totals=None):
+        r1 = root / "r1"
+        r1.mkdir()
+        metadata = {
+            "num_cores": 4, "cpu_clock": "2GHz",
+            "l1i_size": "16kB", "l1d_size": "32kB", "l2_size": "512kB",
+            "l1_associativity": 2, "l2_associativity": 8,
+            "cache_line_bytes": 64,
+        }
+        (r1 / "r1_metadata.json").write_text(json.dumps(metadata))
+        (r1 / "stats.txt").write_text("".join(
+            f"system.cpu{core}.commitStats0.numInsts 100\n"
+            f"system.cpu{core}.numCycles 100\n"
+            for core in range(4)
+        ))
+        modules = granular_34_modules()
+        modules[-2].update({
+            "source_cacti": "/legacy/cacti.json",
+            "cacti_characterization_id": "a" * 64,
+            "mcpat_reported_area_mm2": modules[-2]["area_mm2"],
+        })
+        calculated_totals = {
+            field: sum(module[field] for module in modules)
+            for field in (
+                "area_mm2", "dynamic_power_w", "leakage_power_w", "total_power_w",
+            )
+        }
+        payload = {
+            "modules": modules,
+            "module_totals": calculated_totals if module_totals is None else module_totals,
+            "checks": {
+                "core_count": 4,
+                "core_logic_granularity": "McPAT top-level functional blocks",
+            },
+            "power_provenance": {"postprocessing": "none"},
+            "cache_contract": {"schema_version": 1, "contract_id": "d" * 64},
+            "embedded_cacti_p": {
+                "schema_version": 1,
+                "authority": "McPAT 1.3 embedded CACTI-P",
+                "records": embedded_records(),
+            },
+            "provenance": provenance or {
+                "xml_sha256": "1" * 64, "mapping_sha256": "2" * 64,
+                "output_sha256": "3" * 64, "binary_sha256": "4" * 64,
+                "patch_sha256": "5" * 64,
+            },
+            "source_cacti": "/legacy/cacti.json",
+            "cacti_characterization_id": "a" * 64,
+        }
+        mcpat_path = root / "mcpat.json"
+        mcpat_path.write_text(json.dumps(payload))
+        return r1, mcpat_path, payload
+
+    def test_build_model_serializes_native_authority_schema_and_conservation(self):
+        # Break caught: reintroducing standalone CACTI area or losing strict
+        # record/hash/mobility authority in modules.json.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            r1, mcpat_path, source = self.write_native_model_inputs(root)
+            output = root / "modules.json"
+            model = build_model(r1, mcpat_path, output)
+        self.assertEqual(model["cache_authority"], "McPAT 1.3 embedded CACTI-P")
+        self.assertEqual(model["embedded_cacti_p"], source["embedded_cacti_p"])
+        self.assertEqual(model["mcpat_provenance"], source["provenance"])
+        self.assertEqual(model["module_schema"]["core_count"], 4)
+        self.assertEqual(model["module_schema"]["module_count"], 34)
+        self.assertEqual(
+            model["module_schema"]["core_logic_granularity"],
+            "McPAT top-level functional blocks",
+        )
+        self.assertEqual(model["mobility_contract"]["movable_names"], ["shared_l2"])
+        self.assertEqual(len(model["mobility_contract"]["fixed_names"]), 33)
+        self.assertEqual(model["totals"], source["module_totals"])
+        self.assertNotIn("source_cacti", model)
+        self.assertNotIn("cacti_characterization_id", model)
+        forbidden = {
+            "source_cacti", "cacti_characterization_id",
+            "mcpat_reported_area_mm2",
+        }
+        self.assertTrue(all(
+            forbidden.isdisjoint(module) for module in model["modules"]
+        ))
+
+    def test_build_model_rejects_missing_hash_and_nonconserving_totals(self):
+        complete = {
+            "xml_sha256": "1" * 64, "mapping_sha256": "2" * 64,
+            "output_sha256": "3" * 64, "binary_sha256": "4" * 64,
+            "patch_sha256": "5" * 64,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing_hash = dict(complete)
+            missing_hash.pop("output_sha256")
+            r1, mcpat_path, _ = self.write_native_model_inputs(
+                root, provenance=missing_hash,
+            )
+            with self.assertRaisesRegex(ValueError, "hash|provenance"):
+                build_model(r1, mcpat_path, root / "modules.json")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            r1, mcpat_path, _ = self.write_native_model_inputs(
+                root,
+                module_totals={
+                    "area_mm2": 999.0, "dynamic_power_w": 17.5,
+                    "leakage_power_w": 3.5, "total_power_w": 21.0,
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "conserv"):
+                build_model(r1, mcpat_path, root / "modules.json")
+
+    def test_build_model_rejects_missing_or_contradictory_strict_checks(self):
+        for checks in (
+            {},
+            {"core_count": 3,
+             "core_logic_granularity": "McPAT top-level functional blocks"},
+            {"core_count": 4,
+             "core_logic_granularity": "legacy aggregate core_logic fallback"},
+        ):
+            with self.subTest(checks=checks), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                r1, mcpat_path, payload = self.write_native_model_inputs(root)
+                payload["checks"] = checks
+                mcpat_path.write_text(json.dumps(payload))
+                with self.assertRaisesRegex(ValueError, "strict|granular|core"):
+                    build_model(r1, mcpat_path, root / "modules.json")
 
 
 class McPATPatchTests(unittest.TestCase):
