@@ -139,6 +139,7 @@ def _validate_direct_native_pair(
                 point, "fixed-bin" if label == "fixed" else "clip3d",
                 key, config, config_path, require_layout_only=False,
                 existing_r2_validator=existing_validator,
+                expected_r1=Path(r1_root).resolve() / key.relative_path(),
             )
         except (OSError, TypeError, ValueError) as error:
             raise ValueError(

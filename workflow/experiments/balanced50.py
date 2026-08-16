@@ -176,6 +176,7 @@ def validate_layout_point(
         point: Path, method: str, key: ArchitectureKey, config: dict,
         config_path: Path, *, require_layout_only: bool,
         existing_r2_validator: Callable[[str, ArchitectureKey, Path], dict] | None,
+        expected_r1: Path | None = None,
 ) -> dict:
     """Apply the root preflight contract to one selected physical point."""
     point = Path(point).resolve()
@@ -189,6 +190,9 @@ def validate_layout_point(
     run_config = _read_object(point / "run_config.json", "run_config.json")
     summary = _read_object(point / "pipeline_summary.json", "pipeline_summary.json")
     physical = _validate_physical_model(point)
+    if expected_r1 is not None \
+            and physical.get("source_r1") != str(Path(expected_r1).resolve()):
+        raise ValueError(f"{method} physical model R1 source mismatch at {point}")
     if run_config.get("layout_method") != method:
         raise ValueError(f"{method} layout method mismatch in run_config at {point}")
     if summary.get("layout_method", summary.get("layout_mode")) != method:

@@ -312,6 +312,7 @@ def validate_corrected_physical_artifacts(output: Path) -> dict:
         "cache_authority": _CACHE_AUTHORITY,
         "mcpat_provenance": native["provenance"],
         "module_count": len(module_records),
+        "source_r1": str(Path(source_r1).resolve()),
     }
 
 

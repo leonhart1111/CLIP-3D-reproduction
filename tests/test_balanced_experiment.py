@@ -2984,6 +2984,48 @@ class PairedR2RunnerTests(unittest.TestCase):
         self.assertEqual(snapshot(self.clip_root), before["clip"])
         self.assertFalse(self.status_root.exists())
 
+    def test_direct_pair_rejects_native_points_from_different_r1(self):
+        """Direct admission binds physical evidence to the caller's R1 point."""
+        from workflow.r2.run_paired_sweep import run_pair
+
+        def snapshot(root: Path) -> dict[str, bytes]:
+            return {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*") if path.is_file()
+            }
+
+        alternate_r1_root = self.root / "alternate-r1"
+        shutil.copytree(
+            self.fixture.r1,
+            alternate_r1_root / self.key.relative_path(),
+        )
+        for point in (self.fixture.fixed, self.fixture.clip):
+            summary_path = point / "pipeline_summary.json"
+            summary = read_json(summary_path)
+            summary["ipc2"] = None
+            summary["bips2"] = None
+            write_json(summary_path, summary)
+
+        before = {
+            "fixed": snapshot(self.fixed_root),
+            "clip": snapshot(self.clip_root),
+        }
+        with patch(
+            "workflow.r2.run_paired_sweep.run_r2.run",
+            side_effect=AssertionError("wrong-R1 roots must not execute R2"),
+        ), patch(
+            "workflow.r2.run_paired_sweep.attach_result.attach",
+            side_effect=AssertionError("wrong-R1 roots must not attach R2"),
+        ), self.assertRaisesRegex(ValueError, "R1"):
+            run_pair(
+                self.key, alternate_r1_root, self.fixed_root, self.clip_root,
+                self.config_path, status_root=self.status_root,
+            )
+
+        self.assertEqual(snapshot(self.fixed_root), before["fixed"])
+        self.assertEqual(snapshot(self.clip_root), before["clip"])
+        self.assertFalse(self.status_root.exists())
+
     @staticmethod
     def _complete_gem5(command, **_kwargs):
         output = Path(next(arg.split("=", 1)[1] for arg in command
