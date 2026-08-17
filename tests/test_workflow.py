@@ -43,6 +43,7 @@ from workflow.floorplan.optimize_layout import (
     discrete_wire_score,
     optimize,
     proxy_temperature,
+    proxy_temperature_components,
 )
 from workflow.mcpat.parse_mcpat import parse_mcpat_text, subtract
 from workflow.r2.calibrate_lambda_wire import (
@@ -1326,7 +1327,7 @@ class GridTests(unittest.TestCase):
     def test_pipeline_forwards_discrete_partition_options_to_optimizer(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            write_json(root / "modules.json", self.model())
+            write_json(root / "modules.json", self.granular_model())
             config = {
                 "frequency": {
                     "ambient_c": 25.0, "f0_ghz": 2.0, "fmin_ghz": 0.4,
@@ -1888,6 +1889,148 @@ class GridTests(unittest.TestCase):
             self.assertIn("layout_delays", report["baseline"])
             self.assertIn("mean_wire_cycles_rounded", report["predicted_deltas"])
             self.assertIn("paper_mean_r2_cycle_changed", diagnostics)
+
+    def granular_model(self):
+        """Eight fixed blocks per core plus shared L2 and NoC (34 modules)."""
+        blocks = (
+            ("core_ifu", 0.15, 0.12, 0.03),
+            ("core_rename", 0.15, 0.12, 0.03),
+            ("core_lsu", 0.15, 0.12, 0.03),
+            ("core_mmu", 0.10, 0.08, 0.02),
+            ("core_exec", 0.20, 0.16, 0.04),
+            ("l1i", 0.10, 0.08, 0.02),
+            ("l1d", 0.10, 0.08, 0.02),
+            ("core_other", 0.05, 0.04, 0.01),
+        )
+        modules = []
+        for core in range(4):
+            for kind, area, dynamic, leakage in blocks:
+                modules.append({
+                    "name": f"core{core}_{kind}",
+                    "kind": kind,
+                    "core": core,
+                    "area_mm2": area,
+                    "dynamic_power_w": dynamic,
+                    "leakage_power_w": leakage,
+                    "total_power_w": dynamic + leakage,
+                })
+        modules.extend((
+            {"name": "shared_l2", "kind": "l2", "area_mm2": 1.0,
+             "dynamic_power_w": 0.4, "leakage_power_w": 0.1,
+             "total_power_w": 0.5},
+            {"name": "noc", "kind": "interconnect", "area_mm2": 0.1,
+             "dynamic_power_w": 0.1, "leakage_power_w": 0.01,
+             "total_power_w": 0.11},
+        ))
+        return {"schema_version": 1, "ipc1": 4.0, "gamma": 0.21,
+                "modules": modules, "totals": {"total_power_w": 4.61,
+                "dynamic_power_w": 3.7, "leakage_power_w": 0.91}}
+
+    def test_granular_proxy_uses_all_34_modules(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.granular_model())
+            report = optimize(
+                root / "modules.json", root / "layout.json",
+                root / "report.json", allowed_l2_tiers=[1],
+                require_scipy=False,
+            )
+            layout = read_json(root / "layout.json")
+        proxy = report["thermal_proxy"]
+        self.assertEqual(proxy["module_count"], 34)
+        self.assertEqual(proxy["fixed_module_count"], 33)
+        self.assertEqual(proxy["movable_names"], ["shared_l2"])
+        self.assertEqual(len(layout["modules"]), 34)
+
+    def test_optimizer_changes_only_shared_l2(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.granular_model())
+            report = optimize(
+                root / "modules.json", root / "layout.json",
+                root / "report.json", allowed_l2_tiers=[1],
+                require_scipy=False,
+            )
+            baseline = {
+                module["name"]: module
+                for module in baseline_layout(self.granular_model())["modules"]
+            }
+            selected = {
+                module["name"]: module
+                for module in read_json(root / "layout.json")["modules"]
+            }
+        physical = ("tier", "x_mm", "y_mm", "width_mm", "height_mm")
+        for name, before in baseline.items():
+            if name == "shared_l2":
+                continue
+            after = selected[name]
+            for field in physical:
+                self.assertEqual(before[field], after[field], (name, field))
+            self.assertEqual(before["area_mm2"], after["area_mm2"])
+            self.assertEqual(before["total_power_w"], after["total_power_w"])
+
+    def test_proxy_report_records_fixed_and_movable_sets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.granular_model())
+            report = optimize(
+                root / "modules.json", root / "layout.json",
+                root / "report.json", allowed_l2_tiers=[1],
+                require_scipy=False,
+            )
+        proxy = report["thermal_proxy"]
+        self.assertEqual(proxy["role"], "search-heuristic")
+        self.assertEqual(len(proxy["module_names"]), 34)
+        self.assertEqual(len(proxy["fixed_names"]), 33)
+        self.assertIn("shared_l2", proxy["movable_names"])
+        self.assertGreaterEqual(
+            proxy["quadrature_sample_pair_count"],
+            proxy["module_pair_count"],
+        )
+        self.assertIn("HotSpot", proxy["warning"])
+        self.assertIsNotNone(proxy["spatial_response_range_w"])
+
+    def test_proxy_components_match_scalar_and_count_modules(self):
+        layout = baseline_layout(self.granular_model())
+        modules = layout["modules"]
+        components = proxy_temperature_components(
+            modules, layout["die_width_mm"], 25.0, 5.0,
+            0.3, 0.1, 0.9, "area-quadrature", 2,
+        )
+        scalar = proxy_temperature(
+            modules, layout["die_width_mm"], 25.0, 5.0,
+            0.3, 0.1, 0.9, "area-quadrature", 2,
+        )
+        self.assertEqual(components["module_count"], 34)
+        self.assertEqual(len(components["module_names"]), 34)
+        self.assertEqual(components["module_pair_count"], 34 ** 2)
+        self.assertEqual(components["quadrature_sample_pair_count"], (34 * 4) ** 2)
+        self.assertAlmostEqual(components["proxy_temperature_c"], scalar)
+
+    def test_formal_proxy_rejects_aggregate_core_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+            with self.assertRaisesRegex(ValueError, "core_logic"):
+                optimize(
+                    root / "modules.json", root / "layout.json",
+                    root / "report.json", require_granular_cores=True,
+                )
+
+    def test_proxy_rejects_degenerate_legal_l2_response(self):
+        model = self.granular_model()
+        for module in model["modules"]:
+            module["dynamic_power_w"] = 0.0
+            module["leakage_power_w"] = 0.0
+            module["total_power_w"] = 0.0
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", model)
+            with self.assertRaisesRegex(ValueError, "degenerate"):
+                optimize(
+                    root / "modules.json", root / "layout.json",
+                    root / "report.json", require_granular_cores=True,
+                )
 
     def test_comparison_layouts_emit_three_recorded_candidates(self):
         with tempfile.TemporaryDirectory() as temporary:

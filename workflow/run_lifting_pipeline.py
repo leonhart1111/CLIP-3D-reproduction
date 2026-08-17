@@ -575,6 +575,7 @@ def optimize_clip3d_layout(modules_path: Path, proposed_layout: Path,
         int(optimizer.get("partition_grid_steps", 41)),
         optimizer.get("include_fixed_baseline", True),
         optimizer.get("lc_die_side_ratio"),
+        require_granular_cores=optimizer.get("require_granular_cores", True),
     )
 
 

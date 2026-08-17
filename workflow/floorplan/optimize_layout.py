@@ -14,6 +14,7 @@ import math
 from pathlib import Path
 
 from workflow.common import read_json, write_json
+from workflow.floorplan.build_module_model import validate_mobility_contract
 from workflow.floorplan.discrete_partition import search_discrete_partitions
 from workflow.floorplan.generate_hotspot_inputs import baseline_layout, check_geometry, overlap
 from workflow.floorplan.layout_metrics import (
@@ -85,19 +86,83 @@ def spatial_coupling(modules: list[dict], side: float,
     return hotspot
 
 
+def proxy_temperature_components(
+    modules: list[dict], side: float, ambient: float,
+    r_convec: float, alpha: float, beta: float,
+    cross_tier_weight: float,
+    spatial_model: str = "area-quadrature",
+    quadrature_order: int = 2,
+    lc_mm: float | None = None,
+) -> dict:
+    """Return every equation-(13) proxy component and its search semantics."""
+    total = sum(module["total_power_w"] for module in modules)
+    bottom_power = sum(
+        module["total_power_w"] for module in modules if module["tier"] == 0
+    )
+    spatial = spatial_coupling(
+        modules, side, cross_tier_weight, spatial_model,
+        quadrature_order, lc_mm,
+    )
+    proxy = ambient + r_convec * total + alpha * spatial + beta * bottom_power
+    components = {
+        "total_power_w": total,
+        "bottom_power_w": bottom_power,
+        "spatial_coupling_w": spatial,
+        "proxy_temperature_c": proxy,
+    }
+    for name, value in components.items():
+        if not math.isfinite(value):
+            raise ValueError(f"thermal proxy component {name} is non-finite")
+    points_per_module = quadrature_order ** 2
+    return {
+        "role": "search-heuristic",
+        **components,
+        "module_count": len(modules),
+        "module_names": [module["name"] for module in modules],
+        "module_pair_count": len(modules) ** 2,
+        "quadrature_sample_pair_count": (
+            len(modules) * points_per_module
+        ) ** 2,
+    }
+
+
 def proxy_temperature(modules: list[dict], side: float, ambient: float,
                       r_convec: float, alpha: float, beta: float,
                       cross_tier_weight: float,
                       spatial_model: str = "center",
                       quadrature_order: int = 2,
                       lc_mm: float | None = None) -> float:
-    total = sum(module["total_power_w"] for module in modules)
-    hotspot = spatial_coupling(
-        modules, side, cross_tier_weight, spatial_model,
-        quadrature_order, lc_mm,
-    )
-    bottom_power = sum(m["total_power_w"] for m in modules if m["tier"] == 0)
-    return ambient + r_convec * total + alpha * hotspot + beta * bottom_power
+    return proxy_temperature_components(
+        modules, side, ambient, r_convec, alpha, beta,
+        cross_tier_weight, spatial_model, quadrature_order, lc_mm,
+    )["proxy_temperature_c"]
+
+
+_FIXED_PHYSICAL_FIELDS = (
+    "tier", "x_mm", "y_mm", "width_mm", "height_mm", "area_mm2",
+)
+_FIXED_POWER_FIELDS = (
+    "dynamic_power_w", "subthreshold_leakage_w", "gate_leakage_w",
+    "leakage_power_w", "total_power_w",
+)
+
+
+def _assert_fixed_modules_unchanged(baseline: list[dict],
+                                    selected: list[dict]) -> None:
+    """Reject any optimizer change to a fixed (non-L2) module."""
+    baseline_by_name = {module["name"]: module for module in baseline}
+    selected_by_name = {module["name"]: module for module in selected}
+    for name, before in baseline_by_name.items():
+        if before.get("kind") == "l2":
+            continue
+        after = selected_by_name.get(name)
+        if after is None:
+            raise ValueError(f"optimizer dropped fixed module {name}")
+        for field in _FIXED_PHYSICAL_FIELDS + _FIXED_POWER_FIELDS:
+            if field in before and before[field] != after.get(field):
+                raise ValueError(
+                    f"optimizer changed fixed module {name} field {field}"
+                )
 
 
 def collision_area(candidate: dict, others: list[dict]) -> float:
@@ -152,9 +217,12 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
              wire_aggregation: str = "mean",
              partition_grid_steps: int = 41,
              include_fixed_baseline: bool = True,
-             lc_die_side_ratio: float | None = None) -> dict:
+             lc_die_side_ratio: float | None = None,
+             require_granular_cores: bool = False) -> dict:
     model = read_json(model_path)
     base = baseline_layout(model, utilization)
+    if require_granular_cores:
+        validate_mobility_contract(base["modules"], expected_cores=4)
     side = base["die_width_mm"]
     lc_ratio = 0.5 if lc_die_side_ratio is None else float(lc_die_side_ratio)
     if not math.isfinite(lc_ratio) or lc_ratio <= 0:
@@ -206,11 +274,12 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
     # cycle discretization, while a low-power movable L2 may have too little
     # thermal leverage to move the real HotSpot result.  Recording both here
     # prevents a lower proxy loss from being mistaken for a measured gain.
-    baseline_proxy = proxy_temperature(
+    baseline_components = proxy_temperature_components(
         base["modules"], side, ambient, r_convec, alpha, beta,
         cross_tier_weight, proxy_spatial_model, proxy_quadrature_order,
         lc_mm,
     )
+    baseline_proxy = baseline_components["proxy_temperature_c"]
     baseline_frequency = closed_form_frequency(
         baseline_proxy, model["gamma"], f0_ghz, fmin_ghz, tsafe, ambient
     )[0]
@@ -384,7 +453,40 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
     optimized["policy"] = "CLIP-3D equation (15) optimized"
     optimized["modules"] = fixed + [dict(original, tier=best["tier"],
                                           x_mm=best["x_mm"], y_mm=best["y_mm"])]
+    _assert_fixed_modules_unchanged(base["modules"], optimized["modules"])
     check_geometry(optimized["modules"], side)
+    selected_components = proxy_temperature_components(
+        optimized["modules"], side, ambient, r_convec, alpha, beta,
+        cross_tier_weight, proxy_spatial_model, proxy_quadrature_order,
+        lc_mm,
+    )
+    legal_candidates = [
+        candidate for candidate in candidates
+        if candidate.get("collision_mm2", 0.0) <= 1e-8
+    ]
+    distinct_positions = {
+        (candidate["tier"], round(candidate["x_mm"], 9),
+         round(candidate["y_mm"], 9))
+        for candidate in legal_candidates
+    }
+    spatial_range = None
+    if len(distinct_positions) >= 2:
+        spatial_values = []
+        for candidate in legal_candidates:
+            candidate_modules = fixed + [dict(
+                original, tier=candidate["tier"],
+                x_mm=candidate["x_mm"], y_mm=candidate["y_mm"],
+            )]
+            spatial_values.append(spatial_coupling(
+                candidate_modules, side, cross_tier_weight,
+                proxy_spatial_model, proxy_quadrature_order, lc_mm,
+            ))
+        spatial_range = max(spatial_values) - min(spatial_values)
+        if not math.isfinite(spatial_range) or spatial_range <= 1e-12:
+            raise ValueError(
+                "thermal proxy spatial response is degenerate across "
+                "distinct legal L2 positions"
+            )
     optimized_delays = derive_layout_delays(
         optimized, f0_ghz, wire_rounding, communication_weights
     )
@@ -392,6 +494,16 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
     total_power = float(model["totals"]["total_power_w"])
     movable_power = float(original["total_power_w"])
     movable_fraction = movable_power / total_power if total_power > 0 else 0.0
+    movable_names = [
+        module["name"] for module in base["modules"]
+        if module.get("movable") is True
+    ]
+    if not movable_names:
+        movable_names = ["shared_l2"]
+    fixed_names = [
+        module["name"] for module in base["modules"]
+        if module["name"] not in movable_names
+    ]
     mean_cycle_changed = (
         baseline_delays["wire_cycles"] != optimized_delays["wire_cycles"]
     )
@@ -474,9 +586,40 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
             "movable_l2_power_fraction": movable_fraction,
             "paper_mean_r2_cycle_changed": mean_cycle_changed,
             "conservative_maximum_r2_cycle_changed": maximum_cycle_changed,
-            "selected_r2_cycle_changed": selected_cycle_changed,
-            "optimized_layout_delays": optimized_delays,
-            "cautions": cautions,
+                "selected_r2_cycle_changed": selected_cycle_changed,
+                "optimized_layout_delays": optimized_delays,
+                "cautions": cautions,
+        },
+        "thermal_proxy": {
+            "role": "search-heuristic",
+            "module_count": baseline_components["module_count"],
+            "module_names": baseline_components["module_names"],
+            "fixed_module_count": len(fixed_names),
+            "fixed_names": fixed_names,
+            "movable_names": movable_names,
+            "module_pair_count": baseline_components["module_pair_count"],
+            "quadrature_sample_pair_count": baseline_components[
+                "quadrature_sample_pair_count"
+            ],
+            "spatial_response_range_w": spatial_range,
+            "baseline_components": {
+                key: baseline_components[key]
+                for key in (
+                    "total_power_w", "bottom_power_w", "spatial_coupling_w",
+                    "proxy_temperature_c",
+                )
+            },
+            "selected_components": {
+                key: selected_components[key]
+                for key in (
+                    "total_power_w", "bottom_power_w", "spatial_coupling_w",
+                    "proxy_temperature_c",
+                )
+            },
+            "warning": (
+                "proxy_temperature_c guides search only; reportable Tmax "
+                "must come from HotSpot"
+            ),
         },
         "warning": "proxy_tmax_c guides search only; run HotSpot on output_layout for reportable Tmax.",
     }
