@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "name": "unscaled_alpha_lc_identification_reduced",
+  "technology_nm": 45,
+  "frequency": {"f0_ghz": 2.0},
+  "mcpat": {
+    "temperature_k": 320,
+    "device_type": 0,
+    "longer_channel_device": 1,
+    "interconnect_projection_type": 1,
+    "opt_for_clk": 0
+  },
+  "workloads": ["fft", "cholesky", "matmul", "stencil", "stream"],
+  "l1d_sizes": ["16kB", "128kB"],
+  "l2_sizes": ["128kB", "2048kB"],
+  "placements_per_point": 5,
+  "physical": {
+    "grid_size": 64,
+    "grid_convergence_sizes": [32, 64],
+    "grid_convergence_selected_size": 64,
+    "grid_convergence_tolerance_c": 0.1,
+    "compact_trace": true,
+    "ptrace_precision": 9,
+    "input_granularity": "module",
+    "utilization": 0.7,
+    "ambient_c": 25.0,
+    "r_convec_k_per_w": 1.042,
+    "thermal_stack": {
+      "silicon_resistivity_mk_per_w": 0.01,
+      "tim_resistivity_mk_per_w": 0.25,
+      "interposer_thickness_m": 0.0001,
+      "active_silicon_thickness_m": 0.00005,
+      "tim_thickness_m": 0.00002,
+      "local_resistance_scale": 1.0,
+      "silicon_resistance_scale": 1.0,
+      "tim_resistance_scale": 1.0
+    }
+  },
+  "identification": {
+    "lc_bounds_die_side_ratio": [0.02, 4.0],
+    "huber_delta_c": 0.5,
+    "bootstrap_samples": 200,
+    "bootstrap_seed": 20260817,
+    "minimum_unit_response_cases": 72,
+    "cross_tier_max_relative_interval_width": 0.9
+  },
+  "acceptance": {
+    "held_out_delta_t_mae_c_max": 2.0,
+    "held_out_delta_t_rmse_c_max": 3.0,
+    "aggregate_spatial_spearman_min": 0.6,
+    "per_workload_spatial_spearman_min": 0.5,
+    "median_selection_regret_c_max": 2.0,
+    "p95_selection_regret_c_max": 4.0,
+    "jacobian_rank_required": 2,
+    "reject_parameter_on_boundary": false
+  },
+  "provenance": {
+    "reference_truth": "local unscaled CACTI/McPAT/HotSpot toolchain",
+    "paper_values_used_as_fit_targets": false,
+    "r1_policy": "reuse completed R1 read-only; never rerun",
+    "r2_policy": "not part of alpha/Lc identification",
+    "beta_policy": "not identified; cancels in strict-P1 relative-temperature fit",
+    "reduction_policy": "reduced exploratory campaign: 5 placements x 20 work points, relaxed acceptance for usable proxy parameters"
+  }
+}

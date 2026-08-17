@@ -44,8 +44,11 @@ def validate_identification_config(config: dict) -> None:
     stack = physical.get("thermal_stack") or {}
     if float(stack.get("local_resistance_scale", math.nan)) != 1.0:
         raise ValueError("alpha/Lc identification requires local_resistance_scale == 1.0")
-    if int(config.get("placements_per_point", 0)) != len(PLACEMENT_LABELS):
-        raise ValueError(f"formal campaign requires {len(PLACEMENT_LABELS)} placements per point")
+    placements = int(config.get("placements_per_point", 0))
+    if not 5 <= placements <= len(PLACEMENT_LABELS):
+        raise ValueError(
+            f"placements_per_point must be between 5 and {len(PLACEMENT_LABELS)}"
+        )
     if not 0 < float(physical.get("utilization", 0)) <= 1:
         raise ValueError("physical utilization must be in (0, 1]")
     if int(physical.get("grid_size", 0)) < 2:
@@ -1101,8 +1104,14 @@ def _normalized_lattice(steps: int = 41) -> list[tuple[float, float]]:
 def placement_design(model_path: Path, utilization: float,
                      requested: int = 13) -> list[dict]:
     """Return deterministic distinct legal L2 placements for spatial fitting."""
-    if requested != len(PLACEMENT_LABELS):
-        raise ValueError(f"the formal placement design requires {len(PLACEMENT_LABELS)} cases")
+    if (
+        isinstance(requested, bool)
+        or not isinstance(requested, int)
+        or not 3 <= requested <= len(PLACEMENT_LABELS)
+    ):
+        raise ValueError(
+            f"placement design requires between 3 and {len(PLACEMENT_LABELS)} cases"
+        )
     base = baseline_layout(read_json(model_path), utilization)
     l2 = next(module for module in base["modules"] if module["kind"] == "l2")
     fixed = [dict(module) for module in base["modules"] if module["kind"] != "l2"]
@@ -1139,6 +1148,7 @@ def placement_design(model_path: Path, utilization: float,
             min(max((center_x - float(l2["width_mm"]) / 2.0) / upper_x, 0.0), 1.0),
             min(max((center_y - float(l2["height_mm"]) / 2.0) / upper_y, 0.0), 1.0),
         ))
+    targets = targets[:requested]
 
     lattice = _normalized_lattice()
     selected: list[dict] = []
@@ -1173,13 +1183,10 @@ def placement_design(model_path: Path, utilization: float,
             break
         selected.append(chosen)
         used.append((chosen["x_mm"], chosen["y_mm"]))
-    if len(selected) < 11:
+    if len(selected) < requested:
         raise RuntimeError(
-            f"geometry provides {len(selected)} placements; at least 11 distinct are required"
-        )
-    if len(selected) != requested:
-        raise RuntimeError(
-            f"geometry provides only {len(selected)} of {requested} requested placements"
+            f"geometry provides only {len(selected)} of {requested} "
+            "requested distinct placements"
         )
     return selected
 
@@ -1295,7 +1302,10 @@ def real_power_design(models_root: Path, config: dict) -> list[dict]:
                 if "power_provenance" in model or "area_provenance" in model:
                     validate_model_contract(model)
                 group = f"{workload}:l1d_{l1d}:l2_{l2}"
-                for placement in placement_design(model_path, utilization):
+                for placement in placement_design(
+                    model_path, utilization,
+                    requested=int(config["placements_per_point"]),
+                ):
                     design.append({
                         "group": group, "workload": workload,
                         "architecture": f"l1d_{l1d}:l2_{l2}",
