@@ -97,11 +97,25 @@ def draw_tier(axis, modules: list[dict], values: list[float], metric: str,
     axis.set_xlim(0, die_width)
     axis.set_ylim(0, die_height)
     axis.set_aspect("equal")
-    axis.set_title(f"tier {tier} — power: {metric}", fontsize=font_size + 1)
+    occupied = sum(
+        float(module["width_mm"]) * float(module["height_mm"])
+        for module in modules
+    )
+    whitespace = max(0.0, 1.0 - occupied / (die_width * die_height))
+    axis.set_title(
+        f"tier {tier} — power: {metric} — whitespace {whitespace:.0%}",
+        fontsize=font_size + 1,
+    )
     axis.set_xlabel("x (mm)")
     axis.set_ylabel("y (mm)")
     axis.grid(True, linewidth=0.3, alpha=0.4)
 
+    # Uncovered die area is shaded light gray so whitespace is distinguishable
+    # from a true zero-power module (which would take the colormap minimum).
+    axis.add_patch(Rectangle(
+        (0, 0), die_width, die_height, facecolor="#e8e8e8",
+        edgecolor="none", zorder=0,
+    ))
     for module, value in zip(modules, values):
         x, y = float(module["x_mm"]), float(module["y_mm"])
         width, height = float(module["width_mm"]), float(module["height_mm"])
@@ -140,6 +154,14 @@ def main() -> None:
         "--no-labels", action="store_true",
         help="skip module name/power labels",
     )
+    parser.add_argument(
+        "--vmin-w", type=float, default=None,
+        help="lower bound of the power color scale in watts (shared for comparison)",
+    )
+    parser.add_argument(
+        "--vmax-w", type=float, default=None,
+        help="upper bound of the power color scale in watts (shared for comparison)",
+    )
     parser.add_argument("--title", default=None)
     args = parser.parse_args()
 
@@ -157,8 +179,19 @@ def main() -> None:
     positive = [v for v in values if v > 0]
     if not positive:
         raise ValueError("no positive power values; cannot build a log color scale")
-    vmin = math.log10(min(positive))
-    vmax = math.log10(max(positive))
+    if args.vmin_w is not None or args.vmax_w is not None:
+        vmin = args.vmin_w
+        vmax = args.vmax_w
+        if vmin is None or vmax is None:
+            raise ValueError("--vmin-w and --vmax-w must be supplied together")
+        if not math.isfinite(vmin) or not math.isfinite(vmax) or vmin <= 0 \
+                or vmax <= vmin:
+            raise ValueError("invalid shared power scale (need 0 < vmin < vmax)")
+        vmin = math.log10(vmin)
+        vmax = math.log10(vmax)
+    else:
+        vmin = math.log10(min(positive))
+        vmax = math.log10(max(positive))
     if vmax - vmin < 0.5:
         vmin = math.floor(vmin)
         vmax = math.ceil(vmax)
