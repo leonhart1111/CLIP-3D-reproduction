@@ -183,6 +183,36 @@ class PairedValidationUnitTests(unittest.TestCase):
     """Catch cycle drift and publication of predicted or incomplete BIPS."""
 
     @staticmethod
+    def native_cache_identity():
+        return {
+            "schema_version": 1,
+            "cache_authority": "McPAT 1.3 embedded CACTI-P",
+            "cache_contract_id": "contract-id",
+            "record_ids": {
+                "l1i": [f"l1i-{core}" for core in range(4)],
+                "l1d": [f"l1d-{core}" for core in range(4)],
+                "l2": ["l2-shared"],
+            },
+            "mcpat_output_sha256": "a" * 64,
+            "mcpat_binary_sha256": "b" * 64,
+        }
+
+    @classmethod
+    def native_vector(cls):
+        identity = cls.native_cache_identity()
+        return {
+            "mcpat_cacti_p_provenance": {
+                "authority": identity["cache_authority"],
+                "mcpat_output_sha256": identity["mcpat_output_sha256"],
+                "mcpat_binary_sha256": identity["mcpat_binary_sha256"],
+                "records": {
+                    level: {"record_ids": record_ids}
+                    for level, record_ids in identity["record_ids"].items()
+                },
+            },
+        }
+
+    @staticmethod
     def vector(cycle=7, aggregation="traffic-weighted"):
         return {
             "components_cycles": {"layout_wire": cycle},
@@ -216,13 +246,15 @@ class PairedValidationUnitTests(unittest.TestCase):
         r2_result = branch_dir / "gem5_r2/r2_result.json"
         write_json(layout, {"branch": name})
         write_json(hotspot, {"f_sus_trans_ghz": frequency})
-        write_json(latency, {"branch": name, "layout_wire": 7})
+        write_json(latency, self.native_vector())
         write_json(r2_result, {"ipc2": ipc2})
         branch = self.branch(name, ipc2, frequency)
         branch.update({
             "r2_executed": True,
             "failure": None,
             "validation_classification": "validated",
+            "cache_authority": "McPAT 1.3 embedded CACTI-P",
+            "native_cache_identity": self.native_cache_identity(),
             "artifacts": {
                 "layout": str(layout.resolve()),
                 "layout_sha256": sha256_file(layout),
@@ -235,6 +267,24 @@ class PairedValidationUnitTests(unittest.TestCase):
             },
         })
         return branch
+
+    def test_paired_report_rejects_different_native_mcpat_hashes(self):
+        """Two internally bound branches cannot pair under different McPAT hashes."""
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            fixed = self.materialized_branch(output, "fixed-bin", 1.4, 1.8)
+            clip = self.materialized_branch(output, "clip3d", 1.5, 1.9)
+            clip["native_cache_identity"]["mcpat_output_sha256"] = "c" * 64
+            vector_path = Path(clip["artifacts"]["r2_latency"])
+            vector = read_json(vector_path)
+            vector["mcpat_cacti_p_provenance"]["mcpat_output_sha256"] = "c" * 64
+            write_json(vector_path, vector)
+            clip["artifacts"]["r2_latency_sha256"] = sha256_file(vector_path)
+
+            with self.assertRaisesRegex(ValueError, "McPAT|cache"):
+                publish_paired_comparison(
+                    fixed, clip, output, r2_requested=True,
+                )
 
     def test_selected_cycle_must_equal_every_r2_representation(self):
         self.assertEqual(
@@ -443,13 +493,13 @@ class TransientROMPairedPipelineTests(unittest.TestCase):
             return result
 
         def build_vector(*args, **kwargs):
-            layout = Path(args[5]).resolve()
+            layout = Path(args[4]).resolve()
             cycle = (
                 fixed_cycle if layout == self.fixed_layout.resolve()
                 else clip_cycle
             )
-            vector = self.vector(cycle)
-            write_json(Path(args[2]), vector)
+            vector = fixture.native_vector(**self.vector(cycle))
+            write_json(Path(args[1]), vector)
             return vector
 
         def run_r2(*args, **kwargs):
@@ -501,10 +551,10 @@ class TransientROMPairedPipelineTests(unittest.TestCase):
         ])
         self.assertEqual(build_vector_mock.call_count, 2)
         self.assertEqual(
-            build_vector_mock.call_args_list[0].args[5], self.fixed_layout.resolve()
+            build_vector_mock.call_args_list[0].args[4], self.fixed_layout.resolve()
         )
         self.assertEqual(
-            build_vector_mock.call_args_list[1].args[5],
+            build_vector_mock.call_args_list[1].args[4],
             self.fixture.proposed_layout.resolve(),
         )
         run_r2_mock.assert_not_called()

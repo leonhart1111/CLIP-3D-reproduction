@@ -3026,9 +3026,56 @@ class ROMPipelineTests(unittest.TestCase):
             directory.mkdir(parents=True)
         self.cacti.parent.mkdir(parents=True)
         self.hotspot.write_text("mock hotspot", encoding="utf-8")
-        module_model = CalibrationDesignTests.model()
-        module_model["ipc1"] = 2.0
-        write_json(self.modules, module_model)
+        from tests.test_mcpat_native_cache import (
+            write_native_physical_fixture,
+            write_native_r1_fixture,
+        )
+
+        metadata = {
+            "schema_version": 2,
+            "workload": "matmul",
+            "num_cores": 4,
+            "cpu_clock": "2GHz",
+            "clock": "2GHz",
+            "l1i_size": "32kB",
+            "l1d_size": "32kB",
+            "l2_size": "512kB",
+            "l1_associativity": 2,
+            "l2_associativity": 8,
+            "cache_line_bytes": 64,
+            "warmup_insts_cpu0": 100,
+            "measure_insts_cpu0": 100,
+            "instruction_window_scope": "cpu0",
+        }
+        write_native_r1_fixture(self.source_r1, metadata)
+        write_json(self.source_r1 / "status.json", {"state": "success"})
+        binary = self.root / "tools/mcpat"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"strict patched McPAT ROM fixture\n")
+        mcpat, _module_model = write_native_physical_fixture(
+            self.steady, self.source_r1, binary, metadata,
+        )
+        mcpat_output = self.steady / "mcpat/mcpat.out"
+        write_json(self.steady / "pipeline_summary.json", {
+            "r1": str(self.source_r1.resolve()),
+            "layout_method": "fixed-bin",
+            "ipc2": None,
+            "bips2": None,
+            "r2_source": None,
+            "cache_authority": "McPAT 1.3 embedded CACTI-P",
+            "mcpat_provenance": mcpat["provenance"],
+            "stage_seconds": {},
+            "artifacts": {
+                "mcpat_json": str((self.steady / "mcpat/mcpat.json").resolve()),
+                "mcpat_output": str(mcpat_output.resolve()),
+                "mcpat_binary": str(binary.resolve()),
+            },
+            "artifact_sha256": {
+                "mcpat_json": sha256_file(self.steady / "mcpat/mcpat.json"),
+                "mcpat_output": mcpat["provenance"]["hashes"]["output_sha256"],
+                "mcpat_binary": mcpat["provenance"]["hashes"]["binary_sha256"],
+            },
+        })
         write_json(self.cacti, {"frequency_ghz": 2.0, "records": []})
         write_json(self.config_path, self.config())
 
@@ -3080,9 +3127,44 @@ class ROMPipelineTests(unittest.TestCase):
             "stage_seconds": {"windowed_mcpat": 1.0},
         }
 
+    def raw_power_windows(self) -> dict:
+        """Return the standard raw-window fixture over this native module set."""
+        power = ROMCalibrationCaseTests.raw_windows()
+        modules = read_json(self.modules)["modules"]
+        for window in power["windows"]:
+            window["modules"] = [dict(module) for module in modules]
+            window["totals"] = {
+                field: sum(float(module[field]) for module in modules)
+                for field in (
+                    "dynamic_power_w", "leakage_power_w", "total_power_w",
+                )
+            }
+        power["module_names"] = [module["name"] for module in modules]
+        return power
+
+    def native_vector(self, **overrides: object) -> dict:
+        """Return a mocked R2 boundary carrying the real native cache identity."""
+        from workflow.r2.attachment_validation import native_cache_identity
+
+        identity = native_cache_identity(read_json(self.modules))
+        vector = {
+            "critical_l1d_to_l2_cycles": 7,
+            "mcpat_cacti_p_provenance": {
+                "authority": identity["cache_authority"],
+                "mcpat_output_sha256": identity["mcpat_output_sha256"],
+                "mcpat_binary_sha256": identity["mcpat_binary_sha256"],
+                "records": {
+                    level: {"record_ids": record_ids}
+                    for level, record_ids in identity["record_ids"].items()
+                },
+            },
+        }
+        vector.update(overrides)
+        return vector
+
     def optimization(self) -> dict:
         design = build_design(
-            CalibrationDesignTests.model(), [1], parse_settings({})
+            read_json(self.modules), [1], parse_settings({})
         )
         self.proposed_layout.parent.mkdir(parents=True, exist_ok=True)
         if not self.proposed_layout.is_file():
@@ -3370,7 +3452,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value=self.optimization(),
         ), patch(
             "workflow.transient.rom.run_pipeline.build_vector",
-            return_value={"critical_l1d_to_l2_cycles": 7},
+            return_value=self.native_vector(),
         ) as build_vector_mock, patch(
             "workflow.transient.rom.run_pipeline.run_r2",
             return_value={"ipc2": 1.5},
@@ -3412,7 +3494,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value=self.optimization(),
         ), patch(
             "workflow.transient.rom.run_pipeline.build_vector",
-            return_value={"critical_l1d_to_l2_cycles": 7},
+            return_value=self.native_vector(),
         ), patch(
             "workflow.transient.rom.run_pipeline.run_r2",
             return_value={"ipc2": 1.5},
@@ -3425,28 +3507,13 @@ class ROMPipelineTests(unittest.TestCase):
                 self.transient_r1, calibrate=False, execute_r2=True,
             )
 
-    def steady_summary(self, *, cacti_path: Path | None = None,
-                       cacti_sha256: str | None = None,
-                       **overrides: object) -> dict:
-        summary = {
-            "layout_method": "fixed-bin",
-            "ipc2": None,
-            "bips2": None,
-            "r2_source": None,
-            "artifacts": {
-                "cacti": str((cacti_path or self.cacti).resolve()),
-            },
-            "artifact_sha256": {
-                "cacti": cacti_sha256 or hashlib.sha256(
-                    self.cacti.read_bytes()
-                ).hexdigest(),
-            },
-        }
+    def steady_summary(self, **overrides: object) -> dict:
+        summary = read_json(self.steady / "pipeline_summary.json")
         summary.update(overrides)
         return summary
 
     def bind_package(self, package: Path) -> None:
-        source_model = CalibrationDesignTests.model()
+        source_model = read_json(self.modules)
         settings = parse_settings({})
         design = build_design(source_model, [1], settings)
         design_identity = canonical_json_sha256(design)
@@ -3458,9 +3525,7 @@ class ROMPipelineTests(unittest.TestCase):
             "configuration_hash": "sha256:" + hashlib.sha256(
                 self.config_path.read_bytes()
             ).hexdigest(),
-            "power_trace": power_trace_identity(
-                ROMCalibrationCaseTests.raw_windows()
-            ),
+            "power_trace": power_trace_identity(self.raw_power_windows()),
             "calibration_design_hash": design_identity,
         }
         fixed_names = tuple(
@@ -3481,7 +3546,7 @@ class ROMPipelineTests(unittest.TestCase):
         write_synthetic_accepted_package(
             package, design, identity, settings, model, self.modules,
             self.config_path,
-            ROMCalibrationCaseTests.raw_windows(),
+            self.raw_power_windows(),
         )
 
     def test_pipeline_prepares_windows_once_reuses_package_and_validates_final_layout(self):
@@ -3499,7 +3564,7 @@ class ROMPipelineTests(unittest.TestCase):
 
         def build_vector_side_effect(*args, **kwargs):
             events.append("r2-vector")
-            return {"critical_l1d_to_l2_cycles": 7}
+            return self.native_vector()
 
         def run_r2_side_effect(*args, **kwargs):
             events.append("r2")
@@ -3546,7 +3611,7 @@ class ROMPipelineTests(unittest.TestCase):
         optimize.assert_called_once()
         self.assertEqual(events, ["hotspot", "r2-vector", "r2"])
         self.assertEqual(
-            build_vector_mock.call_args.args[5], self.proposed_layout.resolve()
+            build_vector_mock.call_args.args[4], self.proposed_layout.resolve()
         )
         self.assertEqual(
             final_search.call_args.args[1], self.proposed_layout.resolve()
@@ -3557,7 +3622,7 @@ class ROMPipelineTests(unittest.TestCase):
         self.assertEqual(result["bips2_trans"], 2.7)
         self.assertEqual(
             result["rom_acceptance"]["identity"]["power_trace"],
-            power_trace_identity(ROMCalibrationCaseTests.raw_windows()),
+            power_trace_identity(self.raw_power_windows()),
         )
         keys = []
 
@@ -3671,64 +3736,34 @@ class ROMPipelineTests(unittest.TestCase):
         self.assertEqual(result["final_validation_classification"], "validated")
         self.assertTrue(result["r2_executed"])
 
-    def test_pipeline_rejects_steady_preflight_cacti_path_before_power_or_r2(self):
-        # Break caught: a steady summary pointing at a different CACTI result
-        # must not silently authorize the expected-path file for R2 derivation.
-        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+    def test_rom_preflight_accepts_native_mcpat_without_cacti_file(self):
+        # Break caught: corrected ROM execution must not require a standalone
+        # CACTI artifact after McPAT embedded CACTI-P became authoritative.
+        self.cacti.unlink()
 
-        other_cacti = self.root / "other/cacti_characterization.json"
-        other_cacti.parent.mkdir(parents=True)
-        write_json(other_cacti, {"frequency_ghz": 9.0, "records": []})
-        with patch(
-            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
-        ), patch(
-            "workflow.transient.rom.run_pipeline.validate_source_r1",
-            return_value={"metadata": {"workload": "matmul"}},
-        ), patch(
-            "workflow.transient.rom.run_pipeline.validate_steady_output",
-            return_value={"summary": self.steady_summary(cacti_path=other_cacti)},
-        ), patch(
-            "workflow.transient.rom.run_pipeline.prepare_power_windows"
-        ) as prepare, patch(
-            "workflow.transient.rom.run_pipeline.build_vector"
-        ) as build_vector_mock:
-            with self.assertRaisesRegex(ValueError, "CACTI artifact path"):
-                run_transient_rom_pipeline(
-                    self.source_r1, self.steady, self.output, self.config_path,
-                    self.transient_r1, calibrate=False, execute_r2=False,
-                )
+        try:
+            summary = self.completed_rom_summary()
+        except Exception as error:  # pragma: no cover - assertion bridge
+            self.fail(f"native McPAT ROM preflight was rejected: {error}")
 
-        prepare.assert_not_called()
-        build_vector_mock.assert_not_called()
+        self.assertEqual(
+            summary["cache_authority"], "McPAT 1.3 embedded CACTI-P",
+        )
+        self.assertNotIn("cacti", summary["artifacts"])
 
-    def test_pipeline_rejects_replaced_steady_preflight_cacti_before_power_or_r2(self):
-        # Break caught: replacing CACTI after the steady summary was written
-        # must invalidate its recorded identity before any ROM/R2 work begins.
-        from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
+    def test_rom_rejects_replaced_mcpat_native_record(self):
+        # Break caught: a replaced embedded record ID must fail before any ROM
+        # package, layout, final validation, or R2 result can be reused.
+        modules = read_json(self.modules)
+        l2_record = next(
+            record for record in modules["embedded_cacti_p"]["records"]
+            if record["cache"] == "l2"
+        )
+        l2_record["record_id"] = "f" * 64
+        write_json(self.modules, modules)
 
-        steady_summary = self.steady_summary()
-        write_json(self.cacti, {"frequency_ghz": 7.0, "records": []})
-        with patch(
-            "workflow.transient.rom.run_pipeline.DEFAULT_HOTSPOT", self.hotspot
-        ), patch(
-            "workflow.transient.rom.run_pipeline.validate_source_r1",
-            return_value={"metadata": {"workload": "matmul"}},
-        ), patch(
-            "workflow.transient.rom.run_pipeline.validate_steady_output",
-            return_value={"summary": steady_summary},
-        ), patch(
-            "workflow.transient.rom.run_pipeline.prepare_power_windows"
-        ) as prepare, patch(
-            "workflow.transient.rom.run_pipeline.build_vector"
-        ) as build_vector_mock:
-            with self.assertRaisesRegex(ValueError, "CACTI artifact sha256"):
-                run_transient_rom_pipeline(
-                    self.source_r1, self.steady, self.output, self.config_path,
-                    self.transient_r1, calibrate=False, execute_r2=False,
-                )
-
-        prepare.assert_not_called()
-        build_vector_mock.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "McPAT.*cache|record_id"):
+            self.completed_rom_summary()
 
     def test_final_pss_nonconvergence_is_audited_and_skips_r2(self):
         # Break caught: treating a nonconverged PSS point as thermal infeasibility
@@ -3755,7 +3790,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value=self.optimization(),
         ), patch(
             "workflow.transient.rom.run_pipeline.build_vector",
-            return_value={"critical_l1d_to_l2_cycles": 7},
+            return_value=self.native_vector(),
         ) as build_vector_mock, patch(
             "workflow.transient.rom.run_pipeline.run_r2"
         ) as run_r2_mock, patch(
@@ -4143,7 +4178,7 @@ class ROMPipelineTests(unittest.TestCase):
             side_effect=optimize_side_effect,
         ), patch(
             "workflow.transient.rom.run_pipeline.build_vector",
-            return_value={"critical_l1d_to_l2_cycles": 7},
+            return_value=self.native_vector(),
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
             side_effect=self.final_validation_side_effect(),
@@ -4214,7 +4249,7 @@ class ROMPipelineTests(unittest.TestCase):
             return_value=optimization,
         ) as optimize, patch(
             "workflow.transient.rom.run_pipeline.build_vector",
-            return_value={"critical_l1d_to_l2_cycles": 7},
+            return_value=self.native_vector(),
         ), patch(
             "workflow.transient.rom.run_pipeline.search_layout_frequency",
             side_effect=self.final_validation_side_effect(),
@@ -4323,7 +4358,7 @@ class ROMPipelineTests(unittest.TestCase):
             "workflow.transient.rom.run_pipeline.optimize_transient_layout"
         ) as optimize, patch(
             "workflow.transient.rom.run_pipeline.build_vector",
-            return_value={"critical_l1d_to_l2_cycles": 7},
+            return_value=self.native_vector(),
         ), patch(
             "workflow.transient.rom.run_pipeline.run_r2",
             return_value={"ipc2": 1.5},

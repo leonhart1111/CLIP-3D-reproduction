@@ -1299,6 +1299,10 @@ class StrictR2ReuseTests(unittest.TestCase):
             "num_cores": 4,
             "cpu_type": "X86O3CPU",
             "clock": "2GHz",
+            "cpu_clock": "2GHz",
+            "l1_associativity": 2,
+            "l2_associativity": 8,
+            "cache_line_bytes": 64,
             "warmup_insts_cpu0": 100000000,
             "measure_insts_cpu0": 500000000,
             "instruction_window_scope": "cpu0",
@@ -1318,11 +1322,19 @@ class StrictR2ReuseTests(unittest.TestCase):
             "system.cpu3.numCycles 200000000\n",
             encoding="utf-8",
         )
+        with (self.r1 / "stats.txt").open("a", encoding="utf-8") as stream:
+            for core in range(4):
+                stream.write(
+                    f"system.l2.demandAccesses::cpu{core}.data {100 + core}\n"
+                )
         write_json(self.r1 / "status.json", {
             "schema_version": 2,
             "state": "success",
             "instruction_window_scope": "cpu0",
         })
+        self.mcpat_binary = self.root / "tools/mcpat"
+        self.mcpat_binary.parent.mkdir(parents=True)
+        self.mcpat_binary.write_bytes(b"strict patched McPAT R2 fixture\n")
         for point, method, frequency in (
                 (self.fixed, "fixed-bin", 1.4),
                 (self.clip, "clip3d", 1.1)):
@@ -1388,10 +1400,26 @@ class StrictR2ReuseTests(unittest.TestCase):
                 "total_power_w": 100.0,
             }],
         })
+        from tests.test_mcpat_native_cache import write_native_physical_fixture
+        from workflow.r2.build_latency_vector import build_vector
+
+        mcpat, model = write_native_physical_fixture(
+            point, self.r1, self.mcpat_binary, self.metadata,
+        )
+        build_vector(
+            point / "modules.json", point / "r2_latency.json",
+            tsv_hops=1, wire_cycles=3,
+        )
+        ipc1 = model["ipc1"]
+        gamma = float(model["gamma"])
+        target_tmax_c = 25.0 + 70.0 / (
+            gamma + (1.0 - gamma) * frequency / 2.0
+        )
+        target_tmax_k = target_tmax_c + 273.15
         hotspot = point / "hotspot"
         hotspot.mkdir(parents=True, exist_ok=True)
         (hotspot / "steady.txt").write_text(
-            "core0 407.525\n", encoding="utf-8"
+            f"core0 {target_tmax_k:.15g}\n", encoding="utf-8"
         )
         write_json(hotspot / "hotspot_manifest.json", {
             "schema_version": 1,
@@ -1405,33 +1433,19 @@ class StrictR2ReuseTests(unittest.TestCase):
             "power_trace": str((point / "hotspot/power.ptrace").resolve()),
             "steady_file": str((point / "hotspot/steady.txt").resolve()),
             "grid_steady_file": str((point / "hotspot/grid.steady.txt").resolve()),
-            "tmax_k": 407.525,
-            "tmax_c": 134.375,
+            "tmax_k": target_tmax_k,
+            "tmax_c": target_tmax_c,
             "peak_unit": "core0",
             "ambient_c": 25.0,
             "r_convec_k_per_w": 5.0,
             "sample_count": 1,
         })
-        write_json(point / "performance.json", {
-            "schema_version": 1,
-            "equation": 13,
-            "gamma": 0.2,
-            "leakage_power_w": 20.0,
-            "dynamic_power_w": 80.0,
-            "tmax_f0_c": 134.375,
-            "ambient_c": 25.0,
-            "tsafe_c": 95.0,
-            "f0_ghz": 2.0,
-            "fmin_ghz": 0.4,
-            "unclamped_solution_ghz": frequency,
-            "sustainable_frequency_ghz": frequency,
-            "estimated_tmax_at_fmin_c": 64.375,
-            "thermal_feasible_at_fmin": True,
-            "floor_power_scale": 0.36,
-            "state": "thermally_limited",
-            "ipc1": ipc1,
-            "bips1_thermal": ipc1 * frequency,
-        })
+        from workflow.thermal.sustainable_frequency import derive
+        performance = derive(
+            model, read_json(point / "hotspot/thermal_result.json"),
+            2.0, 0.4, 95.0, 25.0,
+        )
+        write_json(point / "performance.json", performance)
         write_json(point / "pipeline_summary.json", {
             "schema_version": 2,
             "r1": str(self.r1.resolve()),
@@ -1442,11 +1456,13 @@ class StrictR2ReuseTests(unittest.TestCase):
             "l2_size": "512kB",
             "layout_method": method,
             "layout_mode": method,
-            "gamma": 0.2,
-            "tmax_c": 134.375,
-            "sustainable_frequency_ghz": frequency,
+            "gamma": model["gamma"],
+            "tmax_c": target_tmax_c,
+            "sustainable_frequency_ghz": performance[
+                "sustainable_frequency_ghz"
+            ],
             "ipc1": ipc1,
-            "bips1_thermal": ipc1 * frequency,
+            "bips1_thermal": performance["bips1_thermal"],
             "ipc2": None,
             "bips2": None,
             "r2_source": None,
@@ -1467,6 +1483,38 @@ class StrictR2ReuseTests(unittest.TestCase):
                 "r2_result": None,
             },
         })
+        summary_path = point / "pipeline_summary.json"
+        summary = read_json(summary_path)
+        summary.update({
+            "schema_version": 3,
+            "module_count": len(model["modules"]),
+            "total_power_w": model["totals"]["total_power_w"],
+            "power_provenance": model["power_provenance"],
+            "area_provenance": model["area_provenance"],
+            "cache_authority": model["cache_authority"],
+            "mcpat_provenance": model["mcpat_provenance"],
+            "communication_profile": model["communication_profile"],
+            "gamma": model["gamma"],
+            "ipc1": model["ipc1"],
+            "tmax_c": performance["tmax_f0_c"],
+            "sustainable_frequency_ghz": performance[
+                "sustainable_frequency_ghz"
+            ],
+            "bips1_thermal": performance["bips1_thermal"],
+        })
+        summary["stage_seconds"].pop("cacti", None)
+        mcpat_output = point / "mcpat/mcpat.out"
+        summary["artifacts"].update({
+            "mcpat_json": str((point / "mcpat/mcpat.json").resolve()),
+            "mcpat_output": str(mcpat_output.resolve()),
+            "mcpat_binary": str(self.mcpat_binary.resolve()),
+        })
+        summary["artifact_sha256"] = {
+            "mcpat_json": sha256_file(point / "mcpat/mcpat.json"),
+            "mcpat_output": mcpat["provenance"]["hashes"]["output_sha256"],
+            "mcpat_binary": mcpat["provenance"]["hashes"]["binary_sha256"],
+        }
+        write_json(summary_path, summary)
 
     def _identity(self, latency_path: Path) -> dict:
         metadata = read_json(self.r1 / "r1_metadata.json")
@@ -1487,13 +1535,14 @@ class StrictR2ReuseTests(unittest.TestCase):
         output = self.fixed / "gem5_r2"
         result_path = output / "r2_result.json"
         identity = self._identity(self.fixed / "r2_latency.json")
+        gem5_args = read_json(self.fixed / "r2_latency.json")["gem5_args"]
         command = [
             "/opt/gem5.opt", "--listener-mode=off", f"--outdir={output.resolve()}",
             "/opt/clip_r1.py", "--stage", "R2", "--workload", "fft",
             "--l1i-size", "32kB", "--l1d-size", "32kB",
             "--l2-size", "512kB", "--warmup-insts", "100000000",
             "--measure-insts", "500000000", "--instruction-window-scope",
-            identity["instruction_window_scope"], *self.gem5_args,
+            identity["instruction_window_scope"], *gem5_args,
             "--options", "--threads 4",
         ]
         (output / "stats.txt").parent.mkdir(parents=True, exist_ok=True)
@@ -1556,8 +1605,8 @@ class StrictR2ReuseTests(unittest.TestCase):
         status["r2_result_sha256"] = sha256_file(result_path)
         write_json(status_path, status)
 
-    def test_local_attach_accepts_legacy_r1_and_module_scope_omission(self):
-        """A pre-schema cpu0 run can attach its already measured local R2."""
+    def test_local_attach_rejects_legacy_r1_and_module_scope_omission(self):
+        """Legacy scope evidence remains readable but cannot be relabeled native."""
         from workflow.r2.attach_result import attach
 
         self.metadata.pop("instruction_window_scope")
@@ -1568,9 +1617,8 @@ class StrictR2ReuseTests(unittest.TestCase):
         write_json(modules_path, modules)
         self._write_source_result()
 
-        attached = attach(self.fixed)
-
-        self.assertEqual(attached["ipc2"], 3.25)
+        with self.assertRaisesRegex(ValueError, "McPAT-native|module"):
+            attach(self.fixed)
 
     def test_local_attach_rejects_explicit_scope_mismatch(self):
         """Compatibility for an absent key must not accept all-cores evidence."""
@@ -2011,7 +2059,7 @@ class StrictR2ReuseTests(unittest.TestCase):
             self.assertEqual(attached[summary_field], published[performance_field])
         result_path = (self.fixed / "gem5_r2/r2_result.json").resolve()
         self.assertEqual(attached["r2_source"], str(result_path))
-        self.assertEqual(attached["artifacts"], {
+        expected_artifacts = {
             "config": str((self.fixed / "run_config.json").resolve()),
             "modules": str((self.fixed / "modules.json").resolve()),
             "thermal": str(
@@ -2020,7 +2068,22 @@ class StrictR2ReuseTests(unittest.TestCase):
             "performance": str((self.fixed / "performance.json").resolve()),
             "r2_latency": str((self.fixed / "r2_latency.json").resolve()),
             "r2_result": str(result_path),
-        })
+        }
+        for field, value in expected_artifacts.items():
+            self.assertEqual(attached["artifacts"][field], value)
+        self.assertEqual(
+            attached["artifacts"]["mcpat_json"],
+            str((self.fixed / "mcpat/mcpat.json").resolve()),
+        )
+        self.assertEqual(
+            attached["artifacts"]["mcpat_output"],
+            str((self.fixed / "mcpat/mcpat.out").resolve()),
+        )
+        self.assertEqual(
+            attached["artifacts"]["mcpat_binary"],
+            str(self.mcpat_binary.resolve()),
+        )
+        self.assertNotIn("cacti", attached["artifacts"])
         self.assertEqual(attached["stage_seconds"]["gem5_r2"], 17.5)
         self.assertEqual(
             attached["total_pipeline_seconds"],
@@ -2144,6 +2207,49 @@ class StrictR2ReuseTests(unittest.TestCase):
 
         self.assertFalse(decision["accepted"])
         self.assertTrue(any("gem5_overrides" in reason for reason in decision["reasons"]))
+
+    def test_local_attachment_rejects_changed_mcpat_binary_hash(self):
+        """A live binary replacement cannot retain corrected attachment authority."""
+        from workflow.r2.attach_result import attach
+
+        self.mcpat_binary.write_bytes(b"replaced McPAT binary\n")
+
+        with self.assertRaisesRegex(ValueError, "McPAT|binary"):
+            attach(self.fixed)
+
+    def test_reuse_rejects_changed_native_record_and_mcpat_hash_identities(self):
+        """Equal latency overrides cannot hide changed McPAT-native identities."""
+        from workflow.r2.reuse_result import validate_reuse
+
+        def replace_record_id(modules: dict) -> None:
+            record = next(
+                item for item in modules["embedded_cacti_p"]["records"]
+                if item["cache"] == "l2"
+            )
+            record["record_id"] = "f" * 64
+
+        def replace_output_hash(modules: dict) -> None:
+            modules["mcpat_provenance"]["hashes"]["output_sha256"] = "e" * 64
+
+        for label, mutate in (
+                ("record-id", replace_record_id),
+                ("output-hash", replace_output_hash)):
+            with self.subTest(label=label):
+                self._write_point(self.clip, "clip3d", 1.1)
+                modules_path = self.clip / "modules.json"
+                modules = read_json(modules_path)
+                mutate(modules)
+                write_json(modules_path, modules)
+
+                decision = validate_reuse(
+                    self.fixed, self.clip, self.r1, self.config_path,
+                )
+
+                self.assertFalse(decision["accepted"])
+                self.assertTrue(any(
+                    "McPAT" in reason or "cache" in reason
+                    for reason in decision["reasons"]
+                ), decision["reasons"])
 
     def test_override_schema_rejects_loose_types_keys_and_cycle_bounds(self):
         """Only complete positive uint64 integer latency overrides are renderable."""
@@ -2844,7 +2950,9 @@ class StrictR2ReuseTests(unittest.TestCase):
                          sha256_file(self.clip / "hotspot/thermal_result.json"))
         self.assertEqual(artifact["target_outputs"]["performance"]["sha256"],
                          sha256_file(self.clip / "performance.json"))
-        self.assertEqual(artifact["target_outputs"]["sustainable_frequency_ghz"], 1.1)
+        self.assertAlmostEqual(
+            artifact["target_outputs"]["sustainable_frequency_ghz"], 1.1,
+        )
         self.assertAlmostEqual(artifact["target_outputs"]["bips2"], 3.25 * 1.1)
 
 
@@ -2875,6 +2983,7 @@ class PairedR2RunnerTests(unittest.TestCase):
         )
         from workflow.floorplan.build_module_model import build_model
         from workflow.r2 import attach_result
+        from workflow.r2.build_latency_vector import build_vector
         from workflow.thermal.sustainable_frequency import derive
 
         metadata = read_json(self.fixture.r1 / "r1_metadata.json")
@@ -2920,6 +3029,10 @@ class PairedR2RunnerTests(unittest.TestCase):
             write_json(point / "hotspot/layout.json", {
                 "modules": layout_modules,
             })
+            build_vector(
+                point / "modules.json", point / "r2_latency.json",
+                tsv_hops=1, wire_cycles=3,
+            )
             if method == "clip3d":
                 write_json(point / "optimizer_report.json", {})
                 write_json(point / "layout_selection.json", {})
@@ -4694,6 +4807,9 @@ class PairedAggregationTests(unittest.TestCase):
         )
         self.config = read_json(self.config_path)
         self.classification = self.config["experiment_classification"]
+        self.mcpat_binary = self.root / "tools/mcpat"
+        self.mcpat_binary.parent.mkdir(parents=True)
+        self.mcpat_binary.write_bytes(b"strict patched McPAT report fixture\n")
 
     def _write_point(self, root: Path, key: dict, method: str, ipc2: float,
                      tmax_c: float) -> Path:
@@ -4708,6 +4824,11 @@ class PairedAggregationTests(unittest.TestCase):
             **key,
             "l1i_size": "32kB",
             "num_cores": 4,
+            "cpu_clock": "2GHz",
+            "clock": "2GHz",
+            "l1_associativity": 2,
+            "l2_associativity": 8,
+            "cache_line_bytes": 64,
             "instruction_window_scope": "cpu0",
             "warmup_insts_cpu0": 0,
             "measure_insts_cpu0": 100,
@@ -4719,6 +4840,7 @@ class PairedAggregationTests(unittest.TestCase):
             + "".join(
                 f"system.cpu{core}.commitStats0.numInsts 100\n"
                 f"system.cpu{core}.numCycles 50\n"
+                f"system.l2.demandAccesses::cpu{core}.data {100 + core}\n"
                 for core in range(4)
             ), encoding="utf-8",
         )
@@ -4726,31 +4848,21 @@ class PairedAggregationTests(unittest.TestCase):
             f"l2_{key['l2_size']}"
         )
         point.mkdir(parents=True, exist_ok=True)
-        vector = {
-            "gem5_overrides": {name: 7 for name in run_r2.GEM5_OVERRIDE_KEYS},
-            "critical_l1d_to_l2_cycles": 17 if method == "fixed-bin" else 19,
-        }
-        vector["gem5_args"] = run_r2.canonical_gem5_args(vector["gem5_overrides"])
+        from tests.test_mcpat_native_cache import write_native_physical_fixture
+        from workflow.r2.build_latency_vector import build_vector
+
+        mcpat, modules = write_native_physical_fixture(
+            point, r1, self.mcpat_binary, metadata,
+        )
+        vector = build_vector(
+            point / "modules.json", point / "r2_latency.json",
+            tsv_hops=1, wire_cycles=3,
+        )
+        vector["critical_l1d_to_l2_cycles"] = (
+            17 if method == "fixed-bin" else 19
+        )
         write_json(point / "r2_latency.json", vector)
-        ipc1 = 8.0
-        modules = {
-            "schema_version": 2,
-            "source_r1": str(r1.resolve()),
-            "architecture": metadata,
-            "ipc1": ipc1,
-            "gamma": 0.2,
-            "totals": {
-                "dynamic_power_w": 80.0,
-                "leakage_power_w": 20.0,
-                "total_power_w": 100.0,
-            },
-            "modules": [{
-                "name": "fixture-total",
-                "dynamic_power_w": 80.0,
-                "leakage_power_w": 20.0,
-                "total_power_w": 100.0,
-            }],
-        }
+        ipc1 = modules["ipc1"]
         hotspot = point / "hotspot"
         hotspot.mkdir(parents=True, exist_ok=True)
         peak_k = tmax_c + 273.15
@@ -4831,6 +4943,7 @@ class PairedAggregationTests(unittest.TestCase):
         write_json(point / "hotspot/thermal_result.json", thermal)
         write_json(point / "performance.json", performance)
         write_json(point / "pipeline_summary.json", {
+            "schema_version": 3,
             "layout_method": method,
             "experiment_classification": self.classification,
             "workload": key["workload"], "l1d_size": key["l1d_size"],
@@ -4841,6 +4954,13 @@ class PairedAggregationTests(unittest.TestCase):
             "sustainable_frequency_ghz": frequency,
             "ipc1": performance["ipc1"],
             "bips1_thermal": performance["bips1_thermal"],
+            "module_count": len(modules["modules"]),
+            "total_power_w": modules["totals"]["total_power_w"],
+            "power_provenance": modules["power_provenance"],
+            "area_provenance": modules["area_provenance"],
+            "cache_authority": modules["cache_authority"],
+            "mcpat_provenance": modules["mcpat_provenance"],
+            "communication_profile": modules["communication_profile"],
             "r2_critical_path_cycles": vector["critical_l1d_to_l2_cycles"],
             "ipc2": ipc2,
             "bips2": bips2,
@@ -4854,6 +4974,18 @@ class PairedAggregationTests(unittest.TestCase):
                 "performance": str((point / "performance.json").resolve()),
                 "r2_latency": str((point / "r2_latency.json").resolve()),
                 "r2_result": str(local_result.resolve()),
+                "mcpat_json": str((point / "mcpat/mcpat.json").resolve()),
+                "mcpat_output": str((point / "mcpat/mcpat.out").resolve()),
+                "mcpat_binary": str(self.mcpat_binary.resolve()),
+            },
+            "artifact_sha256": {
+                "mcpat_json": sha256_file(point / "mcpat/mcpat.json"),
+                "mcpat_output": mcpat["provenance"]["hashes"][
+                    "output_sha256"
+                ],
+                "mcpat_binary": mcpat["provenance"]["hashes"][
+                    "binary_sha256"
+                ],
             },
         })
         return point
@@ -4899,13 +5031,9 @@ class PairedAggregationTests(unittest.TestCase):
 
     def _attach_real_reuse_for_selected_pair(self) -> tuple[dict, Path]:
         """Install one Task-5 fixture under a selected key and commit real reuse."""
-        from workflow.r2 import attach_result, reuse_result, run_r2
+        from workflow.r2 import attach_result, reuse_result
+        from workflow.thermal.sustainable_frequency import derive
 
-        source = StrictR2ReuseTests(
-            "test_exact_reuse_writes_provenance_and_recomputes_clip_performance"
-        )
-        source.setUp()
-        self.addCleanup(source.doCleanups)
         key = {"workload": "fft", "l1d_size": "64kB", "l2_size": "512kB"}
         relative = Path(key["workload"]) / f"l1d_{key['l1d_size']}" / (
             f"l2_{key['l2_size']}"
@@ -4913,70 +5041,32 @@ class PairedAggregationTests(unittest.TestCase):
         r1 = self.r1_root / relative
         fixed = self.fixed_root / relative
         clip = self.clip_root / relative
-        for old, new in ((source.r1, r1), (source.fixed, fixed), (source.clip, clip)):
-            shutil.copytree(old, new, dirs_exist_ok=True)
-
-        metadata = read_json(r1 / "r1_metadata.json")
-        metadata.update(key)
-        write_json(r1 / "r1_metadata.json", metadata)
-        for point, method in ((fixed, "fixed-bin"), (clip, "clip3d")):
-            run_config = read_json(point / "run_config.json")
-            run_config.update({"source": str(self.config_path.resolve()),
-                               "config": self.config, "layout_method": method})
-            write_json(point / "run_config.json", run_config)
-            modules = read_json(point / "modules.json")
-            modules["source_r1"] = str(r1.resolve())
-            modules["architecture"] = metadata
-            write_json(point / "modules.json", modules)
-            thermal = read_json(point / "hotspot/thermal_result.json")
-            thermal.update({
-                "power_trace": str((point / "hotspot/power.ptrace").resolve()),
-                "steady_file": str((point / "hotspot/steady.txt").resolve()),
-                "grid_steady_file": str((point / "hotspot/grid.steady.txt").resolve()),
-            })
-            write_json(point / "hotspot/thermal_result.json", thermal)
-            summary = read_json(point / "pipeline_summary.json")
-            summary.update({**key, "r1": str(r1.resolve()),
-                            "output": str(point.resolve()), "layout_method": method,
-                            "layout_mode": method,
-                            "r2_critical_path_cycles": read_json(
-                                point / "r2_latency.json"
-                            )["critical_l1d_to_l2_cycles"]})
-            write_json(point / "pipeline_summary.json", summary)
-
-        result_path = fixed / "gem5_r2/r2_result.json"
-        result = read_json(result_path)
-        identity = run_r2._provenance(r1, fixed / "r2_latency.json")
-        command = list(result["command"])
-        command[command.index("--outdir=" + str(source.fixed / "gem5_r2"))] = (
-            "--outdir=" + str((fixed / "gem5_r2").resolve())
+        clip_performance = derive(
+            read_json(clip / "modules.json"),
+            read_json(clip / "hotspot/thermal_result.json"),
+            self.config["frequency"]["f0_ghz"],
+            self.config["frequency"]["fmin_ghz"],
+            self.config["frequency"]["tsafe_c"],
+            self.config["frequency"]["ambient_c"],
         )
-        command[command.index("--l1d-size") + 1] = key["l1d_size"]
-        result.update({**identity, "command": command,
-                       "stats": str((fixed / "gem5_r2/stats.txt").resolve()),
-                       "stats_sha256": sha256_file(fixed / "gem5_r2/stats.txt")})
-        write_json(result_path, result)
-        status_path = fixed / "gem5_r2/status.json"
-        status = read_json(status_path)
-        status.update({**identity, "command": command,
-                       "r2_result": str(result_path.resolve()),
-                       "r2_result_sha256": sha256_file(result_path),
-                       "stats": str((fixed / "gem5_r2/stats.txt").resolve()),
-                       "stats_sha256": sha256_file(fixed / "gem5_r2/stats.txt")})
-        write_json(status_path, status)
-        fixed_summary = read_json(fixed / "pipeline_summary.json")
-        fixed_summary["r2_source"] = str(result_path.resolve())
-        fixed_summary["artifacts"]["r2_result"] = str(result_path.resolve())
-        write_json(fixed / "pipeline_summary.json", fixed_summary)
+        write_json(clip / "performance.json", clip_performance)
+        clip_summary = read_json(clip / "pipeline_summary.json")
+        clip_summary.update({
+            "ipc2": None, "bips2": None, "r2_source": None,
+            "gamma": clip_performance["gamma"],
+            "tmax_c": clip_performance["tmax_f0_c"],
+            "sustainable_frequency_ghz": clip_performance[
+                "sustainable_frequency_ghz"
+            ],
+            "ipc1": clip_performance["ipc1"],
+            "bips1_thermal": clip_performance["bips1_thermal"],
+        })
+        clip_summary["stage_seconds"].pop("gem5_r2", None)
+        clip_summary["artifacts"]["r2_result"] = None
+        write_json(clip / "pipeline_summary.json", clip_summary)
 
         attach_result.attach(fixed)
         fixed_summary = read_json(fixed / "pipeline_summary.json")
-        fixed_performance = read_json(fixed / "performance.json")
-        fixed_summary["sustainable_frequency_ghz"] = fixed_performance[
-            "sustainable_frequency_ghz"
-        ]
-        fixed_summary["bips2"] = fixed_performance["bips2"]
-        write_json(fixed / "pipeline_summary.json", fixed_summary)
         summary = reuse_result.attach_reused_result(fixed, clip, r1, self.config_path)
         pair_path = self.status_root / relative / "pair_status.json"
         pair = read_json(pair_path)
@@ -5401,7 +5491,7 @@ class PairedAggregationTests(unittest.TestCase):
         self.assertTrue(result["complete"])
         self.assertEqual(result["aggregate"]["fixed_to_clip_reuse_count"], 1)
         self.assertEqual(result["aggregate"]["separate_clip_r2_count"], 49)
-        self.assertAlmostEqual(summary["ipc2"], 3.25)
+        self.assertAlmostEqual(summary["ipc2"], 2.0)
 
         marker = read_json(marker_path)
         marker["source_ipc2"] = 99.0

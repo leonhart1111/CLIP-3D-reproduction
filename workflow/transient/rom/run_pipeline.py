@@ -9,6 +9,10 @@ from pathlib import Path
 
 from workflow.common import read_json, sha256_file, write_json
 from workflow.r2.build_latency_vector import build_vector
+from workflow.r2.attachment_validation import (
+    require_corrected_native_cache,
+    validate_vector_native_cache,
+)
 from workflow.r2.run_r2 import run as run_r2
 from workflow.transient.rom.calibrate_rom import (
     _package_identity,
@@ -70,6 +74,24 @@ def package_identity(modules_path: Path, power_windows_path: Path,
     return _package_identity(
         modules_path, power_windows_path, config_path, hotspot, design, config
     )
+
+
+def _require_native_cache_unchanged(
+        steady_preflight_dir: Path, modules_path: Path,
+        expected: dict | None = None) -> dict:
+    """Revalidate live McPAT authority at every ROM reuse/measurement gate."""
+    try:
+        modules = read_json(modules_path)
+        if not isinstance(modules, dict):
+            raise ValueError("modules.json must contain an object")
+        observed = require_corrected_native_cache(
+            steady_preflight_dir, modules,
+        )
+    except (OSError, TypeError, ValueError) as error:
+        raise ValueError(f"McPAT-native cache authority is invalid: {error}") from error
+    if expected is not None and observed != expected:
+        raise ValueError("McPAT-native cache identity changed during ROM execution")
+    return observed
 
 
 def _validate_final_search_result(
@@ -676,7 +698,8 @@ def _candidate_matches_layout(candidate: dict, layout_path: Path,
 
 def _run_final_branch(
     *, branch: str, layout_path: Path, selected: dict | None,
-    modules_path: Path, cacti_path: Path, power_windows_path: Path,
+    modules_path: Path, power_windows_path: Path,
+    native_cache: dict,
     output_dir: Path, config_path: Path, config: dict, settings: ROMSettings,
     frequency_grid: list[float], hotspot: Path, source_r1_dir: Path,
     execute_r2: bool, rerun_r2: bool,
@@ -779,12 +802,13 @@ def _run_final_branch(
     vector = None
     if classification == "validated":
         vector = build_vector(
-            modules_path, cacti_path, latency_path, None, None, layout_path,
+            modules_path, latency_path, None, None, layout_path,
             controls["wire_rounding"], int(delay.get("cycles_per_tsv", 2)),
             int(delay.get("l1_pipeline_cycles", 1)),
             controls["wire_aggregation"],
         )
         try:
+            validate_vector_native_cache(vector, native_cache)
             require_selected_cycle_identity(
                 selected, vector, controls["wire_aggregation"]
             )
@@ -808,6 +832,8 @@ def _run_final_branch(
         "schema_version": 1,
         "branch": branch,
         "state": state,
+        "cache_authority": native_cache["cache_authority"],
+        "native_cache_identity": native_cache,
         "validation_classification": classification,
         "failure": failure,
         "controls": controls,
@@ -958,31 +984,13 @@ def _run_transient_pipeline_core(
     ):
         raise ValueError("transient ROM requires an R2-disabled steady preflight")
     modules_path = (steady_preflight_dir / "modules.json").resolve()
-    cacti_path = (
-        steady_preflight_dir / "cacti/cacti_characterization.json"
-    ).resolve()
-    for path in (modules_path, cacti_path):
-        if not path.is_file():
-            raise FileNotFoundError(path)
-    steady_artifacts = steady_summary.get("artifacts")
-    recorded_cacti = (
-        steady_artifacts.get("cacti")
-        if isinstance(steady_artifacts, dict) else None
+    if not modules_path.is_file():
+        raise FileNotFoundError(modules_path)
+    module_model = read_json(modules_path)
+    native_cache = _require_native_cache_unchanged(
+        steady_preflight_dir, modules_path,
     )
-    if (not isinstance(recorded_cacti, str)
-            or Path(recorded_cacti).resolve() != cacti_path):
-        raise ValueError(
-            "steady preflight CACTI artifact path does not match "
-            "steady_preflight/cacti/cacti_characterization.json"
-        )
-    artifact_sha256 = steady_summary.get("artifact_sha256")
-    recorded_cacti_sha256 = (
-        artifact_sha256.get("cacti")
-        if isinstance(artifact_sha256, dict) else None
-    )
-    if (not isinstance(recorded_cacti_sha256, str)
-            or recorded_cacti_sha256 != sha256_file(cacti_path)):
-        raise ValueError("steady preflight CACTI artifact sha256 does not match")
+    cache_authority = native_cache["cache_authority"]
 
     output_dir.mkdir(parents=True, exist_ok=True)
     if transient_r1_dir is None:
@@ -1015,6 +1023,9 @@ def _run_transient_pipeline_core(
         )
         power_windows_reused = False
     power_windows_path = Path(prepared["power_windows"]).resolve()
+    _require_native_cache_unchanged(
+        steady_preflight_dir, modules_path, native_cache,
+    )
     package_dir = (
         rom_package_dir
         if rom_package_dir is not None
@@ -1083,6 +1094,9 @@ def _run_transient_pipeline_core(
             )
         optimization_reused = False
     proposed_layout = Path(optimization["proposed_layout"]).resolve()
+    _require_native_cache_unchanged(
+        steady_preflight_dir, modules_path, native_cache,
+    )
     selected = optimization.get("selected")
     if not isinstance(selected, dict):
         raise ValueError("ROM optimization lacks a selected candidate")
@@ -1125,23 +1139,34 @@ def _run_transient_pipeline_core(
 
         fixed_dir = paired_validation_dir / "fixed_bin"
         clip_dir = paired_validation_dir / "clip3d"
+        _require_native_cache_unchanged(
+            steady_preflight_dir, modules_path, native_cache,
+        )
         fixed_branch = _run_final_branch(
             branch="fixed-bin", layout_path=fixed_layout,
             selected=fixed_candidate, modules_path=modules_path,
-            cacti_path=cacti_path, power_windows_path=power_windows_path,
+            power_windows_path=power_windows_path,
+            native_cache=native_cache,
             output_dir=fixed_dir, config_path=config_path, config=config,
             settings=settings, frequency_grid=frequency_grid, hotspot=hotspot,
             source_r1_dir=source_r1_dir, execute_r2=False,
             rerun_r2=rerun_r2,
         )
+        _require_native_cache_unchanged(
+            steady_preflight_dir, modules_path, native_cache,
+        )
         clip_branch = _run_final_branch(
             branch="clip3d", layout_path=proposed_layout, selected=selected,
-            modules_path=modules_path, cacti_path=cacti_path,
+            modules_path=modules_path,
             power_windows_path=power_windows_path, output_dir=clip_dir,
+            native_cache=native_cache,
             config_path=config_path, config=config, settings=settings,
             frequency_grid=frequency_grid, hotspot=hotspot,
             source_r1_dir=source_r1_dir, execute_r2=False,
             rerun_r2=rerun_r2,
+        )
+        _require_native_cache_unchanged(
+            steady_preflight_dir, modules_path, native_cache,
         )
         for branch_summary, branch_dir in (
             (fixed_branch, fixed_dir), (clip_branch, clip_dir),
@@ -1154,8 +1179,14 @@ def _run_transient_pipeline_core(
             for branch in (fixed_branch, clip_branch)
         )
         if execute_r2 and both_validated:
+            _require_native_cache_unchanged(
+                steady_preflight_dir, modules_path, native_cache,
+            )
             fixed_branch = _execute_branch_r2(
                 fixed_branch, source_r1_dir, fixed_dir, rerun_r2=rerun_r2
+            )
+            _require_native_cache_unchanged(
+                steady_preflight_dir, modules_path, native_cache,
             )
             clip_branch = _execute_branch_r2(
                 clip_branch, source_r1_dir, clip_dir, rerun_r2=rerun_r2
@@ -1189,6 +1220,8 @@ def _run_transient_pipeline_core(
             "non_formal": True,
             "paper_equivalent": False,
             "state": pipeline_state,
+            "cache_authority": cache_authority,
+            "native_cache_identity": native_cache,
             "source_r1": str(source_r1_dir),
             "steady_preflight": str(steady_preflight_dir),
             "output": str(output_dir),
@@ -1249,7 +1282,6 @@ def _run_transient_pipeline_core(
             "paired_comparison": paired,
             "artifacts": {
                 "modules": str(modules_path),
-                "cacti": str(cacti_path),
                 "power_windows": str(power_windows_path),
                 "rom_package": str(package_dir) if package_dir is not None else None,
                 "optimization_report": str(
@@ -1320,6 +1352,10 @@ def _run_transient_pipeline_core(
             "failure": final_validation_failure,
         }
 
+    _require_native_cache_unchanged(
+        steady_preflight_dir, modules_path, native_cache,
+    )
+
     search = final_validation.get("search")
     evaluations = search.get("evaluations") if isinstance(search, dict) else None
     if not isinstance(evaluations, list):
@@ -1369,14 +1405,21 @@ def _run_transient_pipeline_core(
     vector = None
     r2_result = None
     if final_validation_classification == "validated":
+        _require_native_cache_unchanged(
+            steady_preflight_dir, modules_path, native_cache,
+        )
         vector = build_vector(
-            modules_path, cacti_path, latency_path, None, None, proposed_layout,
+            modules_path, latency_path, None, None, proposed_layout,
             delay.get("wire_rounding", "nearest"),
             int(delay.get("cycles_per_tsv", 2)),
             int(delay.get("l1_pipeline_cycles", 1)),
             delay.get("wire_aggregation", "mean"),
         )
+        validate_vector_native_cache(vector, native_cache)
         if execute_r2:
+            _require_native_cache_unchanged(
+                steady_preflight_dir, modules_path, native_cache,
+            )
             r2_result = run_r2(
                 source_r1_dir, latency_path, output_dir / "gem5_r2",
                 rerun=rerun_r2,
@@ -1396,6 +1439,8 @@ def _run_transient_pipeline_core(
         "non_formal": True,
         "paper_equivalent": False,
         "state": pipeline_state,
+        "cache_authority": cache_authority,
+        "native_cache_identity": native_cache,
         "source_r1": str(source_r1_dir),
         "steady_preflight": str(steady_preflight_dir),
         "output": str(output_dir),
@@ -1435,7 +1480,6 @@ def _run_transient_pipeline_core(
         ),
         "artifacts": {
             "modules": str(modules_path),
-            "cacti": str(cacti_path),
             "power_windows": str(power_windows_path),
             "rom_package": str(package_dir) if package_dir is not None else None,
             "rom_package_manifest": (

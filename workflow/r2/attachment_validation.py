@@ -13,13 +13,81 @@ from workflow.common import (
     aggregate_ipc,
     instruction_window_scope,
     parse_gem5_stats_text,
+    read_json,
 )
+from workflow.r2.build_latency_vector import (
+    _validated_hashes,
+    _validated_native_records,
+)
+from workflow.run_lifting_sweep import validate_corrected_physical_artifacts
 from workflow.thermal.run_hotspot import parse_temperatures
 from workflow.thermal.sustainable_frequency import derive
 
 
 _NO_R2 = object()
 _SUPPORTED_INSTRUCTION_WINDOW_SCOPES = frozenset({"cpu0", "all-cores"})
+
+
+def native_cache_identity(modules: dict) -> dict:
+    """Return the strict McPAT-native identity shared by ROM and R2 gates."""
+    records = _validated_native_records(modules)
+    hashes = _validated_hashes(modules)
+    contract = modules["cache_contract"]
+    return {
+        "schema_version": 1,
+        "cache_authority": modules["cache_authority"],
+        "cache_contract_id": contract["contract_id"],
+        "record_ids": {
+            level: [record["record_id"] for record in records[level]]
+            for level in ("l1i", "l1d", "l2")
+        },
+        "mcpat_output_sha256": hashes["output_sha256"],
+        "mcpat_binary_sha256": hashes["binary_sha256"],
+    }
+
+
+def require_corrected_native_cache(point_dir: Path,
+                                   modules: dict | None = None) -> dict:
+    """Validate Task-6 live authority and return its cache reuse identity."""
+    point_dir = Path(point_dir).resolve()
+    physical = validate_corrected_physical_artifacts(point_dir)
+    live_modules = read_json(point_dir / "modules.json")
+    if not isinstance(live_modules, dict):
+        raise ValueError("McPAT-native modules.json must contain an object")
+    if modules is not None and modules != live_modules:
+        raise ValueError("McPAT-native cache modules changed during validation")
+    identity = native_cache_identity(live_modules)
+    if (physical.get("cache_authority") != identity["cache_authority"]
+            or physical.get("mcpat_provenance") != live_modules.get(
+                "mcpat_provenance"
+            )):
+        raise ValueError("McPAT-native cache authority validation disagrees")
+    return identity
+
+
+def validate_vector_native_cache(vector: dict, expected: dict) -> None:
+    """Bind one Task-5 latency vector to its strict native module identity."""
+    provenance = vector.get("mcpat_cacti_p_provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("latency vector lacks McPAT-native cache provenance")
+    if provenance.get("authority") != expected.get("cache_authority"):
+        raise ValueError("latency vector McPAT cache authority differs")
+    if provenance.get("mcpat_output_sha256") != expected.get(
+            "mcpat_output_sha256"):
+        raise ValueError("latency vector McPAT output hash differs")
+    if provenance.get("mcpat_binary_sha256") != expected.get(
+            "mcpat_binary_sha256"):
+        raise ValueError("latency vector McPAT binary hash differs")
+    converted = provenance.get("records")
+    if not isinstance(converted, dict):
+        raise ValueError("latency vector lacks McPAT cache record IDs")
+    for level in ("l1i", "l1d", "l2"):
+        record = converted.get(level)
+        if (not isinstance(record, dict)
+                or record.get("record_ids") != expected["record_ids"][level]):
+            raise ValueError(
+                f"latency vector McPAT {level.upper()} cache record IDs differ"
+            )
 
 
 def is_supported_instruction_window_scope(value: object) -> bool:
@@ -73,6 +141,10 @@ def validate_physical_coherence(
     """Validate one physical input chain and all equation-(13) derived fields."""
     r1_dir = Path(r1_dir).resolve()
     point_dir = Path(point_dir).resolve()
+    try:
+        require_corrected_native_cache(point_dir, modules)
+    except (OSError, TypeError, ValueError) as error:
+        reasons.append(f"target McPAT-native cache authority is invalid: {error}")
     architecture = modules.get("architecture")
     if not isinstance(architecture, dict):
         reasons.append("target modules architecture is missing")

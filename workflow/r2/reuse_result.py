@@ -13,7 +13,10 @@ import tempfile
 from workflow.common import atomic_write_bytes, write_json
 from workflow.r2.attachment_validation import (
     exclusive_point_lock,
+    native_cache_identity,
+    require_corrected_native_cache,
     validate_physical_coherence,
+    validate_vector_native_cache,
 )
 from workflow.r2.run_r2 import (
     strict_latency_vectors_equal,
@@ -189,12 +192,16 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
         clip_summary_path, reasons, "CLIP pipeline summary", snapshots
     )
     target_modules_path = clip_point / "modules.json"
+    source_modules_path = fixed_point / "modules.json"
     target_thermal_path = clip_point / "hotspot/thermal_result.json"
     target_manifest_path = clip_point / "hotspot/hotspot_manifest.json"
     target_steady_path = clip_point / "hotspot/steady.txt"
     target_performance_path = clip_point / "performance.json"
     target_modules = _read_object(
         target_modules_path, reasons, "target modules", snapshots
+    )
+    source_modules = _read_object(
+        source_modules_path, reasons, "source modules", snapshots
     )
     target_thermal = _read_object(
         target_thermal_path, reasons, "target thermal result", snapshots
@@ -228,18 +235,39 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
     source_result = captured_source_result
     source_status = captured_source_status
 
+    source_native = None
+    target_native = None
+    if source_modules is not None:
+        try:
+            source_native = require_corrected_native_cache(
+                fixed_point, source_modules,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            reasons.append(f"source McPAT-native cache authority is invalid: {error}")
+    if target_modules is not None:
+        try:
+            target_native = native_cache_identity(target_modules)
+        except (TypeError, ValueError) as error:
+            reasons.append(f"target McPAT-native cache identity is invalid: {error}")
+    if source_native is not None and target_native is not None \
+            and source_native != target_native:
+        reasons.append("source and target McPAT-native cache identities differ")
+
     if source_vector is not None and target_vector is not None:
         for label, vector in (("source", source_vector), ("target", target_vector)):
             try:
                 validate_latency_vector(vector)
             except ValueError as error:
                 reasons.append(f"{label} {error}")
-        try:
-            vectors_equal = strict_latency_vectors_equal(source_vector, target_vector)
-        except ValueError:
-            vectors_equal = False
-        if not vectors_equal:
-            reasons.append("source and target gem5_overrides differ or are invalid")
+        for label, vector, identity in (
+                ("source", source_vector, source_native),
+                ("target", target_vector, target_native)):
+            if identity is None:
+                continue
+            try:
+                validate_vector_native_cache(vector, identity)
+            except ValueError as error:
+                reasons.append(f"{label} {error}")
 
     canonical_key = _architecture_key(metadata or {})
     if any(not isinstance(value, str) or not value for value in canonical_key.values()):
@@ -302,6 +330,16 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
             reasons.append("fixed source result provenance does not identify r2_result.json")
         if fixed_summary.get("ipc2") != source_result.get("ipc2"):
             reasons.append("fixed summary IPC2 differs from source result IPC2")
+
+    # Exact Task-5 vector equality remains the final scientific reuse gate,
+    # after both branches have established the same native physical authority.
+    if source_vector is not None and target_vector is not None:
+        try:
+            vectors_equal = strict_latency_vectors_equal(source_vector, target_vector)
+        except ValueError:
+            vectors_equal = False
+        if not vectors_equal:
+            reasons.append("source and target gem5_overrides differ or are invalid")
 
     _record_changed_snapshots(snapshots, reasons)
     context = {
@@ -383,6 +421,14 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
             "steady": {
                 "path": str(target_steady_path),
                 "sha256": _snapshot_sha256(snapshots, target_steady_path),
+            },
+        },
+        "native_cache": {
+            "source": source_native,
+            "target": target_native,
+            "source_modules": {
+                "path": str(source_modules_path),
+                "sha256": _snapshot_sha256(snapshots, source_modules_path),
             },
         },
     }

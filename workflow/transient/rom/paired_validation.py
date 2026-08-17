@@ -9,6 +9,7 @@ from numbers import Integral, Real
 from pathlib import Path
 
 from workflow.common import atomic_write_bytes, read_json, sha256_file, write_json
+from workflow.r2.attachment_validation import validate_vector_native_cache
 
 
 def _finite_optional(value: object, label: str) -> float | None:
@@ -84,7 +85,7 @@ def _validated_artifact(artifacts: dict, field: str, label: str) -> Path:
     return path
 
 
-def _validated_branch(branch: dict, expected_name: str) -> tuple[float, dict]:
+def _validated_branch(branch: dict, expected_name: str) -> tuple[float, dict, dict]:
     if not isinstance(branch, dict) or branch.get("branch") != expected_name:
         raise ValueError(f"paired comparison requires the {expected_name} branch")
     if branch.get("r2_executed") is not True:
@@ -112,16 +113,24 @@ def _validated_branch(branch: dict, expected_name: str) -> tuple[float, dict]:
         raise ValueError(f"{expected_name} lacks controls or artifact identity")
     _validated_artifact(artifacts, "layout", expected_name)
     hotspot_path = _validated_artifact(artifacts, "hotspot", expected_name)
-    _validated_artifact(artifacts, "r2_latency", expected_name)
+    latency_path = _validated_artifact(artifacts, "r2_latency", expected_name)
     r2_path = _validated_artifact(artifacts, "r2_result", expected_name)
     hotspot_result = read_json(hotspot_path)
+    latency_vector = read_json(latency_path)
     r2_result = read_json(r2_path)
     if (not isinstance(hotspot_result, dict)
             or hotspot_result.get("f_sus_trans_ghz") != frequency):
         raise ValueError(f"{expected_name} HotSpot artifact frequency differs")
     if not isinstance(r2_result, dict) or r2_result.get("ipc2") != ipc:
         raise ValueError(f"{expected_name} R2 artifact IPC2 differs")
-    return bips, controls
+    native_cache = branch.get("native_cache_identity")
+    if (not isinstance(native_cache, dict)
+            or branch.get("cache_authority") != native_cache.get(
+                "cache_authority"
+            )):
+        raise ValueError(f"{expected_name} lacks McPAT-native cache identity")
+    validate_vector_native_cache(latency_vector, native_cache)
+    return bips, controls, native_cache
 
 
 def publish_paired_comparison(
@@ -145,14 +154,20 @@ def publish_paired_comparison(
         return None
 
     try:
-        fixed_bips, fixed_controls = _validated_branch(fixed, "fixed-bin")
-        clip_bips, clip_controls = _validated_branch(clip3d, "clip3d")
+        fixed_bips, fixed_controls, fixed_native = _validated_branch(
+            fixed, "fixed-bin"
+        )
+        clip_bips, clip_controls, clip_native = _validated_branch(
+            clip3d, "clip3d"
+        )
     except (OSError, ValueError):
         json_path.unlink(missing_ok=True)
         csv_path.unlink(missing_ok=True)
         raise
     if fixed_controls != clip_controls:
         raise ValueError("paired branches use different optimization controls")
+    if fixed_native != clip_native:
+        raise ValueError("paired branches use different McPAT-native cache identities")
     lambda_wire = _finite_optional(
         fixed_controls.get("lambda_wire"), "paired lambda_wire"
     )
@@ -173,6 +188,7 @@ def publish_paired_comparison(
         "non_formal": True,
         "paper_equivalent": False,
         "controls": fixed_controls,
+        "native_cache_identity": fixed_native,
         "fixed_bin": fixed,
         "clip3d": clip3d,
         "bips2_trans_absolute_difference": absolute,
