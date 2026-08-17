@@ -4,18 +4,27 @@
 import argparse
 import concurrent.futures
 import csv
+import hashlib
 import itertools
 import json
 import math
 import re
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from workflow.r1_protocol import (
+    PROTOCOL_FAMILY,
+    canonical_protocol,
+    protocol_id,
+)
 DEFAULT_EXPERIMENT = PROJECT_ROOT / "configs/experiments/r1_cache_sweep.json"
 DEFAULT_GEM5 = PROJECT_ROOT / "tools/src/gem5/build/X86/gem5.opt"
 DEFAULT_R1_CONFIG = PROJECT_ROOT / "configs/gem5/clip_r1.py"
@@ -28,10 +37,12 @@ class Job:
     l1d_size: str
     l2_size: str
     profile: str
+    family: str
     warmup_insts: int
     measure_insts: int
     instruction_window_scope: str
     options: str | None
+    protocol_id: str
     output_dir: Path
 
     @property
@@ -49,7 +60,7 @@ def parse_arguments():
         )
     )
     parser.add_argument("--experiment", type=Path, default=DEFAULT_EXPERIMENT)
-    parser.add_argument("--profile", choices=("paper", "paper_all_cores", "smoke"), default="paper")
+    parser.add_argument("--profile")
     parser.add_argument("--workloads", nargs="+")
     parser.add_argument("--l1d-sizes", nargs="+")
     parser.add_argument("--l2-sizes", nargs="+")
@@ -97,7 +108,7 @@ def safe_component(value):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
-def make_jobs(args, experiment):
+def make_jobs(args, experiment, r1_config_sha256, gem5_binary_sha256):
     workloads = select_values(
         args.workloads, experiment["workloads"], "workloads"
     )
@@ -107,8 +118,23 @@ def make_jobs(args, experiment):
     l2_sizes = select_values(
         args.l2_sizes, experiment["l2_sizes"], "L2 sizes"
     )
-    profile = experiment["profiles"][args.profile]
+    profiles = experiment.get("profiles")
+    if not isinstance(profiles, dict) or args.profile not in profiles:
+        raise ValueError(
+            f"unknown profile {args.profile!r}; available: "
+            + ", ".join(sorted(profiles))
+        )
+    profile = profiles[args.profile]
     options = profile.get("workload_options", {})
+    canonical = canonical_protocol({
+        "family": PROTOCOL_FAMILY,
+        "profile": args.profile,
+        "warmup_insts": profile["warmup_insts"],
+        "measure_insts": profile["measure_insts"],
+        "instruction_window_scope": profile.get(
+            "instruction_window_scope", "cpu0"
+        ),
+    })
     root = args.output_root.resolve() / args.profile
 
     jobs = []
@@ -127,10 +153,17 @@ def make_jobs(args, experiment):
                 l1d_size=l1d_size,
                 l2_size=l2_size,
                 profile=args.profile,
+                family=canonical["family"],
                 warmup_insts=int(profile["warmup_insts"]),
                 measure_insts=int(profile["measure_insts"]),
                 instruction_window_scope=profile.get("instruction_window_scope", "cpu0"),
                 options=options.get(workload),
+                protocol_id=protocol_id(
+                    canonical,
+                    workload_options=options.get(workload),
+                    gem5_config_sha256=r1_config_sha256,
+                    gem5_binary_sha256=gem5_binary_sha256,
+                ),
                 output_dir=output_dir,
             )
         )
@@ -155,6 +188,12 @@ def command_for(job, args):
         str(job.measure_insts),
         "--instruction-window-scope",
         job.instruction_window_scope,
+        "--r1-protocol-family",
+        job.family,
+        "--r1-profile",
+        job.profile,
+        "--r1-protocol-id",
+        job.protocol_id,
     ]
     if job.options is not None:
         command.extend(("--options", job.options))
@@ -179,6 +218,15 @@ def read_status(job):
             return json.load(stream)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def is_reusable(existing, job) -> bool:
+    """A successful output is reusable only under an identical protocol."""
+    return bool(
+        existing is not None
+        and existing.get("state") == "success"
+        and existing.get("r1_protocol_id") == job.protocol_id
+    )
 
 
 def parse_number(text):
@@ -225,8 +273,7 @@ def run_job(job, args):
     existing = read_status(job)
     if (
         not args.rerun
-        and existing is not None
-        and existing.get("state") == "success"
+        and is_reusable(existing, job)
         and (job.output_dir / "stats.txt").is_file()
     ):
         print(f"[skip]  {job.job_id}", flush=True)
@@ -238,6 +285,14 @@ def run_job(job, args):
         job.output_dir / "command.json",
         {
             "job": {**asdict(job), "output_dir": str(job.output_dir)},
+            "r1_protocol": {
+                "family": job.family,
+                "profile": job.profile,
+                "warmup_insts": job.warmup_insts,
+                "measure_insts": job.measure_insts,
+                "instruction_window_scope": job.instruction_window_scope,
+            },
+            "r1_protocol_id": job.protocol_id,
             "argv": command,
             "shell_command": shlex.join(command),
         },
@@ -246,6 +301,14 @@ def run_job(job, args):
     running = {
         "state": "running",
         "job_id": job.job_id,
+        "r1_protocol": {
+            "family": job.family,
+            "profile": job.profile,
+            "warmup_insts": job.warmup_insts,
+            "measure_insts": job.measure_insts,
+            "instruction_window_scope": job.instruction_window_scope,
+        },
+        "r1_protocol_id": job.protocol_id,
         "started_unix": started,
         "command": command,
     }
@@ -295,6 +358,14 @@ def run_job(job, args):
     status = {
         "state": state,
         "job_id": job.job_id,
+        "r1_protocol": {
+            "family": job.family,
+            "profile": job.profile,
+            "warmup_insts": job.warmup_insts,
+            "measure_insts": job.measure_insts,
+            "instruction_window_scope": job.instruction_window_scope,
+        },
+        "r1_protocol_id": job.protocol_id,
         "return_code": return_code,
         "started_unix": started,
         "finished_unix": finished,
@@ -318,6 +389,7 @@ def write_plan(jobs, args, experiment):
     plan = {
         "experiment": experiment["name"],
         "profile": args.profile,
+        "default_profile": experiment.get("default_profile", "paper"),
         "job_count": len(jobs),
         "jobs": [
             {
@@ -377,7 +449,15 @@ def main():
         raise FileNotFoundError(f"R1 configuration not found: {args.r1_config}")
 
     experiment = load_experiment(args.experiment)
-    jobs = make_jobs(args, experiment)
+    if args.profile is None:
+        args.profile = experiment.get("default_profile", "paper")
+    r1_config_sha256 = hashlib.sha256(
+        args.r1_config.read_bytes()
+    ).hexdigest()
+    gem5_binary_sha256 = hashlib.sha256(
+        args.gem5.read_bytes()
+    ).hexdigest()
+    jobs = make_jobs(args, experiment, r1_config_sha256, gem5_binary_sha256)
     root = write_plan(jobs, args, experiment)
     print(
         f"Planned {len(jobs)} jobs for profile '{args.profile}' in {root}",

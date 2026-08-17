@@ -12,20 +12,30 @@ import time
 from pathlib import Path
 
 from workflow.common import PROJECT_ROOT, read_json, write_json
+from workflow.transient.sampling import resolve_sampling_policy
 
 
 DEFAULT_GEM5 = PROJECT_ROOT / "tools/src/gem5/build/X86/gem5.opt"
 TRANSIENT_CONFIG = PROJECT_ROOT / "configs/gem5/clip_r1_transient.py"
 def completed(output_dir: Path, sample_ms: float,
               source_r1_dir: Path | None = None) -> bool:
-    status = output_dir / "status.json"
-    metadata = output_dir / "r1_metadata.json"
-    stats = output_dir / "stats.txt"
-    if not status.is_file() or not metadata.is_file() or not stats.is_file():
+    status_path = output_dir / "status.json"
+    metadata_path = output_dir / "r1_metadata.json"
+    stats_path = output_dir / "stats.txt"
+    if (
+        not status_path.is_file()
+        or not metadata_path.is_file()
+        or not stats_path.is_file()
+    ):
         return False
-    recorded = read_json(metadata)
+    recorded = read_json(metadata_path)
+    status = read_json(status_path)
+    expected_policy_id = None
+    if source_r1_dir is not None:
+        policy = resolve_sampling_policy(source_r1_dir, sample_ms)
+        expected_policy_id = policy["policy_id"]
     compatible = (
-        read_json(status).get("state") == "success"
+        status.get("state") == "success"
         and recorded.get("transient_statistics") is True
         and recorded.get("transient_stats_mode") == "cumulative"
         and abs(float(recorded.get("sample_interval_ms", -1)) - sample_ms) < 1e-12
@@ -36,10 +46,19 @@ def completed(output_dir: Path, sample_ms: float,
         and int(recorded["measurement_end_tick"])
         > int(recorded["measurement_start_tick"])
     )
+    if compatible and expected_policy_id is not None:
+        recorded_policy_id = status.get("sampling_policy_id")
+        if recorded_policy_id is not None:
+            # Policy identity is enforced for corrected caches; legacy caches
+            # recorded before policy identities keep the numeric gate.
+            compatible = (
+                recorded_policy_id == expected_policy_id
+                and recorded.get("sampling_policy_id") == expected_policy_id
+            )
     if not compatible or source_r1_dir is None:
         return compatible
     source_r1_dir = source_r1_dir.resolve()
-    recorded_status = read_json(status)
+    recorded_status = read_json(status_path)
     status_source = recorded_status.get("source_r1")
     metadata_source = recorded.get("canonical_source_r1")
     if (
@@ -54,7 +73,8 @@ def completed(output_dir: Path, sample_ms: float,
 
 
 def command_from_metadata(source_r1_dir: Path, output_dir: Path, gem5: Path,
-                          sample_ms: float) -> list[str]:
+                          sample_ms: float,
+                          sampling_policy_id: str | None = None) -> list[str]:
     metadata = read_json(source_r1_dir / "r1_metadata.json")
     command = [
         str(gem5.resolve()),
@@ -74,7 +94,18 @@ def command_from_metadata(source_r1_dir: Path, output_dir: Path, gem5: Path,
         "--measure-insts", str(metadata["measure_insts"]),
         "--instruction-window-scope",
         metadata.get("instruction_window_scope", "cpu0"),
+        "--sampling-policy-id", sampling_policy_id or "unidentified",
     ]
+    recorded_protocol = metadata.get("r1_protocol")
+    if isinstance(recorded_protocol, dict):
+        command.extend((
+            "--r1-protocol-family", str(recorded_protocol.get(
+                "family", "clip3d-r1"
+            )),
+            "--r1-profile", str(recorded_protocol.get("profile", "")),
+        ))
+    if metadata.get("r1_protocol_id"):
+        command.extend(("--r1-protocol-id", str(metadata["r1_protocol_id"])))
     workload_command = list(metadata.get("command", []))
     if len(workload_command) > 1:
         command.extend(("--options", shlex.join(workload_command[1:])))
@@ -94,7 +125,7 @@ def command_from_metadata(source_r1_dir: Path, output_dir: Path, gem5: Path,
     return command
 
 
-def run(source_r1_dir: Path, output_dir: Path, sample_ms: float = 10.0,
+def run(source_r1_dir: Path, output_dir: Path, sample_ms: float | None = None,
         gem5: Path = DEFAULT_GEM5, rerun: bool = False) -> dict:
     source_r1_dir = source_r1_dir.resolve()
     output_dir = output_dir.resolve()
@@ -106,11 +137,11 @@ def run(source_r1_dir: Path, output_dir: Path, sample_ms: float = 10.0,
         raise ValueError(
             f"transient R1 output {output_dir} overlaps read-only input {source_r1_dir}"
         )
-    if not math.isfinite(sample_ms) or sample_ms <= 0:
-        raise ValueError("sample_ms must be positive")
     for required in (source_r1_dir / "r1_metadata.json", source_r1_dir / "stats.txt"):
         if not required.is_file():
             raise FileNotFoundError(required)
+    sampling_policy = resolve_sampling_policy(source_r1_dir, sample_ms)
+    sample_ms = float(sampling_policy["requested_interval_ms"])
     source_status = source_r1_dir / "status.json"
     if source_status.is_file() and read_json(source_status).get("state") != "success":
         raise ValueError(f"source R1 is not complete: {source_status}")
@@ -138,10 +169,15 @@ def run(source_r1_dir: Path, output_dir: Path, sample_ms: float = 10.0,
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    command = command_from_metadata(source_r1_dir, output_dir, gem5, sample_ms)
+    command = command_from_metadata(
+        source_r1_dir, output_dir, gem5, sample_ms,
+        sampling_policy_id=sampling_policy["policy_id"],
+    )
     write_json(output_dir / "command.json", {
         "schema_version": 1,
         "source_r1": str(source_r1_dir),
+        "sampling_policy": sampling_policy,
+        "sampling_policy_id": sampling_policy["policy_id"],
         "argv": command,
         "shell_command": shlex.join(command),
     })
@@ -154,6 +190,8 @@ def run(source_r1_dir: Path, output_dir: Path, sample_ms: float = 10.0,
         "started_unix": started,
         "source_r1": str(source_r1_dir),
         "sample_interval_ms": sample_ms,
+        "sampling_policy": sampling_policy,
+        "sampling_policy_id": sampling_policy["policy_id"],
         "source_r1_metadata_sha256": source_metadata_sha256,
         "command": command,
     })
@@ -187,6 +225,8 @@ def run(source_r1_dir: Path, output_dir: Path, sample_ms: float = 10.0,
             "elapsed_seconds": time.time() - started,
             "source_r1": str(source_r1_dir),
             "sample_interval_ms": sample_ms,
+            "sampling_policy": sampling_policy,
+            "sampling_policy_id": sampling_policy["policy_id"],
             "source_r1_metadata_sha256": source_metadata_sha256,
             "command": command,
         }
@@ -211,7 +251,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-r1-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--sample-ms", type=float, default=10.0)
+    parser.add_argument("--sample-ms", type=float, default=None)
     parser.add_argument("--gem5", type=Path, default=DEFAULT_GEM5)
     parser.add_argument("--rerun", action="store_true")
     args = parser.parse_args()

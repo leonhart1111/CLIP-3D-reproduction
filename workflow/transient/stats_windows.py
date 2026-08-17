@@ -65,6 +65,10 @@ def split_windows(transient_r1_dir: Path, output_dir: Path) -> dict:
         raise ValueError("transient R1 metadata lacks canonical_source_r1 provenance")
     sample_ticks = int(metadata["sample_interval_ticks"])
     sample_s = float(metadata["sample_interval_s"])
+    requested_sample_ms = float(metadata.get("requested_sample_interval_ms", sample_s * 1000.0))
+    sampling_policy_id = metadata.get("sampling_policy_id") or (
+        "legacy-unidentified"
+    )
     measurement_start = int(metadata["measurement_start_tick"])
     if "measurement_end_tick" not in metadata:
         raise ValueError("transient R1 metadata lacks independent measurement_end_tick")
@@ -129,6 +133,9 @@ def split_windows(transient_r1_dir: Path, output_dir: Path) -> dict:
             "window_duration_ticks": duration_ticks,
             "window_duration_s": duration_ticks / sim_freq,
             "nominal_sample_interval_s": sample_s,
+            "requested_sample_interval_ms": requested_sample_ms,
+            "tick_rounded_sample_interval_ms": sample_s * 1000.0,
+            "sampling_policy_id": sampling_policy_id,
             "is_partial_window": duration_ticks != sample_ticks,
         }
         write_json(window_dir / "r1_metadata.json", window_metadata)
@@ -158,9 +165,17 @@ def split_windows(transient_r1_dir: Path, output_dir: Path) -> dict:
         "stats_mode": "cumulative snapshots converted to per-window deltas",
         "nominal_sample_interval_ms": sample_s * 1000.0,
         "nominal_sample_interval_ticks": sample_ticks,
+        "requested_sample_interval_ms": requested_sample_ms,
+        "tick_rounded_sample_interval_ms": sample_s * 1000.0,
+        "sampling_policy_id": sampling_policy_id,
         "measurement_start_tick": measurement_start,
         "measurement_end_tick": measurement_end,
         "window_count": len(windows),
+        "actual_window_count": len(windows),
+        "window_durations_ms": [
+            window["duration_s"] * 1000.0 for window in windows
+        ],
+        "padded_duration_s": len(windows) * sample_s,
         "total_duration_s": sum(window["duration_s"] for window in windows),
         "windows": windows,
         "dropped_sections": dropped_sections,

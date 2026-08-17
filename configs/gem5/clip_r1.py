@@ -143,6 +143,9 @@ def parse_arguments():
         default=500_000_000,
         help="CPU0 committed instructions in the measured region",
     )
+    parser.add_argument("--r1-protocol-family", type=str, default="clip3d-r1")
+    parser.add_argument("--r1-profile", type=str)
+    parser.add_argument("--r1-protocol-id", type=str)
     parser.add_argument(
         "--max-ticks-per-phase",
         type=nonnegative_integer,
@@ -358,6 +361,14 @@ def write_metadata(args, binary, options, stdin_path, environment):
         "warmup_insts": args.warmup_insts,
         "measure_insts": args.measure_insts,
         "instruction_window_scope": args.instruction_window_scope,
+        "r1_protocol": {
+            "family": args.r1_protocol_family,
+            "profile": args.r1_profile,
+            "warmup_insts": args.warmup_insts,
+            "measure_insts": args.measure_insts,
+            "instruction_window_scope": args.instruction_window_scope,
+        },
+        "r1_protocol_id": args.r1_protocol_id,
         "stop_anchor": ("CPU0 thread 0" if args.instruction_window_scope == "cpu0"
                         else "all four CPU thread-0 contexts"),
         "thread_mapping": "one process; pthread clone into four CPU contexts",

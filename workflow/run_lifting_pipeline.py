@@ -848,7 +848,7 @@ def main() -> None:
         help=("run the separate time-windowed McPAT/HotSpot branch after the "
               "unchanged steady pipeline; default: false"),
     )
-    parser.add_argument("--transient-sample-ms", type=positive_float, default=10.0)
+    parser.add_argument("--transient-sample-ms", type=positive_float, default=None)
     parser.add_argument(
         "--transient-r1-dir", type=Path,
         help=("reuse an existing periodic-statistics R1; when omitted, the transient "
@@ -951,11 +951,16 @@ def main() -> None:
         )
     if args.transient:
         from workflow.transient.run_transient_pipeline import run_transient_pipeline
+        from workflow.transient.sampling import resolve_sampling_policy
+
+        sampling_policy = resolve_sampling_policy(
+            args.r1_dir.resolve(), args.transient_sample_ms
+        )
 
         transient = run_transient_pipeline(
             args.r1_dir.resolve(), args.output_dir.resolve(),
             (args.output_dir / "transient").resolve(), args.config.resolve(),
-            args.transient_sample_ms,
+            sampling_policy["requested_interval_ms"],
             args.transient_r1_dir.resolve() if args.transient_r1_dir else None,
             args.transient_initial_temperature,
             args.rerun_transient_r1,
@@ -966,6 +971,7 @@ def main() -> None:
                 (args.output_dir / "transient/transient_pipeline_summary.json").resolve()
             ),
             "sample_interval_ms": transient["sample_interval_ms"],
+            "sampling_policy_id": sampling_policy["policy_id"],
             "window_count": transient["window_count"],
             "tmax_c": transient["transient_tmax_c"],
         }

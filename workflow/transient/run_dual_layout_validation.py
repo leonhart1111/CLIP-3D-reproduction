@@ -19,6 +19,7 @@ from workflow.transient.run_transient_pipeline import (
 )
 from workflow.transient.run_transient_r1 import completed as r1_completed
 from workflow.transient.run_transient_r1 import run as run_transient_r1
+from workflow.transient.sampling import resolve_sampling_policy
 from workflow.transient.validation import sampling_resolution_limitation
 
 
@@ -45,7 +46,7 @@ def _validate_reusable_r1(source_r1_dir: Path, shared_r1_dir: Path,
 def run_dual_layout_validation(source_r1_dir: Path, fixed_steady_dir: Path,
                                clip3d_steady_dir: Path, output_root: Path,
                                config_path: Path,
-                               sample_ms: float = 10.0) -> dict:
+                               sample_ms: float | None = None) -> dict:
     """Run a single periodic R1/McPAT trace through two thermal layouts."""
     source_r1_dir = source_r1_dir.resolve()
     fixed_steady_dir = fixed_steady_dir.resolve()
@@ -55,8 +56,8 @@ def run_dual_layout_validation(source_r1_dir: Path, fixed_steady_dir: Path,
     reject_overlapping_output(
         output_root, [source_r1_dir, fixed_steady_dir, clip3d_steady_dir]
     )
-    if not math.isfinite(sample_ms) or sample_ms <= 0:
-        raise ValueError("sample_ms must be positive")
+    sampling_policy = resolve_sampling_policy(source_r1_dir, sample_ms)
+    sample_ms = float(sampling_policy["requested_interval_ms"])
     config = read_json(config_path)
     provenance_audit = validate_dual_steady_inputs(
         source_r1_dir, fixed_steady_dir, clip3d_steady_dir, config, config_path
@@ -72,6 +73,8 @@ def run_dual_layout_validation(source_r1_dir: Path, fixed_steady_dir: Path,
         "clip3d_steady": str(clip3d_steady_dir),
         "config": str(config_path),
         "sample_interval_ms": sample_ms,
+        "sampling_policy": sampling_policy,
+        "sampling_policy_id": sampling_policy["policy_id"],
     }
     write_json(output_root / "status.json", running_status)
 
@@ -130,6 +133,8 @@ def run_dual_layout_validation(source_r1_dir: Path, fixed_steady_dir: Path,
             "clip3d_steady": str(clip3d_steady_dir),
             "config": str(config_path),
             "sample_interval_ms": sample_ms,
+            "sampling_policy": sampling_policy,
+            "sampling_policy_id": sampling_policy["policy_id"],
             "provenance_audit": provenance_audit,
             "shared_preprocessing": prepared,
             "fixed": fixed,
@@ -201,7 +206,7 @@ def main() -> None:
     parser.add_argument("--clip3d-steady-dir", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--sample-ms", type=float, default=10.0)
+    parser.add_argument("--sample-ms", type=float, default=None)
     args = parser.parse_args()
     result = run_dual_layout_validation(
         args.source_r1_dir,

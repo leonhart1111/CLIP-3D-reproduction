@@ -14,6 +14,7 @@ from workflow.floorplan.generate_hotspot_inputs import DEFAULT_THERMAL_STACK
 from workflow.transient.generate_hotspot_trace import materialize_trace
 from workflow.transient.run_hotspot_transient import run_hotspot_transient
 from workflow.transient.run_transient_r1 import run as run_transient_r1
+from workflow.transient.sampling import resolve_sampling_policy
 from workflow.transient.run_windowed_mcpat import run_windows
 from workflow.transient.stats_windows import split_windows
 from workflow.transient.validation import (
@@ -573,7 +574,7 @@ def run_layout_thermal(source_r1_dir: Path, steady_output_dir: Path,
 
 def run_transient_pipeline(source_r1_dir: Path, steady_output_dir: Path,
                            output_dir: Path, config_path: Path,
-                           sample_ms: float = 10.0,
+                           sample_ms: float | None = None,
                            transient_r1_dir: Path | None = None,
                            initial_temperature: str = "steady",
                            rerun_transient_r1: bool = False) -> dict:
@@ -581,14 +582,14 @@ def run_transient_pipeline(source_r1_dir: Path, steady_output_dir: Path,
     steady_output_dir = steady_output_dir.resolve()
     output_dir = output_dir.resolve()
     config_path = config_path.resolve()
-    if not math.isfinite(sample_ms) or sample_ms <= 0:
-        raise ValueError("sample_ms must be positive")
     config = read_json(config_path)
     reject_overlapping_output(output_dir, [source_r1_dir, steady_output_dir])
     validate_steady_output(
         steady_output_dir, source_r1_dir=source_r1_dir, config=config,
         config_path=config_path,
     )
+    sampling_policy = resolve_sampling_policy(source_r1_dir, sample_ms)
+    sample_ms = float(sampling_policy["requested_interval_ms"])
     output_dir.mkdir(parents=True, exist_ok=True)
     stage_seconds = {}
 
@@ -630,6 +631,8 @@ def run_transient_pipeline(source_r1_dir: Path, steady_output_dir: Path,
     result.update({
         "transient_r1_source": transient_r1_source,
         "transient_r1_status": r1_status,
+        "sampling_policy": sampling_policy,
+        "sampling_policy_id": sampling_policy["policy_id"],
         "config": str(config_path),
         "stage_seconds": stage_seconds,
         "total_pipeline_seconds": sum(stage_seconds.values()),
@@ -652,7 +655,7 @@ def main() -> None:
     parser.add_argument("--steady-output-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--sample-ms", type=float, default=10.0)
+    parser.add_argument("--sample-ms", type=float, default=None)
     parser.add_argument("--transient-r1-dir", type=Path)
     parser.add_argument("--initial-temperature", choices=("steady", "ambient"),
                         default="steady")

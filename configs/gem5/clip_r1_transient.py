@@ -30,7 +30,8 @@ def positive_float(text: str) -> float:
 
 def main() -> None:
     wrapper = argparse.ArgumentParser(add_help=False)
-    wrapper.add_argument("--sample-ms", type=positive_float, default=10.0)
+    wrapper.add_argument("--sample-ms", type=positive_float, required=True)
+    wrapper.add_argument("--sampling-policy-id", type=str, required=True)
     wrapper.add_argument("--canonical-source-r1", type=Path, required=True)
     wrapper_args, original_args = wrapper.parse_known_args()
     sys.argv = [sys.argv[0], *original_args]
@@ -82,6 +83,7 @@ def main() -> None:
         "sample_interval_ms": wrapper_args.sample_ms,
         "sample_interval_s": sample_interval_s,
         "sample_interval_ticks": scheduling["sample_interval_ticks"],
+        "sampling_policy_id": wrapper_args.sampling_policy_id,
         "measurement_start_tick": scheduling["measurement_start_tick"],
         "measurement_end_tick": int(m5.curTick()),
         "canonical_source_r1": str(wrapper_args.canonical_source_r1.resolve()),
