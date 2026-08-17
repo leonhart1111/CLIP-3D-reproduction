@@ -88,6 +88,11 @@ def active_layers(manifest: dict | None, requested: list[int] | None) -> list[in
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
+    parser.add_argument(
+        "--diff", type=Path, default=None, metavar="OTHER_SOURCE",
+        help=("subtract this second HotSpot source and plot the temperature "
+              "difference (source - other) with a diverging colormap"),
+    )
     parser.add_argument("--output", "-o", type=Path)
     parser.add_argument(
         "--layer", type=int, action="append", dest="layers",
@@ -105,25 +110,40 @@ def main() -> None:
     layers = active_layers(manifest, args.layers)
 
     values = parse_grid_temperatures(grid_path.read_text(encoding="utf-8"))
-    by_layer: dict[int, np.ndarray] = {}
-    for layer in layers:
-        cells = np.full(grid_size * grid_size, np.nan)
-        for name, value in values:
-            prefix = f"layer_{layer}_g"
-            if name.startswith(prefix):
-                cells[int(name[len(prefix):])] = float(value)
-        if not np.isfinite(cells).any():
-            raise ValueError(
-                f"grid.steady.txt has no cells for layer {layer}; "
-                f"available layers: {sorted({int(n.split('_')[1]) for n, _ in values})}"
-            )
-        by_layer[layer] = cells.reshape(grid_size, grid_size)
+    def collect_layers(path: Path) -> dict[int, np.ndarray]:
+        parsed = parse_grid_temperatures(path.read_text(encoding="utf-8"))
+        result: dict[int, np.ndarray] = {}
+        for layer in layers:
+            cells = np.full(grid_size * grid_size, np.nan)
+            for name, value in parsed:
+                prefix = f"layer_{layer}_g"
+                if name.startswith(prefix):
+                    cells[int(name[len(prefix):])] = float(value)
+            if not np.isfinite(cells).any():
+                raise ValueError(
+                    f"grid.steady.txt has no cells for layer {layer}; "
+                    f"available layers: "
+                    f"{sorted({int(n.split('_')[1]) for n, _ in parsed})}"
+                )
+            result[layer] = cells.reshape(grid_size, grid_size)
+        return result
 
-    all_temps = np.concatenate([by_layer[layer].ravel() for layer in layers])
-    vmin = args.tmin_c if args.tmin_c is not None else float(np.nanmin(all_temps))
-    vmax = args.tmax_c if args.tmax_c is not None else float(np.nanmax(all_temps))
+    by_layer = collect_layers(grid_path)
+    if args.diff is not None:
+        other_path, _other_manifest = resolve_grid_source(args.diff)
+        other = collect_layers(other_path)
+        by_layer = {
+            layer: by_layer[layer] - other[layer] for layer in layers
+        }
+
+    all_values = np.concatenate([by_layer[layer].ravel() for layer in layers])
+    vmin = args.tmin_c if args.tmin_c is not None else float(np.nanmin(all_values))
+    vmax = args.tmax_c if args.tmax_c is not None else float(np.nanmax(all_values))
     if not math.isfinite(vmin) or not math.isfinite(vmax) or vmin >= vmax:
         raise ValueError("invalid temperature range for the color scale")
+    if args.diff is not None:
+        span = max(abs(vmin), abs(vmax))
+        vmin, vmax = -span, span
 
     figure, axes = plt.subplots(
         1, len(layers), figsize=(5.4 * len(layers), 5.0), squeeze=False,
@@ -131,8 +151,9 @@ def main() -> None:
     image = None
     for column, layer in enumerate(layers):
         axis = axes[0][column]
+        colormap = "coolwarm" if args.diff is not None else "autumn"
         image = axis.imshow(
-            by_layer[layer], cmap="autumn", vmin=vmin, vmax=vmax,
+            by_layer[layer], cmap=colormap, vmin=vmin, vmax=vmax,
             origin="upper", aspect="equal",
             extent=(0, die_width, 0, die_height),
         )
@@ -143,7 +164,9 @@ def main() -> None:
     if args.title:
         figure.suptitle(args.title, fontsize=12)
     colorbar = figure.colorbar(image, ax=axes[0][-1], fraction=0.046, pad=0.04)
-    colorbar.set_label("temperature (°C)")
+    colorbar.set_label(
+        "Δ temperature (°C)" if args.diff is not None else "temperature (°C)"
+    )
 
     output = args.output or (
         grid_path.with_suffix("").with_name(
@@ -153,7 +176,8 @@ def main() -> None:
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=160, bbox_inches="tight")
-    print(f"wrote {output} (grid {grid_size}x{grid_size}, layers {layers})")
+    print(f"wrote {output} (grid {grid_size}x{grid_size}, layers {layers}"
+          + (f", diff vs {args.diff}" if args.diff is not None else "") + ")")
 
 
 if __name__ == "__main__":
