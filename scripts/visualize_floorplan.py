@@ -29,10 +29,13 @@ from matplotlib.patches import Rectangle
 import numpy as np
 
 
+# Prefer the layout that HotSpot actually materialized; an optimizer proposal
+# (optimized_layout.json) is NOT necessarily what was simulated when a guarded
+# selection or an earlier attempt fell back to the fixed-bin baseline.
 METRICS = ("total_power_w", "dynamic_power_w", "leakage_power_w")
 LAYOUT_CANDIDATES = (
-    "optimized_layout.json", "hotspot/layout.json", "layout.json",
-    "baseline_layout.json",
+    "hotspot/layout.json", "layout.json", "baseline_layout.json",
+    "optimized_layout.json",
 )
 
 
