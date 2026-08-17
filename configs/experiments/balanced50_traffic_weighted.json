@@ -7,7 +7,7 @@
   },
   "experiment_config": {
     "path": "configs/experiments/clip3d_constrained_5p0_raw_power_p1_lambda0020119_traffic_weighted_exploratory.json",
-    "sha256": "c12d8bf3dd7361ebbaa049ba26c27890111c657a5f2da4d806404917eaecf4c8"
+    "sha256": "cd504221c8c64ce0bf2f1ac7e2bed5f408cd18fe8c9e02d2e659bc0aa17259e9"
   },
   "physical_model": {
     "cache_characterization": "local-cacti-schema-v2",
