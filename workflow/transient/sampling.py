@@ -48,8 +48,11 @@ def measured_roi_duration(r1_dir: Path) -> dict:
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"R1 measured-region {name} must be finite positive")
     cross_checked = sim_ticks / sim_freq
+    # gem5 prints simSeconds with limited significant digits, so the printed
+    # value can differ from simTicks/simFreq by ~1e-5 relative; 0.1% tolerance
+    # still catches a genuinely mismatched region while absorbing print noise.
     if not math.isclose(
-        cross_checked, sim_seconds, rel_tol=1e-6, abs_tol=1e-12
+        cross_checked, sim_seconds, rel_tol=1e-3, abs_tol=1e-12
     ):
         raise ValueError(
             "R1 measured-region simSeconds disagrees with simTicks/simFreq: "
