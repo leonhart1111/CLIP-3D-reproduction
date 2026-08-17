@@ -19,6 +19,7 @@ results/
 
 # Benchmark downloads / binaries
 benchmarks/bin/
+/benchmarks/bin
 benchmarks/inputs/
 benchmarks/src/splash2/
 benchmarks/src/stream/
