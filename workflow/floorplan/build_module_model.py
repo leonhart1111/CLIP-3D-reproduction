@@ -277,6 +277,12 @@ _CONSERVATION_FIELDS = (
     "area_mm2", "dynamic_power_w", "subthreshold_leakage_w",
     "gate_leakage_w", "leakage_power_w", "total_power_w",
 )
+# McPAT prints parent blocks with roughly six significant digits, so a
+# child-block sum reconstructed from the same print can differ by ~1e-6
+# relative.  Use a print-rounding-aware tolerance that still rejects any real
+# conservation break (a missing functional block is >=1% of its parent).
+MCPAT_PARENT_REL_TOL = 1e-4
+MCPAT_PARENT_ABS_TOL = 1e-9
 
 
 def _validated_mcpat_provenance(mcpat: dict) -> dict:
@@ -335,11 +341,11 @@ def _validate_parent_metrics(metrics: object, label: str) -> dict:
     if not math.isclose(
         validated["leakage_power_w"],
         validated["subthreshold_leakage_w"] + validated["gate_leakage_w"],
-        rel_tol=1e-12, abs_tol=1e-12,
+        rel_tol=MCPAT_PARENT_REL_TOL, abs_tol=MCPAT_PARENT_ABS_TOL,
     ) or not math.isclose(
         validated["total_power_w"],
         validated["dynamic_power_w"] + validated["leakage_power_w"],
-        rel_tol=1e-12, abs_tol=1e-12,
+        rel_tol=MCPAT_PARENT_REL_TOL, abs_tol=MCPAT_PARENT_ABS_TOL,
     ):
         raise ValueError(f"McPAT parent {label} has inconsistent derived power")
     return validated
@@ -352,7 +358,8 @@ def _compare_parent_to_children(parent: dict, children: list[dict],
     for field in _CONSERVATION_FIELDS:
         residuals[field] = observed[field] - parent[field]
         if not math.isclose(
-            observed[field], parent[field], rel_tol=1e-12, abs_tol=1e-12,
+            observed[field], parent[field],
+            rel_tol=MCPAT_PARENT_REL_TOL, abs_tol=MCPAT_PARENT_ABS_TOL,
         ):
             raise ValueError(
                 f"McPAT parent conservation failed for {label}.{field}: "
