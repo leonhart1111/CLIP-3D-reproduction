@@ -7,6 +7,11 @@ stack layer; by default only the active power layers from
 ``hotspot_manifest.json`` are drawn (for example layers 1 and 3 for a two-tier
 stack).  Temperatures are rendered with the ``autumn`` colormap (yellow = cool,
 red = hot) on the actual 32x32 (or configured) grid, with axes in millimetres.
+
+HotSpot's ``grid.steady.txt`` numbers cells with row 0 at the top of the die
+(verified against the floorplan power grid: the temperature field correlates
+with the power field only after a vertical flip).  ``origin="upper"`` therefore
+draws row 0 at the top so the map matches the floorplan orientation.
 """
 
 from __future__ import annotations
@@ -128,7 +133,7 @@ def main() -> None:
         axis = axes[0][column]
         image = axis.imshow(
             by_layer[layer], cmap="autumn", vmin=vmin, vmax=vmax,
-            origin="lower", aspect="equal",
+            origin="upper", aspect="equal",
             extent=(0, die_width, 0, die_height),
         )
         axis.set_title(f"Layer {layer}", fontsize=11)
