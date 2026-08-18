@@ -12,6 +12,10 @@ HotSpot's ``grid.steady.txt`` numbers cells with row 0 at the top of the die
 (verified against the floorplan power grid: the temperature field correlates
 with the power field only after a vertical flip).  ``origin="upper"`` therefore
 draws row 0 at the top so the map matches the floorplan orientation.
+
+HotSpot writes grid temperatures in Kelvin; by default the plot converts them
+to Celsius (subtract 273.15) so the colorbar matches ``thermal_result.json``'s
+``tmax_c``.  Pass ``--kelvin`` to keep the raw values.
 """
 
 from __future__ import annotations
@@ -101,6 +105,10 @@ def main() -> None:
     parser.add_argument("--title", default=None)
     parser.add_argument("--tmin-c", type=float, default=None)
     parser.add_argument("--tmax-c", type=float, default=None)
+    parser.add_argument(
+        "--kelvin", action="store_true",
+        help="keep raw Kelvin values instead of converting to Celsius",
+    )
     args = parser.parse_args()
 
     grid_path, manifest_path = resolve_grid_source(args.source)
@@ -118,7 +126,9 @@ def main() -> None:
             for name, value in parsed:
                 prefix = f"layer_{layer}_g"
                 if name.startswith(prefix):
-                    cells[int(name[len(prefix):])] = float(value)
+                    cells[int(name[len(prefix):])] = float(value) - (
+                        0.0 if args.kelvin else 273.15
+                    )
             if not np.isfinite(cells).any():
                 raise ValueError(
                     f"grid.steady.txt has no cells for layer {layer}; "
