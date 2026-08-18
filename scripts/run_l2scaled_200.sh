@@ -8,6 +8,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIP_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$CLIP_ROOT"
 
+# Prefer the node-compatible runtime for locally built McPAT/gem5 binaries.
+if [ -f scripts/env.sh ]; then
+  source scripts/env.sh
+fi
+
 PY="${PY:-$CLIP_ROOT/.venv/bin/python}"
 EXP="${EXP:-configs/experiments/r1_short_convergence_l2scaled.json}"
 CFG="${CFG:-configs/experiments/clip3d_constrained_5p0_raw_power_p1_lambda0020119_traffic_weighted_exploratory.json}"
