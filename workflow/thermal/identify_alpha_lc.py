@@ -830,6 +830,168 @@ def cross_validate_alpha_lc(
     }
 
 
+def _sample_lc_ratio(sample: dict, rule: str = "half-l2") -> float:
+    """Return the per-sample Lc/die-side ratio for a fixed-Lc rule."""
+    if rule != "half-l2":
+        raise ValueError(f"unsupported fixed-Lc rule: {rule}")
+    l2 = next(
+        (module for module in sample["modules"] if module["kind"] == "l2"), None
+    )
+    if l2 is None:
+        raise ValueError(f"sample {sample.get('group')} lacks an L2 module")
+    lc_mm = 0.5 * math.sqrt(float(l2["area_mm2"]))
+    side = float(sample["die_side_mm"])
+    if not math.isfinite(lc_mm) or lc_mm <= 0 or not math.isfinite(side) or side <= 0:
+        raise ValueError(f"sample {sample.get('group')} has invalid Lc geometry")
+    return lc_mm / side
+
+
+def _feature_rows_fixed_lc(samples: list[dict], cross_tier_weight: float,
+                           rule: str = "half-l2",
+                           feature_cache: SpatialFeatureCache | None = None
+                           ) -> list[tuple[dict, float, float]]:
+    cache = feature_cache or SpatialFeatureCache(samples, cross_tier_weight)
+    reference: dict[str, float] = {}
+    raw = []
+    for sample in samples:
+        group = str(sample["group"])
+        feature = cache.feature(sample, _sample_lc_ratio(sample, rule))
+        raw.append((sample, feature))
+        if bool(sample.get("is_reference")):
+            if group in reference:
+                raise ValueError(f"multiple reference layouts in group {group}")
+            reference[group] = feature
+    groups = {str(sample["group"]) for sample in samples}
+    if set(reference) != groups:
+        raise ValueError("every work-point group requires exactly one reference layout")
+    return [
+        (sample, feature - reference[str(sample["group"])],
+         float(sample["delta_t_c"]))
+        for sample, feature in raw
+    ]
+
+
+def fit_alpha_fixed_lc(samples: list[dict], cross_tier_weight: float,
+                       rule: str = "half-l2", huber_delta_c: float = 0.5,
+                       feature_cache: SpatialFeatureCache | None = None) -> dict:
+    """Fit alpha only with a fixed per-sample Lc rule."""
+    rows = _feature_rows_fixed_lc(samples, cross_tier_weight, rule, feature_cache)
+    alpha, objective = _robust_nonnegative_slope(rows, huber_delta_c)
+    ratios = [_sample_lc_ratio(sample, rule) for sample in samples]
+    return {
+        "alpha": alpha,
+        "lc_rule": rule,
+        "lc_die_side_ratio_min": min(ratios),
+        "lc_die_side_ratio_max": max(ratios),
+        "lc_die_side_ratio_median": statistics.median(ratios),
+        "objective": objective,
+        "rows": rows,
+    }
+
+
+def _held_out_fold_fixed_lc(train: list[dict], validation: list[dict],
+                            cross_tier_weight: float,
+                            huber_delta_c: float,
+                            rule: str = "half-l2",
+                            feature_cache: SpatialFeatureCache | None = None
+                            ) -> tuple[dict, list[tuple[dict, float, float]]]:
+    local = fit_alpha_fixed_lc(
+        train, cross_tier_weight, rule, huber_delta_c, feature_cache,
+    )
+    rows = _feature_rows_fixed_lc(
+        validation, cross_tier_weight, rule, feature_cache,
+    )
+    records = [
+        (sample, target, local["alpha"] * feature)
+        for sample, feature, target in rows
+    ]
+    return {
+        "train_parameters": {
+            "alpha": local["alpha"],
+            "lc_rule": rule,
+            "lc_die_side_ratio_median": local["lc_die_side_ratio_median"],
+        },
+        "train_group_count": len({str(sample["group"]) for sample in train}),
+        "validation_group_count": len({
+            str(sample["group"]) for sample in validation
+        }),
+        "validation_metrics": _prediction_metrics_from_records(records),
+    }, records
+
+
+def _leave_one_field_out_fixed_lc(
+        samples: list[dict], field: str, cross_tier_weight: float,
+        huber_delta_c: float, rule: str = "half-l2",
+        feature_cache: SpatialFeatureCache | None = None) -> dict:
+    values = sorted({str(sample[field]) for sample in samples})
+    if len(values) < 2:
+        raise ValueError(f"{field} holdout requires at least two distinct values")
+    folds, out_of_fold = {}, []
+    for value in values:
+        train = [sample for sample in samples if str(sample[field]) != value]
+        validation = [sample for sample in samples if str(sample[field]) == value]
+        fold, records = _held_out_fold_fixed_lc(
+            train, validation, cross_tier_weight, huber_delta_c, rule,
+            feature_cache,
+        )
+        folds[value] = fold
+        out_of_fold.extend(records)
+    return {
+        "split_unit": field,
+        "folds": folds,
+        "aggregate_metrics": _prediction_metrics_from_records(out_of_fold),
+    }
+
+
+def _spatial_holdout_fixed_lc(
+        samples: list[dict], cross_tier_weight: float,
+        huber_delta_c: float, rule: str = "half-l2",
+        feature_cache: SpatialFeatureCache | None = None) -> dict:
+    held_out_labels = {"corner_lr", "corner_ul", "corner_ur"}
+    train = [sample for sample in samples
+             if str(sample["label"]) not in held_out_labels]
+    references = [sample for sample in samples if bool(sample.get("is_reference"))]
+    held_out = [sample for sample in samples
+                if str(sample["label"]) in held_out_labels]
+    groups = {str(sample["group"]) for sample in samples}
+    held_out_groups = {str(sample["group"]) for sample in held_out}
+    if held_out_groups != groups:
+        raise ValueError("spatial holdout requires designated corner cases in every group")
+    fold, records = _held_out_fold_fixed_lc(
+        train, references + held_out, cross_tier_weight, huber_delta_c, rule,
+        feature_cache,
+    )
+    scored = [record for record in records if not bool(record[0].get("is_reference"))]
+    fold["validation_metrics"] = _prediction_metrics_from_records(scored)
+    fold["reference_layouts_used_as_unscored_anchors"] = len(references)
+    return {
+        "split_unit": "layout_label",
+        "held_out_labels": sorted(held_out_labels),
+        "folds": {"corner_directed": fold},
+        "aggregate_metrics": _prediction_metrics_from_records(scored),
+    }
+
+
+def cross_validate_alpha_fixed_lc(
+        samples: list[dict], cross_tier_weight: float,
+        rule: str = "half-l2", huber_delta_c: float = 0.5,
+        feature_cache: SpatialFeatureCache | None = None) -> dict:
+    """Grouped holdouts with Lc fixed per sample; only alpha is refit per fold."""
+    return {
+        "leave_one_workload_out": _leave_one_field_out_fixed_lc(
+            samples, "workload", cross_tier_weight, huber_delta_c, rule,
+            feature_cache,
+        ),
+        "leave_one_architecture_out": _leave_one_field_out_fixed_lc(
+            samples, "architecture", cross_tier_weight, huber_delta_c, rule,
+            feature_cache,
+        ),
+        "spatial_holdout": _spatial_holdout_fixed_lc(
+            samples, cross_tier_weight, huber_delta_c, rule, feature_cache,
+        ),
+    }
+
+
 def _jacobian_diagnostics(samples: list[dict], cross_tier_weight: float,
                           alpha: float, ratio: float,
                           feature_cache: SpatialFeatureCache | None = None) -> dict:
@@ -1047,6 +1209,14 @@ def main() -> None:
     fit_parser.add_argument("--unit-report", type=Path, required=True)
     fit_parser.add_argument("--config", type=Path, required=True)
     fit_parser.add_argument("--output-dir", type=Path, required=True)
+    fixed_lc_parser = subparsers.add_parser(
+        "fit-fixed-lc",
+        help="fit alpha only with Lc fixed at half the L2 module size",
+    )
+    fixed_lc_parser.add_argument("--samples", type=Path, required=True)
+    fixed_lc_parser.add_argument("--unit-report", type=Path, required=True)
+    fixed_lc_parser.add_argument("--config", type=Path, required=True)
+    fixed_lc_parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "plan":
         config = read_json(args.config)
@@ -1092,6 +1262,15 @@ def main() -> None:
         print(
             f"alpha={report['parameters']['alpha']:.9g}, "
             f"Lc/side={report['parameters']['lc_die_side_ratio']:.9g}, "
+            f"accepted={report['acceptance']['accepted']}"
+        )
+    elif args.command == "fit-fixed-lc":
+        report = run_fit_fixed_lc_campaign(
+            args.samples, args.unit_report, read_json(args.config), args.output_dir
+        )
+        print(
+            f"fixed-Lc alpha={report['parameters']['alpha']:.9g}, "
+            f"Lc/side median={report['parameters']['lc_die_side_ratio_median']:.9g}, "
             f"accepted={report['acceptance']['accepted']}"
         )
 
@@ -1541,6 +1720,96 @@ def run_fit_campaign(samples_path: Path, unit_report_path: Path,
     )
     output_root = Path(output_root).resolve()
     write_json(output_root / "fit_report.json", report)
+    return report
+
+
+def _acceptance_fixed_lc(report: dict, acceptance: dict) -> dict:
+    """Apply the same frozen gates as fit_alpha_lc minus rank-2/boundary checks,
+    which do not apply when Lc is fixed and only alpha is identified."""
+    cross_validation = report["cross_validation"]
+    aggregate_splits = {
+        "workload": cross_validation["leave_one_workload_out"]["aggregate_metrics"],
+        "architecture": cross_validation["leave_one_architecture_out"]["aggregate_metrics"],
+        "spatial": cross_validation["spatial_holdout"]["aggregate_metrics"],
+    }
+    mae_max = float(acceptance["held_out_delta_t_mae_c_max"])
+    rmse_max = float(acceptance["held_out_delta_t_rmse_c_max"])
+    spearman_min = float(acceptance["aggregate_spatial_spearman_min"])
+    median_regret_max = float(acceptance["median_selection_regret_c_max"])
+    p95_regret_max = float(acceptance["p95_selection_regret_c_max"])
+    per_workload_min = float(acceptance["per_workload_spatial_spearman_min"])
+    checks = {}
+    for split, metrics in aggregate_splits.items():
+        checks[f"{split}_holdout_mae"] = metrics["mae_c"] <= mae_max
+        checks[f"{split}_holdout_rmse"] = metrics["rmse_c"] <= rmse_max
+        checks[f"{split}_holdout_spearman"] = (
+            metrics["spearman"] is not None
+            and metrics["spearman"] >= spearman_min
+        )
+        checks[f"{split}_holdout_median_selection_regret"] = (
+            metrics["median_selection_regret_c"] <= median_regret_max
+        )
+        checks[f"{split}_holdout_p95_selection_regret"] = (
+            metrics["p95_selection_regret_c"] <= p95_regret_max
+        )
+    workload_spearman = {
+        name: fold["validation_metrics"]["spearman"]
+        for name, fold in cross_validation["leave_one_workload_out"]["folds"].items()
+    }
+    checks["every_workload_spearman"] = all(
+        value is not None and value >= per_workload_min
+        for value in workload_spearman.values()
+    )
+    checks["jacobian_rank"] = "N/A-fixed-Lc"
+    checks["parameters_not_on_boundary"] = "N/A-fixed-Lc"
+    return {
+        "accepted": all(value is True for value in checks.values()),
+        "checks": checks,
+        "held_out_metrics": aggregate_splits,
+        "per_workload_spearman": workload_spearman,
+        "thresholds_frozen_before_real_power_results": True,
+        "training_metrics_used_for_acceptance": False,
+        "note": "Lc fixed at half the L2 module size; only alpha identified (rank-1)",
+    }
+
+
+def run_fit_fixed_lc_campaign(samples_path: Path, unit_report_path: Path,
+                              config: dict, output_root: Path,
+                              rule: str = "half-l2") -> dict:
+    """Fit alpha only with Lc fixed per sample; grouped holdout acceptance."""
+    validate_identification_config(config)
+    unit_report = read_json(unit_report_path)
+    if not unit_report.get("accepted"):
+        raise ValueError("unit-response cross-tier evidence was not accepted")
+    samples = read_json(samples_path)
+    identification = config["identification"]
+    cross_tier_weight = float(unit_report["estimate"])
+    cache = SpatialFeatureCache(samples, cross_tier_weight)
+    fit = fit_alpha_fixed_lc(
+        samples, cross_tier_weight, rule,
+        float(identification["huber_delta_c"]), cache,
+    )
+    report = {
+        "schema_version": 2,
+        "method": "fixed-Lc alpha-only fit",
+        "lc_rule": rule,
+        "lc_formula": "lc_mm = 0.5 * sqrt(area_L2_mm2)",
+        "parameters": {
+            "alpha": fit["alpha"],
+            "lc_die_side_ratio_median": fit["lc_die_side_ratio_median"],
+            "lc_die_side_ratio_range": [
+                fit["lc_die_side_ratio_min"], fit["lc_die_side_ratio_max"],
+            ],
+        },
+        "cross_validation": cross_validate_alpha_fixed_lc(
+            samples, cross_tier_weight, rule,
+            float(identification["huber_delta_c"]), cache,
+        ),
+        "objective": fit["objective"],
+    }
+    report["acceptance"] = _acceptance_fixed_lc(report, config["acceptance"])
+    output_root = Path(output_root).resolve()
+    write_json(output_root / "fit_fixed_lc_report.json", report)
     return report
 
 
