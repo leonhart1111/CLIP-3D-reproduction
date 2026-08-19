@@ -706,7 +706,10 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
     if execute_r2:
         started = time.perf_counter()
         r2_result = run_r2(
-            r1_dir, latency_path, output_dir / "gem5_r2", rerun=rerun_r2
+            r1_dir, latency_path, output_dir / "gem5_r2", rerun=rerun_r2,
+            instruction_window_scope=delay.get(
+                "r2_instruction_window_scope"
+            ),
         )
         r2_source = str((output_dir / "gem5_r2/r2_result.json").resolve())
         performance = evaluate(
