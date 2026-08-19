@@ -218,6 +218,14 @@ def validate_config(config: dict, layout_method: str) -> None:
     )
     if validation_policy not in ("guarded", "paper-single"):
         raise ValueError("layout_optimizer.validation_policy must be guarded or paper-single")
+    thermal_anchor_policy = config.get("layout_optimizer", {}).get(
+        "thermal_anchor_policy", "none"
+    )
+    if thermal_anchor_policy not in ("none", "fixed-bin-hotspot"):
+        raise ValueError(
+            "layout_optimizer.thermal_anchor_policy must be none or "
+            "fixed-bin-hotspot"
+        )
     allowed_tiers = config.get("layout_optimizer", {}).get("allowed_l2_tiers", [0, 1])
     if not allowed_tiers or any(int(tier) not in (0, 1) for tier in allowed_tiers):
         raise ValueError("layout_optimizer.allowed_l2_tiers must contain tier 0 and/or tier 1")
@@ -248,6 +256,10 @@ def validate_config(config: dict, layout_method: str) -> None:
             raise ValueError("strict P1 requires layout_optimizer.validation_policy == paper-single")
         if float(config.get("layout_optimizer", {}).get("beta", 0.0)) != 0.0:
             raise ValueError("strict P1 requires layout_optimizer.beta == 0.0")
+        if thermal_anchor_policy != "none":
+            raise ValueError(
+                "strict P1 forbids an additional fixed-bin HotSpot proxy anchor"
+            )
         if config.get("formal_validation", {}).get("accepted") is True:
             validate_accepted_strict_p1(config)
     proxy_model = config.get("layout_optimizer", {}).get(
@@ -553,7 +565,8 @@ def evaluate_clip3d_paper_single(modules_path: Path, proposed_layout: Path,
 
 
 def optimize_clip3d_layout(modules_path: Path, proposed_layout: Path,
-                           report_path: Path, config: dict) -> dict:
+                           report_path: Path, config: dict,
+                           proxy_anchor_tmax_c: float | None = None) -> dict:
     """Forward one validated experiment configuration to the floorplanner."""
     frequency = config["frequency"]
     physical = config["physical"]
@@ -575,8 +588,36 @@ def optimize_clip3d_layout(modules_path: Path, proposed_layout: Path,
         int(optimizer.get("partition_grid_steps", 41)),
         optimizer.get("include_fixed_baseline", True),
         optimizer.get("lc_die_side_ratio"),
+        proxy_anchor_tmax_c,
         require_granular_cores=optimizer.get("require_granular_cores", True),
     )
+
+
+def evaluate_fixed_bin_proxy_anchor(modules_path: Path, output_dir: Path,
+                                    config: dict, hotspot_tool: Path) -> dict:
+    """Run one same-contract fixed-bin HotSpot solve for relative proxy anchoring.
+
+    This is intentionally opt-in and non-paper-strict.  It leaves the cheap
+    proxy's candidate-to-candidate gradient unchanged, while preventing an
+    unidentifiable absolute offset from putting every candidate on the wrong
+    side of the sustainable-frequency threshold.
+    """
+    physical = config["physical"]
+    frequency = config["frequency"]
+    anchor_dir = output_dir / "proxy_anchor_hotspot"
+    materialize(
+        modules_path, anchor_dir, physical["grid_size"], physical["utilization"],
+        frequency["ambient_c"], physical["r_convec_k_per_w"], None,
+        physical.get("thermal_stack"), **hotspot_materialization_options(physical),
+    )
+    thermal = run_hotspot(anchor_dir, hotspot_tool)
+    return {
+        "policy": "fixed-bin-hotspot",
+        "tmax_c": float(thermal["tmax_c"]),
+        "hotspot_dir": str(anchor_dir.resolve()),
+        "layout": str((anchor_dir / "layout.json").resolve()),
+        "thermal": thermal,
+    }
 
 
 def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
@@ -632,13 +673,25 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
 
     started = time.perf_counter()
     selection = None
+    proxy_anchor = None
     if layout_method == "clip3d":
         optimizer = config["layout_optimizer"]
         proposed_layout = output_dir / "optimized_layout.json"
-        optimize_clip3d_layout(
-            modules_path, proposed_layout,
-            output_dir / "optimizer_report.json", config,
-        )
+        if optimizer.get("thermal_anchor_policy", "none") == "fixed-bin-hotspot":
+            proxy_anchor = evaluate_fixed_bin_proxy_anchor(
+                modules_path, output_dir, config, tools["hotspot"]
+            )
+        if proxy_anchor is None:
+            optimize_clip3d_layout(
+                modules_path, proposed_layout,
+                output_dir / "optimizer_report.json", config,
+            )
+        else:
+            optimize_clip3d_layout(
+                modules_path, proposed_layout,
+                output_dir / "optimizer_report.json", config,
+                proxy_anchor["tmax_c"],
+            )
         if optimizer.get("validation_policy", "guarded") == "paper-single":
             layout_path, thermal, selection = evaluate_clip3d_paper_single(
                 modules_path, proposed_layout, output_dir, config, tools["hotspot"]
@@ -648,6 +701,12 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
                 modules_path, proposed_layout, output_dir, config, tools["hotspot"]
             )
         hotspot_dir = output_dir / "hotspot"
+        if proxy_anchor is not None:
+            selection["proxy_anchor"] = {
+                key: proxy_anchor[key]
+                for key in ("policy", "tmax_c", "hotspot_dir", "layout")
+            }
+            write_json(output_dir / "layout_selection.json", selection)
     elif layout_method in COMPARISON_METHODS:
         layout_path, thermal, selection = evaluate_comparison_candidates(
             modules_path, output_dir, config, layout_method
@@ -767,6 +826,11 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
                 if candidate["collision_mm2"] <= 1e-8
             }),
         }
+        anchor = optimizer_report.get("thermal_proxy", {}).get("anchor", {})
+        if anchor.get("enabled"):
+            diagnostics["proxy_anchor_tmax_c"] = anchor["tmax_c"]
+            diagnostics["proxy_anchor_offset_c"] = anchor["offset_c"]
+            diagnostics["proxy_anchor_contract"] = anchor["contract"]
         if "fixed-bin" in validated:
             diagnostics["fixed_bin_validated_hotspot_tmax_c"] = validated["fixed-bin"]["tmax_c"]
         layout_diagnostics.update(diagnostics)

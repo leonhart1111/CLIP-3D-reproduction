@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Probe equation-(14) thermal-gradient variants against a common HotSpot grid.
+
+This diagnostic deliberately separates a placement heuristic from a detailed
+thermal model.  It materializes one fixed-bin reference and a deterministic
+grid of legal L2 positions using the *same* HotSpot contract, then compares
+the candidates' relative temperatures under one or more equation-(14)
+variants.  It is not a parameter-fitting or paper-promotion mechanism.
+
+The primary outputs are directional: sign agreement against the fixed-bin
+reference, rank correlations over a common set of positions, and the HotSpot
+selection regret of each proxy's coolest candidate.  Absolute proxy
+temperature is anchored to the fixed-bin HotSpot temperature solely to make
+equation (13)'s thermal-frequency regime observable; the anchor adds the same
+constant to every candidate and cannot change a variant's ordering.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+
+from workflow.common import read_json, write_json
+from workflow.floorplan.generate_hotspot_inputs import baseline_layout
+from workflow.floorplan.optimize_layout import proxy_temperature
+from workflow.thermal.calibrate_proxy import candidate_layouts, run_one
+from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT
+from workflow.thermal.sustainable_frequency import closed_form_frequency
+
+
+@dataclass(frozen=True)
+class ProxyVariant:
+    """One equation-(14) geometry choice, holding fitted weights constant."""
+
+    name: str
+    spatial_model: str
+    lc_die_side_ratio: float
+
+
+def parse_variant(text: str) -> ProxyVariant:
+    """Parse ``NAME=MODEL,LC_DIE_SIDE_RATIO`` without hidden defaults."""
+    if "=" not in text:
+        raise argparse.ArgumentTypeError(
+            "variant must be NAME=SPATIAL_MODEL,LC_DIE_SIDE_RATIO"
+        )
+    name, raw = text.split("=", 1)
+    fields = raw.split(",")
+    if not name or any(character in name for character in "/\\") or len(fields) != 2:
+        raise argparse.ArgumentTypeError(
+            "variant must be NAME=SPATIAL_MODEL,LC_DIE_SIDE_RATIO"
+        )
+    spatial_model = fields[0]
+    if spatial_model not in ("center", "area-quadrature"):
+        raise argparse.ArgumentTypeError(
+            "variant spatial model must be center or area-quadrature"
+        )
+    try:
+        ratio = float(fields[1])
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("variant Lc ratio must be numeric") from error
+    if not math.isfinite(ratio) or ratio <= 0.0:
+        raise argparse.ArgumentTypeError("variant Lc ratio must be finite and positive")
+    return ProxyVariant(name, spatial_model, ratio)
+
+
+def _frequency(temperature_c: float, model: dict, config: dict) -> dict:
+    frequency = config["frequency"]
+    value, state, unconstrained = closed_form_frequency(
+        float(temperature_c), float(model["gamma"]),
+        float(frequency["f0_ghz"]), float(frequency["fmin_ghz"]),
+        float(frequency["tsafe_c"]), float(frequency["ambient_c"]),
+    )
+    return {
+        "sustainable_frequency_ghz": value,
+        "state": state,
+        "unclamped_frequency_ghz": unconstrained,
+    }
+
+
+def proxy_for_layout(layout: dict, config: dict, variant: ProxyVariant) -> float:
+    """Evaluate one proxy variant on a materialized module layout."""
+    optimizer = config["layout_optimizer"]
+    physical = config["physical"]
+    frequency = config["frequency"]
+    return proxy_temperature(
+        layout["modules"], float(layout["die_width_mm"]),
+        float(frequency["ambient_c"]), float(physical["r_convec_k_per_w"]),
+        float(optimizer["alpha"]), float(optimizer["beta"]),
+        float(optimizer["cross_tier_weight"]), variant.spatial_model,
+        int(optimizer.get("proxy_quadrature_order", 2)),
+        float(layout["die_width_mm"]) * variant.lc_die_side_ratio,
+    )
+
+
+def _correlation(first: list[float], second: list[float], kind: str) -> float | None:
+    if len(first) < 2 or math.isclose(max(first), min(first)) \
+            or math.isclose(max(second), min(second)):
+        return None
+    if kind == "spearman":
+        def ranks(values: list[float]) -> list[float]:
+            result = [0.0] * len(values)
+            ordered = sorted(range(len(values)), key=lambda index: values[index])
+            start = 0
+            while start < len(ordered):
+                end = start + 1
+                while end < len(ordered) and math.isclose(
+                        values[ordered[start]], values[ordered[end]],
+                        rel_tol=0.0, abs_tol=1.0e-12):
+                    end += 1
+                average = (start + 1 + end) / 2.0
+                for index in ordered[start:end]:
+                    result[index] = average
+                start = end
+            return result
+
+        left, right = ranks(first), ranks(second)
+        left_mean, right_mean = sum(left) / len(left), sum(right) / len(right)
+        numerator = sum((x - left_mean) * (y - right_mean) for x, y in zip(left, right))
+        denominator = math.sqrt(
+            sum((x - left_mean) ** 2 for x in left)
+            * sum((y - right_mean) ** 2 for y in right)
+        )
+        return numerator / denominator if denominator > 0.0 else None
+    concordant = discordant = first_ties = second_ties = 0
+    for left in range(len(first)):
+        for right in range(left + 1, len(first)):
+            delta_first = first[left] - first[right]
+            delta_second = second[left] - second[right]
+            tied_first = math.isclose(delta_first, 0.0, abs_tol=1.0e-12)
+            tied_second = math.isclose(delta_second, 0.0, abs_tol=1.0e-12)
+            if tied_first and not tied_second:
+                first_ties += 1
+            elif tied_second and not tied_first:
+                second_ties += 1
+            elif not tied_first and not tied_second:
+                if delta_first * delta_second > 0.0:
+                    concordant += 1
+                else:
+                    discordant += 1
+    denominator = math.sqrt(
+        (concordant + discordant + first_ties)
+        * (concordant + discordant + second_ties)
+    )
+    return (concordant - discordant) / denominator if denominator > 0.0 else None
+
+
+def summarize_variant(name: str, records: list[dict], anchor: dict,
+                      sign_tolerance_c: float) -> dict:
+    """Summarize rank, signs, frequency regime, and selection regret.
+
+    ``records`` must contain actual HotSpot temperatures and this variant's raw
+    proxy temperatures.  Keeping this pure lets tests cover the scientific
+    metrics without invoking HotSpot.
+    """
+    if not records:
+        raise ValueError("cannot summarize an empty probe grid")
+    if sign_tolerance_c < 0.0:
+        raise ValueError("sign tolerance must be non-negative")
+    raw_anchor = float(anchor["variants"][name]["raw_proxy_tmax_c"])
+    hotspot_anchor = float(anchor["tmax_c"])
+    actual_deltas = [float(record["tmax_c"]) - hotspot_anchor for record in records]
+    proxy_deltas = [float(record["variants"][name]["raw_proxy_tmax_c"]) - raw_anchor
+                    for record in records]
+    considered = [
+        (actual, predicted) for actual, predicted in zip(actual_deltas, proxy_deltas)
+        if abs(actual) > sign_tolerance_c
+    ]
+    signs = [
+        abs(predicted) > 1.0e-12 and (actual > 0.0) == (predicted > 0.0)
+        for actual, predicted in considered
+    ]
+    actual_values = [float(record["tmax_c"]) for record in records]
+    raw_values = [float(record["variants"][name]["raw_proxy_tmax_c"])
+                  for record in records]
+    proxy_best = min(range(len(records)), key=lambda index: (
+        raw_values[index], records[index]["row"], records[index]["column"]
+    ))
+    hotspot_best = min(range(len(records)), key=lambda index: (
+        actual_values[index], records[index]["row"], records[index]["column"]
+    ))
+    anchor_frequency = anchor["variants"][name]["anchored_frequency"]
+    return {
+        "candidate_count": len(records),
+        "hotspot_delta_range_c": [min(actual_deltas), max(actual_deltas)],
+        "proxy_delta_range_c": [min(proxy_deltas), max(proxy_deltas)],
+        "delta_mae_c": sum(abs(actual - predicted) for actual, predicted in
+                           zip(actual_deltas, proxy_deltas)) / len(records),
+        "spearman": _correlation(actual_values, raw_values, "spearman"),
+        "kendall_tau": _correlation(actual_values, raw_values, "kendall"),
+        "sign_tolerance_c": sign_tolerance_c,
+        "sign_comparable_count": len(considered),
+        "sign_agreement_count": sum(signs),
+        "sign_agreement_rate": sum(signs) / len(signs) if signs else None,
+        "proxy_selected": {
+            "row": records[proxy_best]["row"],
+            "column": records[proxy_best]["column"],
+            "tmax_c": actual_values[proxy_best],
+            "raw_proxy_tmax_c": raw_values[proxy_best],
+            "selection_regret_c": actual_values[proxy_best] - min(actual_values),
+        },
+        "hotspot_best": {
+            "row": records[hotspot_best]["row"],
+            "column": records[hotspot_best]["column"],
+            "tmax_c": actual_values[hotspot_best],
+            "raw_proxy_tmax_c": raw_values[hotspot_best],
+        },
+        "thermal_frequency_term_active": (
+            anchor_frequency["state"] != "thermal_headroom"
+        ),
+    }
+
+
+def _sample_from_layout(model_path: Path, label: str, layout: dict,
+                        case_dir: Path, row: int, column: int,
+                        fx: float, fy: float, tier: int) -> dict:
+    return {
+        "model": str(model_path.resolve()), "model_label": label,
+        "tier": tier, "row": row, "column": column, "fx": fx, "fy": fy,
+        "case_dir": str(case_dir.resolve()), "layout": layout,
+    }
+
+
+def run_probe(model_path: Path, config_path: Path, output_dir: Path,
+              variants: list[ProxyVariant], grid_points: int = 3,
+              workers: int = 1, hotspot: Path = DEFAULT_HOTSPOT,
+              sign_tolerance_c: float = 0.02) -> dict:
+    """Run one shared HotSpot grid and evaluate every requested proxy variant."""
+    if grid_points < 2:
+        raise ValueError("grid_points must be at least 2")
+    if workers < 1:
+        raise ValueError("workers must be positive")
+    if sign_tolerance_c < 0.0:
+        raise ValueError("sign tolerance must be non-negative")
+    if not variants:
+        raise ValueError("at least one proxy variant is required")
+    names = [variant.name for variant in variants]
+    if len(set(names)) != len(names):
+        raise ValueError("proxy variant names must be unique")
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise ValueError(f"output directory must be new or empty: {output_dir}")
+
+    config = read_json(config_path)
+    model = read_json(model_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    utilization = float(config["physical"]["utilization"])
+    baseline = baseline_layout(model, utilization)
+    baseline_l2 = next(module for module in baseline["modules"] if module["kind"] == "l2")
+    anchor_sample = _sample_from_layout(
+        model_path, "fixed-bin", baseline, output_dir / "fixed_bin",
+        -1, -1, float(baseline_l2["x_mm"]), float(baseline_l2["y_mm"]),
+        int(baseline_l2["tier"]),
+    )
+    anchor_hotspot = run_one(anchor_sample, config, hotspot, force=False)
+    anchor_layout = read_json(Path(anchor_sample["case_dir"]) / "layout.json")
+    anchor = {
+        "layout": str((Path(anchor_sample["case_dir"]) / "layout.json").resolve()),
+        "hotspot_dir": str(Path(anchor_sample["case_dir"]).resolve()),
+        "tmax_c": float(anchor_hotspot["tmax_c"]),
+        "peak_unit": anchor_hotspot["peak_unit"], "variants": {},
+    }
+    for variant in variants:
+        raw = proxy_for_layout(anchor_layout, config, variant)
+        anchor["variants"][variant.name] = {
+            "raw_proxy_tmax_c": raw,
+            "anchored_proxy_tmax_c": float(anchor_hotspot["tmax_c"]),
+            "anchored_frequency": _frequency(float(anchor_hotspot["tmax_c"]), model, config),
+        }
+
+    samples = []
+    for candidate in candidate_layouts(model_path, grid_points, utilization, (1,)):
+        samples.append(_sample_from_layout(
+            model_path, "grid", candidate["layout"],
+            output_dir / "positions" /
+            f"tier{candidate['tier']}_r{candidate['row']:02d}_c{candidate['column']:02d}",
+            int(candidate["row"]), int(candidate["column"]),
+            float(candidate["fx"]), float(candidate["fy"]), int(candidate["tier"]),
+        ))
+
+    completed = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(run_one, sample, config, hotspot, False): sample
+            for sample in samples
+        }
+        total = len(futures)
+        for future in as_completed(futures):
+            completed.append(future.result())
+            print(f"HotSpot proxy-gradient probes: {len(completed)}/{total}", flush=True)
+    completed.sort(key=lambda item: (item["tier"], item["row"], item["column"]))
+
+    records = []
+    for sample in completed:
+        layout = read_json(Path(sample["case_dir"]) / "layout.json")
+        record = {
+            "tier": int(sample["tier"]), "row": int(sample["row"]),
+            "column": int(sample["column"]), "fx": float(sample["fx"]),
+            "fy": float(sample["fy"]), "x_mm": next(
+                module["x_mm"] for module in layout["modules"] if module["kind"] == "l2"
+            ), "y_mm": next(
+                module["y_mm"] for module in layout["modules"] if module["kind"] == "l2"
+            ), "tmax_c": float(sample["tmax_c"]), "peak_unit": sample["peak_unit"],
+            "hotspot_dir": sample["case_dir"], "variants": {},
+        }
+        actual_frequency = _frequency(record["tmax_c"], model, config)
+        record["hotspot_frequency"] = actual_frequency
+        for variant in variants:
+            raw = proxy_for_layout(layout, config, variant)
+            delta = raw - anchor["variants"][variant.name]["raw_proxy_tmax_c"]
+            anchored = anchor["tmax_c"] + delta
+            record["variants"][variant.name] = {
+                "raw_proxy_tmax_c": raw,
+                "proxy_delta_from_fixed_bin_c": delta,
+                "anchored_proxy_tmax_c": anchored,
+                "anchored_frequency": _frequency(anchored, model, config),
+            }
+        records.append(record)
+
+    report = {
+        "schema_version": 1,
+        "method": "common-HotSpot-grid equation-(14) gradient diagnostic",
+        "purpose": (
+            "Qualitatively validate proxy placement gradients, not absolute thermal "
+            "accuracy or exact top-K rank agreement."
+        ),
+        "model": str(model_path.resolve()), "config": str(config_path.resolve()),
+        "hotspot": str(hotspot.resolve()), "grid_points_per_axis": grid_points,
+        "allowed_l2_tiers": [1], "workers": workers,
+        "variants": [
+            {"name": variant.name, "proxy_spatial_model": variant.spatial_model,
+             "lc_die_side_ratio": variant.lc_die_side_ratio}
+            for variant in variants
+        ],
+        "anchor": anchor, "records": records,
+        "evaluations": {
+            variant.name: summarize_variant(
+                variant.name, records, anchor, sign_tolerance_c
+            ) for variant in variants
+        },
+        "interpretation": {
+            "anchor_policy": (
+                "fixed-bin HotSpot anchor supplies only a common offset; all rank and "
+                "gradient differences originate in the analytical proxy"
+            ),
+            "acceptance_boundary": (
+                "This diagnostic does not require exact HotSpot ranking or top-three "
+                "overlap. Inspect sign agreement, rank trend, and selection regret "
+                "before changing a shared optimizer configuration."
+            ),
+        },
+    }
+    write_json(output_dir / "gradient_diagnostic.json", report)
+    return report
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--modules", type=Path, required=True)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--variant", action="append", type=parse_variant, required=True,
+                        help="repeat NAME=SPATIAL_MODEL,LC_DIE_SIDE_RATIO")
+    parser.add_argument("--grid-points", type=int, default=3)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--hotspot", type=Path, default=DEFAULT_HOTSPOT)
+    parser.add_argument("--sign-tolerance-c", type=float, default=0.02)
+    args = parser.parse_args()
+    report = run_probe(
+        args.modules.resolve(), args.config.resolve(), args.output_dir.resolve(),
+        args.variant, args.grid_points, args.workers, args.hotspot.resolve(),
+        args.sign_tolerance_c,
+    )
+    for name, values in report["evaluations"].items():
+        print(
+            f"{name}: Spearman={values['spearman']}, "
+            f"sign={values['sign_agreement_rate']}, "
+            f"regret={values['proxy_selected']['selection_regret_c']:.6f} C"
+        )
+
+
+if __name__ == "__main__":
+    main()

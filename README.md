@@ -3,7 +3,8 @@
 本项目复现 CLIP-3D 的“架构模拟 → 功耗/缓存物理参数 → 3D 布局 → 热分析 →
 持续频率 → 回标 gem5”闭环，并保留所有关键配置、哈希和中间证据。
 
-> 当前状态（2026-08-19）：工作流和新的固定语义工作量测量协议已经实现；论文级
+> 当前状态（2026-08-20）：工作流和新的固定语义工作量测量协议已经实现；热代理已
+> 修正为论文的 \(L_c=\) die 半宽，并增加可复现的共同 HotSpot 位置梯度诊断。论文级
 > 全量实验和最终数值结论尚未完成。仓库中的 exploratory 配置不能当作论文正式结果。
 
 ## 最重要的测量口径
@@ -35,6 +36,7 @@ work_units_per_ns    = work_units_per_cycle * sustainable_frequency_GHz
 | 同步语义 ROI | FFT、CHOLESKY、STREAM、MATMUL、STENCIL 均有完整 work-unit marker；记录 marker、binary、配置和 protocol SHA-256 |
 | 功耗与缓存物理量 | 严格 McPAT 1.3 流程；缓存面积、长宽比和访问时间以 McPAT 内嵌 CACTI-P 记录为权威，独立 CACTI 不再覆盖正式结果 |
 | 3D 布局与热分析 | fixed-bin 与 CLIP-3D 布局、模块功耗守恒、HotSpot 稳态验证、热约束持续频率和布局可视化 |
+| 热代理梯度诊断 | 对同一批合法 L2 位置只求解一次 HotSpot，并报告各代理变体的温差方向、排序趋势、选点 regret 与频率状态；exploratory 配置用 fixed-bin HotSpot 共同偏置避免频率项错误停在 thermal-headroom |
 | gem5 R2 | 从最终布局生成缓存/仲裁/TSV/线延迟向量并回标 gem5；支持结果身份校验和安全复用 |
 | 配对比较 | fixed-bin/CLIP-3D 配对 runner、断点续跑、完整 provenance 复验；语义协议以 `work_units_per_ns` 排名并执行 IPC same-trace gate |
 | 瞬态研究分支 | 时间窗口 McPAT/HotSpot、five-state 和 POD-ROM 代码路径已经接入；均明确标记为 exploratory/non-formal |
@@ -48,6 +50,10 @@ work_units_per_ns    = work_units_per_cycle * sustainable_frequency_GHz
   方差定标，再决定是否启动完整网格。
 - 论文未公开的热堆叠、代理权重和线延迟权重尚未全部取得可推广的正式标定；带
   `exploratory`、`operational`、`rejected` 的配置均不是 paper-equivalent 配置。
+- 热代理是启发式而非精确 HotSpot 替代品。五个最差点的共同位置扫描支持论文
+  \(L_c=\) die 半宽的质心核作为当前 operational 默认，但不支持按 workload/L2 尺寸
+  调整 \(L_c\)，也不支持将矩形面积求积提升为共享默认；详见
+  [docs/thermal_proxy_gradient_validation_zh.md](docs/thermal_proxy_gradient_validation_zh.md)。
 - 尚未形成论文各表格/图的端到端复现实验包，因此不能声称已经复现论文报告的收益。
 - five-state/POD-ROM 虽有实现与测试，但仍缺完整真实 workload 验证；它们是研究扩展，
   不是论文原方法的已验证替代品。
@@ -110,12 +116,27 @@ python3 scripts/run_r1_sweep.py \
 python3 -m workflow.run_lifting_pipeline \
   --r1-dir runs/architecture_sweep/r1/semantic/matmul/l1d_32kB/l2_512kB \
   --output-dir runs/lifting_semantic/matmul_32kB_512kB/fixed-bin \
-  --config configs/experiments/clip3d_constrained_5p0_raw_power_p1_lambda0020119_traffic_weighted_exploratory.json \
+  --config configs/experiments/clip3d_proxy_anchor_paper_lc_diagnostic.json \
   --layout-method fixed-bin
 ```
 
 将 `--layout-method` 改为 `clip3d`、输出到独立目录即可生成优化布局。确认物理/热结果后
 加 `--run-r2` 才会启动耗时的第二次 gem5；不要让两种布局共用输出目录。
+
+在启动 R2 前，可用共同 HotSpot 位置诊断检查该点的启发式热梯度。它只接受已生成的
+`modules.json`，不会重新运行 gem5 或 McPAT：
+
+```bash
+python3 -m workflow.thermal.diagnose_proxy_gradient \
+  --modules runs/lifting_semantic/matmul_32kB_512kB/fixed-bin/modules.json \
+  --config configs/experiments/clip3d_proxy_anchor_paper_lc_diagnostic.json \
+  --output-dir runs/proxy_gradient/matmul_32kB_512kB \
+  --variant paper-center=center,0.5 \
+  --variant paper-area=area-quadrature,0.5 \
+  --grid-points 3 --workers 2
+```
+
+只应据此比较温差方向和选点 regret；报告性温度与性能仍以最终布局的 HotSpot/R2 为准。
 
 ### 4. 批量 lifting、配对 R2 与汇总
 
