@@ -34,6 +34,17 @@ class LambdaWireExploratoryConfigTests(unittest.TestCase):
         self.assertEqual(
             candidate["layout_optimizer"]["wire_objective"], "continuous"
         )
+        self.assertEqual(
+            candidate["layout_optimizer"]["alpha"], 2.9660311522555
+        )
+        self.assertEqual(
+            candidate["layout_optimizer"]["cross_tier_weight"],
+            0.8852187415639463,
+        )
+        self.assertEqual(
+            candidate["layout_optimizer"]["lc_die_side_ratio"],
+            0.058600738908940346,
+        )
         self.assertFalse(report["recommendation"]["accepted_for_this_workload"])
         self.assertFalse(
             report["recommendation"]["cross_workload_transfer_validated"]
@@ -65,6 +76,11 @@ class LambdaWireExploratoryConfigTests(unittest.TestCase):
         candidate_optimizer = dict(candidate_without_identity["layout_optimizer"])
         source_optimizer.pop("lambda_wire")
         candidate_optimizer.pop("lambda_wire")
+        source_optimizer.pop("alpha")
+        candidate_optimizer.pop("alpha")
+        source_optimizer.pop("cross_tier_weight")
+        candidate_optimizer.pop("cross_tier_weight")
+        candidate_optimizer.pop("lc_die_side_ratio")
         source_optimizer.pop("parameter_provenance")
         candidate_optimizer.pop("parameter_provenance")
         source_without_identity["layout_optimizer"] = source_optimizer

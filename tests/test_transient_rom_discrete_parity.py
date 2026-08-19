@@ -62,6 +62,7 @@ class TransientROMParityConfigTests(unittest.TestCase):
             ("layout_optimizer", "alpha"),
             ("layout_optimizer", "beta"),
             ("layout_optimizer", "cross_tier_weight"),
+            ("layout_optimizer", "lc_die_side_ratio"),
             ("layout_optimizer", "lambda_wire"),
             ("layout_optimizer", "allowed_l2_tiers"),
             ("layout_optimizer", "wire_objective"),

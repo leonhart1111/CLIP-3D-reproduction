@@ -41,9 +41,10 @@
   },
   "layout_optimizer": {
     "r_convec_k_per_w": 5.0,
-    "alpha": 1.5643788695171585,
+    "alpha": 2.9660311522555,
     "beta": 0.0,
-    "cross_tier_weight": 0.995,
+    "cross_tier_weight": 0.8852187415639463,
+    "lc_die_side_ratio": 0.058600738908940346,
     "lambda_wire": 0.0020119160767721133,
     "allowed_l2_tiers": [1],
     "validation_policy": "paper-single",
@@ -52,9 +53,10 @@
     "include_fixed_baseline": true,
     "require_scipy": true,
     "parameter_provenance": {
-      "alpha": "non-formal: retained from the measured raw-power P1 fit",
+      "alpha": "non-formal: fitted on reduced alpha/Lc campaign 2026-08-17 (runs/alpha_lc_reduced_20260817/fit/fit_report.json), accepted=True",
       "beta": "non-formal: fixed_unidentifiable_under_p1",
-      "cross_tier_weight": "non-formal: retained from the measured held-out selection",
+      "cross_tier_weight": "non-formal: unit-response estimate 2026-08-17 (runs/alpha_lc_reduced_20260817/unit_response/unit_response_report.json), accepted=True",
+      "lc_die_side_ratio": "non-formal: fitted on reduced alpha/Lc campaign 2026-08-17, accepted=True",
       "lambda_wire": {
         "source": "manifests/parameter_provenance/lambda_wire_fft_rejected.json",
         "field": "lambda_wire",
