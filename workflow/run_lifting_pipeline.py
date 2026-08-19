@@ -678,6 +678,7 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
         hotspot_dir / "layout.json", delay.get("wire_rounding", "nearest"),
         int(delay.get("cycles_per_tsv", 2)), int(delay.get("l1_pipeline_cycles", 1)),
         delay.get("wire_aggregation", "mean"),
+        float(delay.get("l2_latency_scale", 1.0)),
     )
     stage_seconds["frequency_and_latency"] = time.perf_counter() - started
 

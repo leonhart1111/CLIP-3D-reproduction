@@ -137,6 +137,7 @@ def _base_vector(r1_dir: Path, point_dir: Path, output_dir: Path,
         cycles_per_tsv=int(delay.get("cycles_per_tsv", 2)),
         l1_pipeline_cycles=int(delay.get("l1_pipeline_cycles", 1)),
         wire_aggregation=delay.get("wire_aggregation", "mean"),
+        l2_access_time_scale=float(delay.get("l2_latency_scale", 1.0)),
     )
     module_model = read_json(modules)
     source_r1 = module_model.get("source_r1")
