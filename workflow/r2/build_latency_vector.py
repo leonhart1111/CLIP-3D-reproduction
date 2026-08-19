@@ -130,7 +130,14 @@ def build_vector(modules: Path, output: Path,
                  layout_path: Path | None = None,
                  wire_rounding: str = "nearest", cycles_per_tsv: int = 2,
                  l1_pipeline_cycles: int = 1,
-                 wire_aggregation: str = "mean") -> dict:
+                 wire_aggregation: str = "mean",
+                 l2_access_time_scale: float = 1.0) -> dict:
+    if (isinstance(l2_access_time_scale, bool)
+            or not isinstance(l2_access_time_scale, (int, float))
+            or not math.isfinite(float(l2_access_time_scale))
+            or float(l2_access_time_scale) <= 0):
+        raise ValueError("l2_access_time_scale must be a finite positive number")
+    l2_access_time_scale = float(l2_access_time_scale)
     model = read_json(modules)
     metadata = model["architecture"]
     records = _validated_native_records(model)
@@ -139,9 +146,15 @@ def build_vector(modules: Path, output: Path,
     converted = {}
     for level in ("l1i", "l1d", "l2"):
         access_time_s = float(records[level][0]["access_time_s"])
-        raw, cycles = access_cycles(access_time_s, frequency_hz)
+        effective_time = (
+            access_time_s * l2_access_time_scale if level == "l2"
+            else access_time_s
+        )
+        raw, cycles = access_cycles(effective_time, frequency_hz)
         converted[level] = {
             "access_time_s": access_time_s,
+            "access_time_scaled_s": effective_time,
+            "l2_access_time_scale": l2_access_time_scale if level == "l2" else 1.0,
             "access_cycles_raw": raw,
             "rounding_policy": "ceil",
             "access_cycles": cycles,
@@ -194,6 +207,7 @@ def build_vector(modules: Path, output: Path,
     l2_cycles = converted["l2"]["access_cycles"]
     vector = {
         "schema_version": 1, "equation": 6,
+        "l2_access_time_scale": l2_access_time_scale,
         "components_cycles": {
             "l1i_mcpat_cacti_p": l1i_cycles,
             "l1d_mcpat_cacti_p": l1d_cycles,
@@ -271,11 +285,13 @@ def main() -> None:
         "--wire-aggregation", choices=("mean", "maximum", "traffic-weighted"),
         default="mean",
     )
+    parser.add_argument("--l2-access-time-scale", type=float, default=1.0)
     args = parser.parse_args()
     result = build_vector(args.modules, args.output, args.tsv_hops, args.wire_cycles,
                           args.layout.resolve() if args.layout else None,
                           args.wire_rounding, args.cycles_per_tsv,
-                          args.l1_pipeline_cycles, args.wire_aggregation)
+                          args.l1_pipeline_cycles, args.wire_aggregation,
+                          args.l2_access_time_scale)
     print(f"R2 critical L1D-to-L2 path: {result['critical_l1d_to_l2_cycles']} cycles")
 
 
