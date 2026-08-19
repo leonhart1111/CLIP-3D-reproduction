@@ -19,8 +19,7 @@
     "1MB",
     "2MB",
     "4MB",
-    "8MB",
-    "16MB"
+    "8MB"
   ],
   "fixed_architecture": {
     "cores": 4,
@@ -58,5 +57,6 @@
       "instruction_window_scope": "all-cores",
       "workload_options": {}
     }
-  }
+  },
+  "note": "16MB removed: top-tier L2 height exceeds the die at 45nm (baseline_layout infeasible)"
 }
