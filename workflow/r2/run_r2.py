@@ -82,8 +82,9 @@ def strict_latency_vectors_equal(left: dict, right: dict) -> bool:
                for key in GEM5_OVERRIDE_KEYS)
 
 
-def _command_tail(metadata: dict, vector: dict) -> list[str]:
-    scope = metadata.get("instruction_window_scope", "cpu0")
+def _command_tail(metadata: dict, vector: dict,
+                  scope: str | None = None) -> list[str]:
+    scope = scope or metadata.get("instruction_window_scope", "cpu0")
     overrides = validate_latency_vector(vector)
     gem5_args = canonical_gem5_args(overrides)
     tail = [
@@ -102,24 +103,27 @@ def _command_tail(metadata: dict, vector: dict) -> list[str]:
     return tail
 
 
-def _provenance(r1_dir: Path, latency_path: Path) -> dict:
+def _provenance(r1_dir: Path, latency_path: Path,
+                scope: str | None = None) -> dict:
     metadata = read_json(r1_dir / "r1_metadata.json")
+    effective_scope = scope or metadata.get("instruction_window_scope", "cpu0")
     return {
         "r1_directory": str(r1_dir.resolve()),
         "r1_metadata_sha256": sha256_file(r1_dir / "r1_metadata.json"),
         "r1_stats_sha256": sha256_file(r1_dir / "stats.txt"),
         "latency_vector": str(latency_path.resolve()),
         "latency_sha256": sha256_file(latency_path),
-        "instruction_window_scope": metadata.get("instruction_window_scope", "cpu0"),
+        "instruction_window_scope": effective_scope,
         "warmup_insts_cpu0": metadata["warmup_insts_cpu0"],
         "measure_insts_cpu0": metadata["measure_insts_cpu0"],
     }
 
 
-def _validated_measurement(stats: dict[str, float], metadata: dict) -> tuple[list[dict], float]:
+def _validated_measurement(stats: dict[str, float], metadata: dict,
+                           scope: str | None = None) -> tuple[list[dict], float]:
     """Validate finite integral counters once for both fresh and cached R2 paths."""
     cores = int(metadata["num_cores"])
-    scope = metadata.get("instruction_window_scope", "cpu0")
+    scope = scope or metadata.get("instruction_window_scope", "cpu0")
     minimum = int(metadata["measure_insts_cpu0"]) if scope == "all-cores" else 1
     per_core = []
     for core in range(cores):
@@ -331,7 +335,12 @@ def validate_local_result(r1_dir: Path, latency_path: Path, output_dir: Path) ->
 
 def run(r1_dir: Path, latency_path: Path, output_dir: Path,
         gem5: Path = DEFAULT_GEM5, config: Path = DEFAULT_CONFIG,
-        rerun: bool = False) -> dict:
+        rerun: bool = False,
+        instruction_window_scope: str | None = None) -> dict:
+    if instruction_window_scope not in (None, "cpu0", "all-cores"):
+        raise ValueError(
+            "instruction_window_scope must be cpu0, all-cores, or None"
+        )
     result_path = output_dir / "r2_result.json"
     status_path = output_dir / "status.json"
     status_declares_success = False
@@ -349,10 +358,14 @@ def run(r1_dir: Path, latency_path: Path, output_dir: Path,
 
     metadata = read_json(r1_dir / "r1_metadata.json")
     vector = read_json(latency_path)
-    provenance = _provenance(r1_dir, latency_path)
+    effective_scope = instruction_window_scope or metadata.get(
+        "instruction_window_scope", "cpu0"
+    )
+    provenance = _provenance(r1_dir, latency_path, effective_scope)
     command = [
         str(gem5.resolve()), "--listener-mode=off", f"--outdir={output_dir.resolve()}",
-        str(config.resolve()), *_command_tail(metadata, vector),
+        str(config.resolve()),
+        *_command_tail(metadata, vector, effective_scope),
     ]
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -380,7 +393,7 @@ def run(r1_dir: Path, latency_path: Path, output_dir: Path,
         if not stats_path.is_file():
             raise ValueError("gem5 R2 completed without producing fresh stats")
         stats, stats_sha256 = _stats_snapshot(stats_path)
-        per_core, ipc2 = _validated_measurement(stats, metadata)
+        per_core, ipc2 = _validated_measurement(stats, metadata, effective_scope)
         if sha256_file(stats_path) != stats_sha256:
             raise ValueError("R2 stats changed during validation")
         result = {
@@ -421,9 +434,15 @@ def main() -> None:
     parser.add_argument("--gem5", type=Path, default=DEFAULT_GEM5)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--rerun", action="store_true")
+    parser.add_argument(
+        "--instruction-window-scope", choices=("cpu0", "all-cores"),
+        default=None,
+        help="override the R1-recorded measurement anchor (cpu0 = same instruction stream)",
+    )
     args = parser.parse_args()
     result = run(args.r1_dir.resolve(), args.latency.resolve(), args.output_dir.resolve(),
-                 args.gem5, args.config, args.rerun)
+                 args.gem5, args.config, args.rerun,
+                 args.instruction_window_scope)
     print(f"gem5 R2 IPC2 = {result['ipc2']:.6f}")
 
 
