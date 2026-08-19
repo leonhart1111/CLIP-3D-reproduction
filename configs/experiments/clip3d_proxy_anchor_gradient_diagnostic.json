@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "name": "proxy_anchor_gradient_diagnostic",
+  "experiment_classification": {
+    "mode": "non-formal thermal-proxy gradient diagnostic",
+    "non_formal": true,
+    "paper_equivalent": false,
+    "shared_parameter_accepted": false
+  },
+  "technology_nm": 45,
+  "mcpat": {
+    "temperature_k": 320,
+    "device_type": 0,
+    "longer_channel_device": 1,
+    "interconnect_projection_type": 1,
+    "opt_for_clk": 0
+  },
+  "cacti": {
+    "value_source": "local CACTI run"
+  },
+  "frequency": {
+    "f0_ghz": 2.0,
+    "fmin_ghz": 0.4,
+    "tsafe_c": 95.0,
+    "ambient_c": 25.0
+  },
+  "physical": {
+    "tiers": 2,
+    "grid_size": 32,
+    "utilization": 0.7,
+    "thermal_stack": {
+      "silicon_resistivity_mk_per_w": 0.01,
+      "tim_resistivity_mk_per_w": 0.25,
+      "interposer_thickness_m": 0.0001,
+      "active_silicon_thickness_m": 0.00005,
+      "tim_thickness_m": 0.00002,
+      "local_resistance_scale": 8.72,
+      "calibration": "Inherited current exploratory stack; this diagnostic does not promote it."
+    },
+    "r_convec_k_per_w": 5.0
+  },
+  "layout_optimizer": {
+    "r_convec_k_per_w": 5.0,
+    "alpha": 2.9660311522555,
+    "beta": 0.0,
+    "cross_tier_weight": 0.8852187415639463,
+    "lc_die_side_ratio": 0.058600738908940346,
+    "proxy_spatial_model": "center",
+    "proxy_quadrature_order": 2,
+    "thermal_anchor_policy": "fixed-bin-hotspot",
+    "lambda_wire": 0.0020119160767721133,
+    "allowed_l2_tiers": [1],
+    "validation_policy": "paper-single",
+    "wire_objective": "continuous",
+    "require_scipy": true,
+    "parameter_provenance": {
+      "alpha": "Exploratory alpha/Lc evidence reused only to test the fixed-bin HotSpot anchor; not promoted.",
+      "beta": "fixed_unidentifiable_under_p1",
+      "cross_tier_weight": "Exploratory unit-response estimate reused only for this diagnostic.",
+      "lc_die_side_ratio": "Exploratory fitted value; a separate paper-Lc experiment is required before attribution.",
+      "thermal_anchor_policy": "One same-contract fixed-bin HotSpot solve anchors absolute temperature; the analytical proxy supplies only relative placement deltas.",
+      "lambda_wire": "Retained solely to preserve the current exploratory wire objective."
+    },
+    "baseline_guard_bips_tolerance": 1e-09
+  },
+  "comparison_layouts": {
+    "candidate_grid": 11,
+    "top_k_hotspot": 3,
+    "sa_iterations": 600,
+    "sa_seed": 20260725,
+    "sa_selection_lambda": 0.5
+  },
+  "delay": {
+    "tsv_hops": 1,
+    "cycles_per_tsv": 2,
+    "l1_pipeline_cycles": 1,
+    "wire_rounding": "nearest",
+    "wire_aggregation": "traffic-weighted"
+  },
+  "formal_validation": {
+    "strict_p1": false,
+    "accepted": false,
+    "promotion": "forbidden: two-HotSpot anchored proxy diagnostic"
+  },
+  "operational_validation": {
+    "mode": "diagnostic",
+    "required_checks": [
+      "same-contract fixed-bin anchor exists",
+      "proxy and HotSpot agree on thermal-binding classification",
+      "HotSpot validates the selected layout"
+    ]
+  },
+  "provenance": {
+    "purpose": "Isolate the missing absolute-temperature anchor without changing the proxy spatial gradient.",
+    "reproduction_assumptions": [
+      "This configuration is not paper-equivalent because it adds one fixed-bin HotSpot anchor before optimization.",
+      "It must not be used to claim final performance improvement until gradient-direction and selection-regret tests pass.",
+      "The fixed-bin anchor and the final selected-layout HotSpot must share module geometry, power, stack, cooling, grid, and input granularity."
+    ]
+  }
+}

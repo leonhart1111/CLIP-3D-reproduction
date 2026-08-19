@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import math
 import subprocess
 import sys
@@ -68,8 +69,9 @@ from workflow.run_lifting_sweep import (
 from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT, run_hotspot
 from workflow.thermal.calibrate_proxy import (
     calibrate, candidate_layouts, parse_external_case, proxy_acceptance_checks,
-    sample_split,
+    proxy_prediction, sample_split,
 )
+from workflow.thermal.diagnose_proxy_gradient import ProxyVariant, parse_variant, summarize_variant
 from workflow.thermal.sustainable_frequency import closed_form_frequency
 from workflow.thermal.run_anchor_validation import run_manifest
 from workflow.thermal.validate_frequency import (
@@ -85,6 +87,34 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_proxy_gradient_variant_parser_and_summary_preserve_directional_metrics(self):
+        variant = parse_variant("paper-area=area-quadrature,0.5")
+        self.assertEqual(variant, ProxyVariant("paper-area", "area-quadrature", 0.5))
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_variant("bad=center,0")
+        anchor = {
+            "tmax_c": 100.0,
+            "variants": {
+                "paper-area": {
+                    "raw_proxy_tmax_c": 80.0,
+                    "anchored_frequency": {"state": "thermally_limited"},
+                }
+            },
+        }
+        records = [
+            {"row": 0, "column": 0, "tmax_c": 101.0,
+             "variants": {"paper-area": {"raw_proxy_tmax_c": 81.0}}},
+            {"row": 0, "column": 1, "tmax_c": 99.0,
+             "variants": {"paper-area": {"raw_proxy_tmax_c": 79.0}}},
+            {"row": 1, "column": 1, "tmax_c": 100.5,
+             "variants": {"paper-area": {"raw_proxy_tmax_c": 80.5}}},
+        ]
+        summary = summarize_variant("paper-area", records, anchor, 0.02)
+        self.assertEqual(summary["sign_agreement_rate"], 1.0)
+        self.assertEqual(summary["spearman"], 1.0)
+        self.assertEqual(summary["proxy_selected"]["selection_regret_c"], 0.0)
+        self.assertTrue(summary["thermal_frequency_term_active"])
+
     def test_pipeline_forwards_hotspot_materialization_contract(self):
         """Fixed-bin and paper-single runs must preserve identification inputs."""
         # Break caught: omitting or changing a physical materialization control
@@ -1386,6 +1416,69 @@ class GridTests(unittest.TestCase):
                 places=9,
             )
 
+    def test_proxy_anchor_uses_hotspot_baseline_without_changing_gradient(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+            raw = optimize(
+                root / "modules.json", root / "raw-layout.json",
+                root / "raw-report.json", allowed_l2_tiers=[1],
+                require_scipy=False, lc_die_side_ratio=0.25,
+            )
+            anchored = optimize(
+                root / "modules.json", root / "anchored-layout.json",
+                root / "anchored-report.json", allowed_l2_tiers=[1],
+                require_scipy=False, lc_die_side_ratio=0.25,
+                proxy_anchor_tmax_c=110.0,
+            )
+
+        self.assertAlmostEqual(anchored["baseline"]["proxy_tmax_c"], 110.0)
+        self.assertAlmostEqual(
+            anchored["parameters"]["proxy_anchor_offset_c"],
+            110.0 - raw["baseline"]["proxy_tmax_c"],
+        )
+        for candidate in anchored["candidates"]:
+            self.assertAlmostEqual(
+                candidate["proxy_tmax_c"] - candidate["proxy_tmax_raw_c"],
+                anchored["parameters"]["proxy_anchor_offset_c"],
+            )
+        self.assertTrue(anchored["thermal_proxy"]["anchor"]["enabled"])
+        self.assertLess(anchored["baseline"]["proxy_frequency_ghz"], 2.0)
+
+    def test_optimizer_rejects_nonfinite_proxy_anchor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "modules.json", self.model())
+            with self.assertRaisesRegex(ValueError, "anchor temperature"):
+                optimize(
+                    root / "modules.json", root / "layout.json",
+                    root / "report.json", proxy_anchor_tmax_c=math.nan,
+                )
+
+    def test_proxy_calibration_respects_configured_lc_ratio(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layout = baseline_layout(self.model())
+            case_dir = root / "case"
+            case_dir.mkdir()
+            write_json(case_dir / "layout.json", layout)
+            sample = {"case_dir": str(case_dir)}
+            base = {
+                "physical": {"r_convec_k_per_w": 5.0},
+                "frequency": {"ambient_c": 25.0},
+                "layout_optimizer": {"proxy_spatial_model": "center"},
+            }
+            short = deepcopy(base)
+            short["layout_optimizer"]["lc_die_side_ratio"] = 0.1
+            long = deepcopy(base)
+            long["layout_optimizer"]["lc_die_side_ratio"] = 0.9
+            parameters = [0.3, 0.0, 0.9]
+
+            short_prediction = proxy_prediction(sample, parameters, short)
+            long_prediction = proxy_prediction(sample, parameters, long)
+
+        self.assertNotAlmostEqual(short_prediction, long_prediction, places=9)
+
     def test_optimizer_rejects_nonpositive_or_nonfinite_lc_ratio(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2595,6 +2688,22 @@ class FormalGuardTests(unittest.TestCase):
         config["layout_optimizer"]["allowed_l2_tiers"] = [1]
         config["layout_optimizer"]["wire_objective"] = "invented"
         with self.assertRaises(ValueError):
+            validate_config(config, "clip3d")
+
+    def test_strict_p1_rejects_additional_hotspot_proxy_anchor(self):
+        config = {
+            "schema_version": 1,
+            "physical": {"r_convec_k_per_w": 5.0},
+            "layout_optimizer": {
+                "r_convec_k_per_w": 5.0,
+                "allowed_l2_tiers": [1],
+                "validation_policy": "paper-single",
+                "beta": 0.0,
+                "thermal_anchor_policy": "fixed-bin-hotspot",
+            },
+            "formal_validation": {"strict_p1": True, "accepted": False},
+        }
+        with self.assertRaisesRegex(ValueError, "strict P1 forbids"):
             validate_config(config, "clip3d")
 
     def test_discrete_partition_config_requires_valid_grid_and_baseline(self):

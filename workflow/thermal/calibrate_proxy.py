@@ -230,12 +230,21 @@ def proxy_prediction(sample: dict, parameters: list[float], config: dict) -> flo
     layout = read_json(Path(sample["case_dir"]) / "layout.json")
     physical = config["physical"]
     frequency = config["frequency"]
+    optimizer = config.get("layout_optimizer", {})
+    ratio = optimizer.get("lc_die_side_ratio")
+    if ratio is None:
+        lc_mm = None
+    else:
+        ratio = float(ratio)
+        if not math.isfinite(ratio) or ratio <= 0:
+            raise ValueError("layout_optimizer.lc_die_side_ratio must be finite and positive")
+        lc_mm = float(layout["die_width_mm"]) * ratio
     return proxy_temperature(
         layout["modules"], float(layout["die_width_mm"]),
         float(frequency["ambient_c"]), float(physical["r_convec_k_per_w"]),
         alpha, beta, cross_tier_weight,
-        config.get("layout_optimizer", {}).get("proxy_spatial_model", "center"),
-        int(config.get("layout_optimizer", {}).get("proxy_quadrature_order", 2)),
+        optimizer.get("proxy_spatial_model", "center"),
+        int(optimizer.get("proxy_quadrature_order", 2)), lc_mm,
     )
 
 

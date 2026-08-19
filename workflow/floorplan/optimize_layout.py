@@ -218,6 +218,7 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
              partition_grid_steps: int = 41,
              include_fixed_baseline: bool = True,
              lc_die_side_ratio: float | None = None,
+             proxy_anchor_tmax_c: float | None = None,
              require_granular_cores: bool = False) -> dict:
     model = read_json(model_path)
     base = baseline_layout(model, utilization)
@@ -230,6 +231,14 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
             "thermal characteristic length ratio must be finite and positive"
         )
     lc_mm = side * lc_ratio
+    if proxy_anchor_tmax_c is not None:
+        if (not isinstance(proxy_anchor_tmax_c, (int, float))
+                or isinstance(proxy_anchor_tmax_c, bool)
+                or not math.isfinite(float(proxy_anchor_tmax_c))):
+            raise ValueError(
+                "proxy anchor temperature must be a finite numeric value"
+            )
+        proxy_anchor_tmax_c = float(proxy_anchor_tmax_c)
     original = next(m for m in base["modules"] if m["kind"] == "l2")
     fixed = [dict(m) for m in base["modules"] if m["kind"] != "l2"]
     upper = (side - original["width_mm"], side - original["height_mm"])
@@ -279,7 +288,20 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
         cross_tier_weight, proxy_spatial_model, proxy_quadrature_order,
         lc_mm,
     )
-    baseline_proxy = baseline_components["proxy_temperature_c"]
+    baseline_proxy_raw = baseline_components["proxy_temperature_c"]
+    # The analytical proxy is intentionally a low-cost spatial heuristic.  A
+    # same-contract fixed-bin HotSpot anchor may supply its otherwise
+    # unidentifiable absolute temperature offset.  The proxy's spatial
+    # gradient remains unchanged: every candidate receives the same offset.
+    proxy_anchor_offset_c = (
+        0.0 if proxy_anchor_tmax_c is None
+        else proxy_anchor_tmax_c - baseline_proxy_raw
+    )
+
+    def anchored_proxy(raw_temperature_c: float) -> float:
+        return raw_temperature_c + proxy_anchor_offset_c
+
+    baseline_proxy = anchored_proxy(baseline_proxy_raw)
     baseline_frequency = closed_form_frequency(
         baseline_proxy, model["gamma"], f0_ghz, fmin_ghz, tsafe, ambient
     )[0]
@@ -307,12 +329,13 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
             tier = int(l2["tier"])
             x_mm = float(l2["x_mm"])
             y_mm = float(l2["y_mm"])
-            proxy = proxy_temperature(
+            proxy_raw = proxy_temperature(
                 modules, side, ambient, r_convec, alpha, beta,
                 cross_tier_weight, proxy_spatial_model,
                 proxy_quadrature_order,
                 lc_mm,
             )
+            proxy = anchored_proxy(proxy_raw)
             frequency, frequency_state, raw_frequency = closed_form_frequency(
                 proxy, model["gamma"], f0_ghz, fmin_ghz, tsafe, ambient
             )
@@ -326,6 +349,7 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                 "x_mm": float(x_mm), "y_mm": float(y_mm),
                 "loss": score, "objective_loss": score, "evaluations": 1,
                 "collision_mm2": 0.0, "proxy_tmax_c": proxy,
+                "proxy_tmax_raw_c": proxy_raw,
                 "proxy_frequency_ghz": frequency,
                 "proxy_unclamped_frequency_ghz": raw_frequency,
                 "proxy_frequency_state": frequency_state,
@@ -388,9 +412,12 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                 l2 = dict(original, x_mm=float(point[0]), y_mm=float(point[1]), tier=tier)
                 modules = fixed + [l2]
                 collision = collision_area(l2, fixed)
-                proxy = proxy_temperature(modules, side, ambient, r_convec, alpha, beta,
-                                          cross_tier_weight, proxy_spatial_model,
-                                          proxy_quadrature_order, lc_mm)
+                proxy_raw = proxy_temperature(
+                    modules, side, ambient, r_convec, alpha, beta,
+                    cross_tier_weight, proxy_spatial_model,
+                    proxy_quadrature_order, lc_mm,
+                )
+                proxy = anchored_proxy(proxy_raw)
                 frequency = closed_form_frequency(proxy, model["gamma"], f0_ghz,
                                                    fmin_ghz, tsafe, ambient)[0]
                 _, wire = selected_wire_cycles(modules)
@@ -413,9 +440,12 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                 l2 = dict(original, x_mm=point[0], y_mm=point[1], tier=tier)
                 modules = fixed + [l2]
                 collision = collision_area(l2, fixed)
-                proxy = proxy_temperature(modules, side, ambient, r_convec, alpha, beta,
-                                          cross_tier_weight, proxy_spatial_model,
-                                          proxy_quadrature_order, lc_mm)
+                proxy_raw = proxy_temperature(
+                    modules, side, ambient, r_convec, alpha, beta,
+                    cross_tier_weight, proxy_spatial_model,
+                    proxy_quadrature_order, lc_mm,
+                )
+                proxy = anchored_proxy(proxy_raw)
                 frequency, frequency_state, raw_frequency = closed_form_frequency(
                     proxy, model["gamma"], f0_ghz, fmin_ghz, tsafe, ambient
                 )
@@ -431,6 +461,7 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                 candidate = {"tier": tier, "start": start_name, "x_mm": point[0],
                              "y_mm": point[1], "loss": value, "evaluations": evaluations,
                              "collision_mm2": collision, "proxy_tmax_c": proxy,
+                             "proxy_tmax_raw_c": proxy_raw,
                              "proxy_frequency_ghz": frequency,
                              "proxy_unclamped_frequency_ghz": raw_frequency,
                              "proxy_frequency_state": frequency_state,
@@ -464,18 +495,27 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
         candidate for candidate in candidates
         if candidate.get("collision_mm2", 0.0) <= 1e-8
     ]
-    distinct_positions = {
+    # Solver endpoints are not a valid observability test: when equation (13)
+    # is flat or wire delay has one basin, every multi-start can legitimately
+    # converge to the same point even though the proxy has a real spatial
+    # response.  Always include the three deterministic legal box probes.
+    # Their purpose is diagnostic only and they never participate in selection.
+    observability_positions = {
         (candidate["tier"], round(candidate["x_mm"], 9),
          round(candidate["y_mm"], 9))
         for candidate in legal_candidates
     }
+    for tier in tiers:
+        for x_mm, y_mm in ((0.0, 0.0), (upper[0] / 2.0, upper[1] / 2.0), upper):
+            probe = dict(original, tier=tier, x_mm=x_mm, y_mm=y_mm)
+            if collision_area(probe, fixed) <= 1e-8:
+                observability_positions.add((tier, round(x_mm, 9), round(y_mm, 9)))
     spatial_range = None
-    if len(distinct_positions) >= 2:
+    if len(observability_positions) >= 2:
         spatial_values = []
-        for candidate in legal_candidates:
+        for tier, x_mm, y_mm in sorted(observability_positions):
             candidate_modules = fixed + [dict(
-                original, tier=candidate["tier"],
-                x_mm=candidate["x_mm"], y_mm=candidate["y_mm"],
+                original, tier=tier, x_mm=x_mm, y_mm=y_mm,
             )]
             spatial_values.append(spatial_coupling(
                 candidate_modules, side, cross_tier_weight,
@@ -553,6 +593,8 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                        "proxy_quadrature_order": proxy_quadrature_order,
                        "lc_die_side_ratio": lc_ratio,
                        "lc_mm": lc_mm,
+                       "proxy_anchor_tmax_c": proxy_anchor_tmax_c,
+                       "proxy_anchor_offset_c": proxy_anchor_offset_c,
                        "wire_objective": wire_objective,
                        "wire_aggregation": wire_aggregation,
                        "wire_rounding": wire_rounding,
@@ -562,6 +604,7 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
         "baseline": {
             "policy": base.get("policy", "fixed-bin"),
             "proxy_tmax_c": baseline_proxy,
+            "proxy_tmax_raw_c": baseline_proxy_raw,
             "proxy_frequency_ghz": baseline_frequency,
             "layout_delays": baseline_delays,
         },
@@ -608,6 +651,15 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
                     "total_power_w", "bottom_power_w", "spatial_coupling_w",
                     "proxy_temperature_c",
                 )
+            },
+            "anchor": {
+                "enabled": proxy_anchor_tmax_c is not None,
+                "tmax_c": proxy_anchor_tmax_c,
+                "offset_c": proxy_anchor_offset_c,
+                "contract": (
+                    "fixed-bin HotSpot Tmax plus proxy-relative placement deltas"
+                    if proxy_anchor_tmax_c is not None else "none"
+                ),
             },
             "selected_components": {
                 key: selected_components[key]
