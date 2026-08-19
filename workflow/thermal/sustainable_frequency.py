@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 from workflow.common import read_json, write_json
@@ -29,7 +30,8 @@ def closed_form_frequency(tmax_c: float, gamma: float, f0_ghz: float = 2.0,
 
 def derive(model: dict, thermal: dict, f0_ghz: float = 2.0,
            fmin_ghz: float = 0.4, tsafe_c: float = 95.0,
-           ambient_c: float = 25.0, ipc2: float | None = None) -> dict:
+           ambient_c: float = 25.0, ipc2: float | None = None,
+           work_units_per_cycle: float | None = None) -> dict:
     """Derive equation (13) without performing file I/O."""
     gamma = model["gamma"]
     frequency, state, raw = closed_form_frequency(
@@ -55,17 +57,30 @@ def derive(model: dict, thermal: dict, f0_ghz: float = 2.0,
     if ipc2 is not None:
         result["ipc2"] = ipc2
         result["bips2"] = ipc2 * frequency
+    if work_units_per_cycle is not None:
+        if (not isinstance(work_units_per_cycle, (int, float))
+                or isinstance(work_units_per_cycle, bool)
+                or not math.isfinite(float(work_units_per_cycle))
+                or work_units_per_cycle <= 0):
+            raise ValueError("work_units_per_cycle must be finite and positive")
+        result.update({
+            "primary_performance_metric": "work_units_per_ns",
+            "work_units_per_cycle": work_units_per_cycle,
+            "work_units_per_ns": work_units_per_cycle * frequency,
+        })
     return result
 
 
 def evaluate(module_model: Path, thermal_result: Path, output: Path,
              f0_ghz: float = 2.0, fmin_ghz: float = 0.4,
              tsafe_c: float = 95.0, ambient_c: float = 25.0,
-             ipc2: float | None = None) -> dict:
+             ipc2: float | None = None,
+             work_units_per_cycle: float | None = None) -> dict:
     model = read_json(module_model)
     thermal = read_json(thermal_result)
     result = derive(
-        model, thermal, f0_ghz, fmin_ghz, tsafe_c, ambient_c, ipc2
+        model, thermal, f0_ghz, fmin_ghz, tsafe_c, ambient_c, ipc2,
+        work_units_per_cycle,
     )
     write_json(output, result)
     return result

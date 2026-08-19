@@ -6,7 +6,15 @@ The R1 design grid contains 100 independently resumable gem5 runs:
 - L1D size in `{16, 32, 64, 128}` kB;
 - shared L2 size in `{128, 256, 512, 1024, 2048}` kB.
 
-The grid is machine-readable in `configs/experiments/r1_cache_sweep.json`. The runner is `scripts/run_r1_sweep.py`.
+The historical instruction-window grid remains machine-readable in
+`configs/experiments/r1_cache_sweep.json`. The corrected fixed-work grid is in
+`configs/experiments/r1_semantic_cache_sweep.json`. The runner is
+`scripts/run_r1_sweep.py`; see `docs/semantic_roi_protocol_zh.md` for the new
+measurement contract.
+
+The existing CPU0/all-core 100/200-point outputs are read-only legacy evidence.
+Do not combine them with `semantic-work` points or use them in a corrected
+fixed-bin/CLIP-3D comparison.
 
 ## Generate the paper plan without running
 
@@ -36,6 +44,22 @@ Successful points are skipped on later invocations. Use `--rerun` only when resu
 
 The sweep root contains `summary.csv` and `summary.json`. A point is successful only if gem5 exits normally and all four cores have positive measured committed-instruction counts.
 
+## Corrected semantic-work plan and execution
+
+```bash
+python3 scripts/run_r1_sweep.py \
+  --experiment configs/experiments/r1_semantic_cache_sweep.json
+
+python3 scripts/run_r1_sweep.py \
+  --experiment configs/experiments/r1_semantic_cache_sweep.json \
+  --execute --jobs 1
+```
+
+Semantic points additionally require `roi_events.json`, an exact workload
+binary SHA-256, the configured work-unit contract, and marker-derived global
+completion cycles. A successful status without those live artifacts is not
+reusable.
+
 ## Small end-to-end check
 
 ```bash
@@ -49,7 +73,7 @@ python3 scripts/run_r1_sweep.py \
 
 The `paper` profile uses the paper's 100-million-instruction CPU0 warmup and 500-million-instruction CPU0 measurement. The `smoke` profile is only a pipeline validation and must never be included in paper tables.
 
-The explicit `paper_all_cores` profile implements the literal alternative in which every core must reach both instruction targets. It waits for four distinct gem5 instruction-stop events and then verifies every measured core has at least 500 million instructions. Never mix `paper` and `paper_all_cores` points in one sweep: the currently running formal sweep uses the homogeneous `paper`/CPU0 policy.
+The explicit `paper_all_cores` profile implements the literal alternative in which every core must reach both instruction targets. It waits for four distinct gem5 instruction-stop events and then verifies every measured core has at least 500 million instructions. Never mix `paper`, `paper_all_cores`, and `semantic-work`: only the last one guarantees an equal count of complete workload work units across compared layouts.
 
 ## FFT reproduction note
 

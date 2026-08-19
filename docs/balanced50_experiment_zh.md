@@ -8,6 +8,10 @@ shell。后续代码块依赖当前 shell 中的变量，`set -u` 会让未初�
 而不会扩展为空路径；`set -euo pipefail` 也会一直提供 fail-fast 语义。若必须换用
 新的 shell，先完整重跑此初始化块：
 
+> 注意：本文记录的是旧 CPU0 instruction-window 实验，只能作为 legacy 复盘。
+> 它不能与 `semantic-work` 结果混合，也不能作为新测量协议的 Balanced-50 输入。
+> 新协议见 `docs/semantic_roi_protocol_zh.md`。
+
 ```bash
 set -euo pipefail
 source scripts/env.sh

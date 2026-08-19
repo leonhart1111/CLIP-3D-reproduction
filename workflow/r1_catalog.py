@@ -8,7 +8,13 @@ import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from workflow.common import parse_gem5_stats, read_json, sha256_file
+from workflow.common import (
+    parse_frequency_hz,
+    parse_gem5_stats,
+    read_json,
+    sha256_file,
+)
+from workflow.r1_protocol import SEMANTIC_SCOPE, canonical_protocol
 
 
 @dataclass(frozen=True, order=True)
@@ -68,8 +74,149 @@ def _validate_counters(record: dict, metadata: dict, stats_path: Path,
     record["per_core"] = per_core
 
 
+def _positive_integer(value, label: str, errors: list[str]) -> int | None:
+    if (not isinstance(value, int) or isinstance(value, bool) or value <= 0):
+        errors.append(f"{label} must be a positive integer")
+        return None
+    return value
+
+
+def _validate_semantic_evidence(record: dict, directory: Path, metadata: dict,
+                                status: dict | None, stats_path: Path,
+                                expected_unit: dict) -> None:
+    """Bind a semantic catalogue entry to its binary, markers, and stats."""
+    errors = record["errors"]
+    warmup = _positive_integer(
+        expected_unit.get("warmup"), "semantic warmup work units", errors
+    )
+    measure = _positive_integer(
+        expected_unit.get("measure"), "semantic measure work units", errors
+    )
+    unit_type = expected_unit.get("type")
+    if not isinstance(unit_type, str) or not unit_type.strip():
+        errors.append("semantic work-unit type must be a non-empty string")
+        unit_type = None
+    expected = {
+        "instruction_window_scope": SEMANTIC_SCOPE,
+        "warmup_work_units": warmup,
+        "measure_work_units": measure,
+        "work_unit_type": unit_type,
+    }
+    for field, value in expected.items():
+        if value is not None and metadata.get(field) != value:
+            errors.append(
+                f"metadata {field}={metadata.get(field)!r} does not match "
+                f"semantic profile {value!r}"
+            )
+
+    try:
+        protocol = canonical_protocol(metadata.get("r1_protocol", {}))
+    except (TypeError, ValueError) as exception:
+        errors.append(f"invalid semantic r1_protocol: {exception}")
+    else:
+        for field, value in expected.items():
+            if value is not None and protocol.get(field) != value:
+                errors.append(f"semantic r1_protocol differs for {field}")
+
+    protocol_id = metadata.get("r1_protocol_id")
+    if not isinstance(protocol_id, str) or not protocol_id:
+        errors.append("semantic metadata lacks r1_protocol_id")
+    if isinstance(status, dict) and status.get("r1_protocol_id") != protocol_id:
+        errors.append("semantic status r1_protocol_id differs from metadata")
+
+    digest = metadata.get("binary_sha256")
+    if (not isinstance(digest, str) or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)):
+        errors.append("semantic metadata lacks a lowercase binary SHA-256")
+    binary = metadata.get("binary")
+    if not isinstance(binary, str) or not binary:
+        errors.append("semantic metadata lacks workload binary path")
+    elif not Path(binary).is_file():
+        errors.append("semantic workload binary path does not exist")
+    elif isinstance(digest, str):
+        if sha256_file(Path(binary)) != digest:
+            errors.append("semantic workload binary SHA-256 differs from metadata")
+
+    evidence_path = directory / "roi_events.json"
+    if not evidence_path.is_file():
+        errors.append("missing roi_events.json")
+        return
+    if isinstance(status, dict):
+        for field, path in (
+                ("stats_sha256", stats_path),
+                ("r1_metadata_sha256", directory / "r1_metadata.json"),
+                ("roi_events_sha256", evidence_path)):
+            if path.is_file() and status.get(field) != sha256_file(path):
+                errors.append(f"semantic status {field} differs from live artifact")
+    evidence = _read(evidence_path, errors, "roi_events.json")
+    if not isinstance(evidence, dict):
+        errors.append("roi_events.json must contain an object")
+        return
+    marker_expected = {
+        "scope": SEMANTIC_SCOPE,
+        "work_unit_type": unit_type,
+        "warmup_work_units": warmup,
+        "measure_work_units": measure,
+        "marker_work_id": 1,
+    }
+    for field, value in marker_expected.items():
+        if value is not None and evidence.get(field) != value:
+            errors.append(f"semantic ROI evidence differs for {field}")
+    events = evidence.get("events")
+    valid_events = (
+        isinstance(events, list)
+        and len(events) == 2
+        and all(isinstance(event, dict) for event in events)
+        and [event.get("cause") for event in events] == ["workbegin", "workend"]
+        and all(event.get("work_id") == 1 for event in events)
+        and all(isinstance(event.get("tick"), int)
+                and not isinstance(event.get("tick"), bool) for event in events)
+        and events[1]["tick"] > events[0]["tick"]
+    )
+    if not valid_events:
+        errors.append("semantic ROI marker sequence is incomplete or unordered")
+        return
+    completion_ticks = events[1]["tick"] - events[0]["tick"]
+    if evidence.get("completion_ticks") != completion_ticks:
+        errors.append("semantic ROI completion_ticks differs from marker ticks")
+    if not stats_path.is_file():
+        return
+    try:
+        stats = parse_gem5_stats(stats_path, include_nonfinite=True)
+    except (OSError, UnicodeDecodeError):
+        return
+    sim_ticks = stats.get("simTicks")
+    sim_freq = stats.get("simFreq")
+    if (not isinstance(sim_ticks, (int, float))
+            or not math.isfinite(sim_ticks)
+            or not float(sim_ticks).is_integer()
+            or int(sim_ticks) != completion_ticks):
+        errors.append("semantic ROI marker ticks differ from stats simTicks")
+    if (not isinstance(sim_freq, (int, float)) or not math.isfinite(sim_freq)
+            or sim_freq <= 0 or not float(sim_freq).is_integer()):
+        errors.append("semantic stats simFreq must be a positive integer")
+        return
+    try:
+        cpu_frequency = parse_frequency_hz(metadata["cpu_clock"])
+    except (KeyError, TypeError, ValueError) as exception:
+        errors.append(f"invalid semantic CPU clock: {exception}")
+        return
+    completion_cycles = completion_ticks * cpu_frequency / int(sim_freq)
+    record.update({
+        "work_unit_type": unit_type,
+        "warmup_work_units": warmup,
+        "measure_work_units": measure,
+        "completion_ticks": completion_ticks,
+        "completion_cycles": completion_cycles,
+        "work_units_per_cycle": (
+            measure / completion_cycles
+            if measure is not None and completion_cycles > 0 else None
+        ),
+    })
+
+
 def _record_for(root: Path, key: ArchitectureKey, expected_scope: str,
-                validate_counters: bool) -> dict:
+                validate_counters: bool, profile_data: dict) -> dict:
     directory = root / key.relative_path()
     record = {
         "key": asdict(key),
@@ -83,6 +230,7 @@ def _record_for(root: Path, key: ArchitectureKey, expected_scope: str,
     status_path = directory / "status.json"
     metadata_path = directory / "r1_metadata.json"
     stats_path = directory / "stats.txt"
+    status = None
     if not status_path.is_file():
         errors.append("missing status.json")
     else:
@@ -120,6 +268,17 @@ def _record_for(root: Path, key: ArchitectureKey, expected_scope: str,
             )
         if validate_counters and stats_path.is_file():
             _validate_counters(record, metadata, stats_path, expected_scope)
+        if expected_scope == SEMANTIC_SCOPE:
+            units = profile_data.get("semantic_work_units")
+            expected_unit = units.get(key.workload) if isinstance(units, dict) else None
+            if not isinstance(expected_unit, dict):
+                errors.append(
+                    f"semantic profile lacks work-unit declaration for {key.workload}"
+                )
+            else:
+                _validate_semantic_evidence(
+                    record, directory, metadata, status, stats_path, expected_unit
+                )
 
     record["valid"] = not errors
     return record
@@ -138,7 +297,10 @@ def build_catalogue(root: Path, experiment_path: Path, profile: str = "paper",
     expected_scope = profile_data.get("instruction_window_scope", "cpu0")
     keys = expected_keys(experiment)
     canonical_paths = {key.relative_path().as_posix() for key in keys}
-    records = [_record_for(root, key, expected_scope, validate_counters) for key in keys]
+    records = [
+        _record_for(root, key, expected_scope, validate_counters, profile_data)
+        for key in keys
+    ]
 
     excluded = []
     if root.is_dir():

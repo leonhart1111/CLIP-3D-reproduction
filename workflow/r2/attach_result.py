@@ -152,6 +152,9 @@ def validate_local_attachment(point_dir: Path, r1_dir: Path | None = None,
     validate_physical_coherence(
         metadata, config, modules, thermal, performance, summary, r1_dir,
         point_dir, reasons, expected_ipc2=ipc2,
+        expected_work_units_per_cycle=captured_result.get(
+            "work_units_per_cycle"
+        ),
         r1_stats_bytes=r1_stats_bytes,
         thermal_steady_bytes=thermal_steady_bytes,
         thermal_manifest=thermal_manifest,
@@ -256,6 +259,7 @@ def attach(point_dir: Path) -> dict:
                 staged_modules, staged_thermal, staged_performance,
                 frequency["f0_ghz"], frequency["fmin_ghz"],
                 frequency["tsafe_c"], frequency["ambient_c"], result["ipc2"],
+                result.get("work_units_per_cycle"),
             )
             published_summary = deepcopy(summary)
             published_summary.update({
@@ -268,6 +272,11 @@ def attach(point_dir: Path) -> dict:
                 "bips1_thermal": performance["bips1_thermal"],
                 "ipc2": performance["ipc2"],
                 "bips2": performance["bips2"],
+                "primary_performance_metric": performance.get(
+                    "primary_performance_metric", "bips2"
+                ),
+                "work_units_per_cycle": performance.get("work_units_per_cycle"),
+                "work_units_per_ns": performance.get("work_units_per_ns"),
                 "r2_source": str(result_path.resolve()),
             })
             published_summary.pop("r2_reused", None)
@@ -299,6 +308,9 @@ def attach(point_dir: Path) -> dict:
                 metadata, config, modules, thermal, performance,
                 published_summary, r1_dir, point_dir, reasons,
                 expected_ipc2=result["ipc2"],
+                expected_work_units_per_cycle=result.get(
+                    "work_units_per_cycle"
+                ),
                 r1_stats_bytes=r1_stats_bytes,
                 thermal_steady_bytes=thermal_steady_bytes,
                 thermal_manifest=thermal_manifest,

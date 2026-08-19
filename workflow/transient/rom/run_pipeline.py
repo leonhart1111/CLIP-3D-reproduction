@@ -899,6 +899,7 @@ def _execute_branch_r2(branch: dict, source_r1_dir: Path, output_dir: Path,
         metrics = branch_metrics(
             r2_result.get("ipc2"),
             updated.get("validated_f_sus_trans_hotspot_ghz"),
+            r2_result.get("work_units_per_cycle"),
         )
     except (OSError, RuntimeError, ValueError) as error:
         updated["state"] = "r2_failed"

@@ -1,9 +1,10 @@
 """Canonical gem5 R1 protocols and stable protocol identities.
 
 A protocol identity separates legacy 100M-warmup/500M-measurement runs from
-short all-core convergence candidates.  It binds the instruction window, the
-workload command, and the exact gem5 configuration/binary, so a successful
-output directory is only reusable when every identity component matches.
+short all-core convergence candidates and semantic-work ROIs.  It binds the
+measurement window, workload command/binary, and exact gem5 configuration and
+binary, so a successful output directory is reusable only when every identity
+component matches.
 """
 
 from __future__ import annotations
@@ -16,7 +17,8 @@ from typing import Any, Mapping
 
 PROTOCOL_FAMILY = "clip3d-r1"
 PROTOCOL_SCHEMA_VERSION = 1
-SUPPORTED_SCOPES = frozenset({"cpu0", "all-cores"})
+SEMANTIC_SCOPE = "semantic-work"
+SUPPORTED_SCOPES = frozenset({"cpu0", "all-cores", SEMANTIC_SCOPE})
 LEGACY_PROFILE_NAMES = frozenset({"paper", "paper_all_cores", "smoke"})
 
 
@@ -24,9 +26,12 @@ LEGACY_PROFILE_NAMES = frozenset({"paper", "paper_all_cores", "smoke"})
 class R1Protocol:
     family: str
     profile: str
-    warmup_insts: int
-    measure_insts: int
     instruction_window_scope: str
+    warmup_insts: int | None = None
+    measure_insts: int | None = None
+    warmup_work_units: int | None = None
+    measure_work_units: int | None = None
+    work_unit_type: str | None = None
 
 
 def _positive_int(value: Any, label: str) -> int:
@@ -48,34 +53,58 @@ def canonical_protocol(value: Mapping[str, Any]) -> dict:
     scope = value.get("instruction_window_scope")
     if scope not in SUPPORTED_SCOPES:
         raise ValueError(
-            "R1 protocol instruction_window_scope must be cpu0 or all-cores"
+            "R1 protocol instruction_window_scope must be cpu0, all-cores, "
+            "or semantic-work"
         )
     canonical = {
         "schema_version": PROTOCOL_SCHEMA_VERSION,
         "family": family,
         "profile": profile,
-        "warmup_insts": _positive_int(
-            value.get("warmup_insts"), "warmup_insts"
-        ),
-        "measure_insts": _positive_int(
-            value.get("measure_insts"), "measure_insts"
-        ),
         "instruction_window_scope": scope,
     }
+    if scope == SEMANTIC_SCOPE:
+        unit_type = value.get("work_unit_type")
+        if not isinstance(unit_type, str) or not unit_type.strip():
+            raise ValueError("work_unit_type must be a non-empty string")
+        canonical.update({
+            "warmup_work_units": _positive_int(
+                value.get("warmup_work_units"), "warmup_work_units"
+            ),
+            "measure_work_units": _positive_int(
+                value.get("measure_work_units"), "measure_work_units"
+            ),
+            "work_unit_type": unit_type.strip(),
+            "marker_sequence": ["workbegin", "workend"],
+            "marker_work_id": 1,
+        })
+    else:
+        canonical.update({
+            "warmup_insts": _positive_int(
+                value.get("warmup_insts"), "warmup_insts"
+            ),
+            "measure_insts": _positive_int(
+                value.get("measure_insts"), "measure_insts"
+            ),
+        })
     return canonical
 
 
 def protocol_id(value: Mapping[str, Any],
-                workload_options: Mapping[str, Any] | None = None,
+                workload_options: Any = None,
                 gem5_config_sha256: str | None = None,
-                gem5_binary_sha256: str | None = None) -> str:
+                gem5_binary_sha256: str | None = None,
+                workload_binary_sha256: str | None = None) -> str:
     """Return a stable SHA-256 protocol identity for one R1 job."""
     canonical = canonical_protocol(value)
     payload = {
         **canonical,
-        "workload_options": dict(workload_options or {}),
+        "workload_options": (
+            dict(workload_options) if isinstance(workload_options, Mapping)
+            else workload_options
+        ),
         "gem5_config_sha256": gem5_config_sha256,
         "gem5_binary_sha256": gem5_binary_sha256,
+        "workload_binary_sha256": workload_binary_sha256,
     }
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"),
@@ -106,7 +135,7 @@ def classify_legacy_protocol(metadata: Mapping[str, Any]) -> str:
             return (
                 "legacy-paper-500m"
                 if canonical["profile"] in LEGACY_PROFILE_NAMES
-                and canonical["measure_insts"] >= 500_000_000
+                and canonical.get("measure_insts", 0) >= 500_000_000
                 else "corrected"
             )
         except ValueError:
@@ -122,23 +151,42 @@ def protocol_from_metadata(metadata: Mapping[str, Any]) -> dict:
     """Derive the canonical protocol object recorded by clip_r1.py."""
     if isinstance(metadata.get("r1_protocol"), dict):
         return canonical_protocol(metadata["r1_protocol"])
-    return canonical_protocol({
+    scope = metadata.get("instruction_window_scope", "cpu0")
+    value = {
         "profile": "legacy",
-        "warmup_insts": metadata.get("warmup_insts"),
-        "measure_insts": metadata.get("measure_insts"),
-        "instruction_window_scope": metadata.get(
-            "instruction_window_scope", "cpu0"
-        ),
-    })
+        "instruction_window_scope": scope,
+    }
+    if scope == SEMANTIC_SCOPE:
+        value.update({
+            "warmup_work_units": metadata.get("warmup_work_units"),
+            "measure_work_units": metadata.get("measure_work_units"),
+            "work_unit_type": metadata.get("work_unit_type"),
+        })
+    else:
+        value.update({
+            "warmup_insts": metadata.get("warmup_insts"),
+            "measure_insts": metadata.get("measure_insts"),
+        })
+    return canonical_protocol(value)
 
 
 def protocol_fields(protocol: Mapping[str, Any]) -> dict:
     """Return the flattened dataclass view used by the sweep runner."""
     canonical = canonical_protocol(protocol)
-    return {
+    result = {
         "family": canonical["family"],
         "profile": canonical["profile"],
-        "warmup_insts": canonical["warmup_insts"],
-        "measure_insts": canonical["measure_insts"],
         "instruction_window_scope": canonical["instruction_window_scope"],
     }
+    if canonical["instruction_window_scope"] == SEMANTIC_SCOPE:
+        result.update({
+            "warmup_work_units": canonical["warmup_work_units"],
+            "measure_work_units": canonical["measure_work_units"],
+            "work_unit_type": canonical["work_unit_type"],
+        })
+    else:
+        result.update({
+            "warmup_insts": canonical["warmup_insts"],
+            "measure_insts": canonical["measure_insts"],
+        })
+    return result

@@ -21,9 +21,16 @@ from workflow.experiments.balanced50 import (
     validate_selection,
 )
 from workflow.r2 import attach_result, reuse_result, run_r2
+from workflow.r2.semantic_comparison import compare_semantic_results
 
 
-SCORE_DEFINITION = "paired measured BIPS2=IPC2*f_sus; exact validated reuse allowed"
+LEGACY_SCORE_DEFINITION = (
+    "paired measured BIPS2=IPC2*f_sus; exact validated reuse allowed"
+)
+SEMANTIC_SCORE_DEFINITION = (
+    "paired fixed-work throughput=work_units_per_cycle*f_sus; "
+    "IPC/BIPS comparison allowed only for an identical instruction vector"
+)
 PAIR_STATUS_DIRECTORY = "paired_r2_status"
 
 CSV_FIELDS = (
@@ -33,7 +40,9 @@ CSV_FIELDS = (
     "fixed_wire_cycles", "clip3d_wire_cycles",
     "fixed_vector_sha256", "clip3d_vector_sha256",
     "fixed_ipc2", "clip3d_ipc2", "fixed_bips2", "clip3d_bips2",
-    "clip3d_reused_fixed_r2", "absolute_bips2_difference", "percent_change",
+    "primary_performance_metric", "fixed_primary_score", "clip3d_primary_score",
+    "same_trace", "ipc_comparison_allowed", "clip3d_reused_fixed_r2",
+    "absolute_bips2_difference", "percent_change",
 )
 
 
@@ -162,6 +171,28 @@ def _validate_point(point: Path, method: str, key: object, config: dict,
         _validate_local(
             r1_dir, point, summary, performance, ipc2, bips2
         )
+    r2_source = summary.get("r2_source")
+    if not isinstance(r2_source, str):
+        raise ValueError(f"{method} summary lacks an R2 source")
+    r2_result = _read_object(Path(r2_source), f"{method} R2 result")
+    primary_metric = summary.get("primary_performance_metric", "bips2")
+    work_rate = None
+    work_score = None
+    if primary_metric == "work_units_per_ns":
+        work_rate = _positive(
+            summary.get("work_units_per_cycle"), f"{method} work-unit rate"
+        )
+        work_score = _positive(
+            summary.get("work_units_per_ns"), f"{method} frequency-scaled work rate"
+        )
+        if (r2_result.get("instruction_window_scope") != "semantic-work"
+                or not _same(r2_result.get("work_units_per_cycle"), work_rate)
+                or not _same(work_score, work_rate * frequency)
+                or not _same(performance.get("work_units_per_cycle"), work_rate)
+                or not _same(performance.get("work_units_per_ns"), work_score)):
+            raise ValueError(f"{method} semantic fixed-work metrics are inconsistent")
+    elif primary_metric != "bips2":
+        raise ValueError(f"{method} summary primary performance metric is unsupported")
     return {
         "tmax_c": tmax_c,
         "frequency_ghz": frequency,
@@ -169,6 +200,10 @@ def _validate_point(point: Path, method: str, key: object, config: dict,
         "vector_sha256": sha256_file(vector_path),
         "ipc2": ipc2,
         "bips2": bips2,
+        "primary_performance_metric": primary_metric,
+        "work_units_per_cycle": work_rate,
+        "work_units_per_ns": work_score,
+        "r2_result": r2_result,
     }
 
 
@@ -438,10 +473,45 @@ def summarize(fixed_root: Path, clip_root: Path, selection_path: Path,
             raise ValueError("pair fixed vector hash differs from fixed point")
         if status.get("clip3d_vector_sha256") != clip["vector_sha256"]:
             raise ValueError("pair CLIP vector hash differs from CLIP point")
-        ratio = clip["bips2"] / fixed["bips2"]
-        ratio = _positive(ratio, "BIPS2 ratio")
+        pair_is_semantic = (
+            fixed["primary_performance_metric"] == "work_units_per_ns"
+            and clip["primary_performance_metric"] == "work_units_per_ns"
+        )
+        if ((fixed["primary_performance_metric"] == "work_units_per_ns")
+                != (clip["primary_performance_metric"] == "work_units_per_ns")):
+            raise ValueError("pair mixes legacy and semantic performance metrics")
+        semantic = status.get("semantic_comparison")
+        if pair_is_semantic:
+            recomputed = compare_semantic_results(
+                fixed["r2_result"], clip["r2_result"],
+                fixed["frequency_ghz"], clip["frequency_ghz"],
+            )
+            if not isinstance(semantic, dict) or semantic != recomputed:
+                raise ValueError("pair semantic comparison differs from live R2 evidence")
+            fixed_score = _positive(
+                semantic.get("fixed_score"), "fixed semantic score"
+            )
+            clip_score = _positive(
+                semantic.get("clip3d_score"), "CLIP semantic score"
+            )
+            primary_metric = semantic.get("primary_metric")
+            if primary_metric != "work_units_per_ns":
+                raise ValueError("pair semantic primary metric is unsupported")
+            same_trace = semantic.get("same_trace")
+            ipc_allowed = semantic.get("ipc_comparison_allowed")
+            if not isinstance(same_trace, bool) or ipc_allowed is not same_trace:
+                raise ValueError("pair same-trace IPC gate is malformed")
+        else:
+            if semantic is not None:
+                raise ValueError("legacy pair unexpectedly contains semantic comparison")
+            fixed_score = fixed["bips2"]
+            clip_score = clip["bips2"]
+            primary_metric = "bips2"
+            same_trace = None
+            ipc_allowed = None
+        ratio = _positive(clip_score / fixed_score, "primary score ratio")
         difference = _finite(abs(clip["bips2"] - fixed["bips2"]),
-                             "absolute BIPS2 difference")
+                             "absolute diagnostic BIPS2 difference")
         percent_change = _finite(100.0 * (ratio - 1.0), "percentage change")
         rows.append({
             **_key_dict(key),
@@ -454,18 +524,33 @@ def summarize(fixed_root: Path, clip_root: Path, selection_path: Path,
             "clip3d_vector_sha256": clip["vector_sha256"],
             "fixed_ipc2": fixed["ipc2"], "clip3d_ipc2": clip["ipc2"],
             "fixed_bips2": fixed["bips2"], "clip3d_bips2": clip["bips2"],
+            "primary_performance_metric": primary_metric,
+            "fixed_primary_score": fixed_score,
+            "clip3d_primary_score": clip_score,
+            "same_trace": same_trace,
+            "ipc_comparison_allowed": ipc_allowed,
             "clip3d_reused_fixed_r2": reused,
             "absolute_bips2_difference": difference,
             "percent_change": percent_change,
             "ratio": ratio,
         })
+    metric_names = {row["primary_performance_metric"] for row in rows}
+    if len(metric_names) != 1:
+        raise ValueError(
+            "paired report cannot mix legacy instruction windows and semantic-work ROIs"
+        )
+    score_definition = (
+        SEMANTIC_SCORE_DEFINITION
+        if metric_names == {"work_units_per_ns"}
+        else LEGACY_SCORE_DEFINITION
+    )
     workloads = {}
     for workload in dict.fromkeys(row["workload"] for row in rows):
         workloads[workload] = _statistics([row for row in rows if row["workload"] == workload])
     result = {
         "schema_version": 1,
         "complete": len(rows) == 50 and all(item["n"] == 10 for item in workloads.values()),
-        "score_definition": SCORE_DEFINITION,
+        "score_definition": score_definition,
         "point_count": len(rows),
         "selection": str(Path(selection_path).resolve()),
         "status_root": str(status_root),

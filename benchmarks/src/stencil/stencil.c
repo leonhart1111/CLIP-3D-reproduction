@@ -10,6 +10,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "../../semantic_roi/clip_roi.h"
+
 #define DEFAULT_SIZE 2048U
 #define DEFAULT_ITERATIONS 500U
 #define DEFAULT_THREADS 4U
@@ -21,6 +23,7 @@ typedef struct {
     double *src;
     double *dst;
     pthread_barrier_t barrier;
+    clip_roi_state_t roi;
 } stencil_context_t;
 
 typedef struct {
@@ -76,6 +79,11 @@ static void *jacobi_rows(void *opaque)
         double *dst = context->dst;
         size_t i;
 
+        pthread_barrier_wait(&context->barrier);
+        if (arg->tid == 0) {
+            clip_roi_boundary(&context->roi, iteration);
+        }
+        pthread_barrier_wait(&context->barrier);
         for (i = row_begin; i < row_end; ++i) {
             const size_t offset = i * context->n;
             size_t j;
@@ -175,6 +183,7 @@ int main(int argc, char **argv)
     context.n = n;
     context.iterations = iterations;
     context.threads = threads;
+    clip_roi_configure(&context.roi, iterations, "jacobi-iteration");
     context.src = allocate_grid(elements);
     context.dst = allocate_grid(elements);
     workers = calloc(threads > 1 ? threads - 1 : 1, sizeof(*workers));

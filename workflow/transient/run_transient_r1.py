@@ -90,12 +90,25 @@ def command_from_metadata(source_r1_dir: Path, output_dir: Path, gem5: Path,
         "--l2-size", metadata["l2_size"],
         "--mem-size", metadata["memory_size"],
         "--cpu-clock", metadata["cpu_clock"],
-        "--warmup-insts", str(metadata["warmup_insts"]),
-        "--measure-insts", str(metadata["measure_insts"]),
         "--instruction-window-scope",
         metadata.get("instruction_window_scope", "cpu0"),
         "--sampling-policy-id", sampling_policy_id or "unidentified",
     ]
+    if metadata.get("instruction_window_scope") == "semantic-work":
+        command.extend((
+            "--warmup-work-units", str(metadata["warmup_work_units"]),
+            "--measure-work-units", str(metadata["measure_work_units"]),
+            "--work-unit-type", metadata["work_unit_type"],
+        ))
+    else:
+        command.extend((
+            "--warmup-insts", str(metadata["warmup_insts"]),
+            "--measure-insts", str(metadata["measure_insts"]),
+        ))
+    if metadata.get("binary_sha256"):
+        command.extend((
+            "--workload-binary-sha256", metadata["binary_sha256"],
+        ))
     recorded_protocol = metadata.get("r1_protocol")
     if isinstance(recorded_protocol, dict):
         command.extend((

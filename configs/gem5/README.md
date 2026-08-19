@@ -10,6 +10,17 @@ The same gem5 `Process` object is assigned to all four one-thread CPU contexts. 
 
 At the end of every successful measurement, the configuration reads `stats.txt` and requires positive committed-instruction counts for `cpu0` through `cpu3`.
 
+## Corrected synchronized semantic ROI
+
+The corrected comparison protocol is `semantic-work`, defined in
+`configs/experiments/r1_semantic_cache_sweep.json` and documented in
+`docs/semantic_roi_protocol_zh.md`. Instrumented workloads emit synchronized
+`m5_work_begin(1, 0)` and `m5_work_end(1, 0)` events around a fixed number of
+complete workload work units. gem5 resets at the first marker and dumps/stops
+at the second. Its primary metric is global marker-to-marker completion cycles
+and fixed-work throughput; per-core IPC is diagnostic unless the two compared
+instruction vectors are exactly equal.
+
 ## Short validation run
 
 From the project root:
@@ -43,7 +54,11 @@ tools/src/gem5/build/X86/gem5.opt \
   --measure-insts 500000000
 ```
 
-Instruction exits are anchored to CPU0 because gem5 23.1 exposes per-CPU instruction-stop events, not a single cross-core counted event. For these row-balanced workloads, CPU0 is the reproducible phase anchor; the recorded per-core counts must still be inspected. This convention should be reported alongside experimental results.
+This `paper` command is the historical instruction-window protocol. Its exits
+are anchored to CPU0 because gem5 23.1 exposes per-CPU instruction-stop events,
+not a single cross-core counted event. It remains readable for legacy audit,
+but its results must not be mixed with or used to rank the corrected
+`semantic-work` experiment.
 
 The five workload defaults are:
 

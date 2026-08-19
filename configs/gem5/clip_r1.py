@@ -9,6 +9,7 @@ copies of the benchmark.
 """
 
 import argparse
+import hashlib
 import json
 import re
 import shlex
@@ -33,6 +34,8 @@ from m5.objects import (
 
 
 NUM_CORES = 4
+SEMANTIC_SCOPE = "semantic-work"
+SEMANTIC_WORK_ID = 1
 WARMUP_CAUSE = "CLIP-3D R1 warmup complete"
 MEASUREMENT_CAUSE = "CLIP-3D R1 measurement complete"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -118,10 +121,10 @@ def parse_arguments():
     parser.add_argument("--stage", choices=("R1", "R2"), default="R1")
     parser.add_argument(
         "--instruction-window-scope",
-        choices=("cpu0", "all-cores"),
+        choices=("cpu0", "all-cores", SEMANTIC_SCOPE),
         default="cpu0",
-        help=("cpu0 preserves the in-progress reproduction protocol; all-cores "
-              "waits until every core reaches each instruction target"),
+        help=("legacy cpu0/all-cores instruction stops, or synchronized "
+              "semantic-work benchmark markers"),
     )
     for level in ("l1i", "l1d", "l2"):
         parser.add_argument(f"--{level}-tag-latency", type=positive_integer, default=1)
@@ -143,6 +146,10 @@ def parse_arguments():
         default=500_000_000,
         help="CPU0 committed instructions in the measured region",
     )
+    parser.add_argument("--warmup-work-units", type=positive_integer)
+    parser.add_argument("--measure-work-units", type=positive_integer)
+    parser.add_argument("--work-unit-type")
+    parser.add_argument("--workload-binary-sha256")
     parser.add_argument("--r1-protocol-family", type=str, default="clip3d-r1")
     parser.add_argument("--r1-profile", type=str)
     parser.add_argument("--r1-protocol-id", type=str)
@@ -182,6 +189,13 @@ def build_process(args):
     )
     if not binary.is_file():
         raise FileNotFoundError(f"workload binary does not exist: {binary}")
+    binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+    if (args.workload_binary_sha256 is not None
+            and args.workload_binary_sha256 != binary_sha256):
+        raise ValueError(
+            "workload binary SHA-256 differs from the protocol identity: "
+            f"expected {args.workload_binary_sha256}, observed {binary_sha256}"
+        )
 
     options = (
         shlex.split(args.options)
@@ -216,8 +230,22 @@ def build_process(args):
             "OMP_DYNAMIC=FALSE",
             "OMP_PROC_BIND=FALSE",
         ])
+    if args.instruction_window_scope == SEMANTIC_SCOPE:
+        if (args.warmup_work_units is None
+                or args.measure_work_units is None
+                or not args.work_unit_type):
+            raise ValueError(
+                "semantic-work requires warmup/measure work units and a work-unit type"
+            )
+        environment.extend([
+            "CLIP_ROI_MODE=semantic-work-v1",
+            f"CLIP_ROI_WARMUP_UNITS={args.warmup_work_units}",
+            f"CLIP_ROI_MEASURE_UNITS={args.measure_work_units}",
+            f"CLIP_ROI_WORK_UNIT_TYPE={args.work_unit_type}",
+            f"CLIP_ROI_WORK_ID={SEMANTIC_WORK_ID}",
+        ])
     process.env = environment
-    return process, binary, options, stdin_path
+    return process, binary, binary_sha256, options, stdin_path
 
 
 def configure_o3_cpu(cpu):
@@ -241,6 +269,9 @@ def build_system(args, process):
     system.mem_mode = "timing"
     system.mem_ranges = [AddrRange(args.mem_size)]
     system.cache_line_size = 64
+    system.exit_on_work_items = (
+        args.instruction_window_scope == SEMANTIC_SCOPE
+    )
 
     system.voltage_domain = VoltageDomain()
     system.clk_domain = SrcClockDomain(
@@ -313,13 +344,14 @@ def build_system(args, process):
     return system
 
 
-def write_metadata(args, binary, options, stdin_path, environment):
+def write_metadata(args, binary, binary_sha256, options, stdin_path, environment):
     output_directory = Path(m5.options.outdir)
     output_directory.mkdir(parents=True, exist_ok=True)
     metadata = {
         "stage": f"CLIP-3D {args.stage}",
         "workload": args.workload,
         "binary": str(binary),
+        "binary_sha256": binary_sha256,
         "command": [str(binary), *options],
         "environment": list(environment),
         "stdin": str(stdin_path) if stdin_path is not None else None,
@@ -356,23 +388,48 @@ def write_metadata(args, binary, options, stdin_path, environment):
                      "response": args.xbar_response_latency,
                      "snoop_response": args.xbar_snoop_response_latency},
         },
-        "warmup_insts_cpu0": args.warmup_insts,
-        "measure_insts_cpu0": args.measure_insts,
-        "warmup_insts": args.warmup_insts,
-        "measure_insts": args.measure_insts,
         "instruction_window_scope": args.instruction_window_scope,
-        "r1_protocol": {
-            "family": args.r1_protocol_family,
-            "profile": args.r1_profile,
+        "r1_protocol_id": args.r1_protocol_id,
+        "thread_mapping": "one process; pthread clone into four CPU contexts",
+        "gem5_config_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    }
+    protocol = {
+        "family": args.r1_protocol_family,
+        "profile": args.r1_profile,
+        "instruction_window_scope": args.instruction_window_scope,
+    }
+    if args.instruction_window_scope == SEMANTIC_SCOPE:
+        semantic = {
+            "warmup_work_units": args.warmup_work_units,
+            "measure_work_units": args.measure_work_units,
+            "work_unit_type": args.work_unit_type,
+            "marker_sequence": ["workbegin", "workend"],
+            "marker_work_id": SEMANTIC_WORK_ID,
+        }
+        metadata.update(semantic)
+        protocol.update(semantic)
+        metadata.update({
+            "stop_anchor": "synchronized semantic work-unit boundaries",
+            "primary_performance_metric": "work_units_per_cycle",
+            "ipc_role": "diagnostic; comparable only for identical instruction vectors",
+        })
+    else:
+        legacy = {
+            "warmup_insts_cpu0": args.warmup_insts,
+            "measure_insts_cpu0": args.measure_insts,
             "warmup_insts": args.warmup_insts,
             "measure_insts": args.measure_insts,
-            "instruction_window_scope": args.instruction_window_scope,
-        },
-        "r1_protocol_id": args.r1_protocol_id,
-        "stop_anchor": ("CPU0 thread 0" if args.instruction_window_scope == "cpu0"
-                        else "all four CPU thread-0 contexts"),
-        "thread_mapping": "one process; pthread clone into four CPU contexts",
-    }
+        }
+        metadata.update(legacy)
+        protocol.update({
+            "warmup_insts": args.warmup_insts,
+            "measure_insts": args.measure_insts,
+        })
+        metadata["stop_anchor"] = (
+            "CPU0 thread 0" if args.instruction_window_scope == "cpu0"
+            else "all four CPU thread-0 contexts"
+        )
+    metadata["r1_protocol"] = protocol
     with (output_directory / "r1_metadata.json").open("w") as stream:
         json.dump(metadata, stream, indent=2)
         stream.write("\n")
@@ -387,6 +444,39 @@ def simulate_phase(expected_cause, max_ticks):
         raise RuntimeError(
             f"simulation ended before '{expected_cause}'; actual cause: {cause}"
         )
+
+
+def simulate_semantic_event(expected_cause, max_ticks):
+    event = m5.simulate(max_ticks if max_ticks else m5.MaxTick)
+    cause = event.getCause()
+    code = int(event.getCode())
+    tick = int(m5.curTick())
+    print(f"Exit @ tick {tick}: {cause} (work id {code})")
+    if cause != expected_cause or code != SEMANTIC_WORK_ID:
+        m5.stats.dump()
+        raise RuntimeError(
+            "semantic ROI marker mismatch: "
+            f"expected {expected_cause}/work-id {SEMANTIC_WORK_ID}, "
+            f"observed {cause}/work-id {code}"
+        )
+    return {"cause": cause, "work_id": code, "tick": tick}
+
+
+def write_semantic_evidence(args, events):
+    output_directory = Path(m5.options.outdir)
+    evidence = {
+        "schema_version": 1,
+        "scope": SEMANTIC_SCOPE,
+        "work_unit_type": args.work_unit_type,
+        "warmup_work_units": args.warmup_work_units,
+        "measure_work_units": args.measure_work_units,
+        "marker_work_id": SEMANTIC_WORK_ID,
+        "events": events,
+        "completion_ticks": events[1]["tick"] - events[0]["tick"],
+    }
+    with (output_directory / "roi_events.json").open("w") as stream:
+        json.dump(evidence, stream, indent=2)
+        stream.write("\n")
 
 
 def simulate_all_core_phase(base_cause, max_ticks):
@@ -442,16 +532,31 @@ def validate_four_core_activity(path, minimum_instructions=1):
 
 def main():
     args = parse_arguments()
-    process, binary, options, stdin_path = build_process(args)
+    process, binary, binary_sha256, options, stdin_path = build_process(args)
     system = build_system(args, process)
     root = Root(full_system=False, system=system)
-    write_metadata(args, binary, options, stdin_path, process.env)
+    write_metadata(
+        args, binary, binary_sha256, options, stdin_path, process.env
+    )
 
     m5.instantiate()
     print(
         f"CLIP-3D {args.stage}: {args.workload}, four X86 O3 cores, "
         f"L1D={args.l1d_size}, L2={args.l2_size}"
     )
+
+    if args.instruction_window_scope == SEMANTIC_SCOPE:
+        events = [
+            simulate_semantic_event("workbegin", args.max_ticks_per_phase)
+        ]
+        m5.stats.reset()
+        events.append(
+            simulate_semantic_event("workend", args.max_ticks_per_phase)
+        )
+        m5.stats.dump()
+        validate_four_core_activity(stats_path())
+        write_semantic_evidence(args, events)
+        return
 
     if args.warmup_insts:
         if args.instruction_window_scope == "all-cores":

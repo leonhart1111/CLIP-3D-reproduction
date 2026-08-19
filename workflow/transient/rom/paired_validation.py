@@ -10,6 +10,7 @@ from pathlib import Path
 
 from workflow.common import atomic_write_bytes, read_json, sha256_file, write_json
 from workflow.r2.attachment_validation import validate_vector_native_cache
+from workflow.r2.semantic_comparison import compare_semantic_results
 
 
 def _finite_optional(value: object, label: str) -> float | None:
@@ -59,19 +60,32 @@ def require_selected_cycle_identity(
     return values[0]
 
 
-def branch_metrics(ipc2: float | None, f_hotspot_ghz: float | None) -> dict:
+def branch_metrics(ipc2: float | None, f_hotspot_ghz: float | None,
+                   work_units_per_cycle: float | None = None) -> dict:
     """Name measured IPC and validated HotSpot frequency without proxy aliases."""
     ipc = _finite_optional(ipc2, "measured IPC2")
     frequency = _finite_optional(
         f_hotspot_ghz, "validated HotSpot sustainable frequency"
     )
-    return {
+    result = {
         "validated_f_sus_trans_hotspot_ghz": frequency,
         "measured_ipc2": ipc,
         "measured_bips2_trans": (
             ipc * frequency if ipc is not None and frequency is not None else None
         ),
     }
+    work_rate = _finite_optional(
+        work_units_per_cycle, "measured work units per cycle"
+    )
+    if work_rate is not None:
+        result.update({
+            "primary_performance_metric": "work_units_per_ns",
+            "measured_work_units_per_cycle": work_rate,
+            "measured_work_units_per_ns": (
+                work_rate * frequency if frequency is not None else None
+            ),
+        })
+    return result
 
 
 def _validated_artifact(artifacts: dict, field: str, label: str) -> Path:
@@ -182,6 +196,27 @@ def publish_paired_comparison(
 
     absolute = clip_bips - fixed_bips
     percent = absolute / fixed_bips * 100.0
+    semantic_comparison = None
+    primary_metric = "bips2_trans"
+    primary_fixed = fixed_bips
+    primary_clip = clip_bips
+    if (fixed.get("measured_work_units_per_cycle") is not None
+            or clip3d.get("measured_work_units_per_cycle") is not None):
+        fixed_result = read_json(Path(fixed["artifacts"]["r2_result"]))
+        clip_result = read_json(Path(clip3d["artifacts"]["r2_result"]))
+        semantic_comparison = compare_semantic_results(
+            fixed_result, clip_result,
+            fixed["validated_f_sus_trans_hotspot_ghz"],
+            clip3d["validated_f_sus_trans_hotspot_ghz"],
+        )
+        primary_metric = semantic_comparison["primary_metric"]
+        primary_fixed = semantic_comparison["fixed_score"]
+        primary_clip = semantic_comparison["clip3d_score"]
+        for branch, result in ((fixed, fixed_result), (clip3d, clip_result)):
+            if branch.get("measured_work_units_per_cycle") != result.get(
+                    "work_units_per_cycle"):
+                raise ValueError("semantic branch work rate differs from R2 evidence")
+    primary_percent = (primary_clip / primary_fixed - 1.0) * 100.0
     report = {
         "schema_version": 1,
         "mode": "paired transient ROM real-HotSpot and gem5 R2 comparison",
@@ -193,7 +228,14 @@ def publish_paired_comparison(
         "clip3d": clip3d,
         "bips2_trans_absolute_difference": absolute,
         "bips2_trans_improvement_percent": percent,
+        "primary_performance_metric": primary_metric,
+        "fixed_primary_score": primary_fixed,
+        "clip3d_primary_score": primary_clip,
+        "primary_improvement_percent": primary_percent,
+        "semantic_comparison": semantic_comparison,
         "score_definition": (
+            "fixed semantic work throughput * validated HotSpot frequency"
+            if semantic_comparison is not None else
             "measured IPC2 * validated real-HotSpot transient sustainable frequency"
         ),
     }
