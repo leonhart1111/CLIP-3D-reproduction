@@ -1496,6 +1496,23 @@ class GridTests(unittest.TestCase):
             )
         self.assertTrue(anchored["thermal_proxy"]["anchor"]["enabled"])
         self.assertLess(anchored["baseline"]["proxy_frequency_ghz"], 2.0)
+        observability = anchored["observability_diagnostics"]
+        self.assertTrue(observability["sampled_thermal_frequency_term_active"])
+        self.assertGreaterEqual(
+            len(observability["sampled_l2_positions"]), 2
+        )
+        self.assertIn(
+            "thermally_limited", observability["sampled_proxy_frequency_states"]
+        )
+        baseline_bottom_power = sum(
+            module["total_power_w"]
+            for module in baseline_layout(self.model())["modules"]
+            if module["tier"] == 0
+        )
+        self.assertTrue(all(
+            observation["bottom_power_w"] == baseline_bottom_power
+            for observation in observability["sampled_l2_positions"]
+        ))
 
     def test_optimizer_rejects_nonfinite_proxy_anchor(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2034,6 +2051,41 @@ class GridTests(unittest.TestCase):
             self.assertIn("layout_delays", report["baseline"])
             self.assertIn("mean_wire_cycles_rounded", report["predicted_deltas"])
             self.assertIn("paper_mean_r2_cycle_changed", diagnostics)
+
+    def test_observability_uses_the_candidate_tier_for_bottom_power(self):
+        """A tier move must not reuse the fixed-bin bottom-power term."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            for module in model["modules"]:
+                if module["kind"] == "core_logic":
+                    module["area_mm2"] = 0.1
+                elif module["kind"] == "l2":
+                    # Leave a legal bottom-tier corner without changing the
+                    # power difference this test is about.
+                    module["area_mm2"] = 0.0004
+            write_json(root / "modules.json", model)
+            report = optimize(
+                root / "modules.json", root / "layout.json", root / "report.json",
+                allowed_l2_tiers=[0, 1], require_scipy=False, beta=0.7,
+                proxy_anchor_tmax_c=110.0,
+            )
+
+        observations = report["observability_diagnostics"]["sampled_l2_positions"]
+        by_tier = {}
+        for observation in observations:
+            by_tier.setdefault(observation["tier"], []).append(
+                observation["bottom_power_w"]
+            )
+        fixed_bottom_power = sum(
+            module["total_power_w"]
+            for module in baseline_layout(model)["modules"] if module["tier"] == 0
+        )
+        self.assertEqual(set(by_tier), {0, 1})
+        self.assertTrue(all(value == fixed_bottom_power for value in by_tier[1]))
+        self.assertTrue(all(
+            value == fixed_bottom_power + 0.5 for value in by_tier[0]
+        ))
 
     def granular_model(self):
         """Eight fixed blocks per core plus shared L2 and NoC (34 modules)."""

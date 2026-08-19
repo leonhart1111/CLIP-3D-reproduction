@@ -511,16 +511,40 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
             if collision_area(probe, fixed) <= 1e-8:
                 observability_positions.add((tier, round(x_mm, 9), round(y_mm, 9)))
     spatial_range = None
+    spatial_observations = []
     if len(observability_positions) >= 2:
         spatial_values = []
         for tier, x_mm, y_mm in sorted(observability_positions):
             candidate_modules = fixed + [dict(
                 original, tier=tier, x_mm=x_mm, y_mm=y_mm,
             )]
-            spatial_values.append(spatial_coupling(
+            spatial = spatial_coupling(
                 candidate_modules, side, cross_tier_weight,
                 proxy_spatial_model, proxy_quadrature_order, lc_mm,
-            ))
+            )
+            spatial_values.append(spatial)
+            candidate_bottom_power = sum(
+                float(module["total_power_w"])
+                for module in candidate_modules if int(module["tier"]) == 0
+            )
+            raw_temperature = (
+                ambient + r_convec * baseline_components["total_power_w"]
+                + alpha * spatial + beta * candidate_bottom_power
+            )
+            temperature = anchored_proxy(raw_temperature)
+            sustainable, state, unclamped = closed_form_frequency(
+                temperature, model["gamma"], f0_ghz, fmin_ghz, tsafe, ambient
+            )
+            spatial_observations.append({
+                "tier": tier, "x_mm": x_mm, "y_mm": y_mm,
+                "spatial_coupling_w": spatial,
+                "bottom_power_w": candidate_bottom_power,
+                "proxy_tmax_raw_c": raw_temperature,
+                "proxy_tmax_c": temperature,
+                "proxy_frequency_ghz": sustainable,
+                "proxy_unclamped_frequency_ghz": unclamped,
+                "proxy_frequency_state": state,
+            })
         spatial_range = max(spatial_values) - min(spatial_values)
         if not math.isfinite(spatial_range) or spatial_range <= 1e-12:
             raise ValueError(
@@ -580,6 +604,37 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
             "The rounded worst path changed although the rounded mean did not; "
             "maximum-path R2 is a separate conservative experiment, not paper mean mode."
         )
+    proxy_frequency_states = {}
+    for observation in spatial_observations:
+        state = observation["proxy_frequency_state"]
+        proxy_frequency_states[state] = proxy_frequency_states.get(state, 0) + 1
+    proxy_frequency_values = [
+        observation["proxy_frequency_ghz"] for observation in spatial_observations
+    ]
+    if proxy_frequency_values:
+        proxy_frequency_range = [
+            min(proxy_frequency_values), max(proxy_frequency_values)
+        ]
+        thermal_frequency_term_active = any(
+            value < f0_ghz - 1.0e-12 for value in proxy_frequency_values
+        )
+        thermal_frequency_term_varies = (
+            proxy_frequency_range[1] - proxy_frequency_range[0] > 1.0e-12
+        )
+        if not thermal_frequency_term_active:
+            cautions.append(
+                "Anchored proxy samples all retain thermal headroom; the thermal "
+                "frequency term is flat and cannot influence this L2 placement."
+            )
+        elif not thermal_frequency_term_varies:
+            cautions.append(
+                "Anchored proxy samples are thermally limited but predict no "
+                "frequency variation across the sampled L2 positions."
+            )
+    else:
+        proxy_frequency_range = None
+        thermal_frequency_term_active = None
+        thermal_frequency_term_varies = None
     report = {
         "schema_version": 1, "solver": solver, "selected": best,
         "candidates": candidates,
@@ -627,6 +682,11 @@ def optimize(model_path: Path, output_layout: Path, report_path: Path,
             "movable_l2_power_w": movable_power,
             "total_power_w": total_power,
             "movable_l2_power_fraction": movable_fraction,
+            "sampled_l2_positions": spatial_observations,
+            "sampled_proxy_frequency_states": proxy_frequency_states,
+            "sampled_proxy_frequency_range_ghz": proxy_frequency_range,
+            "sampled_thermal_frequency_term_active": thermal_frequency_term_active,
+            "sampled_thermal_frequency_term_varies": thermal_frequency_term_varies,
             "paper_mean_r2_cycle_changed": mean_cycle_changed,
             "conservative_maximum_r2_cycle_changed": maximum_cycle_changed,
                 "selected_r2_cycle_changed": selected_cycle_changed,

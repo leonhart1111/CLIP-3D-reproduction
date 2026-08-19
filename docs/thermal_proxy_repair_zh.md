@@ -1,0 +1,55 @@
+# 热代理修正：问题分离与验证准则
+
+## 目标与边界
+
+CLIP-3D 的 Equation (14) 不是 HotSpot 的替代品。它只需为 L2 给出有用的
+“离开热区”方向；最终温度和 BIPS 仍由 HotSpot 与 R2 给出。因此本验证不以
+绝对温度、严格全排序，或 HotSpot top-3 与代理 top-3 重合为验收条件。
+
+一个代理变体至少应在**同一 HotSpot 物理合同**下检查：相对 fixed-bin 的温差
+方向、代理选点的 HotSpot selection regret、以及是否真的跨越了频率门限。
+
+## 已区分的四类问题
+
+1. **物理合同漂移。** 64x64 标定曾在预测阶段丢失 `input_granularity`、
+   `compact_trace` 和 `ptrace_precision`，从 module-input 静默退回 grid-cell。
+   这已经修正；任何后续诊断必须记录这三个字段、网格、热栈和 `R_conv`。
+2. **绝对门限与空间梯度混淆。** Equation (14) 的绝对温度只是一阶启发式；
+   原始代理的共同偏置足以把全部候选错误地放在 95 C 以下。non-formal
+   operational 诊断允许一份同合同 fixed-bin HotSpot 作为共同锚点，且只将
+   代理的候选间 delta 送入 Equation (13)。这不改变排序或梯度。
+3. **宏块几何被压缩为质心。** HotSpot 使用经过 CACTI 长宽比和 McPAT 面积
+   归一化的 L2 矩形；代理若把它压成一个点，会漏掉有限矩形的源/受体积分。
+   `area-quadrature` 是允许的最小修正，且不改变 Eq. (14) 的核或共享 `L_c`。
+4. **峰值网格/边界效应。** HotSpot 的峰值可在相邻 grid cell 或不同模块间
+   切换，而简单 `max` 核没有完整的 3D Green 函数。曾试验将 Eq. (14) 全面
+   栅格化为 `grid-field`；在首个 512kB 差点上，方向一致率由 5/8 降为 3/8，
+   故不纳入主线。这个结果支持保留简单论文核，而不是将代理扩展成隐式
+   HotSpot 替代品。
+
+## 关于 Lc 与热绑定
+
+`L_c` 是横向热扩散核的共享长度，不是 L2 的半宽/半长。同一 die、封装和材料
+下，它不能按 workload 或单个 cache 容量重新设定；真正依赖 L2 尺寸的是面积
+积分。严格论文复现采用 `L_c = die-side / 2`；工程版若拟合其它共享值，必须在
+workload、缓存容量和空间位置留出集上验证，不能以训练点误差推广。
+
+频率项是否活动首先由真实 fixed-bin 热状态决定。一个点即使是“代理较差点”，
+也可能在目标冷却包络下始终低于 `T_safe`；此时频率在所有位置都是 2 GHz，热
+代理无法也不应制造性能增益。优化器报告中的
+`observability_diagnostics.sampled_thermal_frequency_term_active` 与
+`sampled_thermal_frequency_term_varies` 显式记录这一区别。
+
+## 分阶段实验
+
+1. 先以语义 ROI 的 `stencil / L1D=128kB / L2=512kB` 在未缩放、64x64、
+   module-input、`R_conv=5` 合同下比较 `fitted/paper × center/area` 四个变体。
+2. 只有在首点确认可重复的方向结果后，才扩展到其余四个差点；每一点使用相同
+   原始 McPAT/CACTI 模型、同一候选格和相同 HotSpot 合同。
+3. 单独选择高功耗 FFT 锚点验证 Equation (13) 的频率链路。低功耗差点只验证
+   温度梯度，不被错误地当作频率测试。
+4. 对接近的选点以更高 HotSpot 网格复核；小于数值/网格不确定度的温差应记为
+   tie，而非代理失败或性能提升。
+
+该文档只定义诊断和决策规则；在五点完成前，不将任何拟合的 `alpha`、`L_c` 或
+面积积分变体标为论文等价或共享已验收参数。
