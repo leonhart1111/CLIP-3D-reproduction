@@ -182,6 +182,25 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
         actual_values[index], records[index]["row"], records[index]["column"]
     ))
     anchor_frequency = anchor["variants"][name]["anchored_frequency"]
+    actual_states = [
+        record.get("hotspot_frequency", {}).get("state") for record in records
+    ]
+    proxy_states = [
+        record["variants"][name].get("anchored_frequency", {}).get("state")
+        for record in records
+    ]
+    state_pairs = [
+        (actual, proxy) for actual, proxy in zip(actual_states, proxy_states)
+        if isinstance(actual, str) and isinstance(proxy, str)
+    ]
+
+    def count_states(states: list[object]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for state in states:
+            if isinstance(state, str):
+                counts[state] = counts.get(state, 0) + 1
+        return counts
+
     return {
         "candidate_count": len(records),
         "hotspot_delta_range_c": [min(actual_deltas), max(actual_deltas)],
@@ -207,8 +226,20 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
             "tmax_c": actual_values[hotspot_best],
             "raw_proxy_tmax_c": raw_values[hotspot_best],
         },
+        "hotspot_frequency_states": count_states(actual_states),
+        "anchored_proxy_frequency_states": count_states(proxy_states),
+        "frequency_state_comparable_count": len(state_pairs),
+        "frequency_state_agreement_count": sum(
+            actual == proxy for actual, proxy in state_pairs
+        ),
+        "frequency_state_agreement_rate": (
+            sum(actual == proxy for actual, proxy in state_pairs) / len(state_pairs)
+            if state_pairs else None
+        ),
         "thermal_frequency_term_active": (
             anchor_frequency["state"] != "thermal_headroom"
+            or any(state != "thermal_headroom" for state in actual_states if isinstance(state, str))
+            or any(state != "thermal_headroom" for state in proxy_states if isinstance(state, str))
         ),
     }
 

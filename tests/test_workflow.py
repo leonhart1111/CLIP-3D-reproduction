@@ -69,7 +69,7 @@ from workflow.run_lifting_sweep import (
 from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT, run_hotspot
 from workflow.thermal.calibrate_proxy import (
     calibrate, candidate_layouts, parse_external_case, proxy_acceptance_checks,
-    proxy_prediction, sample_split,
+    proxy_prediction, run_one, sample_split,
 )
 from workflow.thermal.diagnose_proxy_gradient import ProxyVariant, parse_variant, summarize_variant
 from workflow.thermal.sustainable_frequency import closed_form_frequency
@@ -103,17 +103,36 @@ class WorkflowTests(unittest.TestCase):
         }
         records = [
             {"row": 0, "column": 0, "tmax_c": 101.0,
-             "variants": {"paper-area": {"raw_proxy_tmax_c": 81.0}}},
+             "hotspot_frequency": {"state": "thermally_limited"},
+             "variants": {"paper-area": {
+                 "raw_proxy_tmax_c": 81.0,
+                 "anchored_frequency": {"state": "thermally_limited"},
+             }}},
             {"row": 0, "column": 1, "tmax_c": 99.0,
-             "variants": {"paper-area": {"raw_proxy_tmax_c": 79.0}}},
+             "hotspot_frequency": {"state": "thermal_headroom"},
+             "variants": {"paper-area": {
+                 "raw_proxy_tmax_c": 79.0,
+                 "anchored_frequency": {"state": "thermally_limited"},
+             }}},
             {"row": 1, "column": 1, "tmax_c": 100.5,
-             "variants": {"paper-area": {"raw_proxy_tmax_c": 80.5}}},
+             "hotspot_frequency": {"state": "thermally_limited"},
+             "variants": {"paper-area": {
+                 "raw_proxy_tmax_c": 80.5,
+                 "anchored_frequency": {"state": "thermally_limited"},
+             }}},
         ]
         summary = summarize_variant("paper-area", records, anchor, 0.02)
         self.assertEqual(summary["sign_agreement_rate"], 1.0)
         self.assertEqual(summary["spearman"], 1.0)
         self.assertEqual(summary["proxy_selected"]["selection_regret_c"], 0.0)
         self.assertTrue(summary["thermal_frequency_term_active"])
+        self.assertEqual(summary["hotspot_frequency_states"], {
+            "thermally_limited": 2, "thermal_headroom": 1,
+        })
+        self.assertEqual(summary["anchored_proxy_frequency_states"], {
+            "thermally_limited": 3,
+        })
+        self.assertEqual(summary["frequency_state_agreement_rate"], 2 / 3)
 
     def test_pipeline_forwards_hotspot_materialization_contract(self):
         """Fixed-bin and paper-single runs must preserve identification inputs."""
@@ -1187,6 +1206,39 @@ Cache height x width (mm): 2 x 4
                 config["physical"][key] = value
                 with self.assertRaisesRegex(ValueError, label):
                     validate_config(config, "fixed-bin")
+
+    def test_proxy_diagnostic_preserves_hotspot_materialization_contract(self):
+        """A module-level proxy fit must not be replayed as grid-cell HotSpot."""
+        config = {
+            "physical": {
+                "grid_size": 64,
+                "utilization": 0.7,
+                "r_convec_k_per_w": 1.042,
+                "input_granularity": "module",
+                "compact_trace": True,
+                "ptrace_precision": 9,
+                "thermal_stack": {"local_resistance_scale": 1.0},
+            },
+            "frequency": {"ambient_c": 25.0},
+        }
+        sample = {
+            "model": "/tmp/modules.json", "model_label": "probe",
+            "tier": 1, "row": 0, "column": 0, "fx": 0.0, "fy": 0.0,
+            "layout": {"die_width_mm": 1.0, "modules": []},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            sample["case_dir"] = str(Path(temporary) / "case")
+            with patch("workflow.thermal.calibrate_proxy.materialize") as materialize_mock, \
+                    patch("workflow.thermal.calibrate_proxy.run_hotspot",
+                          return_value={"tmax_c": 100.0, "peak_unit": "t0"}):
+                result = run_one(sample, config, Path("/tmp/hotspot"), force=True)
+
+        self.assertEqual(result["tmax_c"], 100.0)
+        self.assertEqual(materialize_mock.call_args.kwargs, {
+            "input_granularity": "module",
+            "compact_trace": True,
+            "ptrace_precision": 9,
+        })
 
 
 class GridTests(unittest.TestCase):

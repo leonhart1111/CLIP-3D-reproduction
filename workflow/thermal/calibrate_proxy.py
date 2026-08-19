@@ -37,6 +37,34 @@ from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT, run_hotspot
 DEFAULT_CONFIG = PROJECT_ROOT / "configs/experiments/clip3d_constrained_5p0.json"
 
 
+def hotspot_materialization_options(physical: dict) -> dict:
+    """Return the HotSpot-input controls that define a calibration contract.
+
+    A fitted proxy is only transferable to a diagnostic if both calls use the
+    same module-vs-grid input representation and trace precision.  These
+    options used to be silently omitted by ``run_one``, reverting a 64x64
+    module-level calibration to the historical grid-cell default.
+    """
+    input_granularity = physical.get("input_granularity", "grid-cell")
+    if input_granularity not in ("grid-cell", "module"):
+        raise ValueError(
+            "physical.input_granularity must be grid-cell or module"
+        )
+    compact_trace = physical.get("compact_trace", False)
+    if type(compact_trace) is not bool:
+        raise ValueError("physical.compact_trace must be a boolean")
+    ptrace_precision = physical.get("ptrace_precision", 17)
+    if (not isinstance(ptrace_precision, int)
+            or isinstance(ptrace_precision, bool)
+            or ptrace_precision <= 0):
+        raise ValueError("physical.ptrace_precision must be a positive integer")
+    return {
+        "input_granularity": input_granularity,
+        "compact_trace": compact_trace,
+        "ptrace_precision": ptrace_precision,
+    }
+
+
 def parse_model(text: str) -> tuple[str, Path]:
     if "=" not in text:
         raise argparse.ArgumentTypeError("model must be LABEL=PATH")
@@ -211,6 +239,7 @@ def run_one(sample: dict, config: dict, hotspot: Path, force: bool) -> dict:
             int(physical["grid_size"]), float(physical["utilization"]),
             float(frequency["ambient_c"]), float(physical["r_convec_k_per_w"]),
             layout_path, physical.get("thermal_stack"),
+            **hotspot_materialization_options(physical),
         )
         write_json(metadata_path, signature)
         thermal = run_hotspot(case_dir, hotspot)
