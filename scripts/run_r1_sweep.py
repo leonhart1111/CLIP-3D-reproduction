@@ -22,9 +22,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from workflow.r1_protocol import (
     PROTOCOL_FAMILY,
+    SEMANTIC_SCOPE,
     canonical_protocol,
     protocol_id,
 )
+from workflow.common import parse_frequency_hz
 DEFAULT_EXPERIMENT = PROJECT_ROOT / "configs/experiments/r1_cache_sweep.json"
 DEFAULT_GEM5 = PROJECT_ROOT / "tools/src/gem5/build/X86/gem5.opt"
 DEFAULT_R1_CONFIG = PROJECT_ROOT / "configs/gem5/clip_r1.py"
@@ -38,18 +40,42 @@ class Job:
     l2_size: str
     profile: str
     family: str
-    warmup_insts: int
-    measure_insts: int
+    warmup_insts: int | None
+    measure_insts: int | None
     instruction_window_scope: str
     options: str | None
     protocol_id: str
     output_dir: Path
+    warmup_work_units: int | None = None
+    measure_work_units: int | None = None
+    work_unit_type: str | None = None
+    workload_binary_sha256: str | None = None
 
     @property
     def job_id(self):
         return (
             f"{self.workload}__l1d_{self.l1d_size}__l2_{self.l2_size}"
         )
+
+    @property
+    def protocol(self) -> dict:
+        value = {
+            "family": self.family,
+            "profile": self.profile,
+            "instruction_window_scope": self.instruction_window_scope,
+        }
+        if self.instruction_window_scope == SEMANTIC_SCOPE:
+            value.update({
+                "warmup_work_units": self.warmup_work_units,
+                "measure_work_units": self.measure_work_units,
+                "work_unit_type": self.work_unit_type,
+            })
+        else:
+            value.update({
+                "warmup_insts": self.warmup_insts,
+                "measure_insts": self.measure_insts,
+            })
+        return canonical_protocol(value)
 
 
 def parse_arguments():
@@ -108,7 +134,8 @@ def safe_component(value):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
-def make_jobs(args, experiment, r1_config_sha256, gem5_binary_sha256):
+def make_jobs(args, experiment, r1_config_sha256, gem5_binary_sha256,
+              workload_binary_sha256=None):
     workloads = select_values(
         args.workloads, experiment["workloads"], "workloads"
     )
@@ -126,21 +153,45 @@ def make_jobs(args, experiment, r1_config_sha256, gem5_binary_sha256):
         )
     profile = profiles[args.profile]
     options = profile.get("workload_options", {})
-    canonical = canonical_protocol({
-        "family": PROTOCOL_FAMILY,
-        "profile": args.profile,
-        "warmup_insts": profile["warmup_insts"],
-        "measure_insts": profile["measure_insts"],
-        "instruction_window_scope": profile.get(
-            "instruction_window_scope", "cpu0"
-        ),
-    })
+    scope = profile.get("instruction_window_scope", "cpu0")
+    semantic_units = profile.get("semantic_work_units", {})
+    workload_binary_sha256 = workload_binary_sha256 or {}
     root = args.output_root.resolve() / args.profile
 
     jobs = []
     for workload, l1d_size, l2_size in itertools.product(
         workloads, l1d_sizes, l2_sizes
     ):
+        protocol_value = {
+            "family": PROTOCOL_FAMILY,
+            "profile": args.profile,
+            "instruction_window_scope": scope,
+        }
+        if scope == SEMANTIC_SCOPE:
+            unit = semantic_units.get(workload)
+            if not isinstance(unit, dict):
+                raise ValueError(
+                    f"semantic profile lacks work-unit declaration for {workload}"
+                )
+            protocol_value.update({
+                "warmup_work_units": unit.get("warmup"),
+                "measure_work_units": unit.get("measure"),
+                "work_unit_type": unit.get("type"),
+            })
+            binary_digest = workload_binary_sha256.get(workload)
+            if (not isinstance(binary_digest, str) or len(binary_digest) != 64
+                    or any(character not in "0123456789abcdef"
+                           for character in binary_digest)):
+                raise ValueError(
+                    f"semantic profile requires a built, hashed {workload} binary"
+                )
+        else:
+            protocol_value.update({
+                "warmup_insts": profile.get("warmup_insts"),
+                "measure_insts": profile.get("measure_insts"),
+            })
+            binary_digest = None
+        canonical = canonical_protocol(protocol_value)
         output_dir = (
             root
             / safe_component(workload)
@@ -154,15 +205,20 @@ def make_jobs(args, experiment, r1_config_sha256, gem5_binary_sha256):
                 l2_size=l2_size,
                 profile=args.profile,
                 family=canonical["family"],
-                warmup_insts=int(profile["warmup_insts"]),
-                measure_insts=int(profile["measure_insts"]),
-                instruction_window_scope=profile.get("instruction_window_scope", "cpu0"),
+                warmup_insts=canonical.get("warmup_insts"),
+                measure_insts=canonical.get("measure_insts"),
+                warmup_work_units=canonical.get("warmup_work_units"),
+                measure_work_units=canonical.get("measure_work_units"),
+                work_unit_type=canonical.get("work_unit_type"),
+                instruction_window_scope=scope,
                 options=options.get(workload),
+                workload_binary_sha256=binary_digest,
                 protocol_id=protocol_id(
                     canonical,
                     workload_options=options.get(workload),
                     gem5_config_sha256=r1_config_sha256,
                     gem5_binary_sha256=gem5_binary_sha256,
+                    workload_binary_sha256=binary_digest,
                 ),
                 output_dir=output_dir,
             )
@@ -182,10 +238,6 @@ def command_for(job, args):
         job.l1d_size,
         "--l2-size",
         job.l2_size,
-        "--warmup-insts",
-        str(job.warmup_insts),
-        "--measure-insts",
-        str(job.measure_insts),
         "--instruction-window-scope",
         job.instruction_window_scope,
         "--r1-protocol-family",
@@ -195,6 +247,21 @@ def command_for(job, args):
         "--r1-protocol-id",
         job.protocol_id,
     ]
+    if job.instruction_window_scope == SEMANTIC_SCOPE:
+        command.extend((
+            "--warmup-work-units", str(job.warmup_work_units),
+            "--measure-work-units", str(job.measure_work_units),
+            "--work-unit-type", str(job.work_unit_type),
+        ))
+    else:
+        command.extend((
+            "--warmup-insts", str(job.warmup_insts),
+            "--measure-insts", str(job.measure_insts),
+        ))
+    if job.workload_binary_sha256 is not None:
+        command.extend((
+            "--workload-binary-sha256", job.workload_binary_sha256,
+        ))
     if job.options is not None:
         command.extend(("--options", job.options))
     return command
@@ -227,6 +294,44 @@ def is_reusable(existing, job) -> bool:
         and existing.get("state") == "success"
         and existing.get("r1_protocol_id") == job.protocol_id
     )
+
+
+def artifacts_reusable(existing, job) -> bool:
+    """Require semantic marker/binary evidence before accepting a cached R1."""
+    if not is_reusable(existing, job):
+        return False
+    stats_path = job.output_dir / "stats.txt"
+    if not stats_path.is_file():
+        return False
+    if job.instruction_window_scope != SEMANTIC_SCOPE:
+        return True
+    try:
+        statistics = extract_stats(stats_path)
+        if any(statistics[f"cpu{core}_insts"] <= 0 for core in range(4)):
+            return False
+        semantic_evidence(job.output_dir, job)
+        metadata_path = job.output_dir / "r1_metadata.json"
+        evidence_path = job.output_dir / "roi_events.json"
+        with metadata_path.open() as stream:
+            metadata = json.load(stream)
+        if (metadata.get("r1_protocol_id") != job.protocol_id
+                or canonical_protocol(metadata.get("r1_protocol", {})) != job.protocol
+                or metadata.get("binary_sha256") != job.workload_binary_sha256
+                or existing.get("stats_sha256") != hashlib.sha256(
+                    stats_path.read_bytes()).hexdigest()
+                or existing.get("r1_metadata_sha256") != hashlib.sha256(
+                    metadata_path.read_bytes()).hexdigest()
+                or existing.get("roi_events_sha256") != hashlib.sha256(
+                    evidence_path.read_bytes()).hexdigest()):
+            return False
+        binary = Path(metadata["binary"])
+        return (
+            binary.is_file()
+            and hashlib.sha256(binary.read_bytes()).hexdigest()
+            == job.workload_binary_sha256
+        )
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def parse_number(text):
@@ -266,16 +371,62 @@ def extract_stats(path):
     result["aggregate_ipc"] = (
         total_insts / wall_cycles if wall_cycles else None
     )
+    for name in ("simTicks", "simFreq"):
+        match = re.search(rf"^{name}\s+([0-9.eE+-]+)", text, re.M)
+        if match is None:
+            raise ValueError(f"missing {name} in {path}")
+        value = float(match.group(1))
+        if (not math.isfinite(value) or value <= 0
+                or not value.is_integer()):
+            raise ValueError(f"{name} must be a finite positive integer in {path}")
+        result[name] = int(value)
     return result
+
+
+def semantic_evidence(output_dir: Path, job: Job) -> dict:
+    """Require the two synchronized benchmark markers for a semantic ROI."""
+    path = output_dir / "roi_events.json"
+    if not path.is_file():
+        raise ValueError(f"semantic ROI lacks marker evidence: {path}")
+    with path.open() as stream:
+        evidence = json.load(stream)
+    if not isinstance(evidence, dict):
+        raise ValueError("semantic ROI evidence must contain an object")
+    expected = {
+        "scope": SEMANTIC_SCOPE,
+        "work_unit_type": job.work_unit_type,
+        "warmup_work_units": job.warmup_work_units,
+        "measure_work_units": job.measure_work_units,
+        "marker_work_id": 1,
+    }
+    for field, value in expected.items():
+        if evidence.get(field) != value:
+            raise ValueError(
+                f"semantic ROI evidence {field} differs: "
+                f"expected {value!r}, observed {evidence.get(field)!r}"
+            )
+    events = evidence.get("events")
+    if (not isinstance(events, list) or len(events) != 2
+            or not all(isinstance(event, dict) for event in events)
+            or [event.get("cause") for event in events]
+            != ["workbegin", "workend"]
+            or not all(event.get("work_id") == 1 for event in events)
+            or not all(isinstance(event.get("tick"), int)
+                       and not isinstance(event.get("tick"), bool)
+                       for event in events)
+            or events[1]["tick"] <= events[0]["tick"]):
+        raise ValueError("semantic ROI marker sequence is incomplete or unordered")
+    statistics = extract_stats(output_dir / "stats.txt")
+    completion_ticks = events[1]["tick"] - events[0]["tick"]
+    if (evidence.get("completion_ticks") != completion_ticks
+            or completion_ticks != statistics["simTicks"]):
+        raise ValueError("semantic marker ticks differ from measured stats simTicks")
+    return evidence
 
 
 def run_job(job, args):
     existing = read_status(job)
-    if (
-        not args.rerun
-        and is_reusable(existing, job)
-        and (job.output_dir / "stats.txt").is_file()
-    ):
+    if not args.rerun and artifacts_reusable(existing, job):
         print(f"[skip]  {job.job_id}", flush=True)
         return existing
 
@@ -285,13 +436,7 @@ def run_job(job, args):
         job.output_dir / "command.json",
         {
             "job": {**asdict(job), "output_dir": str(job.output_dir)},
-            "r1_protocol": {
-                "family": job.family,
-                "profile": job.profile,
-                "warmup_insts": job.warmup_insts,
-                "measure_insts": job.measure_insts,
-                "instruction_window_scope": job.instruction_window_scope,
-            },
+            "r1_protocol": job.protocol,
             "r1_protocol_id": job.protocol_id,
             "argv": command,
             "shell_command": shlex.join(command),
@@ -301,13 +446,7 @@ def run_job(job, args):
     running = {
         "state": "running",
         "job_id": job.job_id,
-        "r1_protocol": {
-            "family": job.family,
-            "profile": job.profile,
-            "warmup_insts": job.warmup_insts,
-            "measure_insts": job.measure_insts,
-            "instruction_window_scope": job.instruction_window_scope,
-        },
+        "r1_protocol": job.protocol,
         "r1_protocol_id": job.protocol_id,
         "started_unix": started,
         "command": command,
@@ -345,6 +484,8 @@ def run_job(job, args):
                          if statistics[f"cpu{core}_insts"] < job.measure_insts]
                 if short:
                     raise ValueError(f"cores below measurement target: {short}")
+            if job.instruction_window_scope == SEMANTIC_SCOPE:
+                semantic_evidence(job.output_dir, job)
             state = "success"
         else:
             error = f"gem5 exited with status {return_code}"
@@ -358,13 +499,7 @@ def run_job(job, args):
     status = {
         "state": state,
         "job_id": job.job_id,
-        "r1_protocol": {
-            "family": job.family,
-            "profile": job.profile,
-            "warmup_insts": job.warmup_insts,
-            "measure_insts": job.measure_insts,
-            "instruction_window_scope": job.instruction_window_scope,
-        },
+        "r1_protocol": job.protocol,
         "r1_protocol_id": job.protocol_id,
         "return_code": return_code,
         "started_unix": started,
@@ -374,7 +509,44 @@ def run_job(job, args):
         "stats_file": str(job.output_dir / "stats.txt"),
     }
     if state == "success":
-        status.update(extract_stats(job.output_dir / "stats.txt"))
+        statistics = extract_stats(job.output_dir / "stats.txt")
+        status.update({
+            "stats_sha256": hashlib.sha256(
+                (job.output_dir / "stats.txt").read_bytes()
+            ).hexdigest(),
+            "r1_metadata_sha256": hashlib.sha256(
+                (job.output_dir / "r1_metadata.json").read_bytes()
+            ).hexdigest(),
+        })
+        status.update(statistics)
+        if job.instruction_window_scope == SEMANTIC_SCOPE:
+            evidence = semantic_evidence(job.output_dir, job)
+            with (job.output_dir / "r1_metadata.json").open() as stream:
+                metadata = json.load(stream)
+            cpu_clock_hz = parse_frequency_hz(metadata["cpu_clock"])
+            completion_cycles = (
+                evidence["completion_ticks"] * cpu_clock_hz
+                / statistics["simFreq"]
+            )
+            status.update({
+                "work_unit_type": job.work_unit_type,
+                "warmup_work_units": job.warmup_work_units,
+                "measure_work_units": job.measure_work_units,
+                "completion_ticks": evidence["completion_ticks"],
+                "completion_cycles": completion_cycles,
+                "work_units_per_cycle": (
+                    job.measure_work_units / completion_cycles
+                ),
+                "instruction_vector": [
+                    statistics[f"cpu{core}_insts"] for core in range(4)
+                ],
+                "primary_performance_metric": "work_units_per_cycle",
+                "roi_events": str(job.output_dir / "roi_events.json"),
+                "roi_events_sha256": hashlib.sha256(
+                    (job.output_dir / "roi_events.json").read_bytes()
+                ).hexdigest(),
+                "workload_binary_sha256": job.workload_binary_sha256,
+            })
     atomic_json(job.output_dir / "status.json", status)
     print(
         f"[{state:7}] {job.job_id} ({status['elapsed_seconds']:.1f}s)",
@@ -415,6 +587,9 @@ def write_summary(jobs, root):
             "l2_size": job.l2_size,
             "profile": job.profile,
             "instruction_window_scope": job.instruction_window_scope,
+            "work_unit_type": job.work_unit_type,
+            "warmup_work_units": job.warmup_work_units,
+            "measure_work_units": job.measure_work_units,
             "state": status.get("state"),
             "return_code": status.get("return_code"),
             "elapsed_seconds": status.get("elapsed_seconds"),
@@ -425,6 +600,7 @@ def write_summary(jobs, root):
             "cpu0_insts", "cpu1_insts", "cpu2_insts", "cpu3_insts",
             "cpu0_ipc", "cpu1_ipc", "cpu2_ipc", "cpu3_ipc",
             "total_insts", "wall_cycles", "aggregate_ipc",
+            "completion_cycles", "work_units_per_cycle",
         ):
             row[key] = status.get(key)
         rows.append(row)
@@ -457,7 +633,18 @@ def main():
     gem5_binary_sha256 = hashlib.sha256(
         args.gem5.read_bytes()
     ).hexdigest()
-    jobs = make_jobs(args, experiment, r1_config_sha256, gem5_binary_sha256)
+    workload_hashes = {}
+    for workload in experiment["workloads"]:
+        binary = PROJECT_ROOT / "benchmarks/bin" / workload
+        if binary.is_file():
+            workload_hashes[workload] = hashlib.sha256(binary.read_bytes()).hexdigest()
+        elif args.execute and (
+                args.workloads is None or workload in args.workloads):
+            raise FileNotFoundError(f"workload binary not found: {binary}")
+    jobs = make_jobs(
+        args, experiment, r1_config_sha256, gem5_binary_sha256,
+        workload_hashes,
+    )
     root = write_plan(jobs, args, experiment)
     print(
         f"Planned {len(jobs)} jobs for profile '{args.profile}' in {root}",

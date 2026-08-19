@@ -1,0 +1,61 @@
+diff --git a/src/splash2/kernels/cholesky/src/solve.C b/src/splash2/kernels/cholesky/src/solve.C
+--- a/src/splash2/kernels/cholesky/src/solve.C
++++ b/src/splash2/kernels/cholesky/src/solve.C
+@@ -34,6 +34,7 @@
+ MAIN_ENV
+ 
+ #include <math.h>
++#include "clip_roi.h"
+ #include "matrix.h"
+ 
+ #define SH_MEM_AMT   100000000
+@@ -104,6 +105,7 @@
+   extern int *block_start, *all_blocks;
+   unsigned long start;
+   double mint, maxt, avgt;
++  clip_roi_state_t clip_roi;
+ 
+   CLOCK(start)
+ 
+@@ -136,6 +138,8 @@
+     }
+   }
+ 
++  clip_roi_configure(&clip_roi, iters, "numeric-factorization");
++
+   CS = CacheSize / 8.0;
+   CS = sqrt(CS);
+   BS = (int) floor(CS+0.5);
+@@ -265,6 +269,7 @@
+ 
+   PreAllocate1FO(0);
+   for (i=0; i<iters; i++) {
++    clip_roi_boundary(&clip_roi, i);
+     if (i > 0)
+       RestoreNumericState();
+     gp->pid = 0;
+diff --git a/src/splash2/kernels/cholesky/src/makefile b/src/splash2/kernels/cholesky/src/makefile
+--- a/src/splash2/kernels/cholesky/src/makefile
++++ b/src/splash2/kernels/cholesky/src/makefile
+@@ -2,6 +2,10 @@
+ OBJS = amal.o assign.o bfac.o bksolve.o block2.o fo.o mf.o numLL.o \
+      parts.o seg.o solve.o tree.o util.o malloc.o 
+ LDFLAGS += -lpthread -lm
++ROI_OBJECTS = $(if $(CLIP_ROI_DIR),$(CLIP_ROI_DIR)/clip_roi.o $(CLIP_ROI_DIR)/m5op.o)
++ifneq ($(CLIP_ROI_DIR),)
++  CFLAGS += -I$(CLIP_ROI_DIR)
++endif
+ MACROS = ../../../null_macros/c.m4.null.pthread
+ 
+ x = *
+@@ -13,8 +17,8 @@
+   endif
+ endif
+ 
+-$(TARGET): $(OBJS)
+-	$(CC) $(OBJS) $(CFLAGS) -o $(TARGET) $(LDFLAGS)
++$(TARGET): $(OBJS) $(ROI_OBJECTS)
++	$(CC) $(OBJS) $(ROI_OBJECTS) $(CFLAGS) -o $(TARGET) $(LDFLAGS)
+ 
+ install:
+ 	mkdir -p $(PREFIX)/bin

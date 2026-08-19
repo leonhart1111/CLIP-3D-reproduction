@@ -364,7 +364,8 @@ python -m unittest discover -s tests -v
 - 公式(14)-(15)未公开的 `alpha`、`beta`、跨层权重和 `lambda_wire` 数值；
 - 将拓扑罚时放在 gem5 xbar `forward_latency` 的具体反标方法。
 - Cool3D-standard 与 SA+λ 的论文实现和搜索参数未公开，本项目提供确定性、完整留痕的独立对照复现；
-- 当前正在运行的正式 R1 使用 CPU0 指令停止锚点；另提供独立的 `paper_all_cores` 协议，但两种口径不能混合。
+- 历史 R1 使用 CPU0 或 all-core 指令停止锚点；新的正式比较使用独立的 `semantic-work` 同步 work-unit ROI。三种口径不能混合，旧 100/200 点不得补入新协议结果。
+- `semantic-work` 的主性能量是 marker 间固定工作吞吐率；只有 fixed/CLIP 逐核动态指令向量完全相同时，IPC/BIPS 才能作为 same-trace 比较量。
 
 这些假设全部写入配置或每点 JSON。论文明确给出的 45 nm、核心数、频率、关联度、网格、利用率、硅厚、温度限制、冷却热阻和 TSV 周期则单独标为 paper parameters。
 

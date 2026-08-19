@@ -33,6 +33,25 @@ def format_temperature_csv_row(record: dict) -> dict:
     }
 
 
+def parse_frequency_hz(value: str) -> float:
+    """Parse the explicit frequency forms used by the gem5 workflow."""
+    if not isinstance(value, str):
+        raise ValueError("frequency must be a string")
+    match = re.fullmatch(
+        r"\s*([0-9]+(?:\.[0-9]+)?)\s*(Hz|kHz|MHz|GHz|THz)\s*", value
+    )
+    if match is None:
+        raise ValueError(f"unsupported frequency: {value!r}")
+    scale = {
+        "Hz": 1.0,
+        "kHz": 1.0e3,
+        "MHz": 1.0e6,
+        "GHz": 1.0e9,
+        "THz": 1.0e12,
+    }[match.group(2)]
+    return float(match.group(1)) * scale
+
+
 def read_json(path: Path | str) -> Any:
     with Path(path).open(encoding="utf-8") as stream:
         return json.load(stream)

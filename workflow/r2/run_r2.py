@@ -13,11 +13,13 @@ from pathlib import Path
 from workflow.common import (
     PROJECT_ROOT,
     aggregate_ipc,
+    parse_frequency_hz,
     parse_gem5_stats,
     read_json,
     sha256_file,
     write_json,
 )
+from workflow.r1_protocol import SEMANTIC_SCOPE, canonical_protocol
 
 
 DEFAULT_GEM5 = PROJECT_ROOT / "tools/src/gem5/build/X86/gem5.opt"
@@ -82,6 +84,42 @@ def strict_latency_vectors_equal(left: dict, right: dict) -> bool:
                for key in GEM5_OVERRIDE_KEYS)
 
 
+def _semantic_contract(metadata: dict) -> None:
+    """Require the live fixed-work identity consumed by a semantic R2."""
+    for field in ("warmup_work_units", "measure_work_units"):
+        value = metadata.get(field)
+        if (not isinstance(value, int) or isinstance(value, bool) or value <= 0):
+            raise ValueError(f"semantic R2 metadata requires positive {field}")
+    unit_type = metadata.get("work_unit_type")
+    if not isinstance(unit_type, str) or not unit_type.strip():
+        raise ValueError("semantic R2 metadata requires work_unit_type")
+    binary = metadata.get("binary")
+    if not isinstance(binary, str) or not binary:
+        raise ValueError("semantic R2 metadata requires binary")
+    binary_path = Path(binary)
+    if not binary_path.is_file():
+        raise ValueError("semantic R2 workload binary does not exist")
+    binary_sha256 = metadata.get("binary_sha256")
+    if (not isinstance(binary_sha256, str) or len(binary_sha256) != 64
+            or any(character not in "0123456789abcdef"
+                   for character in binary_sha256)):
+        raise ValueError("semantic R2 metadata requires binary_sha256")
+    if sha256_file(binary_path) != binary_sha256:
+        raise ValueError("semantic R2 workload binary differs from binary_sha256")
+    try:
+        protocol = canonical_protocol(metadata.get("r1_protocol", {}))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"semantic R2 metadata has invalid r1_protocol: {error}") from error
+    for field in (
+            "instruction_window_scope", "warmup_work_units",
+            "measure_work_units", "work_unit_type"):
+        if protocol.get(field) != metadata.get(field):
+            raise ValueError(f"semantic R2 r1_protocol differs for {field}")
+    identity = metadata.get("r1_protocol_id")
+    if not isinstance(identity, str) or not identity:
+        raise ValueError("semantic R2 metadata requires r1_protocol_id")
+
+
 def _command_tail(metadata: dict, vector: dict,
                   scope: str | None = None) -> list[str]:
     scope = scope or metadata.get("instruction_window_scope", "cpu0")
@@ -89,12 +127,41 @@ def _command_tail(metadata: dict, vector: dict,
     gem5_args = canonical_gem5_args(overrides)
     tail = [
         "--stage", "R2", "--workload", metadata["workload"],
-        "--l1i-size", metadata["l1i_size"], "--l1d-size", metadata["l1d_size"],
-        "--l2-size", metadata["l2_size"], "--warmup-insts",
-        str(metadata["warmup_insts_cpu0"]), "--measure-insts",
-        str(metadata["measure_insts_cpu0"]), "--instruction-window-scope", scope,
-        *gem5_args,
     ]
+    if scope == SEMANTIC_SCOPE:
+        _semantic_contract(metadata)
+        tail.extend(("--binary", metadata["binary"]))
+    tail.extend((
+        "--l1i-size", metadata["l1i_size"], "--l1d-size", metadata["l1d_size"],
+        "--l2-size", metadata["l2_size"],
+    ))
+    if scope == SEMANTIC_SCOPE:
+        tail.extend((
+            "--warmup-work-units", str(metadata["warmup_work_units"]),
+            "--measure-work-units", str(metadata["measure_work_units"]),
+            "--work-unit-type", metadata["work_unit_type"],
+        ))
+    else:
+        tail.extend((
+            "--warmup-insts", str(metadata["warmup_insts_cpu0"]),
+            "--measure-insts", str(metadata["measure_insts_cpu0"]),
+        ))
+    tail.extend(("--instruction-window-scope", scope, *gem5_args))
+    if scope == SEMANTIC_SCOPE:
+        tail.extend(("--workload-binary-sha256", metadata["binary_sha256"]))
+        protocol = metadata.get("r1_protocol")
+        if not isinstance(protocol, dict):
+            raise ValueError("semantic R2 metadata requires r1_protocol")
+        if not protocol.get("family") or not protocol.get("profile"):
+            raise ValueError("semantic R2 protocol requires family and profile")
+        tail.extend((
+            "--r1-protocol-family", protocol["family"],
+            "--r1-profile", protocol["profile"],
+        ))
+        protocol_identity = metadata.get("r1_protocol_id")
+        if not isinstance(protocol_identity, str) or not protocol_identity:
+            raise ValueError("semantic R2 metadata requires r1_protocol_id")
+        tail.extend(("--r1-protocol-id", protocol_identity))
     options = metadata.get("command", [])[1:]
     if options:
         tail.extend(("--options", " ".join(options)))
@@ -107,16 +174,31 @@ def _provenance(r1_dir: Path, latency_path: Path,
                 scope: str | None = None) -> dict:
     metadata = read_json(r1_dir / "r1_metadata.json")
     effective_scope = scope or metadata.get("instruction_window_scope", "cpu0")
-    return {
+    provenance = {
         "r1_directory": str(r1_dir.resolve()),
         "r1_metadata_sha256": sha256_file(r1_dir / "r1_metadata.json"),
         "r1_stats_sha256": sha256_file(r1_dir / "stats.txt"),
         "latency_vector": str(latency_path.resolve()),
         "latency_sha256": sha256_file(latency_path),
         "instruction_window_scope": effective_scope,
-        "warmup_insts_cpu0": metadata["warmup_insts_cpu0"],
-        "measure_insts_cpu0": metadata["measure_insts_cpu0"],
     }
+    if effective_scope == SEMANTIC_SCOPE:
+        _semantic_contract(metadata)
+        roi_path = r1_dir / "roi_events.json"
+        provenance.update({
+            "r1_protocol_id": metadata["r1_protocol_id"],
+            "workload_binary_sha256": metadata["binary_sha256"],
+            "warmup_work_units": metadata["warmup_work_units"],
+            "measure_work_units": metadata["measure_work_units"],
+            "work_unit_type": metadata["work_unit_type"],
+            "r1_roi_events_sha256": sha256_file(roi_path),
+        })
+    else:
+        provenance.update({
+            "warmup_insts_cpu0": metadata["warmup_insts_cpu0"],
+            "measure_insts_cpu0": metadata["measure_insts_cpu0"],
+        })
+    return provenance
 
 
 def _validated_measurement(stats: dict[str, float], metadata: dict,
@@ -151,6 +233,69 @@ def _validated_measurement(stats: dict[str, float], metadata: dict,
     return per_core, aggregate_ipc(stats, cores)
 
 
+def _semantic_metrics(stats: dict[str, float], metadata: dict,
+                      output_dir: Path) -> dict:
+    """Validate marker evidence and derive global fixed-work completion rate."""
+    evidence_path = output_dir / "roi_events.json"
+    evidence = read_json(evidence_path)
+    if not isinstance(evidence, dict):
+        raise ValueError("R2 semantic marker evidence must contain an object")
+    for field in ("warmup_work_units", "measure_work_units"):
+        value = metadata.get(field)
+        if (not isinstance(value, int) or isinstance(value, bool) or value <= 0):
+            raise ValueError(f"R2 semantic metadata {field} must be positive")
+    if (not isinstance(metadata.get("work_unit_type"), str)
+            or not metadata["work_unit_type"].strip()):
+        raise ValueError("R2 semantic metadata work_unit_type is invalid")
+    expected = {
+        "scope": SEMANTIC_SCOPE,
+        "work_unit_type": metadata["work_unit_type"],
+        "warmup_work_units": metadata["warmup_work_units"],
+        "measure_work_units": metadata["measure_work_units"],
+        "marker_work_id": 1,
+    }
+    for field, wanted in expected.items():
+        if evidence.get(field) != wanted:
+            raise ValueError(f"R2 semantic marker evidence differs for {field}")
+    events = evidence.get("events")
+    if (not isinstance(events, list) or len(events) != 2
+            or not all(isinstance(event, dict) for event in events)
+            or [event.get("cause") for event in events]
+            != ["workbegin", "workend"]
+            or not all(event.get("work_id") == 1 for event in events)
+            or not all(isinstance(event.get("tick"), int)
+                       and not isinstance(event.get("tick"), bool)
+                       for event in events)
+            or events[1]["tick"] <= events[0]["tick"]):
+        raise ValueError("R2 semantic marker sequence is incomplete or unordered")
+    completion_ticks = events[1]["tick"] - events[0]["tick"]
+    if evidence.get("completion_ticks") != completion_ticks:
+        raise ValueError("R2 semantic completion_ticks differs from marker ticks")
+    for name in ("simTicks", "simFreq"):
+        value = stats.get(name)
+        if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not math.isfinite(value) or value <= 0
+                or not float(value).is_integer()):
+            raise ValueError(f"R2 {name} must be a finite positive integer")
+    if completion_ticks != int(stats["simTicks"]):
+        raise ValueError("R2 semantic marker ticks differ from stats simTicks")
+    completion_cycles = (
+        completion_ticks * parse_frequency_hz(metadata["cpu_clock"])
+        / int(stats["simFreq"])
+    )
+    measure_units = int(metadata["measure_work_units"])
+    return {
+        "primary_performance_metric": "work_units_per_cycle",
+        "work_unit_type": metadata["work_unit_type"],
+        "measure_work_units": measure_units,
+        "completion_ticks": completion_ticks,
+        "completion_cycles": completion_cycles,
+        "work_units_per_cycle": measure_units / completion_cycles,
+        "roi_events": str(evidence_path.resolve()),
+        "roi_events_sha256": sha256_file(evidence_path),
+    }
+
+
 def _stats_snapshot(path: Path) -> tuple[dict[str, float], str]:
     """Parse and hash the same captured gem5 statistics bytes."""
     data = Path(path).read_bytes()
@@ -173,7 +318,8 @@ def _stats_snapshot(path: Path) -> tuple[dict[str, float], str]:
 
 
 def _validate_measurement(result: dict, status: dict, metadata: dict,
-                          output_dir: Path, reasons: list[str]) -> None:
+                          output_dir: Path, reasons: list[str],
+                          scope: str | None = None) -> None:
     """Bind recorded IPC/per-core values to the measured R2 stats file."""
     stats_path = output_dir / "stats.txt"
     if not stats_path.is_file():
@@ -193,7 +339,10 @@ def _validate_measurement(result: dict, status: dict, metadata: dict,
             reasons.append(f"R2 {label} stats_sha256 does not match cached stats")
 
     try:
-        measured_per_core, measured_ipc = _validated_measurement(stats, metadata)
+        effective_scope = scope or metadata.get("instruction_window_scope", "cpu0")
+        measured_per_core, measured_ipc = _validated_measurement(
+            stats, metadata, effective_scope
+        )
     except (KeyError, TypeError, ValueError) as error:
         reasons.append(f"cannot validate R2 stats: {error}")
         return
@@ -229,10 +378,29 @@ def _validate_measurement(result: dict, status: dict, metadata: dict,
         reasons.append("R2 result IPC2 differs from cached stats")
     if status.get("ipc2") != result.get("ipc2"):
         reasons.append("R2 status IPC2 differs from cached result")
+    if effective_scope == SEMANTIC_SCOPE:
+        instruction_vector = [
+            measured["instructions"] for measured in measured_per_core
+        ]
+        if result.get("instruction_vector") != instruction_vector:
+            reasons.append(
+                "R2 result instruction vector differs from cached stats"
+            )
+        try:
+            semantic = _semantic_metrics(stats, metadata, output_dir)
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            reasons.append(f"cannot validate R2 semantic metrics: {error}")
+            return
+        for field, wanted in semantic.items():
+            if isinstance(result.get(field), bool) or result.get(field) != wanted:
+                reasons.append(f"R2 result {field} differs from semantic evidence")
+            if isinstance(status.get(field), bool) or status.get(field) != wanted:
+                reasons.append(f"R2 status {field} differs from semantic evidence")
 
 
 def _validate_command(result: dict, status: dict, metadata: dict, vector: dict,
-                      output_dir: Path, reasons: list[str]) -> None:
+                      output_dir: Path, reasons: list[str],
+                      scope: str | None = None) -> None:
     result_command = result.get("command")
     status_command = status.get("command")
     if status.get("return_code") != 0:
@@ -244,7 +412,7 @@ def _validate_command(result: dict, status: dict, metadata: dict, vector: dict,
     if status_command != result_command:
         reasons.append("R2 status command differs from cached result command")
     try:
-        expected_tail = _command_tail(metadata, vector)
+        expected_tail = _command_tail(metadata, vector, scope)
     except (KeyError, TypeError, ValueError) as error:
         reasons.append(f"cannot establish canonical R2 command: {error}")
         return
@@ -259,7 +427,8 @@ def _validate_command(result: dict, status: dict, metadata: dict, vector: dict,
         reasons.append("R2 command does not match canonical metadata and latency arguments")
 
 
-def validate_local_result(r1_dir: Path, latency_path: Path, output_dir: Path) -> dict:
+def validate_local_result(r1_dir: Path, latency_path: Path, output_dir: Path,
+                          instruction_window_scope: str | None = None) -> dict:
     """Decide whether an existing successful R2 is exactly reusable in place."""
     r1_dir = Path(r1_dir).resolve()
     latency_path = Path(latency_path).resolve()
@@ -296,7 +465,9 @@ def validate_local_result(r1_dir: Path, latency_path: Path, output_dir: Path) ->
     try:
         metadata = read_json(r1_dir / "r1_metadata.json")
         vector = read_json(latency_path)
-        expected = _provenance(r1_dir, latency_path)
+        expected = _provenance(
+            r1_dir, latency_path, instruction_window_scope
+        )
     except (KeyError, OSError, ValueError) as error:
         reasons.append(f"cannot establish requested R2 provenance: {error}")
         expected = {}
@@ -321,8 +492,14 @@ def validate_local_result(r1_dir: Path, latency_path: Path, output_dir: Path) ->
         if status.get("r2_result_sha256") != result_sha256:
             reasons.append("R2 status r2_result_sha256 does not match the cached result")
     if "metadata" in locals() and "vector" in locals():
-        _validate_command(result, status, metadata, vector, output_dir, reasons)
-        _validate_measurement(result, status, metadata, output_dir, reasons)
+        _validate_command(
+            result, status, metadata, vector, output_dir, reasons,
+            instruction_window_scope,
+        )
+        _validate_measurement(
+            result, status, metadata, output_dir, reasons,
+            instruction_window_scope,
+        )
     return {
         "accepted": not reasons,
         "reasons": reasons,
@@ -337,9 +514,10 @@ def run(r1_dir: Path, latency_path: Path, output_dir: Path,
         gem5: Path = DEFAULT_GEM5, config: Path = DEFAULT_CONFIG,
         rerun: bool = False,
         instruction_window_scope: str | None = None) -> dict:
-    if instruction_window_scope not in (None, "cpu0", "all-cores"):
+    if instruction_window_scope not in (None, "cpu0", "all-cores", SEMANTIC_SCOPE):
         raise ValueError(
-            "instruction_window_scope must be cpu0, all-cores, or None"
+            "instruction_window_scope must be cpu0, all-cores, "
+            "semantic-work, or None"
         )
     result_path = output_dir / "r2_result.json"
     status_path = output_dir / "status.json"
@@ -347,7 +525,9 @@ def run(r1_dir: Path, latency_path: Path, output_dir: Path,
     if not rerun and status_path.is_file():
         status_declares_success = read_json(status_path).get("state") == "success"
     if not rerun and (result_path.is_file() or status_declares_success):
-        decision = validate_local_result(r1_dir, latency_path, output_dir)
+        decision = validate_local_result(
+            r1_dir, latency_path, output_dir, instruction_window_scope
+        )
         if decision["accepted"]:
             return decision["result"]
         details = "; ".join(decision["reasons"])
@@ -394,13 +574,19 @@ def run(r1_dir: Path, latency_path: Path, output_dir: Path,
             raise ValueError("gem5 R2 completed without producing fresh stats")
         stats, stats_sha256 = _stats_snapshot(stats_path)
         per_core, ipc2 = _validated_measurement(stats, metadata, effective_scope)
+        semantic = (
+            _semantic_metrics(stats, metadata, output_dir)
+            if effective_scope == SEMANTIC_SCOPE else {}
+        )
         if sha256_file(stats_path) != stats_sha256:
             raise ValueError("R2 stats changed during validation")
         result = {
             "schema_version": 3, "command": command, **provenance,
             "ipc2": ipc2, "per_core": per_core,
+            "instruction_vector": [item["instructions"] for item in per_core],
             "stats": str(stats_path), "stats_sha256": stats_sha256,
             "elapsed_seconds": time.time() - started,
+            **semantic,
         }
         write_json(result_path, result)
         if sha256_file(stats_path) != stats_sha256:
@@ -413,6 +599,7 @@ def run(r1_dir: Path, latency_path: Path, output_dir: Path,
             "command": command,
             "r2_result": str(result_path.resolve()),
             "r2_result_sha256": sha256_file(result_path),
+            **semantic,
             **provenance,
         })
         return result
@@ -435,7 +622,8 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--rerun", action="store_true")
     parser.add_argument(
-        "--instruction-window-scope", choices=("cpu0", "all-cores"),
+        "--instruction-window-scope",
+        choices=("cpu0", "all-cores", SEMANTIC_SCOPE),
         default=None,
         help="override the R1-recorded measurement anchor (cpu0 = same instruction stream)",
     )

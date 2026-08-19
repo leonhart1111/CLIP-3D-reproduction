@@ -24,6 +24,7 @@ from workflow.experiments.balanced50 import (
 )
 from workflow.r1_catalog import ArchitectureKey
 from workflow.r2 import attach_result, reuse_result, run_r2
+from workflow.r2.semantic_comparison import compare_semantic_results
 from workflow.r2.attachment_validation import exclusive_point_lock
 
 
@@ -231,7 +232,20 @@ def _summary_metrics(point: Path, result: dict, label: str,
         raise ValueError(f"{label} summary lacks finite positive IPC2/BIPS2")
     if not _same_number(ipc2, result.get("ipc2")):
         raise ValueError(f"{label} summary IPC2 differs from validated R2 result")
-    return {"ipc2": float(ipc2), "bips2": float(bips2)}
+    metrics = {"ipc2": float(ipc2), "bips2": float(bips2)}
+    if result.get("instruction_window_scope") == "semantic-work":
+        rate = summary.get("work_units_per_cycle")
+        score = summary.get("work_units_per_ns")
+        if (not _finite_positive(rate) or not _finite_positive(score)
+                or not _same_number(rate, result.get("work_units_per_cycle"))):
+            raise ValueError(
+                f"{label} summary lacks validated semantic fixed-work metrics"
+            )
+        metrics.update({
+            "work_units_per_cycle": float(rate),
+            "work_units_per_ns": float(score),
+        })
+    return metrics
 
 
 def _identity(record: dict, key: ArchitectureKey, paths: dict[str, Path],
@@ -555,6 +569,10 @@ def _run_pair_locked(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
             "fixed_complete": True,
             "fixed_ipc2": fixed_metrics["ipc2"],
             "fixed_bips2": fixed_metrics["bips2"],
+            "fixed_work_units_per_cycle": fixed_metrics.get(
+                "work_units_per_cycle"
+            ),
+            "fixed_work_units_per_ns": fixed_metrics.get("work_units_per_ns"),
             "fixed_r2_result": str(
                 (paths["fixed"] / "gem5_r2/r2_result.json").resolve()
             ),
@@ -622,6 +640,16 @@ def _run_pair_locked(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
             clip_result, clip_metrics = clip_validated
             clip_artifact = paths["clip"] / "gem5_r2/r2_result.json"
 
+        semantic_comparison = None
+        if fixed_result.get("instruction_window_scope") == "semantic-work":
+            fixed_summary = read_json(paths["fixed"] / "pipeline_summary.json")
+            clip_summary = read_json(paths["clip"] / "pipeline_summary.json")
+            semantic_comparison = compare_semantic_results(
+                fixed_result, clip_result,
+                fixed_summary["sustainable_frequency_ghz"],
+                clip_summary["sustainable_frequency_ghz"],
+            )
+
         record.update({
             "state": "success",
             "phase": "complete",
@@ -631,6 +659,14 @@ def _run_pair_locked(key: ArchitectureKey, r1_root: Path, fixed_root: Path,
             "physical_r2_runs": 1 if reused else 2,
             "clip3d_ipc2": clip_metrics["ipc2"],
             "clip3d_bips2": clip_metrics["bips2"],
+            "clip3d_work_units_per_cycle": clip_metrics.get(
+                "work_units_per_cycle"
+            ),
+            "clip3d_work_units_per_ns": clip_metrics.get("work_units_per_ns"),
+            "semantic_comparison": semantic_comparison,
+            "primary_performance_metric": (
+                "work_units_per_ns" if semantic_comparison is not None else "bips2"
+            ),
             "clip3d_r2_artifact": str(clip_artifact.resolve()),
             "artifacts": {
                 "fixed_summary": str(

@@ -285,8 +285,14 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
         reasons.append("CLIP pipeline summary layout method is not clip3d")
 
     if metadata is not None and source_result is not None:
-        for field in (
-                "instruction_window_scope", "warmup_insts_cpu0", "measure_insts_cpu0"):
+        fields = ["instruction_window_scope"]
+        if metadata.get("instruction_window_scope") == "semantic-work":
+            fields.extend((
+                "warmup_work_units", "measure_work_units", "work_unit_type",
+            ))
+        else:
+            fields.extend(("warmup_insts_cpu0", "measure_insts_cpu0"))
+        for field in fields:
             expected = metadata.get(
                 field, "cpu0" if field == "instruction_window_scope" else None
             )
@@ -311,6 +317,10 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
         validate_physical_coherence(
             metadata, config, target_modules, target_thermal,
             target_performance, clip_summary, r1_dir, clip_point, reasons,
+            expected_work_units_per_cycle=(
+                source_result.get("work_units_per_cycle")
+                if source_result is not None else None
+            ),
             r1_stats_bytes=snapshots[r1_stats_path]["bytes"],
             thermal_steady_bytes=target_steady["bytes"],
             thermal_manifest=target_manifest,
@@ -387,6 +397,7 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
             "sha256": _snapshot_sha256(snapshots, source_stats_path),
         },
         "source_ipc2": source_result["ipc2"],
+        "source_work_units_per_cycle": source_result.get("work_units_per_cycle"),
         "canonical_architecture_key": canonical_key,
         "r1": {
             "directory": str(r1_dir),
@@ -397,8 +408,14 @@ def _validate_reuse(fixed_point: Path, clip_point: Path, r1_dir: Path,
             "instruction_window_scope": metadata.get(
                 "instruction_window_scope", "cpu0"
             ),
-            "warmup_insts_cpu0": metadata["warmup_insts_cpu0"],
-            "measure_insts_cpu0": metadata["measure_insts_cpu0"],
+            **({
+                "warmup_work_units": metadata["warmup_work_units"],
+                "measure_work_units": metadata["measure_work_units"],
+                "work_unit_type": metadata["work_unit_type"],
+            } if metadata.get("instruction_window_scope") == "semantic-work" else {
+                "warmup_insts_cpu0": metadata["warmup_insts_cpu0"],
+                "measure_insts_cpu0": metadata["measure_insts_cpu0"],
+            }),
         },
         "config": {
             "path": str(config_path),
@@ -512,6 +529,7 @@ def _attach_reused_result_locked(fixed_point: Path, clip_point: Path, r1_dir: Pa
                 frequency["tsafe_c"],
                 frequency["ambient_c"],
                 ipc2,
+                artifact.get("source_work_units_per_cycle"),
             )
             performance_sha256 = hashlib.sha256(
                 staged_performance.read_bytes()
@@ -528,6 +546,11 @@ def _attach_reused_result_locked(fixed_point: Path, clip_point: Path, r1_dir: Pa
                 "bips1_thermal": performance["bips1_thermal"],
                 "ipc2": ipc2,
                 "bips2": performance["bips2"],
+                "primary_performance_metric": performance.get(
+                    "primary_performance_metric", "bips2"
+                ),
+                "work_units_per_cycle": performance.get("work_units_per_cycle"),
+                "work_units_per_ns": performance.get("work_units_per_ns"),
                 "r2_source": str(source_result_path),
                 "r2_reused": True,
                 "r2_reuse_artifact": str(artifact_path),

@@ -25,7 +25,9 @@ from workflow.thermal.sustainable_frequency import derive
 
 
 _NO_R2 = object()
-_SUPPORTED_INSTRUCTION_WINDOW_SCOPES = frozenset({"cpu0", "all-cores"})
+_SUPPORTED_INSTRUCTION_WINDOW_SCOPES = frozenset({
+    "cpu0", "all-cores", "semantic-work",
+})
 
 
 def native_cache_identity(modules: dict) -> dict:
@@ -135,6 +137,7 @@ def validate_physical_coherence(
         metadata: dict, config: dict, modules: dict, thermal: dict,
         performance: dict, summary: dict, r1_dir: Path, point_dir: Path,
         reasons: list[str], expected_ipc2: object = _NO_R2, *,
+        expected_work_units_per_cycle: object = _NO_R2,
         r1_stats_bytes: bytes | None = None,
         thermal_steady_bytes: bytes | None = None,
         thermal_manifest: dict | None = None) -> dict | None:
@@ -149,9 +152,16 @@ def validate_physical_coherence(
     if not isinstance(architecture, dict):
         reasons.append("target modules architecture is missing")
     else:
-        for field in (
-                "workload", "l1i_size", "l1d_size", "l2_size", "num_cores",
-                "warmup_insts_cpu0", "measure_insts_cpu0"):
+        identity_fields = [
+            "workload", "l1i_size", "l1d_size", "l2_size", "num_cores",
+        ]
+        if instruction_window_scope(metadata) == "semantic-work":
+            identity_fields.extend((
+                "warmup_work_units", "measure_work_units", "work_unit_type",
+            ))
+        else:
+            identity_fields.extend(("warmup_insts_cpu0", "measure_insts_cpu0"))
+        for field in identity_fields:
             expected = metadata.get(field)
             if architecture.get(field) != expected:
                 reasons.append(
@@ -301,9 +311,17 @@ def validate_physical_coherence(
 
     try:
         ipc2 = None if expected_ipc2 is _NO_R2 else expected_ipc2
+        has_work_rate = (
+            expected_work_units_per_cycle is not _NO_R2
+            and expected_work_units_per_cycle is not None
+        )
+        work_rate = (
+            None if not has_work_rate
+            else expected_work_units_per_cycle
+        )
         expected_performance = derive(
             modules, thermal, frequency["f0_ghz"], frequency["fmin_ghz"],
-            frequency["tsafe_c"], frequency["ambient_c"], ipc2,
+            frequency["tsafe_c"], frequency["ambient_c"], ipc2, work_rate,
         )
     except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
         reasons.append(f"cannot derive target thermal performance: {error}")
@@ -331,6 +349,15 @@ def validate_physical_coherence(
              "target summary ipc2 differs from target performance"),
             ("bips2", "bips2",
              "target summary bips2 differs from target performance"),
+        )
+    if has_work_rate:
+        summary_fields += (
+            ("primary_performance_metric", "primary_performance_metric",
+             "target summary primary metric differs from target performance"),
+            ("work_units_per_cycle", "work_units_per_cycle",
+             "target summary work-unit rate differs from target performance"),
+            ("work_units_per_ns", "work_units_per_ns",
+             "target summary frequency-scaled work rate differs from target performance"),
         )
     for summary_field, performance_field, message in summary_fields:
         if not _matches_expected(

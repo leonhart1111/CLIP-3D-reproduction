@@ -10,6 +10,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "../../semantic_roi/clip_roi.h"
+
 #define DEFAULT_SIZE 1024U
 #define DEFAULT_REPEATS 1U
 #define DEFAULT_THREADS 4U
@@ -23,6 +25,8 @@ typedef struct {
     const double *b;
     double *c;
     double guard;
+    pthread_barrier_t *unit_barrier;
+    const clip_roi_state_t *roi;
 } worker_arg_t;
 
 static void usage(const char *program)
@@ -63,21 +67,46 @@ static void *multiply_rows(void *opaque)
     worker_arg_t *arg = (worker_arg_t *)opaque;
     const size_t row_begin = arg->n * arg->tid / arg->threads;
     const size_t row_end = arg->n * (arg->tid + 1) / arg->threads;
+    const size_t units_per_repeat = arg->n / arg->threads;
     size_t repeat;
 
     for (repeat = 0; repeat < arg->repeats; ++repeat) {
-        size_t i;
+        size_t row_offset;
 
-        for (i = row_begin; i < row_end; ++i) {
+        for (row_offset = 0; row_offset < units_per_repeat; ++row_offset) {
+            const size_t work_unit = repeat * units_per_repeat + row_offset;
+            const size_t i = row_begin + row_offset;
             double *c_row = &arg->c[i * arg->n];
             size_t k;
 
+            pthread_barrier_wait(arg->unit_barrier);
+            if (arg->tid == 0) {
+                clip_roi_boundary(arg->roi, work_unit);
+            }
+            pthread_barrier_wait(arg->unit_barrier);
             memset(c_row, 0, arg->n * sizeof(double));
             for (k = 0; k < arg->n; ++k) {
                 const double a_value = arg->a[i * arg->n + k];
                 const double *b_row = &arg->b[k * arg->n];
                 size_t j;
 
+                for (j = 0; j < arg->n; ++j) {
+                    c_row[j] += a_value * b_row[j];
+                }
+            }
+        }
+
+        /* Preserve all native rows when n is not divisible by the thread count. */
+        for (row_offset = row_begin + units_per_repeat;
+             row_offset < row_end; ++row_offset) {
+            double *c_row = &arg->c[row_offset * arg->n];
+            size_t k;
+
+            memset(c_row, 0, arg->n * sizeof(double));
+            for (k = 0; k < arg->n; ++k) {
+                const double a_value = arg->a[row_offset * arg->n + k];
+                const double *b_row = &arg->b[k * arg->n];
+                size_t j;
                 for (j = 0; j < arg->n; ++j) {
                     c_row[j] += a_value * b_row[j];
                 }
@@ -143,12 +172,15 @@ int main(int argc, char **argv)
     double *c = NULL;
     pthread_t *workers = NULL;
     worker_arg_t *args = NULL;
+    pthread_barrier_t unit_barrier;
+    clip_roi_state_t roi;
     struct timespec start;
     struct timespec finish;
     long double checksum = 0.0L;
     double guard = 0.0;
     int option;
     int status = EXIT_FAILURE;
+    int unit_barrier_initialized = 0;
     size_t i;
 
     while ((option = getopt(argc, argv, "n:r:t:h")) != -1) {
@@ -193,6 +225,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "MATMUL allocation size overflows size_t.\n");
         return EXIT_FAILURE;
     }
+    if (repeats > SIZE_MAX / (n / threads)) {
+        fprintf(stderr, "MATMUL semantic work-unit count overflows size_t.\n");
+        return EXIT_FAILURE;
+    }
+    clip_roi_configure(&roi, repeats * (n / threads),
+                       "balanced-row-batch");
 
     a = allocate_matrix(elements);
     b = allocate_matrix(elements);
@@ -220,7 +258,15 @@ int main(int argc, char **argv)
         args[i].b = b;
         args[i].c = c;
         args[i].guard = 0.0;
+        args[i].unit_barrier = &unit_barrier;
+        args[i].roi = &roi;
     }
+
+    if (pthread_barrier_init(&unit_barrier, NULL, (unsigned)threads) != 0) {
+        fprintf(stderr, "MATMUL could not initialize its work-unit barrier.\n");
+        goto cleanup;
+    }
+    unit_barrier_initialized = 1;
 
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (i = 1; i < threads; ++i) {
@@ -259,6 +305,9 @@ int main(int argc, char **argv)
     status = EXIT_SUCCESS;
 
 cleanup:
+    if (unit_barrier_initialized) {
+        pthread_barrier_destroy(&unit_barrier);
+    }
     free(args);
     free(workers);
     free(c);

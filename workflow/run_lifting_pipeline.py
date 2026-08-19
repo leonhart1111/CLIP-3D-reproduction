@@ -702,6 +702,7 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
             modules_path, hotspot_dir / "thermal_result.json", performance_path,
             frequency["f0_ghz"], frequency["fmin_ghz"], frequency["tsafe_c"],
             frequency["ambient_c"], r2_result["ipc2"],
+            r2_result.get("work_units_per_cycle"),
         )
     if execute_r2:
         started = time.perf_counter()
@@ -716,6 +717,7 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
             modules_path, hotspot_dir / "thermal_result.json", performance_path,
             frequency["f0_ghz"], frequency["fmin_ghz"], frequency["tsafe_c"],
             frequency["ambient_c"], r2_result["ipc2"],
+            r2_result.get("work_units_per_cycle"),
         )
         stage_seconds["gem5_r2"] = time.perf_counter() - started
 
@@ -793,6 +795,16 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
         "layout_selection": selection,
         "ipc2": r2_result["ipc2"] if r2_result else None,
         "bips2": performance.get("bips2"), "r2_source": r2_source,
+        "primary_performance_metric": performance.get(
+            "primary_performance_metric", "bips2"
+        ),
+        "work_units_per_cycle": performance.get("work_units_per_cycle"),
+        "work_units_per_ns": performance.get("work_units_per_ns"),
+        "ipc2_comparison_role": (
+            "diagnostic; pairwise same-trace gate required"
+            if performance.get("work_units_per_cycle") is not None
+            else "legacy primary metric"
+        ),
         "stage_seconds": stage_seconds,
         "total_pipeline_seconds": sum(stage_seconds.values()),
         "comparison_selection": selection,

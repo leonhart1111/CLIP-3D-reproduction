@@ -1,0 +1,57 @@
+diff --git a/src/stream/stream.c b/src/stream/stream.c
+--- a/src/stream/stream.c
++++ b/src/stream/stream.c
+@@ -46,6 +46,7 @@
+ # include <float.h>
+ # include <limits.h>
+ # include <sys/time.h>
++# include "clip_roi.h"
+ 
+ /*-----------------------------------------------------------------------
+  * INSTRUCTIONS:
+@@ -213,6 +214,10 @@
+     ssize_t		j;
+     STREAM_TYPE		scalar;
+     double		t, times[4][NTIMES];
++    clip_roi_state_t	clip_roi;
++
++    clip_roi_configure(&clip_roi, NTIMES,
++		"copy-scale-add-triad-iteration");
+ 
+     /* --- SETUP --- determine precision and check timing --- */
+ 
+@@ -306,6 +311,7 @@
+     scalar = 3.0;
+     for (k=0; k<NTIMES; k++)
+ 	{
++	clip_roi_boundary(&clip_roi, k);
+ 	times[0][k] = mysecond();
+ #ifdef TUNED
+         tuned_STREAM_Copy();
+diff --git a/src/stream/Makefile b/src/stream/Makefile
+--- a/src/stream/Makefile
++++ b/src/stream/Makefile
+@@ -1,5 +1,9 @@
+ CC = gcc
+ CFLAGS = -O3 -g -fopenmp
++ROI_OBJECTS = $(if $(CLIP_ROI_DIR),$(CLIP_ROI_DIR)/clip_roi.o $(CLIP_ROI_DIR)/m5op.o)
++ifneq ($(CLIP_ROI_DIR),)
++CFLAGS += -I$(CLIP_ROI_DIR)
++endif
+ 
+ # CLIP-3D uses a 100-million-instruction warmup followed by a
+ # 500-million-instruction measurement window. Upstream STREAM's default
+@@ -20,11 +24,11 @@
+ 	$(FC) $(FFLAGS) -c stream.f
+ 	$(FC) $(FFLAGS) stream.o mysecond.o -o stream_f.exe
+ 
+-stream_c.exe: stream.c
++stream_c.exe: stream.c $(ROI_OBJECTS)
+ 	$(CC) $(CFLAGS) \
+ 		-DSTREAM_ARRAY_SIZE=$(STREAM_ARRAY_SIZE) \
+ 		-DNTIMES=$(STREAM_NTIMES) \
+-		stream.c -o stream_c.exe
++		stream.c $(ROI_OBJECTS) -o stream_c.exe
+ 
+ clean:
+ 	rm -f stream_f.exe stream_c.exe *.o

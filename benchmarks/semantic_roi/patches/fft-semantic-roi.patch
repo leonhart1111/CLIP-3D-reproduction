@@ -1,0 +1,65 @@
+diff --git a/src/splash2/kernels/fft/src/fft.C b/src/splash2/kernels/fft/src/fft.C
+--- a/src/splash2/kernels/fft/src/fft.C
++++ b/src/splash2/kernels/fft/src/fft.C
+@@ -45,6 +45,7 @@
+ 
+ #include <stdio.h>
+ #include <math.h>
++#include "clip_roi.h"
+ #define PAGE_SIZE               4096
+ #define NUM_CACHE_LINES        65536 
+ #define LOG2_LINE_SIZE             4
+@@ -100,6 +101,7 @@
+ double ck1;
+ double ck3;                        /* checksums for testing answer */
+ int pad_length;
++clip_roi_state_t clip_roi;
+ 
+ void SlaveStart();
+ double TouchArray(double *,double *,double *,double *,int,int,int,int);
+@@ -192,6 +194,8 @@
+     }
+   }
+ 
++  clip_roi_configure(&clip_roi, repetitions, "parallel-forward-fft");
++
+   MAIN_INITENV(,80000000);
+ 
+   N = 1<<M;
+@@ -468,6 +472,11 @@
+   }
+ 
+   for (i=0; i<repetitions; i++) {
++    BARRIER(Global->start, P);
++    if (MyNum == 0) {
++      clip_roi_boundary(&clip_roi, i);
++    }
++    BARRIER(Global->start, P);
+     /* perform forward FFT */
+     FFT1D(1, M, N, x, trans, upriv, umain2, MyNum, &l_transtime,
+           MyFirst, MyLast, pad_length, P, test_result, doprint, dostats,
+diff --git a/src/splash2/kernels/fft/src/makefile b/src/splash2/kernels/fft/src/makefile
+--- a/src/splash2/kernels/fft/src/makefile
++++ b/src/splash2/kernels/fft/src/makefile
+@@ -1,6 +1,10 @@
+ TARGET = fft
+ OBJS = fft.o
+ LDFLAGS += -lpthread -lm
++ROI_OBJECTS = $(if $(CLIP_ROI_DIR),$(CLIP_ROI_DIR)/clip_roi.o $(CLIP_ROI_DIR)/m5op.o)
++ifneq ($(CLIP_ROI_DIR),)
++  CFLAGS += -I$(CLIP_ROI_DIR)
++endif
+ MACROS = ../../../null_macros/c.m4.null.pthread
+ 
+ x = *
+@@ -12,8 +16,8 @@
+   endif
+ endif
+ 
+-$(TARGET): $(OBJS)
+-	$(CC) $(OBJS) $(CFLAGS) -o $(TARGET) $(LDFLAGS)
++$(TARGET): $(OBJS) $(ROI_OBJECTS)
++	$(CC) $(OBJS) $(ROI_OBJECTS) $(CFLAGS) -o $(TARGET) $(LDFLAGS)
+ 
+ install:
+ 	mkdir -p $(PREFIX)/bin
