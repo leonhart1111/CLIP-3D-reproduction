@@ -157,6 +157,7 @@ class WorkflowTests(unittest.TestCase):
             "variants": {
                 "paper-area": {
                     "raw_proxy_tmax_c": 80.0,
+                    "raw_frequency": {"state": "thermal_headroom"},
                     "anchored_frequency": {"state": "thermally_limited"},
                 }
             },
@@ -166,18 +167,21 @@ class WorkflowTests(unittest.TestCase):
              "hotspot_frequency": {"state": "thermally_limited"},
              "variants": {"paper-area": {
                  "raw_proxy_tmax_c": 81.0,
+                 "raw_frequency": {"state": "thermal_headroom"},
                  "anchored_frequency": {"state": "thermally_limited"},
              }}},
             {"row": 0, "column": 1, "tmax_c": 99.0,
              "hotspot_frequency": {"state": "thermal_headroom"},
              "variants": {"paper-area": {
                  "raw_proxy_tmax_c": 79.0,
+                 "raw_frequency": {"state": "thermal_headroom"},
                  "anchored_frequency": {"state": "thermally_limited"},
              }}},
             {"row": 1, "column": 1, "tmax_c": 100.5,
              "hotspot_frequency": {"state": "thermally_limited"},
              "variants": {"paper-area": {
                  "raw_proxy_tmax_c": 80.5,
+                 "raw_frequency": {"state": "thermal_headroom"},
                  "anchored_frequency": {"state": "thermally_limited"},
              }}},
         ]
@@ -192,7 +196,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(summary["anchored_proxy_frequency_states"], {
             "thermally_limited": 3,
         })
+        self.assertEqual(summary["raw_proxy_frequency_states"], {
+            "thermal_headroom": 3,
+        })
         self.assertEqual(summary["frequency_state_agreement_rate"], 2 / 3)
+        self.assertEqual(summary["raw_frequency_state_agreement_rate"], 1 / 3)
+        self.assertFalse(summary["raw_thermal_frequency_term_active"])
 
     def test_pipeline_forwards_hotspot_materialization_contract(self):
         """Fixed-bin and paper-single runs must preserve identification inputs."""

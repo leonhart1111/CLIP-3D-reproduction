@@ -199,10 +199,19 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
         record["variants"][name].get("anchored_frequency", {}).get("state")
         for record in records
     ]
+    raw_proxy_states = [
+        record["variants"][name].get("raw_frequency", {}).get("state")
+        for record in records
+    ]
     state_pairs = [
         (actual, proxy) for actual, proxy in zip(actual_states, proxy_states)
         if isinstance(actual, str) and isinstance(proxy, str)
     ]
+    raw_state_pairs = [
+        (actual, proxy) for actual, proxy in zip(actual_states, raw_proxy_states)
+        if isinstance(actual, str) and isinstance(proxy, str)
+    ]
+    raw_anchor_state = anchor["variants"][name].get("raw_frequency", {}).get("state")
 
     def count_states(states: list[object]) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -238,6 +247,7 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
         },
         "hotspot_frequency_states": count_states(actual_states),
         "anchored_proxy_frequency_states": count_states(proxy_states),
+        "raw_proxy_frequency_states": count_states(raw_proxy_states),
         "frequency_state_comparable_count": len(state_pairs),
         "frequency_state_agreement_count": sum(
             actual == proxy for actual, proxy in state_pairs
@@ -245,6 +255,20 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
         "frequency_state_agreement_rate": (
             sum(actual == proxy for actual, proxy in state_pairs) / len(state_pairs)
             if state_pairs else None
+        ),
+        "raw_frequency_state_comparable_count": len(raw_state_pairs),
+        "raw_frequency_state_agreement_count": sum(
+            actual == proxy for actual, proxy in raw_state_pairs
+        ),
+        "raw_frequency_state_agreement_rate": (
+            sum(actual == proxy for actual, proxy in raw_state_pairs)
+            / len(raw_state_pairs) if raw_state_pairs else None
+        ),
+        "raw_thermal_frequency_term_active": (
+            (isinstance(raw_anchor_state, str)
+             and raw_anchor_state != "thermal_headroom")
+            or any(state != "thermal_headroom" for state in raw_proxy_states
+                   if isinstance(state, str))
         ),
         "thermal_frequency_term_active": (
             anchor_frequency["state"] != "thermal_headroom"
@@ -303,6 +327,7 @@ def run_probe(model_path: Path, config_path: Path, output_dir: Path,
         raw = proxy_for_layout(anchor_layout, config, variant)
         anchor["variants"][variant.name] = {
             "raw_proxy_tmax_c": raw,
+            "raw_frequency": _frequency(raw, model, config),
             "anchored_proxy_tmax_c": float(anchor_hotspot["tmax_c"]),
             "anchored_frequency": _frequency(float(anchor_hotspot["tmax_c"]), model, config),
         }
@@ -350,6 +375,7 @@ def run_probe(model_path: Path, config_path: Path, output_dir: Path,
             anchored = anchor["tmax_c"] + delta
             record["variants"][variant.name] = {
                 "raw_proxy_tmax_c": raw,
+                "raw_frequency": _frequency(raw, model, config),
                 "proxy_delta_from_fixed_bin_c": delta,
                 "anchored_proxy_tmax_c": anchored,
                 "anchored_frequency": _frequency(anchored, model, config),
