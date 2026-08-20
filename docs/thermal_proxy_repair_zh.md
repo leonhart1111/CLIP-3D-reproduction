@@ -32,7 +32,7 @@ CLIP-3D 的 Equation (14) 不是 HotSpot 的替代品。它只需为 L2 给出�
 | 候选问题 | 最小可证伪测试 | 当前状态与可作出的结论 |
 | --- | --- | --- |
 | HotSpot 输入合同在标定与预测间漂移 | 对同一 `modules.json` 比对 grid、module/grid-cell 输入、ptrace 精度、stack 和 `R_conv`；只复用合同完全匹配的探针 | 已定位并修复 `run_one()` 漏传三项 materialization 选项的问题；后续 64x64 诊断使用 module-input 合同。它消除了无效比较，但不保证代理精度。 |
-| Eq.(14) 的绝对偏置让 Equation (13) 进入错误门限，或 module-level \(\gamma\) 使 uniform-\(\gamma\) 近似失效 | 同一 fixed-bin 的 HotSpot 温度只作为候选间共同偏置，比较 raw 与 anchor 后的频率状态；另选真实高功耗 FFT 锚点，并以分离 dynamic/leakage ptrace 在 1.0 GHz 和闭式 \(f_{sus}\) 重跑 HotSpot | FFT fixed-bin 已证实闭式热限频链路可进入 1.15 GHz；低功耗 stencil 在真实 HotSpot 下全部 2 GHz 是不可观测，而非频率公式失败。当前模型的 module-level \(\gamma\) 范围约为 0.03--1.0，因此 FFT 分离功耗验证已排队；在其结果出现前，不能将 global-\(\gamma\) 近似提升为已验收。 |
+| Eq.(14) 的绝对偏置让 Equation (13) 进入错误门限，或 module-level \(\gamma\) 使 uniform-\(\gamma\) 近似失效 | 同一 fixed-bin 的 HotSpot 温度只作为候选间共同偏置，比较 raw 与 anchor 后的频率状态；另选真实高功耗 FFT 锚点，并以分离 dynamic/leakage ptrace 在 1.0 GHz 和闭式 \(f_{sus}\) 重跑 HotSpot | FFT fixed-bin 已证实闭式热限频链路可进入 1.15 GHz；低功耗 stencil 在真实 HotSpot 下全部 2 GHz 是不可观测，而非频率公式失败。FFT 的 1.0 GHz 分离功耗 HotSpot 为 90.603891 C，而 Eq.(11) 的 global-\(\gamma\) 预测为 90.919710 C，误差 −0.315819 C，远超 0.02 C；因此 global-\(\gamma\) 已被拒绝，Eq.(9) two-point 解与独立安全复核正在运行。 |
 | L2 有限矩形被质心化，或把核长度错误地随 L2 尺寸改变 | 固定共享参数与同一 HotSpot 网格，比较 center 与 area-quadrature；保持 `L_c=die/2` 的几何消融与冻结拟合候选分开 | 首个 L2 留出点中面积积分的冻结候选方向较好。不可把 L2 长宽代入 `L_c`：论文把 `L_c` 设为 die half-width，L2 尺寸仅应出现在面积积分。完整留出汇总仍在运行。 |
 | HotSpot peak 的 cell/边界切换使极小温差不可靠 | 以 `|ΔT|>=0.02 C` 才计 sign；对接近选点用更高 grid 重跑 | `grid-field` 扩展在首点更差，未采用。当前不把亚阈值的反向符号计为代理失败；高分辨率复核只在完整留出证据显示真实选择差异时执行。 |
 
