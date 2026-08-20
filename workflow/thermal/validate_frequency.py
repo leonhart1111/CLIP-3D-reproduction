@@ -486,6 +486,77 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
             f"{settings['max_safe_error_c']:.6g} C"
         )
 
+    # Do not silently promote this substitute for Equation (13).  It is a
+    # separate, paper-prescribed Eq.(9) fallback and is only exercised after
+    # the scalar-gamma test has actually failed.  Its independent HotSpot run
+    # makes the cellwise affine reconstruction auditable at the same strict
+    # safety threshold.
+    two_point_validation = None
+    two_point_accepted = False
+    if two_point.get("available"):
+        two_point_frequency = float(two_point["sustainable_frequency_ghz"])
+        if two_point_frequency >= f0:
+            two_point_validation = {
+                "frequency_ghz": two_point_frequency,
+                "safe_temperature_c": tsafe,
+                "not_required": True,
+                "accepted": True,
+                "basis": "two-point affine solution has nominal-frequency thermal headroom",
+            }
+            two_point_accepted = True
+        elif not accepted:
+            candidate = run_frequency(
+                two_point_frequency, "_two_point_fsus", record_hotspot_failure=True,
+            )
+            if "hotspot_error" in candidate:
+                two_point_validation = {
+                    "frequency_ghz": two_point_frequency,
+                    "hotspot_tmax_c": None,
+                    "safe_temperature_c": tsafe,
+                    "safe_error_c": None,
+                    "max_safe_error_c": settings["max_safe_error_c"],
+                    "accepted": False,
+                    "power_trace": candidate["power_trace"],
+                    "error": candidate["hotspot_error"],
+                }
+            else:
+                hotspot_tmax = float(candidate["hotspot_tmax_c"])
+                safe_error = (
+                    abs(hotspot_tmax - tsafe)
+                    if math.isfinite(hotspot_tmax) else math.inf
+                )
+                two_point_validation = {
+                    "frequency_ghz": two_point_frequency,
+                    "hotspot_tmax_c": hotspot_tmax,
+                    "safe_temperature_c": tsafe,
+                    "safe_error_c": safe_error,
+                    "max_safe_error_c": settings["max_safe_error_c"],
+                    "accepted": (
+                        math.isfinite(hotspot_tmax)
+                        and safe_error <= settings["max_safe_error_c"]
+                    ),
+                    "power_trace": candidate["power_trace"],
+                }
+                two_point_accepted = two_point_validation["accepted"]
+        else:
+            two_point_validation = {
+                "frequency_ghz": two_point_frequency,
+                "safe_temperature_c": tsafe,
+                "not_required": True,
+                "accepted": False,
+                "basis": "global-gamma validation already passed; fallback was not invoked",
+            }
+    if two_point.get("available"):
+        two_point["solution_validation"] = two_point_validation
+        two_point["recommendation"] = {
+            "accepted": two_point_accepted,
+            "basis": (
+                "independent separated-power HotSpot safety result"
+                if two_point_validation and not two_point_validation.get("not_required")
+                else (two_point_validation or {}).get("basis", "not evaluated")
+            ),
+        }
+
     result = {
         "schema_version": 1, "equations": [11, 12, 13],
         "case_dir": str(case_dir), "modules": str(modules_path.resolve()),

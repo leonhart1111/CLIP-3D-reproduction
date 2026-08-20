@@ -612,6 +612,52 @@ class FrequencyTests(unittest.TestCase):
                 result["predicted_tmax_at_sustainable_frequency_c"], 95.0,
             )
 
+    def test_frequency_validation_runs_two_point_fallback_after_gamma_rejection(self):
+        """A rejected scalar gamma must trigger, but not masquerade as, Eq.(9)."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = root / "case"
+            case.mkdir()
+            nominal = case / "grid.steady.txt"
+            reference = case / "one.grid.steady.txt"
+            nominal.write_text(
+                "Layer 1:\n0\t373.15\n1\t363.15\n", encoding="utf-8",
+            )
+            reference.write_text(
+                "Layer 1:\n0\t333.15\n1\t353.15\n", encoding="utf-8",
+            )
+            write_json(root / "modules.json", {"gamma": 0.2})
+            write_json(case / "hotspot_manifest.json", {
+                "ambient_c": 25.0, "r_convec_k_per_w": 5.0,
+                "active_power_layers": [1],
+            })
+            write_json(case / "thermal_result.json", {
+                "tmax_c": 100.0, "grid_steady_file": str(nominal),
+            })
+            (case / "power_dynamic.ptrace").write_text("a\n8\n", encoding="utf-8")
+            (case / "power_leakage.ptrace").write_text("a\n2\n", encoding="utf-8")
+            (case / "power.ptrace").write_text("a\n10\n", encoding="utf-8")
+
+            with patch("workflow.thermal.validate_frequency.run_hotspot",
+                       side_effect=[
+                           {"tmax_c": 80.0, "grid_steady_file": str(reference)},
+                           {"tmax_c": 95.03},
+                           {"tmax_c": 95.005},
+                       ]) as runner:
+                result = validate_case(
+                    case, root / "modules.json", root / "validation.json", [1.0],
+                )
+
+            self.assertFalse(result["recommendation"]["accepted"])
+            fallback = result["two_point_affine_frequency"]
+            self.assertTrue(fallback["available"])
+            self.assertAlmostEqual(fallback["sustainable_frequency_ghz"], 1.875)
+            self.assertTrue(fallback["recommendation"]["accepted"])
+            self.assertAlmostEqual(
+                fallback["solution_validation"]["safe_error_c"], 0.005,
+            )
+            self.assertEqual(runner.call_count, 3)
+
     def test_frequency_validation_defaults_to_separated_hotspot_trace(self):
         """Formal frequency validation writes and reports the per-cell raw-power trace."""
         with tempfile.TemporaryDirectory() as temporary:
