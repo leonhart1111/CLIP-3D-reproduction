@@ -91,7 +91,19 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
 
 class WorkflowTests(unittest.TestCase):
     def test_proxy_gradient_series_uses_weighted_sign_counts_and_keeps_labels(self):
-        def diagnostic(sign_comparable, sign_agreement, spearman, regret, active):
+        def diagnostic(sign_comparable, sign_agreement, spearman, regret, active,
+                       observability=None):
+            evaluation = {
+                "candidate_count": 9,
+                "sign_comparable_count": sign_comparable,
+                "sign_agreement_count": sign_agreement,
+                "sign_agreement_rate": sign_agreement / sign_comparable,
+                "spearman": spearman,
+                "proxy_selected": {"selection_regret_c": regret},
+                "thermal_frequency_term_active": active,
+            }
+            if observability:
+                evaluation.update(observability)
             return {
                 "method": "common-HotSpot-grid equation-(14) gradient diagnostic",
                 "model": "fixture-model", "config": "fixture-config",
@@ -101,22 +113,19 @@ class WorkflowTests(unittest.TestCase):
                     "name": "fitted-area", "proxy_spatial_model": "area-quadrature",
                     "lc_die_side_ratio": 0.0586007,
                 }],
-                "evaluations": {"fitted-area": {
-                    "candidate_count": 9,
-                    "sign_comparable_count": sign_comparable,
-                    "sign_agreement_count": sign_agreement,
-                    "sign_agreement_rate": sign_agreement / sign_comparable,
-                    "spearman": spearman,
-                    "proxy_selected": {"selection_regret_c": regret},
-                    "thermal_frequency_term_active": active,
-                }},
+                "evaluations": {"fitted-area": evaluation},
             }
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             first, second = root / "first.json", root / "second.json"
             write_json(first, diagnostic(2, 2, 1.0, 0.0, False))
-            write_json(second, diagnostic(6, 3, 0.5, 0.4, True))
+            write_json(second, diagnostic(6, 3, 0.5, 0.4, True, {
+                "raw_thermal_frequency_term_active": True,
+                "hotspot_frequency_varies": True,
+                "anchored_proxy_frequency_varies": False,
+                "raw_proxy_frequency_varies": False,
+            }))
             result = summarize_reports([("l2-holdout", first), ("in-fit", second)])
 
         values = result["variants"]["fitted-area"]
@@ -125,6 +134,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(values["weighted_sign_agreement_rate"], 0.625)
         self.assertEqual(values["selection_regret_c"]["mean"], 0.2)
         self.assertEqual(values["thermal_frequency_term_active_report_count"], 1)
+        observability = values["frequency_observability"]
+        self.assertEqual(observability["raw_thermal_frequency_term_active"], {
+            "observed_report_count": 1, "true_report_count": 1,
+        })
+        self.assertEqual(observability["hotspot_frequency_varies"], {
+            "observed_report_count": 1, "true_report_count": 1,
+        })
+        self.assertEqual(observability["anchored_proxy_frequency_varies"], {
+            "observed_report_count": 1, "true_report_count": 0,
+        })
         self.assertEqual(values["per_report"][0]["label"], "l2-holdout")
         self.assertEqual(result["common_contract"]["config"], "fixture-config")
 

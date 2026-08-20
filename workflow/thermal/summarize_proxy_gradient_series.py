@@ -96,6 +96,15 @@ def summarize_reports(reports: list[tuple[str, Path]]) -> dict:
         spearman = []
         regrets = []
         active_reports = 0
+        observability_keys = (
+            "raw_thermal_frequency_term_active",
+            "hotspot_frequency_varies",
+            "anchored_proxy_frequency_varies",
+            "raw_proxy_frequency_varies",
+        )
+        observability = {
+            key: {"observed": 0, "true": 0} for key in observability_keys
+        }
         for label, path, document in loaded:
             values = document["evaluations"][variant]
             comparable = int(values["sign_comparable_count"])
@@ -117,6 +126,15 @@ def summarize_reports(reports: list[tuple[str, Path]]) -> dict:
             regrets.append(regret)
             active = bool(values["thermal_frequency_term_active"])
             active_reports += int(active)
+            observed_observability = {}
+            for key in observability_keys:
+                value = values.get(key)
+                if value is not None and type(value) is not bool:
+                    raise ValueError(f"invalid {key} for {variant} in {path}")
+                if type(value) is bool:
+                    observability[key]["observed"] += 1
+                    observability[key]["true"] += int(value)
+                observed_observability[key] = value
             per_report.append({
                 "label": label,
                 "report": str(path),
@@ -129,6 +147,7 @@ def summarize_reports(reports: list[tuple[str, Path]]) -> dict:
                 "spearman": raw_spearman,
                 "selection_regret_c": regret,
                 "thermal_frequency_term_active": active,
+                **observed_observability,
             })
         summaries[variant] = {
             "report_count": len(per_report),
@@ -143,6 +162,13 @@ def summarize_reports(reports: list[tuple[str, Path]]) -> dict:
                 **_mean_median(regrets), "max": max(regrets),
             },
             "thermal_frequency_term_active_report_count": active_reports,
+            "frequency_observability": {
+                key: {
+                    "observed_report_count": values["observed"],
+                    "true_report_count": values["true"],
+                }
+                for key, values in observability.items()
+            },
             "per_report": per_report,
         }
 
