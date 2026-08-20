@@ -852,10 +852,12 @@ class FrequencyTests(unittest.TestCase):
             self.assertEqual(read_json(root / "summary.json"), summary)
             self.assertEqual(summary["requested_frequency_hotspot_run_count"], 3)
             self.assertEqual(summary["fsus_safety_solve_count"], 1)
+            self.assertEqual(summary["two_point_safety_solve_count"], 0)
             self.assertEqual(summary["hotspot_run_count"], 4)
             self.assertEqual(summary["max_abs_uniform_gamma_comparison_error_c"], 0.75)
             self.assertEqual(summary["safe_error_limit_c"], 0.02)
             self.assertFalse(summary["recommendation"]["accepted"])
+            self.assertFalse(summary["two_point_fallback_recommendation"]["accepted"])
 
             mixed_limits = [dict(item) for item in results]
             mixed_limits[1] = dict(mixed_limits[1])
@@ -864,6 +866,37 @@ class FrequencyTests(unittest.TestCase):
                        side_effect=mixed_limits):
                 with self.assertRaisesRegex(ValueError, "same max_safe_error_c"):
                     run_manifest(root / "anchors.json", root / "mixed.json")
+
+    def test_anchor_summary_reports_validated_two_point_fallback_separately(self):
+        """A rejected scalar gamma may be replaced only by an audited Eq.(9) result."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "anchors.json", {
+                "cases": [{"label": "fft", "case_dir": str(root / "fft")}],
+            })
+            scalar_rejected_two_point_accepted = {
+                "frequencies": [{}],
+                "max_abs_uniform_gamma_comparison_error_c": 0.32,
+                "frequency_settings": {"max_safe_error_c": 0.02},
+                "solution_validation": {"accepted": True, "safe_error_c": 0.0},
+                "recommendation": {"accepted": False},
+                "two_point_affine_frequency": {
+                    "available": True,
+                    "solution_validation": {"accepted": True, "safe_error_c": 0.0},
+                    "recommendation": {"accepted": True},
+                },
+            }
+            with patch("workflow.thermal.run_anchor_validation.validate_case",
+                       return_value=scalar_rejected_two_point_accepted):
+                summary = run_manifest(root / "anchors.json", root / "summary.json")
+
+            self.assertFalse(summary["recommendation"]["accepted"])
+            self.assertEqual(summary["two_point_safety_solve_count"], 1)
+            self.assertEqual(summary["hotspot_run_count"], 3)
+            self.assertEqual(
+                summary["two_point_fallback_recommendation"],
+                {"available_case_count": 1, "accepted_case_count": 1, "accepted": True},
+            )
 
     def test_anchor_manifest_forwards_frequency_settings(self):
         """Manifest f0 must control the dynamic scale used in every anchor case."""
