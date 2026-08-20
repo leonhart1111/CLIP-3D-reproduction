@@ -51,5 +51,26 @@ workload、缓存容量和空间位置留出集上验证，不能以训练点误
 4. 对接近的选点以更高 HotSpot 网格复核；小于数值/网格不确定度的温差应记为
    tie，而非代理失败或性能提升。
 
+## 当前证据（2026-08-20，尚未完成五点扩展）
+
+首个语义差点 `stencil / L1D=128kB / L2=512kB` 已在 3x3 个合法 top-tier
+位置上完成。normal（`R_conv=1.042`）和 stressed（`R_conv=5`）合同给出相同
+结论；下表列 stressed 的结果（normal 的选择与方向结论相同）。这里的
+`sign` 仅在相对 fixed-bin 温差绝对值不少于 0.02 C 时计入。
+
+| 共享几何变体 | Spearman | sign | selection regret |
+| --- | ---: | ---: | ---: |
+| fitted area-quadrature, `L_c/die=0.0586007` | 1.000 | 6/6 | 0.000 C |
+| fitted center, `L_c/die=0.0586007` | 0.883 | 6/6 | 0.000 C |
+| paper center, `L_c/die=0.5` | 0.350 | 3/6 | 0.050 C |
+| paper area-quadrature, `L_c/die=0.5` | 0.500 | 3/6 | 0.033 C |
+
+因此，当前证据支持把 `area-quadrature + L_c/die=0.0586007` 作为**待扩展验证的
+共享诊断候选**；它不是按 workload/cache 调参，也尚未被提升为论文等价默认值。
+同一高功耗/低功耗锚点还表明频率项的分界正确：`stencil / 128kB / 2048kB`
+在 stressed 合同下为 93.762 C（仍有 2 GHz headroom），而
+`fft / 64kB / 1024kB` 为 118.118 C（进入 Equation (13) 的热限频区）。后者只
+验证频率链路；五个低功耗差点继续只评价空间梯度。
+
 该文档只定义诊断和决策规则；在五点完成前，不将任何拟合的 `alpha`、`L_c` 或
 面积积分变体标为论文等价或共享已验收参数。
