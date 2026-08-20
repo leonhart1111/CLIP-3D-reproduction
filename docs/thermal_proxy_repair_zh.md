@@ -90,5 +90,9 @@ reduced identification：训练设计只包含 `L1D={16,128}kB`、`L2={128,2048}
 `thermal_proxy_gradient_validation_zh.md`，它已被明确标为历史诊断，不能与当前 64x64
 物理合同证据混用。
 
+完成多个点后，用 `workflow/thermal/summarize_proxy_gradient_series.py` 仅汇总已完成的
+`gradient_diagnostic.json`。调用方必须将留出与拟合集内点作为不同 `LABEL=PATH` 传入；
+它使用可比较 sign 的总计数而非平均每点比例，且不触发重拟合或新的 HotSpot 求解。
+
 该文档只定义诊断和决策规则；在五点完成前，不将任何拟合的 `alpha`、`L_c` 或
 面积积分变体标为论文等价或共享已验收参数。

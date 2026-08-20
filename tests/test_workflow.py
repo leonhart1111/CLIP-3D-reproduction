@@ -74,6 +74,7 @@ from workflow.thermal.calibrate_proxy import (
 from workflow.thermal.diagnose_proxy_gradient import (
     ProxyVariant, parse_variant, prepare_output_directory, summarize_variant,
 )
+from workflow.thermal.summarize_proxy_gradient_series import summarize_reports
 from workflow.thermal.sustainable_frequency import closed_form_frequency
 from workflow.thermal.run_anchor_validation import run_manifest
 from workflow.thermal.validate_frequency import (
@@ -89,6 +90,38 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_proxy_gradient_series_uses_weighted_sign_counts_and_keeps_labels(self):
+        def diagnostic(sign_comparable, sign_agreement, spearman, regret, active):
+            return {
+                "method": "common-HotSpot-grid equation-(14) gradient diagnostic",
+                "model": "fixture-model", "config": "fixture-config",
+                "grid_points_per_axis": 3,
+                "evaluations": {"fitted-area": {
+                    "candidate_count": 9,
+                    "sign_comparable_count": sign_comparable,
+                    "sign_agreement_count": sign_agreement,
+                    "sign_agreement_rate": sign_agreement / sign_comparable,
+                    "spearman": spearman,
+                    "proxy_selected": {"selection_regret_c": regret},
+                    "thermal_frequency_term_active": active,
+                }},
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first, second = root / "first.json", root / "second.json"
+            write_json(first, diagnostic(2, 2, 1.0, 0.0, False))
+            write_json(second, diagnostic(6, 3, 0.5, 0.4, True))
+            result = summarize_reports([("l2-holdout", first), ("in-fit", second)])
+
+        values = result["variants"]["fitted-area"]
+        self.assertEqual(values["weighted_sign_comparable_count"], 8)
+        self.assertEqual(values["weighted_sign_agreement_count"], 5)
+        self.assertEqual(values["weighted_sign_agreement_rate"], 0.625)
+        self.assertEqual(values["selection_regret_c"]["mean"], 0.2)
+        self.assertEqual(values["thermal_frequency_term_active_report_count"], 1)
+        self.assertEqual(values["per_report"][0]["label"], "l2-holdout")
+
     def test_proxy_gradient_resume_requires_explicit_opt_in(self):
         with tempfile.TemporaryDirectory() as temporary:
             output_dir = Path(temporary) / "gradient"
