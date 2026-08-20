@@ -78,6 +78,13 @@ dynamic/leakage 热图，逐 cell 重建 Equation (9) 的
 验证/校准，绝不把 HotSpot 调用加入 Equation (14) 的优化内环。只有随后在这个
 闭式频率运行的独立 HotSpot 仍满足 0.02 C 安全误差时，才可把该回退报告为通过。
 
+不能把这个回退偷换成“将 Equation (14) 的模块 dynamic/leakage 分量分别求和”
+的无 HotSpot 版本。一个隔离的候选 worktree 在同一 FFT fixed-bin anchor 上作了
+这一测试：其 component-affine proxy 为 `1.148779 GHz`，不仅没有逼近真实两热图
+解 `1.159790 GHz`，还比 global-\(\gamma\) 的 `1.150022 GHz` 略差。因此该候选
+不合并；它说明真正缺失的是 **HotSpot 的动态/漏电空间热图**，不是再给 Eq.(14)
+增加一个模块功耗权重即可弥补的参数问题。
+
 频率项是否活动首先由真实 fixed-bin 热状态决定。一个点即使是“代理较差点”，
 也可能在目标冷却包络下始终低于 `T_safe`；此时频率在所有位置都是 2 GHz，热
 代理无法也不应制造性能增益。优化器报告中的
