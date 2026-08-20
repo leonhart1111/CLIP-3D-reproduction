@@ -30,21 +30,25 @@ def run_manifest(manifest_path: Path, output: Path) -> dict:
     fsus_safety_solve_count = sum(
         item["result"]["solution_validation"] is not None for item in results
     )
-    two_point_safety_solve_count = sum(
-        (item["result"].get("two_point_affine_frequency") or {})
-        .get("solution_validation", {}).get("not_required") is not True
-        and (item["result"].get("two_point_affine_frequency") or {})
-        .get("solution_validation") is not None
+    two_point_results = [
+        item["result"].get("two_point_affine_frequency") or {}
         for item in results
+    ]
+    two_point_validations = [
+        value.get("solution_validation")
+        if isinstance(value.get("solution_validation"), dict) else None
+        for value in two_point_results
+    ]
+    two_point_safety_solve_count = sum(
+        validation is not None and validation.get("not_required") is not True
+        for validation in two_point_validations
     )
     two_point_available_count = sum(
-        bool((item["result"].get("two_point_affine_frequency") or {}).get("available"))
-        for item in results
+        bool(value.get("available")) for value in two_point_results
     )
     two_point_accepted_count = sum(
-        bool((item["result"].get("two_point_affine_frequency") or {})
-             .get("recommendation", {}).get("accepted"))
-        for item in results
+        bool(value.get("recommendation", {}).get("accepted"))
+        for value in two_point_results
     )
     safe_errors = [
         item["result"]["solution_validation"]["safe_error_c"]
@@ -90,9 +94,8 @@ def run_manifest(manifest_path: Path, output: Path) -> dict:
             # Equation-(13) shortcut as accepted.
             "accepted": all(
                 item["result"]["recommendation"]["accepted"]
-                or bool((item["result"].get("two_point_affine_frequency") or {})
-                        .get("recommendation", {}).get("accepted"))
-                for item in results
+                or bool(value.get("recommendation", {}).get("accepted"))
+                for item, value in zip(results, two_point_results)
             ),
         },
         "cases": results,
