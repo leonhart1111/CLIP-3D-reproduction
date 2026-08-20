@@ -70,6 +70,14 @@ dynamic/leakage HotSpot 在 \(f_{sus}\) 的安全误差不超过 **0.02 C**（�
 度量级误差替代。温度落入热限频状态本身并不足以让布局优化受益：只有不同
 合法位置的可持续频率确实有差异，Equation (13) 才对 L2 的位置提供热梯度。
 
+若 global-\(\gamma\) 检验未通过，验证器保留该失败；不会改调 \(\alpha\)、\(L_c\)，
+也不会放宽阈值。它从同一布局的 nominal \(f_0\) 热图与一份低频、逐 cell 分离
+dynamic/leakage 热图，逐 cell 重建 Equation (9) 的
+\(A_i+(f/f_0)B_i\)，再以最先达到 \(T_{safe}\) 的 cell 求 two-point
+`two_point_affine_frequency`。这是论文说明的“一次额外 HotSpot”回退；结果仅作
+验证/校准，绝不把 HotSpot 调用加入 Equation (14) 的优化内环。只有随后在这个
+闭式频率运行的独立 HotSpot 仍满足 0.02 C 安全误差时，才可把该回退报告为通过。
+
 频率项是否活动首先由真实 fixed-bin 热状态决定。一个点即使是“代理较差点”，
 也可能在目标冷却包络下始终低于 `T_safe`；此时频率在所有位置都是 2 GHz，热
 代理无法也不应制造性能增益。优化器报告中的

@@ -80,6 +80,7 @@ from workflow.thermal.run_anchor_validation import run_manifest
 from workflow.thermal.validate_frequency import (
     compose_separated_ptrace,
     read_ptrace,
+    two_point_affine_frequency,
     validate_case,
 )
 
@@ -579,6 +580,37 @@ class FrequencyTests(unittest.TestCase):
                     root / "dynamic.ptrace", root / "leakage.ptrace", root / "one.ptrace",
                     frequency_ghz=1.0, f0_ghz=2.0,
                 )
+
+    def test_two_point_affine_frequency_uses_cellwise_not_global_gamma_limit(self):
+        """Equation (9) must be limited by the hottest affine cell, not a scalar average."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nominal = root / "nominal.grid.steady.txt"
+            reference = root / "reference.grid.steady.txt"
+            # At f0=2 GHz, cell 0 is 100 C and cell 1 is 90 C.  At 1 GHz
+            # they are respectively 60 C and 80 C, so their affine maps are
+            # 20 + 80*f/f0 and 70 + 20*f/f0 C.  Cell 0 limits 95 C at 1.875.
+            nominal.write_text(
+                "Layer 1:\n0\t373.15\n1\t363.15\n", encoding="utf-8",
+            )
+            reference.write_text(
+                "Layer 1:\n0\t333.15\n1\t353.15\n", encoding="utf-8",
+            )
+            result = two_point_affine_frequency(
+                {"grid_steady_file": str(nominal)},
+                {"grid_steady_file": str(reference)},
+                {"ambient_c": 25.0, "active_power_layers": [1]}, 1.0,
+                {"f0_ghz": 2.0, "fmin_ghz": 0.4, "tsafe_c": 95.0},
+            )
+
+            self.assertTrue(result["available"])
+            self.assertEqual(result["equation"], 9)
+            self.assertEqual(result["limiting_unit"], "layer_1_g0")
+            self.assertEqual(result["frequency_state"], "thermally_limited")
+            self.assertAlmostEqual(result["sustainable_frequency_ghz"], 1.875)
+            self.assertAlmostEqual(
+                result["predicted_tmax_at_sustainable_frequency_c"], 95.0,
+            )
 
     def test_frequency_validation_defaults_to_separated_hotspot_trace(self):
         """Formal frequency validation writes and reports the per-cell raw-power trace."""
