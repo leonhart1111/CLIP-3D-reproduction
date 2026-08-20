@@ -220,6 +220,31 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
                 counts[state] = counts.get(state, 0) + 1
         return counts
 
+    def frequency_values(entries: list[dict], field: str) -> list[float]:
+        values = []
+        for entry in entries:
+            frequency = entry.get(field, {})
+            value = frequency.get("sustainable_frequency_ghz") \
+                if isinstance(frequency, dict) else None
+            if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(float(value))):
+                values.append(float(value))
+        return values
+
+    hotspot_frequencies = frequency_values(records, "hotspot_frequency")
+    anchored_frequencies = frequency_values(
+        [record["variants"][name] for record in records], "anchored_frequency"
+    )
+    raw_frequencies = frequency_values(
+        [record["variants"][name] for record in records], "raw_frequency"
+    )
+
+    def frequency_range(values: list[float]) -> list[float] | None:
+        return [min(values), max(values)] if values else None
+
+    def frequency_varies(values: list[float]) -> bool:
+        return len(values) > 1 and max(values) - min(values) > 1.0e-12
+
     return {
         "candidate_count": len(records),
         "hotspot_delta_range_c": [min(actual_deltas), max(actual_deltas)],
@@ -248,6 +273,14 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
         "hotspot_frequency_states": count_states(actual_states),
         "anchored_proxy_frequency_states": count_states(proxy_states),
         "raw_proxy_frequency_states": count_states(raw_proxy_states),
+        "hotspot_sustainable_frequency_range_ghz": frequency_range(hotspot_frequencies),
+        "anchored_proxy_sustainable_frequency_range_ghz": frequency_range(
+            anchored_frequencies
+        ),
+        "raw_proxy_sustainable_frequency_range_ghz": frequency_range(raw_frequencies),
+        "hotspot_frequency_varies": frequency_varies(hotspot_frequencies),
+        "anchored_proxy_frequency_varies": frequency_varies(anchored_frequencies),
+        "raw_proxy_frequency_varies": frequency_varies(raw_frequencies),
         "frequency_state_comparable_count": len(state_pairs),
         "frequency_state_agreement_count": sum(
             actual == proxy for actual, proxy in state_pairs

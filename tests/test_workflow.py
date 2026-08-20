@@ -157,32 +157,54 @@ class WorkflowTests(unittest.TestCase):
             "variants": {
                 "paper-area": {
                     "raw_proxy_tmax_c": 80.0,
-                    "raw_frequency": {"state": "thermal_headroom"},
-                    "anchored_frequency": {"state": "thermally_limited"},
+                    "raw_frequency": {
+                        "state": "thermal_headroom", "sustainable_frequency_ghz": 2.0,
+                    },
+                    "anchored_frequency": {
+                        "state": "thermally_limited", "sustainable_frequency_ghz": 1.9,
+                    },
                 }
             },
         }
         records = [
             {"row": 0, "column": 0, "tmax_c": 101.0,
-             "hotspot_frequency": {"state": "thermally_limited"},
+             "hotspot_frequency": {
+                 "state": "thermally_limited", "sustainable_frequency_ghz": 1.9,
+             },
              "variants": {"paper-area": {
                  "raw_proxy_tmax_c": 81.0,
-                 "raw_frequency": {"state": "thermal_headroom"},
-                 "anchored_frequency": {"state": "thermally_limited"},
+                 "raw_frequency": {
+                     "state": "thermal_headroom", "sustainable_frequency_ghz": 2.0,
+                 },
+                 "anchored_frequency": {
+                     "state": "thermally_limited", "sustainable_frequency_ghz": 1.9,
+                 },
              }}},
             {"row": 0, "column": 1, "tmax_c": 99.0,
-             "hotspot_frequency": {"state": "thermal_headroom"},
+             "hotspot_frequency": {
+                 "state": "thermal_headroom", "sustainable_frequency_ghz": 2.0,
+             },
              "variants": {"paper-area": {
                  "raw_proxy_tmax_c": 79.0,
-                 "raw_frequency": {"state": "thermal_headroom"},
-                 "anchored_frequency": {"state": "thermally_limited"},
+                 "raw_frequency": {
+                     "state": "thermal_headroom", "sustainable_frequency_ghz": 2.0,
+                 },
+                 "anchored_frequency": {
+                     "state": "thermally_limited", "sustainable_frequency_ghz": 1.9,
+                 },
              }}},
             {"row": 1, "column": 1, "tmax_c": 100.5,
-             "hotspot_frequency": {"state": "thermally_limited"},
+             "hotspot_frequency": {
+                 "state": "thermally_limited", "sustainable_frequency_ghz": 1.95,
+             },
              "variants": {"paper-area": {
                  "raw_proxy_tmax_c": 80.5,
-                 "raw_frequency": {"state": "thermal_headroom"},
-                 "anchored_frequency": {"state": "thermally_limited"},
+                 "raw_frequency": {
+                     "state": "thermal_headroom", "sustainable_frequency_ghz": 2.0,
+                 },
+                 "anchored_frequency": {
+                     "state": "thermally_limited", "sustainable_frequency_ghz": 1.9,
+                 },
              }}},
         ]
         summary = summarize_variant("paper-area", records, anchor, 0.02)
@@ -202,6 +224,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(summary["frequency_state_agreement_rate"], 2 / 3)
         self.assertEqual(summary["raw_frequency_state_agreement_rate"], 1 / 3)
         self.assertFalse(summary["raw_thermal_frequency_term_active"])
+        self.assertEqual(summary["hotspot_sustainable_frequency_range_ghz"], [1.9, 2.0])
+        self.assertFalse(summary["anchored_proxy_frequency_varies"])
+        self.assertFalse(summary["raw_proxy_frequency_varies"])
+        self.assertTrue(summary["hotspot_frequency_varies"])
 
     def test_pipeline_forwards_hotspot_materialization_contract(self):
         """Fixed-bin and paper-single runs must preserve identification inputs."""
