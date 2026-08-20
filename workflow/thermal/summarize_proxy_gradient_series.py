@@ -35,6 +35,46 @@ def _mean_median(values: list[float]) -> dict:
     }
 
 
+def _read_hotspot_frequency_observability(values: dict, path: Path) -> dict | None:
+    """Validate the optional physical frequency-observability record.
+
+    Older diagnostic reports predate this field, so a series remains readable
+    across that schema addition.  When the field is present, however, do not
+    silently aggregate malformed values: the headroom is evidence for whether
+    a placement range can physically exercise the thermal-frequency branch.
+    """
+    raw = values.get("hotspot_frequency_observability")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"invalid hotspot frequency observability in {path}")
+    try:
+        safe = float(raw["safe_temperature_c"])
+        bounds = raw["hotspot_tmax_range_c"]
+        headroom = float(raw["hottest_headroom_to_safe_c"])
+        crosses = raw["sampled_positions_cross_safe_threshold"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"invalid hotspot frequency observability in {path}") from error
+    if (not math.isfinite(safe) or not isinstance(bounds, list) or len(bounds) != 2
+            or type(crosses) is not bool):
+        raise ValueError(f"invalid hotspot frequency observability in {path}")
+    try:
+        coolest, hottest = (float(value) for value in bounds)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid hotspot frequency observability in {path}") from error
+    if (not math.isfinite(coolest) or not math.isfinite(hottest)
+            or coolest > hottest or not math.isfinite(headroom)):
+        raise ValueError(f"invalid hotspot frequency observability in {path}")
+    if not math.isclose(headroom, safe - hottest, rel_tol=0.0, abs_tol=1.0e-9):
+        raise ValueError(f"inconsistent hotspot frequency observability in {path}")
+    return {
+        "safe_temperature_c": safe,
+        "hotspot_tmax_range_c": [coolest, hottest],
+        "hottest_headroom_to_safe_c": headroom,
+        "sampled_positions_cross_safe_threshold": crosses,
+    }
+
+
 def _contract_signature(document: dict) -> tuple:
     """Return the report fields that must not differ in one evidence series."""
     variants = document.get("variants")
@@ -105,6 +145,7 @@ def summarize_reports(reports: list[tuple[str, Path]]) -> dict:
         observability = {
             key: {"observed": 0, "true": 0} for key in observability_keys
         }
+        hotspot_observability = []
         for label, path, document in loaded:
             values = document["evaluations"][variant]
             comparable = int(values["sign_comparable_count"])
@@ -126,6 +167,9 @@ def summarize_reports(reports: list[tuple[str, Path]]) -> dict:
             regrets.append(regret)
             active = bool(values["thermal_frequency_term_active"])
             active_reports += int(active)
+            physical_observability = _read_hotspot_frequency_observability(values, path)
+            if physical_observability is not None:
+                hotspot_observability.append(physical_observability)
             observed_observability = {}
             for key in observability_keys:
                 value = values.get(key)
@@ -147,8 +191,11 @@ def summarize_reports(reports: list[tuple[str, Path]]) -> dict:
                 "spearman": raw_spearman,
                 "selection_regret_c": regret,
                 "thermal_frequency_term_active": active,
+                "hotspot_frequency_observability": physical_observability,
                 **observed_observability,
             })
+        headrooms = [item["hottest_headroom_to_safe_c"]
+                     for item in hotspot_observability]
         summaries[variant] = {
             "report_count": len(per_report),
             "candidate_count": candidate_count,
@@ -168,6 +215,18 @@ def summarize_reports(reports: list[tuple[str, Path]]) -> dict:
                     "true_report_count": values["true"],
                 }
                 for key, values in observability.items()
+            },
+            "hotspot_frequency_observability": {
+                "observed_report_count": len(hotspot_observability),
+                "sampled_positions_cross_safe_threshold_report_count": sum(
+                    item["sampled_positions_cross_safe_threshold"]
+                    for item in hotspot_observability
+                ),
+                "hottest_headroom_to_safe_c": {
+                    **_mean_median(headrooms),
+                    "min": min(headrooms) if headrooms else None,
+                    "max": max(headrooms) if headrooms else None,
+                },
             },
             "per_report": per_report,
         }

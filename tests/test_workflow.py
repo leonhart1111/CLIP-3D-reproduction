@@ -93,7 +93,7 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
 class WorkflowTests(unittest.TestCase):
     def test_proxy_gradient_series_uses_weighted_sign_counts_and_keeps_labels(self):
         def diagnostic(sign_comparable, sign_agreement, spearman, regret, active,
-                       observability=None):
+                       observability=None, hotspot_observability=None):
             evaluation = {
                 "candidate_count": 9,
                 "sign_comparable_count": sign_comparable,
@@ -103,6 +103,8 @@ class WorkflowTests(unittest.TestCase):
                 "proxy_selected": {"selection_regret_c": regret},
                 "thermal_frequency_term_active": active,
             }
+            if hotspot_observability is not None:
+                evaluation["hotspot_frequency_observability"] = hotspot_observability
             if observability:
                 evaluation.update(observability)
             return {
@@ -126,6 +128,11 @@ class WorkflowTests(unittest.TestCase):
                 "hotspot_frequency_varies": True,
                 "anchored_proxy_frequency_varies": False,
                 "raw_proxy_frequency_varies": False,
+            }, {
+                "safe_temperature_c": 95.0,
+                "hotspot_tmax_range_c": [90.0, 96.0],
+                "hottest_headroom_to_safe_c": -1.0,
+                "sampled_positions_cross_safe_threshold": True,
             }))
             result = summarize_reports([("l2-holdout", first), ("in-fit", second)])
 
@@ -145,6 +152,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(observability["anchored_proxy_frequency_varies"], {
             "observed_report_count": 1, "true_report_count": 0,
         })
+        self.assertEqual(values["hotspot_frequency_observability"], {
+            "observed_report_count": 1,
+            "sampled_positions_cross_safe_threshold_report_count": 1,
+            "hottest_headroom_to_safe_c": {
+                "count": 1, "mean": -1.0, "median": -1.0,
+                "min": -1.0, "max": -1.0,
+            },
+        })
+        self.assertIsNone(values["per_report"][0]["hotspot_frequency_observability"])
+        self.assertEqual(
+            values["per_report"][1]["hotspot_frequency_observability"]
+            ["hottest_headroom_to_safe_c"], -1.0,
+        )
         self.assertEqual(values["per_report"][0]["label"], "l2-holdout")
         self.assertEqual(result["common_contract"]["config"], "fixture-config")
 
