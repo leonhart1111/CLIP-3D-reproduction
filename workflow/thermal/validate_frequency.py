@@ -467,11 +467,32 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
                 "power_trace": solution_run["power_trace"],
             }
 
-    accepted = (
+    max_uniform_gamma_error = max(
+        abs(run["uniform_gamma_comparison"]["error_vs_hotspot_c"])
+        for run in runs
+    )
+    uniform_gamma_acceptable = (
+        max_uniform_gamma_error <= settings["max_safe_error_c"]
+    )
+    scalar_solution_accepted = (
         fsus >= f0 or
         (solution_validation is not None and solution_validation["accepted"])
     )
-    if fsus >= f0:
+    # A safety solve at the scalar closed form is necessary but not
+    # sufficient.  The frequency derivation also assumes that the total
+    # power field can be scaled with one global leakage fraction.  The
+    # separated-power reference solves above are the direct observability
+    # test for that assumption.  Without this gate a coincidental 95 C solve
+    # could endorse Eq. (13) even after its spatial scaling law was measured
+    # to miss by far more than the Table-III-scale tolerance.
+    accepted = uniform_gamma_acceptable and scalar_solution_accepted
+    if not uniform_gamma_acceptable:
+        recommendation_basis = (
+            "separated-power HotSpot disagrees with the global-gamma "
+            "temperature law by more than "
+            f"{settings['max_safe_error_c']:.6g} C"
+        )
+    elif fsus >= f0:
         recommendation_basis = "f_sus is at f0; no below-f0 HotSpot safety solve is required"
     elif solution_validation is None:
         recommendation_basis = "below-f0 HotSpot safety solve was skipped"
@@ -563,10 +584,8 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
         "r_convec_k_per_w": manifest["r_convec_k_per_w"],
         "ambient_c": ambient, "gamma": gamma, "f0_ghz": f0,
         "base_tmax_c": base_thermal["tmax_c"], "frequencies": runs,
-        "max_abs_uniform_gamma_comparison_error_c": max(
-            abs(run["uniform_gamma_comparison"]["error_vs_hotspot_c"])
-            for run in runs
-        ),
+        "max_abs_uniform_gamma_comparison_error_c": max_uniform_gamma_error,
+        "uniform_gamma_acceptable": uniform_gamma_acceptable,
         "sustainable_frequency_ghz": fsus, "frequency_state": state,
         "unclamped_frequency_ghz": raw, "solution_validation": solution_validation,
         "two_point_affine_frequency": two_point,

@@ -641,7 +641,10 @@ class FrequencyTests(unittest.TestCase):
             with patch("workflow.thermal.validate_frequency.run_hotspot",
                        side_effect=[
                            {"tmax_c": 80.0, "grid_steady_file": str(reference)},
-                           {"tmax_c": 95.03},
+                           # Even an exact scalar f_sus safety point cannot
+                           # repair the already-observed nonuniform power
+                           # field at the reference frequency.
+                           {"tmax_c": 95.0},
                            {"tmax_c": 95.005},
                        ]) as runner:
                 result = validate_case(
@@ -649,6 +652,8 @@ class FrequencyTests(unittest.TestCase):
                 )
 
             self.assertFalse(result["recommendation"]["accepted"])
+            self.assertFalse(result["uniform_gamma_acceptable"])
+            self.assertTrue(result["solution_validation"]["accepted"])
             fallback = result["two_point_affine_frequency"]
             self.assertTrue(fallback["available"])
             self.assertAlmostEqual(fallback["sustainable_frequency_ghz"], 1.875)
@@ -725,8 +730,10 @@ class FrequencyTests(unittest.TestCase):
             (case / "power_leakage.ptrace").write_text("a\n2\n", encoding="utf-8")
             (case / "power.ptrace").write_text("a\n10\n", encoding="utf-8")
 
+            # The 1 GHz reference must also satisfy the scalar spatial-power
+            # assumption; this test isolates the separate f_sus safety gate.
             with patch("workflow.thermal.validate_frequency.run_hotspot",
-                       side_effect=[{"tmax_c": 80.0}, {"tmax_c": 95.03}]):
+                       side_effect=[{"tmax_c": 70.0}, {"tmax_c": 95.03}]):
                 strict = validate_case(
                     case, root / "modules.json", root / "strict.json", [1.0],
                 )
@@ -739,7 +746,7 @@ class FrequencyTests(unittest.TestCase):
             self.assertFalse(strict["recommendation"]["accepted"])
 
             with patch("workflow.thermal.validate_frequency.run_hotspot",
-                       side_effect=[{"tmax_c": 80.0}, {"tmax_c": 95.03}]):
+                       side_effect=[{"tmax_c": 70.0}, {"tmax_c": 95.03}]):
                 relaxed = validate_case(
                     case, root / "modules.json", root / "relaxed.json", [1.0],
                     frequency_settings={"max_safe_error_c": 0.05},

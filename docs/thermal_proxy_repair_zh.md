@@ -77,6 +77,8 @@ dynamic/leakage 热图，逐 cell 重建 Equation (9) 的
 `two_point_affine_frequency`。这是论文说明的“一次额外 HotSpot”回退；结果仅作
 验证/校准，绝不把 HotSpot 调用加入 Equation (14) 的优化内环。只有随后在这个
 闭式频率运行的独立 HotSpot 仍满足 0.02 C 安全误差时，才可把该回退报告为通过。
+因此 global-\(\gamma\) 的正式接受同时要求：分离功耗参考点的空间温度误差不超过
+0.02 C，且其闭式 \(f_{sus}\) 安全复核通过；不能只因后者偶然落在 95 C 就接受前者。
 
 不能把这个回退偷换成“将 Equation (14) 的模块 dynamic/leakage 分量分别求和”
 的无 HotSpot 版本。一个隔离的候选 worktree 在同一 FFT fixed-bin anchor 上作了
