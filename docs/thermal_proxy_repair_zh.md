@@ -14,10 +14,12 @@ CLIP-3D 的 Equation (14) 不是 HotSpot 的替代品。它只需为 L2 给出�
 1. **物理合同漂移。** 64x64 标定曾在预测阶段丢失 `input_granularity`、
    `compact_trace` 和 `ptrace_precision`，从 module-input 静默退回 grid-cell。
    这已经修正；任何后续诊断必须记录这三个字段、网格、热栈和 `R_conv`。
-2. **绝对门限与空间梯度混淆。** Equation (14) 的绝对温度只是一阶启发式；
-   原始代理的共同偏置足以把全部候选错误地放在 95 C 以下。non-formal
+2. **频率模型的适用条件被混淆。** Equation (14) 的绝对温度只是一阶启发式；
+   原始代理的共同偏置可把候选送入错误的 95 C 分支。即使门限正确，Equation
+   (13) 的单一全局 \(\gamma\) 还假定动态/漏电功耗在空间上近似同比例。non-formal
    operational 诊断允许一份同合同 fixed-bin HotSpot 作为共同锚点，且只将
-   代理的候选间 delta 送入 Equation (13)。这不改变排序或梯度。
+   代理的候选间 delta 送入 Equation (13)。这不改变排序或梯度；对于明显非均匀
+   \(\gamma\)，则按论文的两点 HotSpot 回退做单独验证，而不重新拟合代理系数。
 3. **宏块几何被压缩为质心。** HotSpot 使用经过 CACTI 长宽比和 McPAT 面积
    归一化的 L2 矩形；代理若把它压成一个点，会漏掉有限矩形的源/受体积分。
    `area-quadrature` 是允许的最小修正，且不改变 Eq. (14) 的核或共享 `L_c`。
@@ -30,7 +32,7 @@ CLIP-3D 的 Equation (14) 不是 HotSpot 的替代品。它只需为 L2 给出�
 | 候选问题 | 最小可证伪测试 | 当前状态与可作出的结论 |
 | --- | --- | --- |
 | HotSpot 输入合同在标定与预测间漂移 | 对同一 `modules.json` 比对 grid、module/grid-cell 输入、ptrace 精度、stack 和 `R_conv`；只复用合同完全匹配的探针 | 已定位并修复 `run_one()` 漏传三项 materialization 选项的问题；后续 64x64 诊断使用 module-input 合同。它消除了无效比较，但不保证代理精度。 |
-| Eq.(14) 的绝对偏置让 Equation (13) 进入错误门限 | 同一 fixed-bin 的 HotSpot 温度只作为候选间共同偏置，比较 raw 与 anchor 后的频率状态；另选真实高功耗 FFT 锚点 | FFT fixed-bin 已证实闭式热限频链路可进入 1.15 GHz；低功耗 stencil 在真实 HotSpot 下全部 2 GHz 是不可观测，而非频率公式失败。raw/anchor 双状态记录已加入，FFT 的位置梯度诊断待五点结束后串行运行。 |
+| Eq.(14) 的绝对偏置让 Equation (13) 进入错误门限，或 module-level \(\gamma\) 使 uniform-\(\gamma\) 近似失效 | 同一 fixed-bin 的 HotSpot 温度只作为候选间共同偏置，比较 raw 与 anchor 后的频率状态；另选真实高功耗 FFT 锚点，并以分离 dynamic/leakage ptrace 在 1.0 GHz 和闭式 \(f_{sus}\) 重跑 HotSpot | FFT fixed-bin 已证实闭式热限频链路可进入 1.15 GHz；低功耗 stencil 在真实 HotSpot 下全部 2 GHz 是不可观测，而非频率公式失败。当前模型的 module-level \(\gamma\) 范围约为 0.03--1.0，因此 FFT 分离功耗验证已排队；在其结果出现前，不能将 global-\(\gamma\) 近似提升为已验收。 |
 | L2 有限矩形被质心化，或把核长度错误地随 L2 尺寸改变 | 固定共享参数与同一 HotSpot 网格，比较 center 与 area-quadrature；保持 `L_c=die/2` 的几何消融与冻结拟合候选分开 | 首个 L2 留出点中面积积分的冻结候选方向较好。不可把 L2 长宽代入 `L_c`：论文把 `L_c` 设为 die half-width，L2 尺寸仅应出现在面积积分。完整留出汇总仍在运行。 |
 | HotSpot peak 的 cell/边界切换使极小温差不可靠 | 以 `|ΔT|>=0.02 C` 才计 sign；对接近选点用更高 grid 重跑 | `grid-field` 扩展在首点更差，未采用。当前不把亚阈值的反向符号计为代理失败；高分辨率复核只在完整留出证据显示真实选择差异时执行。 |
 
@@ -60,9 +62,11 @@ HotSpot 回归参数。因此低功耗点的原始代理若全部落在 95 C 以
 梯度诊断同时输出 raw Equation-(14) 与 fixed-bin-anchor 后的频率状态及其各自同
 HotSpot 的状态一致率。前者用来暴露单位换算/绝对偏置造成的错误门限；后者仅用来
 验证“在已知热包络内，梯度能否导向更冷的位置”。两者都不参与温度排序的计算。
-报告还分别给出三者的可持续频率范围及 `*_frequency_varies`。温度落入热限频状态
-本身并不足以让布局优化受益：只有不同合法位置的可持续频率确实有差异，Equation
-(13) 才对 L2 的位置提供热梯度。
+报告还分别给出三者的可持续频率范围及 `*_frequency_varies`。频率验证还记录
+module-level \(\gamma\) 的功率加权值、范围和跨度；只有该范围足够窄、或分离
+dynamic/leakage HotSpot 在 \(f_{sus}\) 的安全误差可接受时，global-\(\gamma\) 闭式
+频率才可作为频率证据。温度落入热限频状态本身并不足以让布局优化受益：只有不同
+合法位置的可持续频率确实有差异，Equation (13) 才对 L2 的位置提供热梯度。
 
 频率项是否活动首先由真实 fixed-bin 热状态决定。一个点即使是“代理较差点”，
 也可能在目标冷却包络下始终低于 `T_safe`；此时频率在所有位置都是 2 GHz，热
@@ -79,8 +83,8 @@ HotSpot 的状态一致率。前者用来暴露单位换算/绝对偏置造成�
    若长时 HotSpot 任务中断，以同一命令加 `--resume` 重启；它只复用
    `calibration_sample.json` 与当前合同完全一致的已完成探针，避免把部分目录
    误当成有效结果。
-3. 单独选择高功耗 FFT 锚点验证 Equation (13) 的频率链路。低功耗差点只验证
-   温度梯度，不被错误地当作频率测试。
+3. 单独选择高功耗 FFT 锚点验证 Equation (13) 的频率链路及 uniform-\(\gamma\)
+   前提。低功耗差点只验证温度梯度，不被错误地当作频率测试。
 4. 对接近的选点以更高 HotSpot 网格复核；小于数值/网格不确定度的温差应记为
    tie，而非代理失败或性能提升。
 
