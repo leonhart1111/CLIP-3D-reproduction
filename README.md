@@ -75,3 +75,37 @@ python3 -m workflow.run_lifting_pipeline \
 ```
 
 完整方法说明见 [docs/clip3d_pipeline_zh.md](docs/clip3d_pipeline_zh.md)，严格正式执行顺序见 [docs/formal_reproduction_zh.md](docs/formal_reproduction_zh.md)，可选10 ms瞬态热仿真见 [docs/transient_thermal_zh.md](docs/transient_thermal_zh.md)。热代理和线延迟参数的独立验证方法见 [docs/surrogate_parameter_validation_zh.md](docs/surrogate_parameter_validation_zh.md)。
+
+## 热代理梯度诊断（non-formal）
+
+`workflow.thermal.diagnose_proxy_gradient` 是热代理的主交互入口。它固定一个
+`modules.json` 与 HotSpot 物理合同，在合法 L2 位置上运行共同的 HotSpot 网格，并比较
+Equation (14) 变体的基础温度梯度；它不拟合参数、不运行 gem5/McPAT/R2，也不把结果称为
+论文等价优化。最终布局温度仍应使用完整流水线的 HotSpot 结果。
+
+```bash
+cd /home/zyjiang/Agenticflow/CLIP
+source ./scripts/env.sh
+python -m workflow.thermal.diagnose_proxy_gradient \
+  --modules <existing-modules.json> \
+  --config configs/experiments/clip3d_unscaled_stressed_proxy_gradient_diagnostic.json \
+  --output-dir runs/proxy_gradient/<case-name> \
+  --variant fitted-area=area-quadrature,0.058600738908940346 \
+  --variant fitted-center=center,0.058600738908940346 \
+  --variant paper-center=center,0.5 \
+  --variant paper-area=area-quadrature,0.5 \
+  --grid-points 3 --workers 2
+```
+
+若命令在 HotSpot 求解期间中断，以**完全相同的参数**增加 `--resume`；仅合同匹配的完整
+探针会被复用。多个点完成后使用下列入口汇总，必须将拟合集内点与架构留出点标为不同标签：
+
+```bash
+python -m workflow.thermal.summarize_proxy_gradient_series \
+  --report l2-holdout=runs/proxy_gradient/<held-out-case>/gradient_diagnostic.json \
+  --report in-fit-regression=runs/proxy_gradient/<in-fit-case>/gradient_diagnostic.json \
+  --output runs/proxy_gradient/series_summary.json
+```
+
+汇总器拒绝混用不同的 config、HotSpot、网格、允许 tier 或代理变体。诊断的科学边界、已知
+问题和当前实验结论见 [docs/thermal_proxy_repair_zh.md](docs/thermal_proxy_repair_zh.md)。
