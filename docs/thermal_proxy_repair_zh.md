@@ -46,6 +46,9 @@ workload、缓存容量和空间位置留出集上验证，不能以训练点误
    module-input、`R_conv=5` 合同下比较 `fitted/paper × center/area` 四个变体。
 2. 只有在首点确认可重复的方向结果后，才扩展到其余四个差点；每一点使用相同
    原始 McPAT/CACTI 模型、同一候选格和相同 HotSpot 合同。
+   若长时 HotSpot 任务中断，以同一命令加 `--resume` 重启；它只复用
+   `calibration_sample.json` 与当前合同完全一致的已完成探针，避免把部分目录
+   误当成有效结果。
 3. 单独选择高功耗 FFT 锚点验证 Equation (13) 的频率链路。低功耗差点只验证
    温度梯度，不被错误地当作频率测试。
 4. 对接近的选点以更高 HotSpot 网格复核；小于数值/网格不确定度的温差应记为

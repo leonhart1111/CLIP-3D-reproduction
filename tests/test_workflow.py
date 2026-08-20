@@ -71,7 +71,9 @@ from workflow.thermal.calibrate_proxy import (
     calibrate, candidate_layouts, parse_external_case, proxy_acceptance_checks,
     proxy_prediction, run_one, sample_split,
 )
-from workflow.thermal.diagnose_proxy_gradient import ProxyVariant, parse_variant, summarize_variant
+from workflow.thermal.diagnose_proxy_gradient import (
+    ProxyVariant, parse_variant, prepare_output_directory, summarize_variant,
+)
 from workflow.thermal.sustainable_frequency import closed_form_frequency
 from workflow.thermal.run_anchor_validation import run_manifest
 from workflow.thermal.validate_frequency import (
@@ -87,6 +89,15 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_proxy_gradient_resume_requires_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "gradient"
+            prepare_output_directory(output_dir, resume=False)
+            (output_dir / "partial-artifact").write_text("partial", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "--resume"):
+                prepare_output_directory(output_dir, resume=False)
+            prepare_output_directory(output_dir, resume=True)
+
     def test_proxy_gradient_variant_parser_and_summary_preserve_directional_metrics(self):
         variant = parse_variant("paper-area=area-quadrature,0.5")
         self.assertEqual(variant, ProxyVariant("paper-area", "area-quadrature", 0.5))

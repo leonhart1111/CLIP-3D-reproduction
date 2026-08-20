@@ -66,6 +66,16 @@ def parse_variant(text: str) -> ProxyVariant:
     return ProxyVariant(name, spatial_model, ratio)
 
 
+def prepare_output_directory(output_dir: Path, resume: bool) -> None:
+    """Create an output directory, retaining matching completed probes on resume."""
+    if output_dir.exists() and any(output_dir.iterdir()) and not resume:
+        raise ValueError(
+            "output directory must be new or empty; pass --resume to reuse "
+            f"matching completed HotSpot probes: {output_dir}"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
 def _frequency(temperature_c: float, model: dict, config: dict) -> dict:
     frequency = config["frequency"]
     value, state, unconstrained = closed_form_frequency(
@@ -257,7 +267,7 @@ def _sample_from_layout(model_path: Path, label: str, layout: dict,
 def run_probe(model_path: Path, config_path: Path, output_dir: Path,
               variants: list[ProxyVariant], grid_points: int = 3,
               workers: int = 1, hotspot: Path = DEFAULT_HOTSPOT,
-              sign_tolerance_c: float = 0.02) -> dict:
+              sign_tolerance_c: float = 0.02, resume: bool = False) -> dict:
     """Run one shared HotSpot grid and evaluate every requested proxy variant."""
     if grid_points < 2:
         raise ValueError("grid_points must be at least 2")
@@ -270,12 +280,9 @@ def run_probe(model_path: Path, config_path: Path, output_dir: Path,
     names = [variant.name for variant in variants]
     if len(set(names)) != len(names):
         raise ValueError("proxy variant names must be unique")
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise ValueError(f"output directory must be new or empty: {output_dir}")
-
     config = read_json(config_path)
     model = read_json(model_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_directory(output_dir, resume)
     utilization = float(config["physical"]["utilization"])
     baseline = baseline_layout(model, utilization)
     baseline_l2 = next(module for module in baseline["modules"] if module["kind"] == "l2")
@@ -358,7 +365,7 @@ def run_probe(model_path: Path, config_path: Path, output_dir: Path,
         ),
         "model": str(model_path.resolve()), "config": str(config_path.resolve()),
         "hotspot": str(hotspot.resolve()), "grid_points_per_axis": grid_points,
-        "allowed_l2_tiers": [1], "workers": workers,
+        "allowed_l2_tiers": [1], "workers": workers, "resume_requested": resume,
         "variants": [
             {"name": variant.name, "proxy_spatial_model": variant.spatial_model,
              "lc_die_side_ratio": variant.lc_die_side_ratio}
@@ -397,11 +404,15 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--hotspot", type=Path, default=DEFAULT_HOTSPOT)
     parser.add_argument("--sign-tolerance-c", type=float, default=0.02)
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="reuse matching completed HotSpot probes in a non-empty output directory",
+    )
     args = parser.parse_args()
     report = run_probe(
         args.modules.resolve(), args.config.resolve(), args.output_dir.resolve(),
         args.variant, args.grid_points, args.workers, args.hotspot.resolve(),
-        args.sign_tolerance_c,
+        args.sign_tolerance_c, args.resume,
     )
     for name, values in report["evaluations"].items():
         print(
