@@ -104,11 +104,15 @@ def resolve_frequency_settings(frequency_settings: dict | None,
         "f0_ghz": 2.0,
         "fmin_ghz": 0.4,
         "tsafe_c": 95.0,
+        # Table III reports <=0.02 C error for the paper's validation
+        # anchors.  Do not let a degree-scale miss silently endorse the
+        # global-gamma shortcut merely because it lands near the DTM limit.
+        "max_safe_error_c": 0.02,
         "scaling_mode": scaling_mode,
     }
     if frequency_settings:
         settings.update(frequency_settings)
-    for key in ("f0_ghz", "fmin_ghz", "tsafe_c"):
+    for key in ("f0_ghz", "fmin_ghz", "tsafe_c", "max_safe_error_c"):
         settings[key] = float(settings[key])
         if not math.isfinite(settings[key]):
             raise ValueError(f"{key} must be finite")
@@ -116,6 +120,8 @@ def resolve_frequency_settings(frequency_settings: dict | None,
         raise ValueError("f0_ghz and fmin_ghz must be positive")
     if settings["fmin_ghz"] > settings["f0_ghz"]:
         raise ValueError("fmin_ghz must not exceed f0_ghz")
+    if settings["max_safe_error_c"] < 0.0:
+        raise ValueError("max_safe_error_c must be non-negative")
     if settings["scaling_mode"] not in {
         "separated-dynamic-leakage", "paper-uniform-gamma",
     }:
@@ -285,6 +291,7 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
                 "hotspot_tmax_c": None,
                 "safe_temperature_c": tsafe,
                 "safe_error_c": None,
+                "max_safe_error_c": settings["max_safe_error_c"],
                 "accepted": False,
                 "power_trace": solution_run["power_trace"],
                 "error": solution_run["hotspot_error"],
@@ -298,7 +305,11 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
                 "frequency_ghz": fsus, "hotspot_tmax_c": hotspot_tmax,
                 "safe_temperature_c": tsafe,
                 "safe_error_c": safe_error,
-                "accepted": math.isfinite(hotspot_tmax) and safe_error <= 1.0,
+                "max_safe_error_c": settings["max_safe_error_c"],
+                "accepted": (
+                    math.isfinite(hotspot_tmax)
+                    and safe_error <= settings["max_safe_error_c"]
+                ),
                 "power_trace": solution_run["power_trace"],
             }
 
@@ -316,7 +327,10 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
             f"{solution_validation['error']}"
         )
     else:
-        recommendation_basis = "below-f0 HotSpot safety error is finite and no greater than 1.0 C"
+        recommendation_basis = (
+            "below-f0 HotSpot safety error is finite and no greater than "
+            f"{settings['max_safe_error_c']:.6g} C"
+        )
 
     result = {
         "schema_version": 1, "equations": [11, 12, 13],

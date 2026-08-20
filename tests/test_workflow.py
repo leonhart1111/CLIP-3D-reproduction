@@ -622,6 +622,7 @@ class FrequencyTests(unittest.TestCase):
             self.assertIn("max_abs_uniform_gamma_comparison_error_c", result)
             self.assertNotIn("max_abs_linear_error_c", result)
             self.assertFalse(result["recommendation"]["accepted"])
+            self.assertEqual(result["frequency_settings"]["max_safe_error_c"], 0.02)
             self.assertEqual(
                 result["module_gamma_observability"]["module_gamma_range"],
                 [0.0, 0.75],
@@ -629,6 +630,45 @@ class FrequencyTests(unittest.TestCase):
             self.assertEqual(
                 result["module_gamma_observability"]["power_weighted_gamma"],
                 0.375,
+            )
+
+    def test_frequency_validation_requires_paper_scale_safety_error(self):
+        """A degree-scale DTM miss must not endorse the uniform-gamma shortcut."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = root / "case"
+            case.mkdir()
+            write_json(root / "modules.json", {"gamma": 0.2})
+            write_json(case / "hotspot_manifest.json", {
+                "ambient_c": 25.0, "r_convec_k_per_w": 5.0,
+            })
+            write_json(case / "thermal_result.json", {"tmax_c": 100.0})
+            (case / "power_dynamic.ptrace").write_text("a\n8\n", encoding="utf-8")
+            (case / "power_leakage.ptrace").write_text("a\n2\n", encoding="utf-8")
+            (case / "power.ptrace").write_text("a\n10\n", encoding="utf-8")
+
+            with patch("workflow.thermal.validate_frequency.run_hotspot",
+                       side_effect=[{"tmax_c": 80.0}, {"tmax_c": 95.03}]):
+                strict = validate_case(
+                    case, root / "modules.json", root / "strict.json", [1.0],
+                )
+            self.assertAlmostEqual(
+                strict["solution_validation"]["safe_error_c"], 0.03,
+            )
+            self.assertEqual(
+                strict["solution_validation"]["max_safe_error_c"], 0.02,
+            )
+            self.assertFalse(strict["recommendation"]["accepted"])
+
+            with patch("workflow.thermal.validate_frequency.run_hotspot",
+                       side_effect=[{"tmax_c": 80.0}, {"tmax_c": 95.03}]):
+                relaxed = validate_case(
+                    case, root / "modules.json", root / "relaxed.json", [1.0],
+                    frequency_settings={"max_safe_error_c": 0.05},
+                )
+            self.assertTrue(relaxed["recommendation"]["accepted"])
+            self.assertEqual(
+                relaxed["solution_validation"]["max_safe_error_c"], 0.05,
             )
 
     def test_frequency_validation_forwards_explicit_hotspot_binary(self):
