@@ -227,7 +227,7 @@ class WorkflowTests(unittest.TestCase):
                  },
              }}},
         ]
-        summary = summarize_variant("paper-area", records, anchor, 0.02)
+        summary = summarize_variant("paper-area", records, anchor, 0.02, 95.0)
         self.assertEqual(summary["sign_agreement_rate"], 1.0)
         self.assertEqual(summary["spearman"], 1.0)
         self.assertEqual(summary["proxy_selected"]["selection_regret_c"], 0.0)
@@ -248,6 +248,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(summary["anchored_proxy_frequency_varies"])
         self.assertFalse(summary["raw_proxy_frequency_varies"])
         self.assertTrue(summary["hotspot_frequency_varies"])
+        self.assertEqual(summary["hotspot_frequency_observability"], {
+            "safe_temperature_c": 95.0,
+            "hotspot_tmax_range_c": [99.0, 101.0],
+            "hottest_headroom_to_safe_c": -6.0,
+            "sampled_positions_cross_safe_threshold": False,
+        })
 
     def test_pipeline_forwards_hotspot_materialization_contract(self):
         """Fixed-bin and paper-single runs must preserve identification inputs."""

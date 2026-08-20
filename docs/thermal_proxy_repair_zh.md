@@ -93,6 +93,10 @@ dynamic/leakage 热图，逐 cell 重建 Equation (9) 的
 代理无法也不应制造性能增益。优化器报告中的
 `observability_diagnostics.sampled_thermal_frequency_term_active` 与
 `sampled_thermal_frequency_term_varies` 显式记录这一区别。
+共同 HotSpot 网格诊断还报告每个变体的
+`hotspot_frequency_observability.hottest_headroom_to_safe_c`：为正且没有跨阈值时，
+当前 L2 可移动范围在物理上不足以激活频率项；这不是低相关度排名或 \(L_c\)
+参数的证据。
 
 ## 分阶段实验
 

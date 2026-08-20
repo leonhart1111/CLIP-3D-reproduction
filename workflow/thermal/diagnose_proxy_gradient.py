@@ -158,7 +158,8 @@ def _correlation(first: list[float], second: list[float], kind: str) -> float | 
 
 
 def summarize_variant(name: str, records: list[dict], anchor: dict,
-                      sign_tolerance_c: float) -> dict:
+                      sign_tolerance_c: float,
+                      tsafe_c: float | None = None) -> dict:
     """Summarize rank, signs, frequency regime, and selection regret.
 
     ``records`` must contain actual HotSpot temperatures and this variant's raw
@@ -169,6 +170,8 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
         raise ValueError("cannot summarize an empty probe grid")
     if sign_tolerance_c < 0.0:
         raise ValueError("sign tolerance must be non-negative")
+    if tsafe_c is not None and not math.isfinite(float(tsafe_c)):
+        raise ValueError("tsafe_c must be finite when supplied")
     raw_anchor = float(anchor["variants"][name]["raw_proxy_tmax_c"])
     hotspot_anchor = float(anchor["tmax_c"])
     actual_deltas = [float(record["tmax_c"]) - hotspot_anchor for record in records]
@@ -245,7 +248,7 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
     def frequency_varies(values: list[float]) -> bool:
         return len(values) > 1 and max(values) - min(values) > 1.0e-12
 
-    return {
+    result = {
         "candidate_count": len(records),
         "hotspot_delta_range_c": [min(actual_deltas), max(actual_deltas)],
         "proxy_delta_range_c": [min(proxy_deltas), max(proxy_deltas)],
@@ -309,6 +312,22 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
             or any(state != "thermal_headroom" for state in proxy_states if isinstance(state, str))
         ),
     }
+    if tsafe_c is not None:
+        hottest = max(actual_values)
+        coolest = min(actual_values)
+        # A spatial surrogate cannot create a frequency gain if the complete
+        # sampled HotSpot envelope lies below the DTM threshold.  Reporting
+        # this margin distinguishes a genuinely inactive physical term from a
+        # ranking or parameter failure in Equation (14).
+        result["hotspot_frequency_observability"] = {
+            "safe_temperature_c": float(tsafe_c),
+            "hotspot_tmax_range_c": [coolest, hottest],
+            "hottest_headroom_to_safe_c": float(tsafe_c) - hottest,
+            "sampled_positions_cross_safe_threshold": (
+                coolest <= float(tsafe_c) < hottest
+            ),
+        }
+    return result
 
 
 def _sample_from_layout(model_path: Path, label: str, layout: dict,
@@ -433,7 +452,8 @@ def run_probe(model_path: Path, config_path: Path, output_dir: Path,
         "anchor": anchor, "records": records,
         "evaluations": {
             variant.name: summarize_variant(
-                variant.name, records, anchor, sign_tolerance_c
+                variant.name, records, anchor, sign_tolerance_c,
+                float(config["frequency"]["tsafe_c"]),
             ) for variant in variants
         },
         "interpretation": {
