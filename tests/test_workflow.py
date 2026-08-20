@@ -586,7 +586,13 @@ class FrequencyTests(unittest.TestCase):
             root = Path(temporary)
             case = root / "case"
             case.mkdir()
-            write_json(root / "modules.json", {"gamma": 0.2})
+            write_json(root / "modules.json", {
+                "gamma": 0.2,
+                "modules": [
+                    {"dynamic_power_w": 1.0, "leakage_power_w": 3.0},
+                    {"dynamic_power_w": 4.0, "leakage_power_w": 0.0},
+                ],
+            })
             write_json(case / "hotspot_manifest.json", {
                 "ambient_c": 25.0, "r_convec_k_per_w": 5.0,
             })
@@ -616,6 +622,14 @@ class FrequencyTests(unittest.TestCase):
             self.assertIn("max_abs_uniform_gamma_comparison_error_c", result)
             self.assertNotIn("max_abs_linear_error_c", result)
             self.assertFalse(result["recommendation"]["accepted"])
+            self.assertEqual(
+                result["module_gamma_observability"]["module_gamma_range"],
+                [0.0, 0.75],
+            )
+            self.assertEqual(
+                result["module_gamma_observability"]["power_weighted_gamma"],
+                0.375,
+            )
 
     def test_frequency_validation_forwards_explicit_hotspot_binary(self):
         """A worktree may validate a real case with a shared built HotSpot."""

@@ -123,6 +123,48 @@ def resolve_frequency_settings(frequency_settings: dict | None,
     return settings
 
 
+def module_gamma_observability(modules: dict) -> dict:
+    """Expose whether Equation (11)'s uniform-gamma shortcut is plausible.
+
+    Equation (13) itself uses the power-weighted scalar gamma.  The paper
+    explicitly identifies a separated dynamic/leakage HotSpot calibration as
+    the fallback when module leakage fractions differ materially, so report
+    that precondition instead of silently treating the scalar as exact.
+    """
+    records = modules.get("modules")
+    if not isinstance(records, list):
+        return {"available": False, "reason": "modules list unavailable"}
+    fractions: list[float] = []
+    dynamic_total = 0.0
+    leakage_total = 0.0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        dynamic = float(record.get("dynamic_power_w", 0.0))
+        leakage = float(record.get("leakage_power_w", 0.0))
+        total = dynamic + leakage
+        if not all(math.isfinite(value) and value >= 0.0
+                   for value in (dynamic, leakage, total)):
+            raise ValueError("module power must be finite and non-negative")
+        dynamic_total += dynamic
+        leakage_total += leakage
+        if total > 0.0:
+            fractions.append(leakage / total)
+    total_power = dynamic_total + leakage_total
+    if not fractions or total_power <= 0.0:
+        return {"available": False, "reason": "no positive-power modules"}
+    lower, upper = min(fractions), max(fractions)
+    return {
+        "available": True,
+        "positive_power_module_count": len(fractions),
+        "dynamic_power_w": dynamic_total,
+        "leakage_power_w": leakage_total,
+        "power_weighted_gamma": leakage_total / total_power,
+        "module_gamma_range": [lower, upper],
+        "module_gamma_spread": upper - lower,
+    }
+
+
 def validate_case(case_dir: Path, modules_path: Path, output: Path,
                   frequencies_ghz: list[float] | None = None,
                   validate_solution: bool = True,
@@ -290,6 +332,7 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
         "unclamped_frequency_ghz": raw, "solution_validation": solution_validation,
         "frequency_settings": settings,
         "scaling_mode": selected_scaling_mode,
+        "module_gamma_observability": module_gamma_observability(modules),
         "recommendation": {
             "accepted": accepted,
             "basis": recommendation_basis,
