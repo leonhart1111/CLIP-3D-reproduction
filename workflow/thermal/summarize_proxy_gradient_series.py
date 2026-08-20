@@ -35,6 +35,27 @@ def _mean_median(values: list[float]) -> dict:
     }
 
 
+def _contract_signature(document: dict) -> tuple:
+    """Return the report fields that must not differ in one evidence series."""
+    variants = document.get("variants")
+    if not isinstance(variants, list) or not variants:
+        raise ValueError("report has no variant metadata")
+    normalized_variants = []
+    for variant in variants:
+        try:
+            normalized_variants.append((
+                str(variant["name"]), str(variant["proxy_spatial_model"]),
+                float(variant["lc_die_side_ratio"]),
+            ))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("report has invalid variant metadata") from error
+    return (
+        document.get("config"), document.get("hotspot"),
+        document.get("grid_points_per_axis"),
+        tuple(document.get("allowed_l2_tiers", [])), tuple(normalized_variants),
+    )
+
+
 def summarize_reports(reports: list[tuple[str, Path]]) -> dict:
     """Summarize reports without averaging per-report sign rates incorrectly."""
     if not reports:
@@ -45,6 +66,7 @@ def summarize_reports(reports: list[tuple[str, Path]]) -> dict:
 
     loaded = []
     expected_variants: tuple[str, ...] | None = None
+    expected_contract: tuple | None = None
     for label, path in reports:
         document = read_json(path)
         if document.get("method") != "common-HotSpot-grid equation-(14) gradient diagnostic":
@@ -57,6 +79,11 @@ def summarize_reports(reports: list[tuple[str, Path]]) -> dict:
             expected_variants = variants
         elif variants != expected_variants:
             raise ValueError("all reports must evaluate the same ordered variants")
+        contract = _contract_signature(document)
+        if expected_contract is None:
+            expected_contract = contract
+        elif contract != expected_contract:
+            raise ValueError("all reports must use the same physical/proxy contract")
         loaded.append((label, path.resolve(), document))
 
     assert expected_variants is not None
@@ -134,6 +161,16 @@ def summarize_reports(reports: list[tuple[str, Path]]) -> dict:
             }
             for label, path, document in loaded
         ],
+        "common_contract": {
+            "config": expected_contract[0], "hotspot": expected_contract[1],
+            "grid_points_per_axis": expected_contract[2],
+            "allowed_l2_tiers": list(expected_contract[3]),
+            "variants": [
+                {"name": name, "proxy_spatial_model": spatial_model,
+                 "lc_die_side_ratio": ratio}
+                for name, spatial_model, ratio in expected_contract[4]
+            ],
+        },
         "variants": summaries,
     }
 

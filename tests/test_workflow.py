@@ -95,7 +95,12 @@ class WorkflowTests(unittest.TestCase):
             return {
                 "method": "common-HotSpot-grid equation-(14) gradient diagnostic",
                 "model": "fixture-model", "config": "fixture-config",
-                "grid_points_per_axis": 3,
+                "hotspot": "fixture-hotspot", "grid_points_per_axis": 3,
+                "allowed_l2_tiers": [1],
+                "variants": [{
+                    "name": "fitted-area", "proxy_spatial_model": "area-quadrature",
+                    "lc_die_side_ratio": 0.0586007,
+                }],
                 "evaluations": {"fitted-area": {
                     "candidate_count": 9,
                     "sign_comparable_count": sign_comparable,
@@ -121,6 +126,17 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(values["selection_regret_c"]["mean"], 0.2)
         self.assertEqual(values["thermal_frequency_term_active_report_count"], 1)
         self.assertEqual(values["per_report"][0]["label"], "l2-holdout")
+        self.assertEqual(result["common_contract"]["config"], "fixture-config")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first, incompatible = root / "first.json", root / "incompatible.json"
+            write_json(first, diagnostic(2, 2, 1.0, 0.0, False))
+            wrong_contract = diagnostic(2, 2, 1.0, 0.0, False)
+            wrong_contract["config"] = "other-config"
+            write_json(incompatible, wrong_contract)
+            with self.assertRaisesRegex(ValueError, "same physical/proxy contract"):
+                summarize_reports([("first", first), ("second", incompatible)])
 
     def test_proxy_gradient_resume_requires_explicit_opt_in(self):
         with tempfile.TemporaryDirectory() as temporary:
