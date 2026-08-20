@@ -18,8 +18,10 @@ constant to every candidate and cannot change a variant's ordering.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +40,9 @@ class ProxyVariant:
     name: str
     spatial_model: str
     lc_die_side_ratio: float
+
+
+OUTPUT_LOCK_NAME = ".proxy_gradient.lock"
 
 
 def parse_variant(text: str) -> ProxyVariant:
@@ -68,12 +73,42 @@ def parse_variant(text: str) -> ProxyVariant:
 
 def prepare_output_directory(output_dir: Path, resume: bool) -> None:
     """Create an output directory, retaining matching completed probes on resume."""
-    if output_dir.exists() and any(output_dir.iterdir()) and not resume:
+    entries = (
+        entry for entry in output_dir.iterdir()
+        if entry.name != OUTPUT_LOCK_NAME
+    ) if output_dir.exists() else ()
+    if output_dir.exists() and any(entries) and not resume:
         raise ValueError(
             "output directory must be new or empty; pass --resume to reuse "
             f"matching completed HotSpot probes: {output_dir}"
         )
     output_dir.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def exclusive_output_directory(output_dir: Path):
+    """Prevent two ``--resume`` drivers from deleting each other's partial case.
+
+    ``run_one`` deliberately removes a non-reusable, incomplete case before it
+    materializes it again.  That is correct after interruption, but destructive
+    if a second diagnostic process operates on the same output tree while a
+    HotSpot child still owns that directory.  The lock covers the complete
+    probe, not just file preparation, and is released automatically on exit.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir / OUTPUT_LOCK_NAME
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                "another proxy-gradient diagnostic already owns output directory "
+                f"{output_dir}"
+            ) from error
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _frequency(temperature_c: float, model: dict, config: dict) -> dict:
@@ -340,10 +375,10 @@ def _sample_from_layout(model_path: Path, label: str, layout: dict,
     }
 
 
-def run_probe(model_path: Path, config_path: Path, output_dir: Path,
-              variants: list[ProxyVariant], grid_points: int = 3,
-              workers: int = 1, hotspot: Path = DEFAULT_HOTSPOT,
-              sign_tolerance_c: float = 0.02, resume: bool = False) -> dict:
+def _run_probe_unlocked(model_path: Path, config_path: Path, output_dir: Path,
+                        variants: list[ProxyVariant], grid_points: int = 3,
+                        workers: int = 1, hotspot: Path = DEFAULT_HOTSPOT,
+                        sign_tolerance_c: float = 0.02, resume: bool = False) -> dict:
     """Run one shared HotSpot grid and evaluate every requested proxy variant."""
     if grid_points < 2:
         raise ValueError("grid_points must be at least 2")
@@ -470,6 +505,18 @@ def run_probe(model_path: Path, config_path: Path, output_dir: Path,
     }
     write_json(output_dir / "gradient_diagnostic.json", report)
     return report
+
+
+def run_probe(model_path: Path, config_path: Path, output_dir: Path,
+              variants: list[ProxyVariant], grid_points: int = 3,
+              workers: int = 1, hotspot: Path = DEFAULT_HOTSPOT,
+              sign_tolerance_c: float = 0.02, resume: bool = False) -> dict:
+    """Run one diagnostic while holding exclusive ownership of its output tree."""
+    with exclusive_output_directory(output_dir):
+        return _run_probe_unlocked(
+            model_path, config_path, output_dir, variants, grid_points, workers,
+            hotspot, sign_tolerance_c, resume,
+        )
 
 
 def main() -> None:

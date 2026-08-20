@@ -72,7 +72,8 @@ from workflow.thermal.calibrate_proxy import (
     proxy_prediction, run_one, sample_split,
 )
 from workflow.thermal.diagnose_proxy_gradient import (
-    ProxyVariant, parse_variant, prepare_output_directory, summarize_variant,
+    ProxyVariant, exclusive_output_directory, parse_variant, prepare_output_directory,
+    summarize_variant,
 )
 from workflow.thermal.summarize_proxy_gradient_series import summarize_reports
 from workflow.thermal.sustainable_frequency import closed_form_frequency
@@ -186,6 +187,19 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "--resume"):
                 prepare_output_directory(output_dir, resume=False)
             prepare_output_directory(output_dir, resume=True)
+
+    def test_proxy_gradient_exclusively_locks_output_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "gradient"
+            with exclusive_output_directory(output_dir):
+                # The lock file itself must not make a brand-new output look
+                # like a resumable partial run.
+                prepare_output_directory(output_dir, resume=False)
+                with self.assertRaisesRegex(RuntimeError, "already owns"):
+                    with exclusive_output_directory(output_dir):
+                        pass
+            with exclusive_output_directory(output_dir):
+                prepare_output_directory(output_dir, resume=False)
 
     def test_proxy_gradient_variant_parser_and_summary_preserve_directional_metrics(self):
         variant = parse_variant("paper-area=area-quadrature,0.5")
