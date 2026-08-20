@@ -617,6 +617,31 @@ class FrequencyTests(unittest.TestCase):
             self.assertNotIn("max_abs_linear_error_c", result)
             self.assertFalse(result["recommendation"]["accepted"])
 
+    def test_frequency_validation_forwards_explicit_hotspot_binary(self):
+        """A worktree may validate a real case with a shared built HotSpot."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = root / "case"
+            case.mkdir()
+            write_json(root / "modules.json", {"gamma": 0.2})
+            write_json(case / "hotspot_manifest.json", {
+                "ambient_c": 25.0, "r_convec_k_per_w": 5.0,
+            })
+            write_json(case / "thermal_result.json", {"tmax_c": 80.0})
+            (case / "power_dynamic.ptrace").write_text("a\n8\n", encoding="utf-8")
+            (case / "power_leakage.ptrace").write_text("a\n2\n", encoding="utf-8")
+            (case / "power.ptrace").write_text("a\n10\n", encoding="utf-8")
+            hotspot = root / "shared-hotspot"
+
+            with patch("workflow.thermal.validate_frequency.run_hotspot",
+                       return_value={"tmax_c": 60.0}) as runner:
+                validate_case(
+                    case, root / "modules.json", root / "validation.json", [1.0],
+                    validate_solution=False, hotspot=hotspot,
+                )
+
+            self.assertEqual(runner.call_args.kwargs["hotspot"], hotspot)
+
     def test_below_f0_hotspot_failure_writes_a_rejected_validation_result(self):
         """A failed mandatory safety solve must leave an auditable rejection on disk."""
         with tempfile.TemporaryDirectory() as temporary:

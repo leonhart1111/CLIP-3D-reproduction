@@ -127,7 +127,8 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
                   frequencies_ghz: list[float] | None = None,
                   validate_solution: bool = True,
                   frequency_settings: dict | None = None,
-                  scaling_mode: str = "separated-dynamic-leakage") -> dict:
+                  scaling_mode: str = "separated-dynamic-leakage",
+                  hotspot: Path | None = None) -> dict:
     case_dir = case_dir.resolve()
     modules = read_json(modules_path)
     manifest = read_json(case_dir / "hotspot_manifest.json")
@@ -181,13 +182,22 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
                 "power_trace": str(trace.resolve()),
             }
         try:
-            thermal = run_hotspot(
-                case_dir, ptrace_name=trace.name,
-                result_name=(
-                    f"thermal_{selected_scaling_mode.replace('-', '_')}_"
-                    f"{stem}GHz{result_suffix}.json"
-                ),
+            result_name = (
+                f"thermal_{selected_scaling_mode.replace('-', '_')}_"
+                f"{stem}GHz{result_suffix}.json"
             )
+            # Keep the default call shape for existing callers and mocked
+            # tests.  A supplied binary is essential when this diagnostic is
+            # run from a lightweight worktree without built tool artifacts.
+            if hotspot is None:
+                thermal = run_hotspot(
+                    case_dir, ptrace_name=trace.name, result_name=result_name,
+                )
+            else:
+                thermal = run_hotspot(
+                    case_dir, hotspot=hotspot, ptrace_name=trace.name,
+                    result_name=result_name,
+                )
         except Exception as error:
             if not record_hotspot_failure:
                 raise
@@ -296,10 +306,14 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--frequencies-ghz", type=float, nargs="+", default=[0.5, 1.0, 2.0])
     parser.add_argument("--no-solution-validation", action="store_true")
+    parser.add_argument(
+        "--hotspot", type=Path,
+        help="optional HotSpot executable; needed when the current worktree has no built binary",
+    )
     args = parser.parse_args()
     result = validate_case(
         args.case_dir, args.modules, args.output, args.frequencies_ghz,
-        not args.no_solution_validation,
+        not args.no_solution_validation, hotspot=args.hotspot,
     )
     print(
         "max uniform-gamma comparison error="
