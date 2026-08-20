@@ -114,10 +114,22 @@ dynamic/leakage 热图，逐 cell 重建 Equation (9) 的
 
 ## 当前证据（2026-08-20，尚未完成五点扩展）
 
-首个语义差点 `stencil / L1D=128kB / L2=512kB` 已在 3x3 个合法 top-tier
-位置上完成。normal（`R_conv=1.042`）和 stressed（`R_conv=5`）合同给出相同
-结论；下表列 stressed 的结果（normal 的选择与方向结论相同）。这里的
-`sign` 仅在相对 fixed-bin 温差绝对值不少于 0.02 C 时计入。
+前三个 L2 架构留出点已在各自 3x3 个合法 top-tier 位置上完成。下表为冻结的
+`fitted-area` 候选；`sign` 仅在相对 fixed-bin 温差绝对值不少于 0.02 C 时计入，
+`headroom` 是采样位置中最热的真实 HotSpot 到 95 C 的余量。
+
+| L2 留出点 | Spearman | sign | selection regret | headroom |
+| --- | ---: | ---: | ---: | ---: |
+| stencil / 128kB / 512kB | 1.000 | 6/6 | 0.000 C | 5.356 C |
+| stencil / 128kB / 256kB | 0.950 | 5/5 | 0.000 C | 6.196 C |
+| stream / 16kB / 1024kB | 0.983 | 8/8 | 0.000 C | 13.002 C |
+
+合计为 19/19 个可比较方向正确，平均 Spearman 为 0.978，三个点的 selection
+regret 都是 0。它证明的是基础梯度有效，不是代理绝对温度精确，也不表示这些低功耗
+点应当降频：三者均未跨越 95 C。
+
+首个 `stencil / 128kB / 512kB` 点还完成了几何消融。normal（`R_conv=1.042`）和
+stressed（`R_conv=5`）合同给出相同选择/方向结论；下表列 stressed 的结果。
 
 | 共享几何变体 | Spearman | sign | selection regret |
 | --- | ---: | ---: | ---: |
@@ -126,7 +138,7 @@ dynamic/leakage 热图，逐 cell 重建 Equation (9) 的
 | paper center, `L_c/die=0.5` | 0.350 | 3/6 | 0.050 C |
 | paper area-quadrature, `L_c/die=0.5` | 0.500 | 3/6 | 0.033 C |
 
-因此，当前证据支持把 `area-quadrature + L_c/die=0.0586007` 作为**待扩展验证的
+因此，当前证据支持把 `area-quadrature + L_c/die=0.0586007` 作为**待继续扩展验证的
 共享诊断候选**；它不是按 workload/cache 调参，也尚未被提升为论文等价默认值。
 同一高功耗/低功耗锚点还表明频率项的分界正确：`stencil / 128kB / 2048kB`
 在 stressed 合同下为 93.762 C（仍有 2 GHz headroom），而
