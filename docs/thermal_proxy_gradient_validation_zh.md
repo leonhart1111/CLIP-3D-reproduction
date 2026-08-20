@@ -1,6 +1,12 @@
-# 热代理梯度诊断与当前 operational 修正
+# 历史 32×32 热代理梯度诊断（已被 64×64 同合同复核取代）
 
-## 结论与边界
+> **状态（2026-08-20）：不要将本文作为当前 operational 默认的依据。** 本文记录
+> commit `e84a7ee` 时的 32×32 preliminary 诊断，因此其 `paper-center, L_c/die=0.5`
+> 建议只是历史结论。当前 64×64、module-input、未缩放物理合同的首个留出点反而由
+> `fitted area-quadrature, L_c/die=0.0586007` 获得更好的方向结果。两套数据不能混合
+> 汇总；当前实验设计、证据边界和后续结果请以 `thermal_proxy_repair_zh.md` 为准。
+
+## 历史结论与边界
 
 截至 2026-08-20，新建的 non-formal
 `configs/experiments/clip3d_proxy_anchor_paper_lc_diagnostic.json` 将 Equation (14) 的

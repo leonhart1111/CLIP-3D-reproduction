@@ -78,5 +78,17 @@ workload、缓存容量和空间位置留出集上验证，不能以训练点误
 117.460 C / 1.168320 GHz，说明 Equation (14) 到 Equation (13) 的热频率项本身
 在高功耗合同下已经被正确激活；五个低功耗差点继续只评价空间梯度。
 
+### 拟合/留出边界
+
+上述共享参数来自 `alpha_lc_unscaled_identification_reduced.json` 的 2026-08-17
+reduced identification：训练设计只包含 `L1D={16,128}kB`、`L2={128,2048}kB`，并在
+训练期固定为未缩放、64x64、module-input 合同。故五个差点中，
+`stencil/128/512`、`stencil/128/256` 与 `stream/16/1024` 是 L2 架构留出，
+`stream/64/128` 是 L1D 架构留出；`stencil/16/2048` 落在该 reduced 设计内，只能作为
+实现回归/空间位置复核，**不得**计入共享参数的泛化结论。所有五点均只评估冻结参数，
+绝不按测试结果重新拟合。此前的 32x32 `paper-L_c` 结论见
+`thermal_proxy_gradient_validation_zh.md`，它已被明确标为历史诊断，不能与当前 64x64
+物理合同证据混用。
+
 该文档只定义诊断和决策规则；在五点完成前，不将任何拟合的 `alpha`、`L_c` 或
 面积积分变体标为论文等价或共享已验收参数。
