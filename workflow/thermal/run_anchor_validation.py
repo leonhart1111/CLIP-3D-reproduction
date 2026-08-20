@@ -36,6 +36,15 @@ def run_manifest(manifest_path: Path, output: Path) -> dict:
         if item["result"]["solution_validation"] is not None
         and item["result"]["solution_validation"]["safe_error_c"] is not None
     ]
+    safe_error_limits = {
+        float(item["result"]["frequency_settings"]["max_safe_error_c"])
+        for item in results
+    }
+    if len(safe_error_limits) != 1:
+        raise ValueError(
+            "all frequency anchors must use the same max_safe_error_c "
+            "acceptance threshold"
+        )
     summary = {
         "schema_version": 1, "manifest": str(manifest_path.resolve()),
         "case_count": len(results),
@@ -47,6 +56,7 @@ def run_manifest(manifest_path: Path, output: Path) -> dict:
         "max_abs_uniform_gamma_comparison_error_c": max(
             item["result"]["max_abs_uniform_gamma_comparison_error_c"] for item in results
         ),
+        "safe_error_limit_c": safe_error_limits.pop(),
         "max_safe_error_c": max(safe_errors, default=0.0),
         "recommendation": {
             "accepted": all(item["result"]["recommendation"]["accepted"]

@@ -6,6 +6,7 @@
     "f0_ghz": 2.0,
     "fmin_ghz": 0.4,
     "tsafe_c": 95.0,
+    "max_safe_error_c": 0.02,
     "scaling_mode": "separated-dynamic-leakage"
   },
   "cases": [

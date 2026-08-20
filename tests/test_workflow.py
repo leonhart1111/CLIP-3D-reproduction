@@ -747,12 +747,14 @@ class FrequencyTests(unittest.TestCase):
                 {
                     "frequencies": [{}, {}],
                     "max_abs_uniform_gamma_comparison_error_c": 0.25,
+                    "frequency_settings": {"max_safe_error_c": 0.02},
                     "solution_validation": {"accepted": True, "safe_error_c": 0.5},
                     "recommendation": {"accepted": True},
                 },
                 {
                     "frequencies": [{}],
                     "max_abs_uniform_gamma_comparison_error_c": 0.75,
+                    "frequency_settings": {"max_safe_error_c": 0.02},
                     "solution_validation": None,
                     "recommendation": {"accepted": False},
                 },
@@ -767,7 +769,16 @@ class FrequencyTests(unittest.TestCase):
             self.assertEqual(summary["fsus_safety_solve_count"], 1)
             self.assertEqual(summary["hotspot_run_count"], 4)
             self.assertEqual(summary["max_abs_uniform_gamma_comparison_error_c"], 0.75)
+            self.assertEqual(summary["safe_error_limit_c"], 0.02)
             self.assertFalse(summary["recommendation"]["accepted"])
+
+            mixed_limits = [dict(item) for item in results]
+            mixed_limits[1] = dict(mixed_limits[1])
+            mixed_limits[1]["frequency_settings"] = {"max_safe_error_c": 0.5}
+            with patch("workflow.thermal.run_anchor_validation.validate_case",
+                       side_effect=mixed_limits):
+                with self.assertRaisesRegex(ValueError, "same max_safe_error_c"):
+                    run_manifest(root / "anchors.json", root / "mixed.json")
 
     def test_anchor_manifest_forwards_frequency_settings(self):
         """Manifest f0 must control the dynamic scale used in every anchor case."""
