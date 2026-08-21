@@ -85,7 +85,8 @@ python -m workflow.analysis.summarize_sweep \
 configs/experiments/table3_anchors.example.json
 ```
 
-确认正式点路径后运行：
+确认正式点路径后运行。示例 manifest 将 `max_safe_error_c` 固定为 0.02 C；这是
+Table III 的数值验证量级，不能以“接近温度门限”的更宽松标准替代：
 
 ```bash
 python -m workflow.thermal.run_anchor_validation \

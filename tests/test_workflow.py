@@ -69,14 +69,19 @@ from workflow.run_lifting_sweep import (
 from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT, run_hotspot
 from workflow.thermal.calibrate_proxy import (
     calibrate, candidate_layouts, parse_external_case, proxy_acceptance_checks,
-    proxy_prediction, sample_split,
+    proxy_prediction, run_one, sample_split,
 )
-from workflow.thermal.diagnose_proxy_gradient import ProxyVariant, parse_variant, summarize_variant
+from workflow.thermal.diagnose_proxy_gradient import (
+    ProxyVariant, exclusive_output_directory, parse_variant, prepare_output_directory,
+    summarize_variant,
+)
+from workflow.thermal.summarize_proxy_gradient_series import summarize_reports
 from workflow.thermal.sustainable_frequency import closed_form_frequency
 from workflow.thermal.run_anchor_validation import run_manifest
 from workflow.thermal.validate_frequency import (
     compose_separated_ptrace,
     read_ptrace,
+    two_point_affine_frequency,
     validate_case,
 )
 
@@ -87,6 +92,115 @@ def metric_lines(area, dynamic, sub, gate, indent="  "):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_proxy_gradient_series_uses_weighted_sign_counts_and_keeps_labels(self):
+        def diagnostic(sign_comparable, sign_agreement, spearman, regret, active,
+                       observability=None, hotspot_observability=None):
+            evaluation = {
+                "candidate_count": 9,
+                "sign_comparable_count": sign_comparable,
+                "sign_agreement_count": sign_agreement,
+                "sign_agreement_rate": sign_agreement / sign_comparable,
+                "spearman": spearman,
+                "proxy_selected": {"selection_regret_c": regret},
+                "thermal_frequency_term_active": active,
+            }
+            if hotspot_observability is not None:
+                evaluation["hotspot_frequency_observability"] = hotspot_observability
+            if observability:
+                evaluation.update(observability)
+            return {
+                "method": "common-HotSpot-grid equation-(14) gradient diagnostic",
+                "model": "fixture-model", "config": "fixture-config",
+                "hotspot": "fixture-hotspot", "grid_points_per_axis": 3,
+                "allowed_l2_tiers": [1],
+                "variants": [{
+                    "name": "fitted-area", "proxy_spatial_model": "area-quadrature",
+                    "lc_die_side_ratio": 0.0586007,
+                }],
+                "evaluations": {"fitted-area": evaluation},
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first, second = root / "first.json", root / "second.json"
+            write_json(first, diagnostic(2, 2, 1.0, 0.0, False))
+            write_json(second, diagnostic(6, 3, 0.5, 0.4, True, {
+                "raw_thermal_frequency_term_active": True,
+                "hotspot_frequency_varies": True,
+                "anchored_proxy_frequency_varies": False,
+                "raw_proxy_frequency_varies": False,
+            }, {
+                "safe_temperature_c": 95.0,
+                "hotspot_tmax_range_c": [90.0, 96.0],
+                "hottest_headroom_to_safe_c": -1.0,
+                "sampled_positions_cross_safe_threshold": True,
+            }))
+            result = summarize_reports([("l2-holdout", first), ("in-fit", second)])
+
+        values = result["variants"]["fitted-area"]
+        self.assertEqual(values["weighted_sign_comparable_count"], 8)
+        self.assertEqual(values["weighted_sign_agreement_count"], 5)
+        self.assertEqual(values["weighted_sign_agreement_rate"], 0.625)
+        self.assertEqual(values["selection_regret_c"]["mean"], 0.2)
+        self.assertEqual(values["thermal_frequency_term_active_report_count"], 1)
+        observability = values["frequency_observability"]
+        self.assertEqual(observability["raw_thermal_frequency_term_active"], {
+            "observed_report_count": 1, "true_report_count": 1,
+        })
+        self.assertEqual(observability["hotspot_frequency_varies"], {
+            "observed_report_count": 1, "true_report_count": 1,
+        })
+        self.assertEqual(observability["anchored_proxy_frequency_varies"], {
+            "observed_report_count": 1, "true_report_count": 0,
+        })
+        self.assertEqual(values["hotspot_frequency_observability"], {
+            "observed_report_count": 1,
+            "sampled_positions_cross_safe_threshold_report_count": 1,
+            "hottest_headroom_to_safe_c": {
+                "count": 1, "mean": -1.0, "median": -1.0,
+                "min": -1.0, "max": -1.0,
+            },
+        })
+        self.assertIsNone(values["per_report"][0]["hotspot_frequency_observability"])
+        self.assertEqual(
+            values["per_report"][1]["hotspot_frequency_observability"]
+            ["hottest_headroom_to_safe_c"], -1.0,
+        )
+        self.assertEqual(values["per_report"][0]["label"], "l2-holdout")
+        self.assertEqual(result["common_contract"]["config"], "fixture-config")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first, incompatible = root / "first.json", root / "incompatible.json"
+            write_json(first, diagnostic(2, 2, 1.0, 0.0, False))
+            wrong_contract = diagnostic(2, 2, 1.0, 0.0, False)
+            wrong_contract["config"] = "other-config"
+            write_json(incompatible, wrong_contract)
+            with self.assertRaisesRegex(ValueError, "same physical/proxy contract"):
+                summarize_reports([("first", first), ("second", incompatible)])
+
+    def test_proxy_gradient_resume_requires_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "gradient"
+            prepare_output_directory(output_dir, resume=False)
+            (output_dir / "partial-artifact").write_text("partial", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "--resume"):
+                prepare_output_directory(output_dir, resume=False)
+            prepare_output_directory(output_dir, resume=True)
+
+    def test_proxy_gradient_exclusively_locks_output_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "gradient"
+            with exclusive_output_directory(output_dir):
+                # The lock file itself must not make a brand-new output look
+                # like a resumable partial run.
+                prepare_output_directory(output_dir, resume=False)
+                with self.assertRaisesRegex(RuntimeError, "already owns"):
+                    with exclusive_output_directory(output_dir):
+                        pass
+            with exclusive_output_directory(output_dir):
+                prepare_output_directory(output_dir, resume=False)
+
     def test_proxy_gradient_variant_parser_and_summary_preserve_directional_metrics(self):
         variant = parse_variant("paper-area=area-quadrature,0.5")
         self.assertEqual(variant, ProxyVariant("paper-area", "area-quadrature", 0.5))
@@ -97,23 +211,83 @@ class WorkflowTests(unittest.TestCase):
             "variants": {
                 "paper-area": {
                     "raw_proxy_tmax_c": 80.0,
-                    "anchored_frequency": {"state": "thermally_limited"},
+                    "raw_frequency": {
+                        "state": "thermal_headroom", "sustainable_frequency_ghz": 2.0,
+                    },
+                    "anchored_frequency": {
+                        "state": "thermally_limited", "sustainable_frequency_ghz": 1.9,
+                    },
                 }
             },
         }
         records = [
             {"row": 0, "column": 0, "tmax_c": 101.0,
-             "variants": {"paper-area": {"raw_proxy_tmax_c": 81.0}}},
+             "hotspot_frequency": {
+                 "state": "thermally_limited", "sustainable_frequency_ghz": 1.9,
+             },
+             "variants": {"paper-area": {
+                 "raw_proxy_tmax_c": 81.0,
+                 "raw_frequency": {
+                     "state": "thermal_headroom", "sustainable_frequency_ghz": 2.0,
+                 },
+                 "anchored_frequency": {
+                     "state": "thermally_limited", "sustainable_frequency_ghz": 1.9,
+                 },
+             }}},
             {"row": 0, "column": 1, "tmax_c": 99.0,
-             "variants": {"paper-area": {"raw_proxy_tmax_c": 79.0}}},
+             "hotspot_frequency": {
+                 "state": "thermal_headroom", "sustainable_frequency_ghz": 2.0,
+             },
+             "variants": {"paper-area": {
+                 "raw_proxy_tmax_c": 79.0,
+                 "raw_frequency": {
+                     "state": "thermal_headroom", "sustainable_frequency_ghz": 2.0,
+                 },
+                 "anchored_frequency": {
+                     "state": "thermally_limited", "sustainable_frequency_ghz": 1.9,
+                 },
+             }}},
             {"row": 1, "column": 1, "tmax_c": 100.5,
-             "variants": {"paper-area": {"raw_proxy_tmax_c": 80.5}}},
+             "hotspot_frequency": {
+                 "state": "thermally_limited", "sustainable_frequency_ghz": 1.95,
+             },
+             "variants": {"paper-area": {
+                 "raw_proxy_tmax_c": 80.5,
+                 "raw_frequency": {
+                     "state": "thermal_headroom", "sustainable_frequency_ghz": 2.0,
+                 },
+                 "anchored_frequency": {
+                     "state": "thermally_limited", "sustainable_frequency_ghz": 1.9,
+                 },
+             }}},
         ]
-        summary = summarize_variant("paper-area", records, anchor, 0.02)
+        summary = summarize_variant("paper-area", records, anchor, 0.02, 95.0)
         self.assertEqual(summary["sign_agreement_rate"], 1.0)
         self.assertEqual(summary["spearman"], 1.0)
         self.assertEqual(summary["proxy_selected"]["selection_regret_c"], 0.0)
         self.assertTrue(summary["thermal_frequency_term_active"])
+        self.assertEqual(summary["hotspot_frequency_states"], {
+            "thermally_limited": 2, "thermal_headroom": 1,
+        })
+        self.assertEqual(summary["anchored_proxy_frequency_states"], {
+            "thermally_limited": 3,
+        })
+        self.assertEqual(summary["raw_proxy_frequency_states"], {
+            "thermal_headroom": 3,
+        })
+        self.assertEqual(summary["frequency_state_agreement_rate"], 2 / 3)
+        self.assertEqual(summary["raw_frequency_state_agreement_rate"], 1 / 3)
+        self.assertFalse(summary["raw_thermal_frequency_term_active"])
+        self.assertEqual(summary["hotspot_sustainable_frequency_range_ghz"], [1.9, 2.0])
+        self.assertFalse(summary["anchored_proxy_frequency_varies"])
+        self.assertFalse(summary["raw_proxy_frequency_varies"])
+        self.assertTrue(summary["hotspot_frequency_varies"])
+        self.assertEqual(summary["hotspot_frequency_observability"], {
+            "safe_temperature_c": 95.0,
+            "hotspot_tmax_range_c": [99.0, 101.0],
+            "hottest_headroom_to_safe_c": -6.0,
+            "sampled_positions_cross_safe_threshold": False,
+        })
 
     def test_pipeline_forwards_hotspot_materialization_contract(self):
         """Fixed-bin and paper-single runs must preserve identification inputs."""
@@ -447,13 +621,101 @@ class FrequencyTests(unittest.TestCase):
                     frequency_ghz=1.0, f0_ghz=2.0,
                 )
 
+    def test_two_point_affine_frequency_uses_cellwise_not_global_gamma_limit(self):
+        """Equation (9) must be limited by the hottest affine cell, not a scalar average."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nominal = root / "nominal.grid.steady.txt"
+            reference = root / "reference.grid.steady.txt"
+            # At f0=2 GHz, cell 0 is 100 C and cell 1 is 90 C.  At 1 GHz
+            # they are respectively 60 C and 80 C, so their affine maps are
+            # 20 + 80*f/f0 and 70 + 20*f/f0 C.  Cell 0 limits 95 C at 1.875.
+            nominal.write_text(
+                "Layer 1:\n0\t373.15\n1\t363.15\n", encoding="utf-8",
+            )
+            reference.write_text(
+                "Layer 1:\n0\t333.15\n1\t353.15\n", encoding="utf-8",
+            )
+            result = two_point_affine_frequency(
+                {"grid_steady_file": str(nominal)},
+                {"grid_steady_file": str(reference)},
+                {"ambient_c": 25.0, "active_power_layers": [1]}, 1.0,
+                {"f0_ghz": 2.0, "fmin_ghz": 0.4, "tsafe_c": 95.0},
+            )
+
+            self.assertTrue(result["available"])
+            self.assertEqual(result["equation"], 9)
+            self.assertEqual(result["limiting_unit"], "layer_1_g0")
+            self.assertEqual(result["frequency_state"], "thermally_limited")
+            self.assertAlmostEqual(result["sustainable_frequency_ghz"], 1.875)
+            self.assertAlmostEqual(
+                result["predicted_tmax_at_sustainable_frequency_c"], 95.0,
+            )
+
+    def test_frequency_validation_runs_two_point_fallback_after_gamma_rejection(self):
+        """A rejected scalar gamma must trigger, but not masquerade as, Eq.(9)."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = root / "case"
+            case.mkdir()
+            nominal = case / "grid.steady.txt"
+            reference = case / "one.grid.steady.txt"
+            nominal.write_text(
+                "Layer 1:\n0\t373.15\n1\t363.15\n", encoding="utf-8",
+            )
+            reference.write_text(
+                "Layer 1:\n0\t333.15\n1\t353.15\n", encoding="utf-8",
+            )
+            write_json(root / "modules.json", {"gamma": 0.2})
+            write_json(case / "hotspot_manifest.json", {
+                "ambient_c": 25.0, "r_convec_k_per_w": 5.0,
+                "active_power_layers": [1],
+            })
+            write_json(case / "thermal_result.json", {
+                "tmax_c": 100.0, "grid_steady_file": str(nominal),
+            })
+            (case / "power_dynamic.ptrace").write_text("a\n8\n", encoding="utf-8")
+            (case / "power_leakage.ptrace").write_text("a\n2\n", encoding="utf-8")
+            (case / "power.ptrace").write_text("a\n10\n", encoding="utf-8")
+
+            with patch("workflow.thermal.validate_frequency.run_hotspot",
+                       side_effect=[
+                           {"tmax_c": 80.0, "grid_steady_file": str(reference)},
+                           # Even an exact scalar f_sus safety point cannot
+                           # repair the already-observed nonuniform power
+                           # field at the reference frequency.
+                           {"tmax_c": 95.0},
+                           {"tmax_c": 95.005},
+                       ]) as runner:
+                result = validate_case(
+                    case, root / "modules.json", root / "validation.json", [1.0],
+                )
+
+            self.assertFalse(result["recommendation"]["accepted"])
+            self.assertFalse(result["uniform_gamma_acceptable"])
+            self.assertTrue(result["solution_validation"]["accepted"])
+            fallback = result["two_point_affine_frequency"]
+            self.assertTrue(fallback["available"])
+            self.assertAlmostEqual(fallback["sustainable_frequency_ghz"], 1.875)
+            self.assertTrue(fallback["recommendation"]["accepted"])
+            self.assertAlmostEqual(
+                fallback["solution_validation"]["safe_error_c"], 0.005,
+            )
+            self.assertEqual(runner.call_count, 3)
+
     def test_frequency_validation_defaults_to_separated_hotspot_trace(self):
         """Formal frequency validation writes and reports the per-cell raw-power trace."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             case = root / "case"
             case.mkdir()
-            write_json(root / "modules.json", {"gamma": 0.2})
+            write_json(root / "modules.json", {
+                "gamma": 0.2,
+                "modules": [
+                    {"dynamic_power_w": 1.0, "leakage_power_w": 3.0},
+                    {"dynamic_power_w": 4.0, "leakage_power_w": 0.0},
+                ],
+            })
             write_json(case / "hotspot_manifest.json", {
                 "ambient_c": 25.0, "r_convec_k_per_w": 5.0,
             })
@@ -483,6 +745,81 @@ class FrequencyTests(unittest.TestCase):
             self.assertIn("max_abs_uniform_gamma_comparison_error_c", result)
             self.assertNotIn("max_abs_linear_error_c", result)
             self.assertFalse(result["recommendation"]["accepted"])
+            self.assertEqual(result["frequency_settings"]["max_safe_error_c"], 0.02)
+            self.assertEqual(
+                result["module_gamma_observability"]["module_gamma_range"],
+                [0.0, 0.75],
+            )
+            self.assertEqual(
+                result["module_gamma_observability"]["power_weighted_gamma"],
+                0.375,
+            )
+
+    def test_frequency_validation_requires_paper_scale_safety_error(self):
+        """A degree-scale DTM miss must not endorse the uniform-gamma shortcut."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = root / "case"
+            case.mkdir()
+            write_json(root / "modules.json", {"gamma": 0.2})
+            write_json(case / "hotspot_manifest.json", {
+                "ambient_c": 25.0, "r_convec_k_per_w": 5.0,
+            })
+            write_json(case / "thermal_result.json", {"tmax_c": 100.0})
+            (case / "power_dynamic.ptrace").write_text("a\n8\n", encoding="utf-8")
+            (case / "power_leakage.ptrace").write_text("a\n2\n", encoding="utf-8")
+            (case / "power.ptrace").write_text("a\n10\n", encoding="utf-8")
+
+            # The 1 GHz reference must also satisfy the scalar spatial-power
+            # assumption; this test isolates the separate f_sus safety gate.
+            with patch("workflow.thermal.validate_frequency.run_hotspot",
+                       side_effect=[{"tmax_c": 70.0}, {"tmax_c": 95.03}]):
+                strict = validate_case(
+                    case, root / "modules.json", root / "strict.json", [1.0],
+                )
+            self.assertAlmostEqual(
+                strict["solution_validation"]["safe_error_c"], 0.03,
+            )
+            self.assertEqual(
+                strict["solution_validation"]["max_safe_error_c"], 0.02,
+            )
+            self.assertFalse(strict["recommendation"]["accepted"])
+
+            with patch("workflow.thermal.validate_frequency.run_hotspot",
+                       side_effect=[{"tmax_c": 70.0}, {"tmax_c": 95.03}]):
+                relaxed = validate_case(
+                    case, root / "modules.json", root / "relaxed.json", [1.0],
+                    frequency_settings={"max_safe_error_c": 0.05},
+                )
+            self.assertTrue(relaxed["recommendation"]["accepted"])
+            self.assertEqual(
+                relaxed["solution_validation"]["max_safe_error_c"], 0.05,
+            )
+
+    def test_frequency_validation_forwards_explicit_hotspot_binary(self):
+        """A worktree may validate a real case with a shared built HotSpot."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            case = root / "case"
+            case.mkdir()
+            write_json(root / "modules.json", {"gamma": 0.2})
+            write_json(case / "hotspot_manifest.json", {
+                "ambient_c": 25.0, "r_convec_k_per_w": 5.0,
+            })
+            write_json(case / "thermal_result.json", {"tmax_c": 80.0})
+            (case / "power_dynamic.ptrace").write_text("a\n8\n", encoding="utf-8")
+            (case / "power_leakage.ptrace").write_text("a\n2\n", encoding="utf-8")
+            (case / "power.ptrace").write_text("a\n10\n", encoding="utf-8")
+            hotspot = root / "shared-hotspot"
+
+            with patch("workflow.thermal.validate_frequency.run_hotspot",
+                       return_value={"tmax_c": 60.0}) as runner:
+                validate_case(
+                    case, root / "modules.json", root / "validation.json", [1.0],
+                    validate_solution=False, hotspot=hotspot,
+                )
+
+            self.assertEqual(runner.call_args.kwargs["hotspot"], hotspot)
 
     def test_below_f0_hotspot_failure_writes_a_rejected_validation_result(self):
         """A failed mandatory safety solve must leave an auditable rejection on disk."""
@@ -535,12 +872,14 @@ class FrequencyTests(unittest.TestCase):
                 {
                     "frequencies": [{}, {}],
                     "max_abs_uniform_gamma_comparison_error_c": 0.25,
+                    "frequency_settings": {"max_safe_error_c": 0.02},
                     "solution_validation": {"accepted": True, "safe_error_c": 0.5},
                     "recommendation": {"accepted": True},
                 },
                 {
                     "frequencies": [{}],
                     "max_abs_uniform_gamma_comparison_error_c": 0.75,
+                    "frequency_settings": {"max_safe_error_c": 0.02},
                     "solution_validation": None,
                     "recommendation": {"accepted": False},
                 },
@@ -553,9 +892,51 @@ class FrequencyTests(unittest.TestCase):
             self.assertEqual(read_json(root / "summary.json"), summary)
             self.assertEqual(summary["requested_frequency_hotspot_run_count"], 3)
             self.assertEqual(summary["fsus_safety_solve_count"], 1)
+            self.assertEqual(summary["two_point_safety_solve_count"], 0)
             self.assertEqual(summary["hotspot_run_count"], 4)
             self.assertEqual(summary["max_abs_uniform_gamma_comparison_error_c"], 0.75)
+            self.assertEqual(summary["safe_error_limit_c"], 0.02)
             self.assertFalse(summary["recommendation"]["accepted"])
+            self.assertFalse(summary["two_point_fallback_recommendation"]["accepted"])
+
+            mixed_limits = [dict(item) for item in results]
+            mixed_limits[1] = dict(mixed_limits[1])
+            mixed_limits[1]["frequency_settings"] = {"max_safe_error_c": 0.5}
+            with patch("workflow.thermal.run_anchor_validation.validate_case",
+                       side_effect=mixed_limits):
+                with self.assertRaisesRegex(ValueError, "same max_safe_error_c"):
+                    run_manifest(root / "anchors.json", root / "mixed.json")
+
+    def test_anchor_summary_reports_validated_two_point_fallback_separately(self):
+        """A rejected scalar gamma may be replaced only by an audited Eq.(9) result."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_json(root / "anchors.json", {
+                "cases": [{"label": "fft", "case_dir": str(root / "fft")}],
+            })
+            scalar_rejected_two_point_accepted = {
+                "frequencies": [{}],
+                "max_abs_uniform_gamma_comparison_error_c": 0.32,
+                "frequency_settings": {"max_safe_error_c": 0.02},
+                "solution_validation": {"accepted": True, "safe_error_c": 0.0},
+                "recommendation": {"accepted": False},
+                "two_point_affine_frequency": {
+                    "available": True,
+                    "solution_validation": {"accepted": True, "safe_error_c": 0.0},
+                    "recommendation": {"accepted": True},
+                },
+            }
+            with patch("workflow.thermal.run_anchor_validation.validate_case",
+                       return_value=scalar_rejected_two_point_accepted):
+                summary = run_manifest(root / "anchors.json", root / "summary.json")
+
+            self.assertFalse(summary["recommendation"]["accepted"])
+            self.assertEqual(summary["two_point_safety_solve_count"], 1)
+            self.assertEqual(summary["hotspot_run_count"], 3)
+            self.assertEqual(
+                summary["two_point_fallback_recommendation"],
+                {"available_case_count": 1, "accepted_case_count": 1, "accepted": True},
+            )
 
     def test_anchor_manifest_forwards_frequency_settings(self):
         """Manifest f0 must control the dynamic scale used in every anchor case."""
@@ -1188,6 +1569,39 @@ Cache height x width (mm): 2 x 4
                 with self.assertRaisesRegex(ValueError, label):
                     validate_config(config, "fixed-bin")
 
+    def test_proxy_diagnostic_preserves_hotspot_materialization_contract(self):
+        """A module-level proxy fit must not be replayed as grid-cell HotSpot."""
+        config = {
+            "physical": {
+                "grid_size": 64,
+                "utilization": 0.7,
+                "r_convec_k_per_w": 1.042,
+                "input_granularity": "module",
+                "compact_trace": True,
+                "ptrace_precision": 9,
+                "thermal_stack": {"local_resistance_scale": 1.0},
+            },
+            "frequency": {"ambient_c": 25.0},
+        }
+        sample = {
+            "model": "/tmp/modules.json", "model_label": "probe",
+            "tier": 1, "row": 0, "column": 0, "fx": 0.0, "fy": 0.0,
+            "layout": {"die_width_mm": 1.0, "modules": []},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            sample["case_dir"] = str(Path(temporary) / "case")
+            with patch("workflow.thermal.calibrate_proxy.materialize") as materialize_mock, \
+                    patch("workflow.thermal.calibrate_proxy.run_hotspot",
+                          return_value={"tmax_c": 100.0, "peak_unit": "t0"}):
+                result = run_one(sample, config, Path("/tmp/hotspot"), force=True)
+
+        self.assertEqual(result["tmax_c"], 100.0)
+        self.assertEqual(materialize_mock.call_args.kwargs, {
+            "input_granularity": "module",
+            "compact_trace": True,
+            "ptrace_precision": 9,
+        })
+
 
 class GridTests(unittest.TestCase):
     def model(self):
@@ -1444,6 +1858,23 @@ class GridTests(unittest.TestCase):
             )
         self.assertTrue(anchored["thermal_proxy"]["anchor"]["enabled"])
         self.assertLess(anchored["baseline"]["proxy_frequency_ghz"], 2.0)
+        observability = anchored["observability_diagnostics"]
+        self.assertTrue(observability["sampled_thermal_frequency_term_active"])
+        self.assertGreaterEqual(
+            len(observability["sampled_l2_positions"]), 2
+        )
+        self.assertIn(
+            "thermally_limited", observability["sampled_proxy_frequency_states"]
+        )
+        baseline_bottom_power = sum(
+            module["total_power_w"]
+            for module in baseline_layout(self.model())["modules"]
+            if module["tier"] == 0
+        )
+        self.assertTrue(all(
+            observation["bottom_power_w"] == baseline_bottom_power
+            for observation in observability["sampled_l2_positions"]
+        ))
 
     def test_optimizer_rejects_nonfinite_proxy_anchor(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1982,6 +2413,41 @@ class GridTests(unittest.TestCase):
             self.assertIn("layout_delays", report["baseline"])
             self.assertIn("mean_wire_cycles_rounded", report["predicted_deltas"])
             self.assertIn("paper_mean_r2_cycle_changed", diagnostics)
+
+    def test_observability_uses_the_candidate_tier_for_bottom_power(self):
+        """A tier move must not reuse the fixed-bin bottom-power term."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = self.model()
+            for module in model["modules"]:
+                if module["kind"] == "core_logic":
+                    module["area_mm2"] = 0.1
+                elif module["kind"] == "l2":
+                    # Leave a legal bottom-tier corner without changing the
+                    # power difference this test is about.
+                    module["area_mm2"] = 0.0004
+            write_json(root / "modules.json", model)
+            report = optimize(
+                root / "modules.json", root / "layout.json", root / "report.json",
+                allowed_l2_tiers=[0, 1], require_scipy=False, beta=0.7,
+                proxy_anchor_tmax_c=110.0,
+            )
+
+        observations = report["observability_diagnostics"]["sampled_l2_positions"]
+        by_tier = {}
+        for observation in observations:
+            by_tier.setdefault(observation["tier"], []).append(
+                observation["bottom_power_w"]
+            )
+        fixed_bottom_power = sum(
+            module["total_power_w"]
+            for module in baseline_layout(model)["modules"] if module["tier"] == 0
+        )
+        self.assertEqual(set(by_tier), {0, 1})
+        self.assertTrue(all(value == fixed_bottom_power for value in by_tier[1]))
+        self.assertTrue(all(
+            value == fixed_bottom_power + 0.5 for value in by_tier[0]
+        ))
 
     def granular_model(self):
         """Eight fixed blocks per core plus shared L2 and NoC (34 modules)."""
@@ -2706,6 +3172,27 @@ class FormalGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "strict P1 forbids"):
             validate_config(config, "clip3d")
 
+    def test_strict_p1_requires_paper_grid_cell_hotspot_contract(self):
+        """Engineering module input must not be mislabelled as paper P1."""
+        config = {
+            "schema_version": 1,
+            "physical": {
+                "grid_size": 64, "input_granularity": "module",
+                "r_convec_k_per_w": 5.0,
+            },
+            "layout_optimizer": {
+                "r_convec_k_per_w": 5.0,
+                "allowed_l2_tiers": [1],
+                "validation_policy": "paper-single", "beta": 0.0,
+            },
+            "formal_validation": {"strict_p1": True, "accepted": False},
+        }
+        with self.assertRaisesRegex(ValueError, "physical.grid_size == 32"):
+            validate_config(config, "clip3d")
+        config["physical"]["grid_size"] = 32
+        with self.assertRaisesRegex(ValueError, "input_granularity == grid-cell"):
+            validate_config(config, "clip3d")
+
     def test_discrete_partition_config_requires_valid_grid_and_baseline(self):
         config = {
             "schema_version": 1,
@@ -2817,6 +3304,22 @@ class ThermalModeDispatchTests(unittest.TestCase):
         self.assertNotIn(module_name, sys.modules)
         self.assertEqual(legacy.call_args.kwargs["layout_method"], "fixed-bin")
         self.assertFalse(legacy.call_args.kwargs["execute_r2"])
+
+    def test_steady_mode_forwards_hotspot_input_granularity_override(self):
+        """The user-facing steady CLI must expose both thermal input modes."""
+        with patch(
+            "workflow.run_lifting_pipeline.run_pipeline",
+            return_value=self.steady_summary(),
+        ) as steady:
+            self.invoke_cli(
+                "--thermal-mode", "steady",
+                "--hotspot-input-granularity", "module",
+            )
+
+        self.assertEqual(
+            steady.call_args.kwargs["hotspot_input_granularity_override"],
+            "module",
+        )
 
     def test_rom_mode_runs_fixed_preflight_then_rom_with_r2_forwarded(self):
         # Break caught: forwarding --run-r2 to the steady pilot either runs R2

@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 
 from workflow.common import read_json, write_json
-from workflow.thermal.run_hotspot import run_hotspot
+from workflow.thermal.run_hotspot import grid_temperatures, run_hotspot
 from workflow.thermal.sustainable_frequency import closed_form_frequency
 
 
@@ -104,11 +104,15 @@ def resolve_frequency_settings(frequency_settings: dict | None,
         "f0_ghz": 2.0,
         "fmin_ghz": 0.4,
         "tsafe_c": 95.0,
+        # Table III reports <=0.02 C error for the paper's validation
+        # anchors.  Do not let a degree-scale miss silently endorse the
+        # global-gamma shortcut merely because it lands near the DTM limit.
+        "max_safe_error_c": 0.02,
         "scaling_mode": scaling_mode,
     }
     if frequency_settings:
         settings.update(frequency_settings)
-    for key in ("f0_ghz", "fmin_ghz", "tsafe_c"):
+    for key in ("f0_ghz", "fmin_ghz", "tsafe_c", "max_safe_error_c"):
         settings[key] = float(settings[key])
         if not math.isfinite(settings[key]):
             raise ValueError(f"{key} must be finite")
@@ -116,6 +120,8 @@ def resolve_frequency_settings(frequency_settings: dict | None,
         raise ValueError("f0_ghz and fmin_ghz must be positive")
     if settings["fmin_ghz"] > settings["f0_ghz"]:
         raise ValueError("fmin_ghz must not exceed f0_ghz")
+    if settings["max_safe_error_c"] < 0.0:
+        raise ValueError("max_safe_error_c must be non-negative")
     if settings["scaling_mode"] not in {
         "separated-dynamic-leakage", "paper-uniform-gamma",
     }:
@@ -123,11 +129,186 @@ def resolve_frequency_settings(frequency_settings: dict | None,
     return settings
 
 
+def module_gamma_observability(modules: dict) -> dict:
+    """Expose whether Equation (11)'s uniform-gamma shortcut is plausible.
+
+    Equation (13) itself uses the power-weighted scalar gamma.  The paper
+    explicitly identifies a separated dynamic/leakage HotSpot calibration as
+    the fallback when module leakage fractions differ materially, so report
+    that precondition instead of silently treating the scalar as exact.
+    """
+    records = modules.get("modules")
+    if not isinstance(records, list):
+        return {"available": False, "reason": "modules list unavailable"}
+    fractions: list[float] = []
+    dynamic_total = 0.0
+    leakage_total = 0.0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        dynamic = float(record.get("dynamic_power_w", 0.0))
+        leakage = float(record.get("leakage_power_w", 0.0))
+        total = dynamic + leakage
+        if not all(math.isfinite(value) and value >= 0.0
+                   for value in (dynamic, leakage, total)):
+            raise ValueError("module power must be finite and non-negative")
+        dynamic_total += dynamic
+        leakage_total += leakage
+        if total > 0.0:
+            fractions.append(leakage / total)
+    total_power = dynamic_total + leakage_total
+    if not fractions or total_power <= 0.0:
+        return {"available": False, "reason": "no positive-power modules"}
+    lower, upper = min(fractions), max(fractions)
+    return {
+        "available": True,
+        "positive_power_module_count": len(fractions),
+        "dynamic_power_w": dynamic_total,
+        "leakage_power_w": leakage_total,
+        "power_weighted_gamma": leakage_total / total_power,
+        "module_gamma_range": [lower, upper],
+        "module_gamma_spread": upper - lower,
+    }
+
+
+def two_point_affine_frequency(base_thermal: dict, reference_thermal: dict,
+                               manifest: dict, reference_frequency_ghz: float,
+                               frequency_settings: dict) -> dict:
+    """Solve Equation (9) from two same-layout HotSpot grid maps.
+
+    ``base_thermal`` is the nominal-``f0`` total-power solve and
+    ``reference_thermal`` is a lower-frequency *separated*
+    dynamic/leakage solve.  Their cellwise difference identifies the dynamic
+    map, while their affine intercept identifies the leakage map.  This is the
+    paper's one-extra-HotSpot fallback for a non-uniform leakage fraction; it
+    deliberately does not change the inexpensive Equation-(14) search proxy.
+
+    The result is optional because lightweight unit tests and old artifacts do
+    not always retain grid-steady paths.  Such a missing map is reported as an
+    unavailable fallback rather than silently substituting the global-gamma
+    shortcut.
+    """
+    f0 = float(frequency_settings["f0_ghz"])
+    fmin = float(frequency_settings["fmin_ghz"])
+    tsafe_k = float(frequency_settings["tsafe_c"]) + 273.15
+    if not math.isfinite(reference_frequency_ghz) or not 0.0 < reference_frequency_ghz < f0:
+        return {
+            "available": False,
+            "reason": "requires one finite separated-power reference frequency in (0,f0)",
+        }
+    base_path = base_thermal.get("grid_steady_file")
+    reference_path = reference_thermal.get("grid_steady_file")
+    if not isinstance(base_path, str) or not isinstance(reference_path, str):
+        return {
+            "available": False,
+            "reason": "nominal or reference HotSpot grid-steady path is unavailable",
+        }
+    base_file, reference_file = Path(base_path), Path(reference_path)
+    if not base_file.is_file() or not reference_file.is_file():
+        return {
+            "available": False,
+            "reason": "nominal or reference HotSpot grid-steady file is unavailable",
+        }
+
+    # run_hotspot's module-input Tmax is deliberately defined over active power
+    # layers, so the two-point fallback must use the identical peak domain.
+    active_layers = manifest.get("active_power_layers")
+    if not isinstance(active_layers, list) or not active_layers:
+        return {
+            "available": False,
+            "reason": "active_power_layers are unavailable in the HotSpot manifest",
+        }
+    active = {int(layer) for layer in active_layers}
+
+    def active_map(path: Path) -> dict[str, float]:
+        return {
+            name: value for name, value in grid_temperatures(path)
+            if int(name.split("_")[1]) in active
+        }
+
+    base_map = active_map(base_file)
+    reference_map = active_map(reference_file)
+    if not base_map or set(base_map) != set(reference_map):
+        return {
+            "available": False,
+            "reason": "nominal and reference active grid cells do not match",
+        }
+
+    x_reference = reference_frequency_ghz / f0
+    denominator = 1.0 - x_reference
+    intercepts: dict[str, float] = {}
+    slopes: dict[str, float] = {}
+    for name in sorted(base_map):
+        dynamic_at_f0 = (base_map[name] - reference_map[name]) / denominator
+        intercepts[name] = base_map[name] - dynamic_at_f0
+        slopes[name] = dynamic_at_f0
+
+    # The cellwise affine temperature is A_i + (f/f0) B_i.  The maximum
+    # admissible normalized frequency is the tightest positive-slope cell.
+    limits: list[tuple[float, str]] = []
+    infeasible_static: list[str] = []
+    for name in sorted(intercepts):
+        slope = slopes[name]
+        intercept = intercepts[name]
+        if slope > 1.0e-9:
+            limits.append(((tsafe_k - intercept) / slope, name))
+        elif intercept > tsafe_k + 1.0e-9:
+            infeasible_static.append(name)
+    if infeasible_static:
+        raw_frequency = -math.inf
+        limiting_unit = infeasible_static[0]
+    elif limits:
+        normalized_limit, limiting_unit = min(limits, key=lambda item: (item[0], item[1]))
+        raw_frequency = f0 * normalized_limit
+    else:
+        raw_frequency = f0
+        limiting_unit = None
+
+    frequency = min(f0, max(fmin, raw_frequency))
+    normalized_frequency = frequency / f0
+    temperatures = {
+        name: intercepts[name] + normalized_frequency * slopes[name]
+        for name in intercepts
+    }
+    temperatures_at_fmin = {
+        name: intercepts[name] + (fmin / f0) * slopes[name]
+        for name in intercepts
+    }
+    peak_unit, peak_k = max(temperatures.items(), key=lambda item: item[1])
+    if raw_frequency >= f0:
+        state = "thermal_headroom"
+    elif raw_frequency < fmin:
+        state = "frequency_floor"
+    else:
+        state = "thermally_limited"
+
+    return {
+        "available": True,
+        "equation": 9,
+        "reference_frequency_ghz": reference_frequency_ghz,
+        "reference_dynamic_scale": x_reference,
+        "active_cell_count": len(base_map),
+        "sustainable_frequency_ghz": frequency,
+        "unclamped_frequency_ghz": raw_frequency,
+        "frequency_state": state,
+        "limiting_unit": limiting_unit,
+        "predicted_tmax_at_sustainable_frequency_c": peak_k - 273.15,
+        "predicted_peak_unit_at_sustainable_frequency": peak_unit,
+        "thermal_feasible_at_fmin": (
+            max(temperatures_at_fmin.values()) <= tsafe_k + 1.0e-9
+        ),
+        "leakage_intercept_tmax_c": max(intercepts.values()) - 273.15,
+        "dynamic_slope_at_f0_range_k": [min(slopes.values()), max(slopes.values())],
+        "ambient_c": float(manifest["ambient_c"]),
+    }
+
+
 def validate_case(case_dir: Path, modules_path: Path, output: Path,
                   frequencies_ghz: list[float] | None = None,
                   validate_solution: bool = True,
                   frequency_settings: dict | None = None,
-                  scaling_mode: str = "separated-dynamic-leakage") -> dict:
+                  scaling_mode: str = "separated-dynamic-leakage",
+                  hotspot: Path | None = None) -> dict:
     case_dir = case_dir.resolve()
     modules = read_json(modules_path)
     manifest = read_json(case_dir / "hotspot_manifest.json")
@@ -181,13 +362,22 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
                 "power_trace": str(trace.resolve()),
             }
         try:
-            thermal = run_hotspot(
-                case_dir, ptrace_name=trace.name,
-                result_name=(
-                    f"thermal_{selected_scaling_mode.replace('-', '_')}_"
-                    f"{stem}GHz{result_suffix}.json"
-                ),
+            result_name = (
+                f"thermal_{selected_scaling_mode.replace('-', '_')}_"
+                f"{stem}GHz{result_suffix}.json"
             )
+            # Keep the default call shape for existing callers and mocked
+            # tests.  A supplied binary is essential when this diagnostic is
+            # run from a lightweight worktree without built tool artifacts.
+            if hotspot is None:
+                thermal = run_hotspot(
+                    case_dir, ptrace_name=trace.name, result_name=result_name,
+                )
+            else:
+                thermal = run_hotspot(
+                    case_dir, hotspot=hotspot, ptrace_name=trace.name,
+                    result_name=result_name,
+                )
         except Exception as error:
             if not record_hotspot_failure:
                 raise
@@ -205,6 +395,10 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
             "hotspot_tmax_c": thermal["tmax_c"],
             "predicted_tmax_c": uniform_gamma_tmax,
             "power_trace": trace_info["power_trace"],
+            # Retain the map path solely for the optional Eq.(9) fallback
+            # below.  It is not a new proxy input and does not affect the
+            # paper's global-gamma result reported alongside it.
+            "grid_steady_file": thermal.get("grid_steady_file"),
             "trace_sums_w": {
                 "dynamic": trace_info["dynamic_trace_sum_w"],
                 "leakage": trace_info["leakage_trace_sum_w"],
@@ -220,6 +414,24 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
         }
 
     runs = [run_frequency(frequency) for frequency in frequencies]
+    separated_reference = next(
+        (run for run in runs if run["frequency_ghz"] < f0), None
+    )
+    if selected_scaling_mode != "separated-dynamic-leakage":
+        two_point = {
+            "available": False,
+            "reason": "Equation (9) fallback requires a separated dynamic/leakage reference trace",
+        }
+    elif separated_reference is None:
+        two_point = {
+            "available": False,
+            "reason": "no requested separated-power reference frequency below f0",
+        }
+    else:
+        two_point = two_point_affine_frequency(
+            base_thermal, separated_reference, manifest,
+            float(separated_reference["frequency_ghz"]), settings,
+        )
 
     fsus, state, raw = closed_form_frequency(
         float(base_thermal["tmax_c"]), gamma, f0, fmin, tsafe, ambient
@@ -233,6 +445,7 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
                 "hotspot_tmax_c": None,
                 "safe_temperature_c": tsafe,
                 "safe_error_c": None,
+                "max_safe_error_c": settings["max_safe_error_c"],
                 "accepted": False,
                 "power_trace": solution_run["power_trace"],
                 "error": solution_run["hotspot_error"],
@@ -246,15 +459,40 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
                 "frequency_ghz": fsus, "hotspot_tmax_c": hotspot_tmax,
                 "safe_temperature_c": tsafe,
                 "safe_error_c": safe_error,
-                "accepted": math.isfinite(hotspot_tmax) and safe_error <= 1.0,
+                "max_safe_error_c": settings["max_safe_error_c"],
+                "accepted": (
+                    math.isfinite(hotspot_tmax)
+                    and safe_error <= settings["max_safe_error_c"]
+                ),
                 "power_trace": solution_run["power_trace"],
             }
 
-    accepted = (
+    max_uniform_gamma_error = max(
+        abs(run["uniform_gamma_comparison"]["error_vs_hotspot_c"])
+        for run in runs
+    )
+    uniform_gamma_acceptable = (
+        max_uniform_gamma_error <= settings["max_safe_error_c"]
+    )
+    scalar_solution_accepted = (
         fsus >= f0 or
         (solution_validation is not None and solution_validation["accepted"])
     )
-    if fsus >= f0:
+    # A safety solve at the scalar closed form is necessary but not
+    # sufficient.  The frequency derivation also assumes that the total
+    # power field can be scaled with one global leakage fraction.  The
+    # separated-power reference solves above are the direct observability
+    # test for that assumption.  Without this gate a coincidental 95 C solve
+    # could endorse Eq. (13) even after its spatial scaling law was measured
+    # to miss by far more than the Table-III-scale tolerance.
+    accepted = uniform_gamma_acceptable and scalar_solution_accepted
+    if not uniform_gamma_acceptable:
+        recommendation_basis = (
+            "separated-power HotSpot disagrees with the global-gamma "
+            "temperature law by more than "
+            f"{settings['max_safe_error_c']:.6g} C"
+        )
+    elif fsus >= f0:
         recommendation_basis = "f_sus is at f0; no below-f0 HotSpot safety solve is required"
     elif solution_validation is None:
         recommendation_basis = "below-f0 HotSpot safety solve was skipped"
@@ -264,7 +502,81 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
             f"{solution_validation['error']}"
         )
     else:
-        recommendation_basis = "below-f0 HotSpot safety error is finite and no greater than 1.0 C"
+        recommendation_basis = (
+            "below-f0 HotSpot safety error is finite and no greater than "
+            f"{settings['max_safe_error_c']:.6g} C"
+        )
+
+    # Do not silently promote this substitute for Equation (13).  It is a
+    # separate, paper-prescribed Eq.(9) fallback and is only exercised after
+    # the scalar-gamma test has actually failed.  Its independent HotSpot run
+    # makes the cellwise affine reconstruction auditable at the same strict
+    # safety threshold.
+    two_point_validation = None
+    two_point_accepted = False
+    if two_point.get("available"):
+        two_point_frequency = float(two_point["sustainable_frequency_ghz"])
+        if two_point_frequency >= f0:
+            two_point_validation = {
+                "frequency_ghz": two_point_frequency,
+                "safe_temperature_c": tsafe,
+                "not_required": True,
+                "accepted": True,
+                "basis": "two-point affine solution has nominal-frequency thermal headroom",
+            }
+            two_point_accepted = True
+        elif not accepted:
+            candidate = run_frequency(
+                two_point_frequency, "_two_point_fsus", record_hotspot_failure=True,
+            )
+            if "hotspot_error" in candidate:
+                two_point_validation = {
+                    "frequency_ghz": two_point_frequency,
+                    "hotspot_tmax_c": None,
+                    "safe_temperature_c": tsafe,
+                    "safe_error_c": None,
+                    "max_safe_error_c": settings["max_safe_error_c"],
+                    "accepted": False,
+                    "power_trace": candidate["power_trace"],
+                    "error": candidate["hotspot_error"],
+                }
+            else:
+                hotspot_tmax = float(candidate["hotspot_tmax_c"])
+                safe_error = (
+                    abs(hotspot_tmax - tsafe)
+                    if math.isfinite(hotspot_tmax) else math.inf
+                )
+                two_point_validation = {
+                    "frequency_ghz": two_point_frequency,
+                    "hotspot_tmax_c": hotspot_tmax,
+                    "safe_temperature_c": tsafe,
+                    "safe_error_c": safe_error,
+                    "max_safe_error_c": settings["max_safe_error_c"],
+                    "accepted": (
+                        math.isfinite(hotspot_tmax)
+                        and safe_error <= settings["max_safe_error_c"]
+                    ),
+                    "power_trace": candidate["power_trace"],
+                }
+                two_point_accepted = two_point_validation["accepted"]
+        else:
+            two_point_validation = {
+                "frequency_ghz": two_point_frequency,
+                "safe_temperature_c": tsafe,
+                "not_required": True,
+                "accepted": False,
+                "basis": "global-gamma validation already passed; fallback was not invoked",
+            }
+    if two_point.get("available"):
+        two_point["solution_validation"] = two_point_validation
+        two_point["recommendation"] = {
+            "accepted": two_point_accepted,
+            "basis": (
+                "independent separated-power HotSpot safety result"
+                if two_point_validation and not two_point_validation.get("not_required")
+                else (two_point_validation or {}).get("basis", "not evaluated")
+            ),
+        }
 
     result = {
         "schema_version": 1, "equations": [11, 12, 13],
@@ -272,14 +584,14 @@ def validate_case(case_dir: Path, modules_path: Path, output: Path,
         "r_convec_k_per_w": manifest["r_convec_k_per_w"],
         "ambient_c": ambient, "gamma": gamma, "f0_ghz": f0,
         "base_tmax_c": base_thermal["tmax_c"], "frequencies": runs,
-        "max_abs_uniform_gamma_comparison_error_c": max(
-            abs(run["uniform_gamma_comparison"]["error_vs_hotspot_c"])
-            for run in runs
-        ),
+        "max_abs_uniform_gamma_comparison_error_c": max_uniform_gamma_error,
+        "uniform_gamma_acceptable": uniform_gamma_acceptable,
         "sustainable_frequency_ghz": fsus, "frequency_state": state,
         "unclamped_frequency_ghz": raw, "solution_validation": solution_validation,
+        "two_point_affine_frequency": two_point,
         "frequency_settings": settings,
         "scaling_mode": selected_scaling_mode,
+        "module_gamma_observability": module_gamma_observability(modules),
         "recommendation": {
             "accepted": accepted,
             "basis": recommendation_basis,
@@ -296,10 +608,14 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--frequencies-ghz", type=float, nargs="+", default=[0.5, 1.0, 2.0])
     parser.add_argument("--no-solution-validation", action="store_true")
+    parser.add_argument(
+        "--hotspot", type=Path,
+        help="optional HotSpot executable; needed when the current worktree has no built binary",
+    )
     args = parser.parse_args()
     result = validate_case(
         args.case_dir, args.modules, args.output, args.frequencies_ghz,
-        not args.no_solution_validation,
+        not args.no_solution_validation, hotspot=args.hotspot,
     )
     print(
         "max uniform-gamma comparison error="

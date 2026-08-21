@@ -18,8 +18,10 @@ constant to every candidate and cannot change a variant's ordering.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,6 +40,9 @@ class ProxyVariant:
     name: str
     spatial_model: str
     lc_die_side_ratio: float
+
+
+OUTPUT_LOCK_NAME = ".proxy_gradient.lock"
 
 
 def parse_variant(text: str) -> ProxyVariant:
@@ -64,6 +69,46 @@ def parse_variant(text: str) -> ProxyVariant:
     if not math.isfinite(ratio) or ratio <= 0.0:
         raise argparse.ArgumentTypeError("variant Lc ratio must be finite and positive")
     return ProxyVariant(name, spatial_model, ratio)
+
+
+def prepare_output_directory(output_dir: Path, resume: bool) -> None:
+    """Create an output directory, retaining matching completed probes on resume."""
+    entries = (
+        entry for entry in output_dir.iterdir()
+        if entry.name != OUTPUT_LOCK_NAME
+    ) if output_dir.exists() else ()
+    if output_dir.exists() and any(entries) and not resume:
+        raise ValueError(
+            "output directory must be new or empty; pass --resume to reuse "
+            f"matching completed HotSpot probes: {output_dir}"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def exclusive_output_directory(output_dir: Path):
+    """Prevent two ``--resume`` drivers from deleting each other's partial case.
+
+    ``run_one`` deliberately removes a non-reusable, incomplete case before it
+    materializes it again.  That is correct after interruption, but destructive
+    if a second diagnostic process operates on the same output tree while a
+    HotSpot child still owns that directory.  The lock covers the complete
+    probe, not just file preparation, and is released automatically on exit.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir / OUTPUT_LOCK_NAME
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                "another proxy-gradient diagnostic already owns output directory "
+                f"{output_dir}"
+            ) from error
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _frequency(temperature_c: float, model: dict, config: dict) -> dict:
@@ -148,7 +193,8 @@ def _correlation(first: list[float], second: list[float], kind: str) -> float | 
 
 
 def summarize_variant(name: str, records: list[dict], anchor: dict,
-                      sign_tolerance_c: float) -> dict:
+                      sign_tolerance_c: float,
+                      tsafe_c: float | None = None) -> dict:
     """Summarize rank, signs, frequency regime, and selection regret.
 
     ``records`` must contain actual HotSpot temperatures and this variant's raw
@@ -159,6 +205,8 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
         raise ValueError("cannot summarize an empty probe grid")
     if sign_tolerance_c < 0.0:
         raise ValueError("sign tolerance must be non-negative")
+    if tsafe_c is not None and not math.isfinite(float(tsafe_c)):
+        raise ValueError("tsafe_c must be finite when supplied")
     raw_anchor = float(anchor["variants"][name]["raw_proxy_tmax_c"])
     hotspot_anchor = float(anchor["tmax_c"])
     actual_deltas = [float(record["tmax_c"]) - hotspot_anchor for record in records]
@@ -182,7 +230,60 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
         actual_values[index], records[index]["row"], records[index]["column"]
     ))
     anchor_frequency = anchor["variants"][name]["anchored_frequency"]
-    return {
+    actual_states = [
+        record.get("hotspot_frequency", {}).get("state") for record in records
+    ]
+    proxy_states = [
+        record["variants"][name].get("anchored_frequency", {}).get("state")
+        for record in records
+    ]
+    raw_proxy_states = [
+        record["variants"][name].get("raw_frequency", {}).get("state")
+        for record in records
+    ]
+    state_pairs = [
+        (actual, proxy) for actual, proxy in zip(actual_states, proxy_states)
+        if isinstance(actual, str) and isinstance(proxy, str)
+    ]
+    raw_state_pairs = [
+        (actual, proxy) for actual, proxy in zip(actual_states, raw_proxy_states)
+        if isinstance(actual, str) and isinstance(proxy, str)
+    ]
+    raw_anchor_state = anchor["variants"][name].get("raw_frequency", {}).get("state")
+
+    def count_states(states: list[object]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for state in states:
+            if isinstance(state, str):
+                counts[state] = counts.get(state, 0) + 1
+        return counts
+
+    def frequency_values(entries: list[dict], field: str) -> list[float]:
+        values = []
+        for entry in entries:
+            frequency = entry.get(field, {})
+            value = frequency.get("sustainable_frequency_ghz") \
+                if isinstance(frequency, dict) else None
+            if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(float(value))):
+                values.append(float(value))
+        return values
+
+    hotspot_frequencies = frequency_values(records, "hotspot_frequency")
+    anchored_frequencies = frequency_values(
+        [record["variants"][name] for record in records], "anchored_frequency"
+    )
+    raw_frequencies = frequency_values(
+        [record["variants"][name] for record in records], "raw_frequency"
+    )
+
+    def frequency_range(values: list[float]) -> list[float] | None:
+        return [min(values), max(values)] if values else None
+
+    def frequency_varies(values: list[float]) -> bool:
+        return len(values) > 1 and max(values) - min(values) > 1.0e-12
+
+    result = {
         "candidate_count": len(records),
         "hotspot_delta_range_c": [min(actual_deltas), max(actual_deltas)],
         "proxy_delta_range_c": [min(proxy_deltas), max(proxy_deltas)],
@@ -207,10 +308,61 @@ def summarize_variant(name: str, records: list[dict], anchor: dict,
             "tmax_c": actual_values[hotspot_best],
             "raw_proxy_tmax_c": raw_values[hotspot_best],
         },
+        "hotspot_frequency_states": count_states(actual_states),
+        "anchored_proxy_frequency_states": count_states(proxy_states),
+        "raw_proxy_frequency_states": count_states(raw_proxy_states),
+        "hotspot_sustainable_frequency_range_ghz": frequency_range(hotspot_frequencies),
+        "anchored_proxy_sustainable_frequency_range_ghz": frequency_range(
+            anchored_frequencies
+        ),
+        "raw_proxy_sustainable_frequency_range_ghz": frequency_range(raw_frequencies),
+        "hotspot_frequency_varies": frequency_varies(hotspot_frequencies),
+        "anchored_proxy_frequency_varies": frequency_varies(anchored_frequencies),
+        "raw_proxy_frequency_varies": frequency_varies(raw_frequencies),
+        "frequency_state_comparable_count": len(state_pairs),
+        "frequency_state_agreement_count": sum(
+            actual == proxy for actual, proxy in state_pairs
+        ),
+        "frequency_state_agreement_rate": (
+            sum(actual == proxy for actual, proxy in state_pairs) / len(state_pairs)
+            if state_pairs else None
+        ),
+        "raw_frequency_state_comparable_count": len(raw_state_pairs),
+        "raw_frequency_state_agreement_count": sum(
+            actual == proxy for actual, proxy in raw_state_pairs
+        ),
+        "raw_frequency_state_agreement_rate": (
+            sum(actual == proxy for actual, proxy in raw_state_pairs)
+            / len(raw_state_pairs) if raw_state_pairs else None
+        ),
+        "raw_thermal_frequency_term_active": (
+            (isinstance(raw_anchor_state, str)
+             and raw_anchor_state != "thermal_headroom")
+            or any(state != "thermal_headroom" for state in raw_proxy_states
+                   if isinstance(state, str))
+        ),
         "thermal_frequency_term_active": (
             anchor_frequency["state"] != "thermal_headroom"
+            or any(state != "thermal_headroom" for state in actual_states if isinstance(state, str))
+            or any(state != "thermal_headroom" for state in proxy_states if isinstance(state, str))
         ),
     }
+    if tsafe_c is not None:
+        hottest = max(actual_values)
+        coolest = min(actual_values)
+        # A spatial surrogate cannot create a frequency gain if the complete
+        # sampled HotSpot envelope lies below the DTM threshold.  Reporting
+        # this margin distinguishes a genuinely inactive physical term from a
+        # ranking or parameter failure in Equation (14).
+        result["hotspot_frequency_observability"] = {
+            "safe_temperature_c": float(tsafe_c),
+            "hotspot_tmax_range_c": [coolest, hottest],
+            "hottest_headroom_to_safe_c": float(tsafe_c) - hottest,
+            "sampled_positions_cross_safe_threshold": (
+                coolest <= float(tsafe_c) < hottest
+            ),
+        }
+    return result
 
 
 def _sample_from_layout(model_path: Path, label: str, layout: dict,
@@ -223,10 +375,10 @@ def _sample_from_layout(model_path: Path, label: str, layout: dict,
     }
 
 
-def run_probe(model_path: Path, config_path: Path, output_dir: Path,
-              variants: list[ProxyVariant], grid_points: int = 3,
-              workers: int = 1, hotspot: Path = DEFAULT_HOTSPOT,
-              sign_tolerance_c: float = 0.02) -> dict:
+def _run_probe_unlocked(model_path: Path, config_path: Path, output_dir: Path,
+                        variants: list[ProxyVariant], grid_points: int = 3,
+                        workers: int = 1, hotspot: Path = DEFAULT_HOTSPOT,
+                        sign_tolerance_c: float = 0.02, resume: bool = False) -> dict:
     """Run one shared HotSpot grid and evaluate every requested proxy variant."""
     if grid_points < 2:
         raise ValueError("grid_points must be at least 2")
@@ -239,12 +391,9 @@ def run_probe(model_path: Path, config_path: Path, output_dir: Path,
     names = [variant.name for variant in variants]
     if len(set(names)) != len(names):
         raise ValueError("proxy variant names must be unique")
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise ValueError(f"output directory must be new or empty: {output_dir}")
-
     config = read_json(config_path)
     model = read_json(model_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_directory(output_dir, resume)
     utilization = float(config["physical"]["utilization"])
     baseline = baseline_layout(model, utilization)
     baseline_l2 = next(module for module in baseline["modules"] if module["kind"] == "l2")
@@ -265,6 +414,7 @@ def run_probe(model_path: Path, config_path: Path, output_dir: Path,
         raw = proxy_for_layout(anchor_layout, config, variant)
         anchor["variants"][variant.name] = {
             "raw_proxy_tmax_c": raw,
+            "raw_frequency": _frequency(raw, model, config),
             "anchored_proxy_tmax_c": float(anchor_hotspot["tmax_c"]),
             "anchored_frequency": _frequency(float(anchor_hotspot["tmax_c"]), model, config),
         }
@@ -312,6 +462,7 @@ def run_probe(model_path: Path, config_path: Path, output_dir: Path,
             anchored = anchor["tmax_c"] + delta
             record["variants"][variant.name] = {
                 "raw_proxy_tmax_c": raw,
+                "raw_frequency": _frequency(raw, model, config),
                 "proxy_delta_from_fixed_bin_c": delta,
                 "anchored_proxy_tmax_c": anchored,
                 "anchored_frequency": _frequency(anchored, model, config),
@@ -327,7 +478,7 @@ def run_probe(model_path: Path, config_path: Path, output_dir: Path,
         ),
         "model": str(model_path.resolve()), "config": str(config_path.resolve()),
         "hotspot": str(hotspot.resolve()), "grid_points_per_axis": grid_points,
-        "allowed_l2_tiers": [1], "workers": workers,
+        "allowed_l2_tiers": [1], "workers": workers, "resume_requested": resume,
         "variants": [
             {"name": variant.name, "proxy_spatial_model": variant.spatial_model,
              "lc_die_side_ratio": variant.lc_die_side_ratio}
@@ -336,7 +487,8 @@ def run_probe(model_path: Path, config_path: Path, output_dir: Path,
         "anchor": anchor, "records": records,
         "evaluations": {
             variant.name: summarize_variant(
-                variant.name, records, anchor, sign_tolerance_c
+                variant.name, records, anchor, sign_tolerance_c,
+                float(config["frequency"]["tsafe_c"]),
             ) for variant in variants
         },
         "interpretation": {
@@ -355,6 +507,18 @@ def run_probe(model_path: Path, config_path: Path, output_dir: Path,
     return report
 
 
+def run_probe(model_path: Path, config_path: Path, output_dir: Path,
+              variants: list[ProxyVariant], grid_points: int = 3,
+              workers: int = 1, hotspot: Path = DEFAULT_HOTSPOT,
+              sign_tolerance_c: float = 0.02, resume: bool = False) -> dict:
+    """Run one diagnostic while holding exclusive ownership of its output tree."""
+    with exclusive_output_directory(output_dir):
+        return _run_probe_unlocked(
+            model_path, config_path, output_dir, variants, grid_points, workers,
+            hotspot, sign_tolerance_c, resume,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--modules", type=Path, required=True)
@@ -366,11 +530,15 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--hotspot", type=Path, default=DEFAULT_HOTSPOT)
     parser.add_argument("--sign-tolerance-c", type=float, default=0.02)
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="reuse matching completed HotSpot probes in a non-empty output directory",
+    )
     args = parser.parse_args()
     report = run_probe(
         args.modules.resolve(), args.config.resolve(), args.output_dir.resolve(),
         args.variant, args.grid_points, args.workers, args.hotspot.resolve(),
-        args.sign_tolerance_c,
+        args.sign_tolerance_c, args.resume,
     )
     for name, values in report["evaluations"].items():
         print(

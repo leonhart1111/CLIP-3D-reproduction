@@ -30,27 +30,73 @@ def run_manifest(manifest_path: Path, output: Path) -> dict:
     fsus_safety_solve_count = sum(
         item["result"]["solution_validation"] is not None for item in results
     )
+    two_point_results = [
+        item["result"].get("two_point_affine_frequency") or {}
+        for item in results
+    ]
+    two_point_validations = [
+        value.get("solution_validation")
+        if isinstance(value.get("solution_validation"), dict) else None
+        for value in two_point_results
+    ]
+    two_point_safety_solve_count = sum(
+        validation is not None and validation.get("not_required") is not True
+        for validation in two_point_validations
+    )
+    two_point_available_count = sum(
+        bool(value.get("available")) for value in two_point_results
+    )
+    two_point_accepted_count = sum(
+        bool(value.get("recommendation", {}).get("accepted"))
+        for value in two_point_results
+    )
     safe_errors = [
         item["result"]["solution_validation"]["safe_error_c"]
         for item in results
         if item["result"]["solution_validation"] is not None
         and item["result"]["solution_validation"]["safe_error_c"] is not None
     ]
+    safe_error_limits = {
+        float(item["result"]["frequency_settings"]["max_safe_error_c"])
+        for item in results
+    }
+    if len(safe_error_limits) != 1:
+        raise ValueError(
+            "all frequency anchors must use the same max_safe_error_c "
+            "acceptance threshold"
+        )
     summary = {
         "schema_version": 1, "manifest": str(manifest_path.resolve()),
         "case_count": len(results),
         "requested_frequency_hotspot_run_count": requested_frequency_hotspot_run_count,
         "fsus_safety_solve_count": fsus_safety_solve_count,
+        "two_point_safety_solve_count": two_point_safety_solve_count,
         "hotspot_run_count": (
             requested_frequency_hotspot_run_count + fsus_safety_solve_count
+            + two_point_safety_solve_count
         ),
         "max_abs_uniform_gamma_comparison_error_c": max(
             item["result"]["max_abs_uniform_gamma_comparison_error_c"] for item in results
         ),
+        "safe_error_limit_c": safe_error_limits.pop(),
         "max_safe_error_c": max(safe_errors, default=0.0),
         "recommendation": {
             "accepted": all(item["result"]["recommendation"]["accepted"]
                             for item in results),
+        },
+        "two_point_fallback_recommendation": {
+            "available_case_count": two_point_available_count,
+            "accepted_case_count": two_point_accepted_count,
+            # A scalar-gamma rejection is not a global rejection if and only
+            # if that case's explicitly reported Eq.(9) fallback passed its
+            # own independent HotSpot safety validation.  Keep this separate
+            # from ``recommendation`` so reports never relabel the scalar
+            # Equation-(13) shortcut as accepted.
+            "accepted": all(
+                item["result"]["recommendation"]["accepted"]
+                or bool(value.get("recommendation", {}).get("accepted"))
+                for item, value in zip(results, two_point_results)
+            ),
         },
         "cases": results,
     }
