@@ -33,7 +33,7 @@ CLIP-3D 的 Equation (14) 不是 HotSpot 的替代品。它只需为 L2 给出�
 | --- | --- | --- |
 | HotSpot 输入合同在标定与预测间漂移 | 对同一 `modules.json` 比对 grid、module/grid-cell 输入、ptrace 精度、stack 和 `R_conv`；只复用合同完全匹配的探针 | 已定位并修复 `run_one()` 漏传三项 materialization 选项的问题；并证实旧 `stream/16/1024` 的 32×32/grid-cell、`local_resistance_scale=8.72` 结果为 97.597166 C，而同布局的未缩放 64×64/module 合同为 81.776555 C。两者都不能与同一个绝对代理温度混用；后续诊断统一使用未缩放 module-input 合同。 |
 | Eq.(14) 的绝对偏置让 Equation (13) 进入错误门限，或 module-level \(\gamma\) 使 uniform-\(\gamma\) 近似失效 | 同一 fixed-bin 的 HotSpot 温度只作为候选间共同偏置，比较 raw 与 anchor 后的频率状态；另选真实高功耗 FFT 锚点，并以分离 dynamic/leakage ptrace 在 1.0 GHz 和闭式 \(f_{sus}\) 重跑 HotSpot | FFT fixed-bin 已证实闭式热限频链路可进入 1.15 GHz；低功耗 stencil 在真实 HotSpot 下全部 2 GHz 是不可观测，而非频率公式失败。FFT 的 1.0 GHz 分离功耗 HotSpot 为 90.603891 C，而 Eq.(11) 的 global-\(\gamma\) 预测为 90.919710 C，误差 −0.315819 C，远超 0.02 C，故 global-\(\gamma\) 被拒绝。Eq.(9) two-point 解为 1.159790386 GHz；其独立、逐 cell 分离功耗 HotSpot 复核为 95.000000 C（`layer_1_g1622`），安全误差 0 C，满足 0.02 C 严格门限。 |
-| L2 有限矩形被质心化，或把核长度错误地随 L2 尺寸改变 | 固定共享参数与同一 HotSpot 网格，比较 center 与 area-quadrature；保持 `L_c=die/2` 的几何消融与冻结拟合候选分开 | 四个架构留出点均支持面积积分的冻结候选；不可把 L2 长宽代入 `L_c`：论文把 `L_c` 设为 die half-width，L2 尺寸仅应出现在面积积分。第五点仅作为拟合集内回归，仍在运行。 |
+| L2 有限矩形被质心化，或把核长度错误地随 L2 尺寸改变 | 固定共享参数与同一 HotSpot 网格，比较 center 与 area-quadrature；保持 `L_c=die/2` 的几何消融与冻结拟合候选分开 | 四个架构留出点和一个拟合集内回归点均支持面积积分的冻结候选；不可把 L2 长宽代入 `L_c`：论文把 `L_c` 设为 die half-width，L2 尺寸仅应出现在面积积分。 |
 | HotSpot peak 的 cell/边界切换使极小温差不可靠 | 以 `|ΔT|>=0.02 C` 才计 sign；记录 peak unit；仅对完整留出证据显示真实选择差异的接近选点以更高 grid 重跑 | 四个留出报告的 36 个位置确实出现 12 个不同 peak grid cell，故当前不把亚阈值的反向符号计为代理失败；也不把没有可复现报告的 `grid-field` 扩展纳入修正。高分辨率复核是条件性验证，而非既有结论。 |
 
 ## 关于 Lc 与热绑定
@@ -111,7 +111,7 @@ dynamic/leakage 热图，逐 cell 重建 Equation (9) 的
 4. 对接近的选点以更高 HotSpot 网格复核；小于数值/网格不确定度的温差应记为
    tie，而非代理失败或性能提升。
 
-## 当前证据（2026-08-20，四个架构留出点已完成）
+## 当前证据（2026-08-21，四个架构留出点和一个拟合集内回归点已完成）
 
 四个架构留出点已在各自 3x3 个合法 top-tier 位置上完成。下表为冻结的
 `fitted-area` 候选；`sign` 仅在相对 fixed-bin 温差绝对值不少于 0.02 C 时计入，
@@ -130,6 +130,20 @@ regret 都是 0。四个 3x3 合法位置范围也均未跨越 95 C；距门限�
 HotSpot 中物理上不可观测，不能以“代理未使频率变化”作为参数或梯度失败的证据。
 系列汇总将这一 `hottest_headroom_to_safe_c` 和是否跨门限显式写入，以免今后把
 headroom 情况误报为频率模型失败。
+
+第五个差点 `stencil / 16kB / 2048kB` 位于 reduced identification 的拟合集内，
+因此只作为实现回归，不并入上面的四点泛化统计。它有 8 个合法位置，全部完成：
+
+| 拟合集内变体 | Spearman | sign | selection regret |
+| --- | ---: | ---: | ---: |
+| fitted area-quadrature, `L_c/die=0.0586007` | 0.905 | 6/6 | 0.005566 C |
+| fitted center, `L_c/die=0.0586007` | -0.048 | 2/6 | 0.348960 C |
+| paper center, `L_c/die=0.5` | 0.119 | 2/6 | 0.348960 C |
+| paper area-quadrature, `L_c/die=0.5` | 0.571 | 3/6 | 0.333699 C |
+
+若为了观察整体运行稳定性而把该 in-fit 点也列入五点系列，必须保留其标签；此时
+`fitted-area` 为 28/28 个可比较方向正确、平均 Spearman 0.968、平均 selection
+regret 0.001113 C。该汇总不能改写为“五个泛化点”。
 
 首个 `stencil / 128kB / 512kB` 点还完成了几何消融。normal（`R_conv=1.042`）和
 stressed（`R_conv=5`）合同给出相同选择/方向结论；下表列 stressed 的结果。
@@ -152,6 +166,26 @@ stressed（`R_conv=5`）合同给出相同选择/方向结论；下表列 stress
 分离 dynamic/leakage HotSpot 的严格验证，最终频率应使用已验证的 Eq.(9) two-point
 值 1.159790386 GHz；五个低功耗差点继续只评价空间梯度。
 
+FFT 高功耗锚点也完成了同合同的 3x3 空间诊断，所有位置的真实 HotSpot 温度均处于
+热限频区。有限矩形积分仍是四个冻结变体中唯一同时取得完整方向一致、完整排序和
+零选点损失的变体：
+
+| FFT 空间变体 | Spearman | sign | selection regret |
+| --- | ---: | ---: | ---: |
+| fitted area-quadrature, `L_c/die=0.0586007` | 1.000 | 6/6 | 0.000000 C |
+| fitted center, `L_c/die=0.0586007` | 0.550 | 6/6 | 0.019773 C |
+| paper center, `L_c/die=0.5` | 0.150 | 3/6 | 0.117708 C |
+| paper area-quadrature, `L_c/die=0.5` | 0.283 | 3/6 | 0.058492 C |
+
+这里必须区分“位于热限频分支”和“跨越 95 C”：FFT 的 9 个位置都高于 95 C，
+所以没有跨阈值；按 Eq.(13) global-\(\gamma\) 诊断得到的频率范围是
+1.145282--1.150062 GHz，说明其温度梯度可进入频率目标。由于 global-\(\gamma\) 已被
+严格验证拒绝，该范围不能称为各位置的真实可持续频率，也不能直接换算成已验证的
+BIPS 增益。下一阶段需对 fixed-bin、代理选点和 HotSpot 最冷点分别建立 Eq.(9)
+two-point 热图并独立复核，才能判断真实频率方向和 selection regret。反之，五个
+较差点的全部位置都低于 95 C，因而真实频率固定为 2 GHz；在当前功耗/冷却合同下
+没有可供布局优化利用的频率梯度。
+
 ### 拟合/留出边界
 
 上述共享参数来自 `alpha_lc_unscaled_identification_reduced.json` 的 2026-08-17
@@ -169,5 +203,6 @@ reduced identification：训练设计只包含 `L1D={16,128}kB`、`L2={128,2048}
 它拒绝混用不同 config/HotSpot/grid/变体合同，使用可比较 sign 的总计数而非平均每点比例，
 且不触发重拟合或新的 HotSpot 求解。
 
-该文档只定义诊断和决策规则；在五点完成前，不将任何拟合的 `alpha`、`L_c` 或
-面积积分变体标为论文等价或共享已验收参数。
+该文档只定义诊断和决策规则。现有四个架构留出点、一个拟合集内回归点和一个高功耗
+FFT 锚点支持将冻结的 fitted-area 候选用于下一阶段验证；仍不将拟合的 `alpha`、
+`L_c` 或面积积分变体标为论文等价或共享已验收参数。
