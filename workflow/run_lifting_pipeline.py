@@ -250,6 +250,17 @@ def validate_config(config: dict, layout_method: str) -> None:
             "methods because their candidate selection uses a different objective"
         )
     if config.get("formal_validation", {}).get("strict_p1") is True:
+        # Paper Section III-B rasterizes every active tier onto a uniform
+        # G=32 power grid before invoking HotSpot.  Module-input and/or a
+        # different grid are useful engineering diagnostics, but constitute a
+        # different thermal experiment and must not silently enter strict P1.
+        physical = config["physical"]
+        if int(physical.get("grid_size", 32)) != 32:
+            raise ValueError("strict P1 requires physical.grid_size == 32")
+        if hotspot_materialization_options(physical)["input_granularity"] != "grid-cell":
+            raise ValueError(
+                "strict P1 requires physical.input_granularity == grid-cell"
+            )
         if list(allowed_tiers) != [1]:
             raise ValueError("strict P1 requires layout_optimizer.allowed_l2_tiers == [1]")
         if validation_policy != "paper-single":
@@ -625,13 +636,19 @@ def run_pipeline(r1_dir: Path, output_dir: Path, config_path: Path,
                  rerun_r2: bool = False,
                  reuse_r2_dir: Path | None = None,
                  wire_objective_override: str | None = None,
-                 proxy_spatial_model_override: str | None = None) -> dict:
+                 proxy_spatial_model_override: str | None = None,
+                 hotspot_input_granularity_override: str | None = None) -> dict:
     validate_r1(r1_dir)
     config = read_json(config_path)
     if wire_objective_override is not None:
         config["layout_optimizer"]["wire_objective"] = wire_objective_override
     if proxy_spatial_model_override is not None:
         config["layout_optimizer"]["proxy_spatial_model"] = proxy_spatial_model_override
+    if hotspot_input_granularity_override is not None:
+        # Keep the choice in the copied run config and in every generated
+        # manifest.  ``validate_config`` below rejects any unsupported value
+        # and prevents a strict-P1 paper run from selecting module input.
+        config["physical"]["input_granularity"] = hotspot_input_granularity_override
     validate_config(config, layout_method)
     if execute_r2 and reuse_r2_dir is not None:
         raise ValueError("choose either execute_r2 or reuse_r2_dir, not both")
@@ -924,6 +941,11 @@ def main() -> None:
         help="override the thermal proxy geometry without editing the source config",
     )
     parser.add_argument(
+        "--hotspot-input-granularity", choices=("grid-cell", "module"),
+        help=("choose pre-rasterized grid-cell power or direct module-rectangle "
+              "power for this steady run; grid-cell is the paper-compatible mode"),
+    )
+    parser.add_argument(
         "--transient", type=boolean_text, default=False, metavar="{true,false}",
         help=("run the separate time-windowed McPAT/HotSpot branch after the "
               "unchanged steady pipeline; default: false"),
@@ -978,6 +1000,7 @@ def main() -> None:
             ),
             wire_objective_override=args.wire_objective,
             proxy_spatial_model_override=args.proxy_spatial_model,
+            hotspot_input_granularity_override=args.hotspot_input_granularity,
         )
     else:
         if args.reuse_r2_dir is not None:
@@ -985,7 +1008,8 @@ def main() -> None:
                 "transient-rom derives R2 from its selected layout; "
                 "--reuse-r2-dir is not supported"
             )
-        if args.wire_objective is not None or args.proxy_spatial_model is not None:
+        if (args.wire_objective is not None or args.proxy_spatial_model is not None
+                or args.hotspot_input_granularity is not None):
             parser.error(
                 "transient-rom scientific identity must come from --config; "
                 "do not use steady optimizer overrides"
@@ -1008,6 +1032,7 @@ def main() -> None:
                 reuse_r2_dir=None,
                 wire_objective_override=None,
                 proxy_spatial_model_override=None,
+                hotspot_input_granularity_override=None,
             )
         from workflow.transient.rom.run_pipeline import run_transient_rom_pipeline
 

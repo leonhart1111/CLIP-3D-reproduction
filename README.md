@@ -76,6 +76,24 @@ python3 -m workflow.run_lifting_pipeline \
 
 完整方法说明见 [docs/clip3d_pipeline_zh.md](docs/clip3d_pipeline_zh.md)，严格正式执行顺序见 [docs/formal_reproduction_zh.md](docs/formal_reproduction_zh.md)，可选10 ms瞬态热仿真见 [docs/transient_thermal_zh.md](docs/transient_thermal_zh.md)。热代理和线延迟参数的独立验证方法见 [docs/surrogate_parameter_validation_zh.md](docs/surrogate_parameter_validation_zh.md)。
 
+### HotSpot 功耗输入粒度
+
+稳态主流程可显式选择 HotSpot 的功耗输入方式：
+
+```bash
+# 论文兼容默认：先按面积重叠栅格化为每层 32×32 功耗格
+python3 -m workflow.run_lifting_pipeline ... \
+  --hotspot-input-granularity grid-cell
+
+# 工程诊断：保留真实模块矩形，交由 HotSpot 映射到其内部热网格
+python3 -m workflow.run_lifting_pipeline ... \
+  --hotspot-input-granularity module
+```
+
+两种方式的结果不能混合。严格 P1 配置固定为 `grid_size=32` 与
+`input_granularity=grid-cell`；`module` 是非论文严格的工程选项，必须与它自己的
+参数辨识、HotSpot 合同和验收结果一起报告。
+
 ## 热代理梯度诊断（non-formal）
 
 `workflow.thermal.diagnose_proxy_gradient` 是热代理的主交互入口。它固定一个

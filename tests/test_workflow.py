@@ -3172,6 +3172,27 @@ class FormalGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "strict P1 forbids"):
             validate_config(config, "clip3d")
 
+    def test_strict_p1_requires_paper_grid_cell_hotspot_contract(self):
+        """Engineering module input must not be mislabelled as paper P1."""
+        config = {
+            "schema_version": 1,
+            "physical": {
+                "grid_size": 64, "input_granularity": "module",
+                "r_convec_k_per_w": 5.0,
+            },
+            "layout_optimizer": {
+                "r_convec_k_per_w": 5.0,
+                "allowed_l2_tiers": [1],
+                "validation_policy": "paper-single", "beta": 0.0,
+            },
+            "formal_validation": {"strict_p1": True, "accepted": False},
+        }
+        with self.assertRaisesRegex(ValueError, "physical.grid_size == 32"):
+            validate_config(config, "clip3d")
+        config["physical"]["grid_size"] = 32
+        with self.assertRaisesRegex(ValueError, "input_granularity == grid-cell"):
+            validate_config(config, "clip3d")
+
     def test_discrete_partition_config_requires_valid_grid_and_baseline(self):
         config = {
             "schema_version": 1,
@@ -3283,6 +3304,22 @@ class ThermalModeDispatchTests(unittest.TestCase):
         self.assertNotIn(module_name, sys.modules)
         self.assertEqual(legacy.call_args.kwargs["layout_method"], "fixed-bin")
         self.assertFalse(legacy.call_args.kwargs["execute_r2"])
+
+    def test_steady_mode_forwards_hotspot_input_granularity_override(self):
+        """The user-facing steady CLI must expose both thermal input modes."""
+        with patch(
+            "workflow.run_lifting_pipeline.run_pipeline",
+            return_value=self.steady_summary(),
+        ) as steady:
+            self.invoke_cli(
+                "--thermal-mode", "steady",
+                "--hotspot-input-granularity", "module",
+            )
+
+        self.assertEqual(
+            steady.call_args.kwargs["hotspot_input_granularity_override"],
+            "module",
+        )
 
     def test_rom_mode_runs_fixed_preflight_then_rom_with_r2_forwarded(self):
         # Break caught: forwarding --run-r2 to the steady pilot either runs R2

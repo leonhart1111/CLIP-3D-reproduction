@@ -21,6 +21,7 @@
   "physical": {
     "tiers": 2,
     "grid_size": 32,
+    "input_granularity": "grid-cell",
     "utilization": 0.7,
     "thermal_stack": {
       "silicon_resistivity_mk_per_w": 0.01,

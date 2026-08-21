@@ -414,15 +414,27 @@ def main() -> None:
     parser.add_argument("--r-convec", type=float, default=3.5)
     parser.add_argument("--layout", type=Path)
     parser.add_argument("--local-resistance-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--input-granularity", choices=("grid-cell", "module"), default="grid-cell",
+        help=("use pre-rasterized grid cells (paper-compatible) or preserve "
+              "module rectangles for a separate engineering diagnostic"),
+    )
+    parser.add_argument("--compact-trace", action="store_true")
+    parser.add_argument("--ptrace-precision", type=int, default=17)
     args = parser.parse_args()
     if args.grid_size < 2:
         parser.error("--grid-size must be at least 2")
     if not 0 < args.utilization <= 1:
         parser.error("--utilization must be in (0, 1]")
+    if args.ptrace_precision <= 0:
+        parser.error("--ptrace-precision must be positive")
     result = materialize(args.modules.resolve(), args.output_dir.resolve(),
                          args.grid_size, args.utilization, args.ambient_c,
                          args.r_convec, args.layout.resolve() if args.layout else None,
-                         {"local_resistance_scale": args.local_resistance_scale})
+                         {"local_resistance_scale": args.local_resistance_scale},
+                         compact_trace=args.compact_trace,
+                         ptrace_precision=args.ptrace_precision,
+                         input_granularity=args.input_granularity)
     residual = max(abs(item[field]["residual"])
                    for item in result["power_conservation"]
                    for field in ("dynamic_power_w", "leakage_power_w", "total_power_w"))
