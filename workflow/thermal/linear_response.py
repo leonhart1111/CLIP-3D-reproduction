@@ -155,6 +155,27 @@ class LinearThermalResponse:
             raise ValueError("thermal sensitivity is non-finite")
         return result
 
+    def sensitivity_map(self, power_w: Iterable[float] | np.ndarray | None = None,
+                        tau: float = 1.0) -> dict[str, np.ndarray]:
+        """Return the full spatial sensitivity contract for one operating point.
+
+        ``temperature_gradient`` is ``d(T_soft)/dT`` for every active HotSpot
+        grid sample. ``response_k_per_w`` is ``dT/dP`` for every sample and
+        source, and ``source_gradient_k_per_w`` is their chain-rule product
+        ``d(T_soft)/dP``. Keeping all three arrays explicit prevents the
+        source-level scalar used for pruning from being mistaken for a spatial
+        sensitivity map.
+        """
+        power = self.baseline_power_w if power_w is None else _vector(power_w, "power_w")
+        temperatures = self.predict(power)
+        temperature_gradient = softmax(temperatures, tau)
+        source_gradient = temperature_gradient @ self.response_k_per_w
+        return {
+            "temperature_gradient": temperature_gradient,
+            "response_k_per_w": self.response_k_per_w.copy(),
+            "source_gradient_k_per_w": source_gradient,
+        }
+
     def score_power_action(self, power_w: Iterable[float] | np.ndarray,
                            tau: float = 1.0) -> dict[str, Any]:
         """Predict a candidate action relative to this response baseline."""

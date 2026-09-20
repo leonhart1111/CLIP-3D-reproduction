@@ -59,6 +59,19 @@ class LinearResponseTests(unittest.TestCase):
         weights /= weights.sum()
         np.testing.assert_allclose(response.sensitivity(tau=1.0), weights @ self.matrix)
 
+    def test_sensitivity_map_exposes_spatial_gradient_and_chain_rule(self):
+        response = LinearThermalResponse(
+            ("p0", "p1"), ("t0", "t1"), self.power, self.temperature,
+            self.matrix, self.intercept, {},
+        )
+        result = response.sensitivity_map(tau=1.0)
+        self.assertEqual(result["temperature_gradient"].shape, (2,))
+        self.assertEqual(result["response_k_per_w"].shape, (2, 2))
+        np.testing.assert_allclose(
+            result["source_gradient_k_per_w"], response.sensitivity(tau=1.0)
+        )
+        self.assertAlmostEqual(float(result["temperature_gradient"].sum()), 1.0)
+
     def test_save_and_load_preserve_hash_bound_response(self):
         response = LinearThermalResponse(
             ("p0", "p1"), ("t0", "t1"), self.power, self.temperature,

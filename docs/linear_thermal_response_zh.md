@@ -54,6 +54,11 @@ ML 后续只替换“快速 thermal predictor”，不会替换 architecture sim
 
 模块增加或减少的功耗按照与 CLIP 功耗栅格化相同的面积交叠权重分配到 32×32 grid，保证扰动总功耗严格等于 `delta_w`。
 
+`LinearThermalResponse.sensitivity_map()` 显式返回三部分：每个 HotSpot
+温度 cell 的 `dTsoft/dT` 权重、完整的 `dT/dP=H` 空间响应矩阵，以及链式相乘
+得到的 `dTsoft/dP`。因此这里的 sensitivity map 不是一个只按模块排列的
+标量列表；后续 ML predictor 也应保持这个接口语义。
+
 ## 3. 已实现代码
 
 | 文件 | 作用 |
