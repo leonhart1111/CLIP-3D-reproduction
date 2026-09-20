@@ -10,6 +10,7 @@ from workflow.thermal.linear_response import (
     parse_ptrace,
     soft_peak,
 )
+from workflow.thermal.build_linear_response import _module_source_map
 from workflow.thermal.linear_search import (
     evaluate_candidates,
     pareto_front,
@@ -74,6 +75,54 @@ class LinearResponseTests(unittest.TestCase):
             path.write_text("p0 p1\n1.0\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "different lengths"):
                 parse_ptrace(path)
+
+    def test_module_input_source_map_uses_trace_module_names(self):
+        """Module-input HotSpot cases must not be interpreted as grid cells."""
+        with tempfile.TemporaryDirectory() as directory:
+            case = Path(directory)
+            (case / "layout.json").write_text(
+                '{"modules": ['
+                '{"name": "pe0", "total_power_w": 2.5},'
+                '{"name": "sram0", "total_power_w": 0.0},'
+                '{"name": "pe1", "total_power_w": 1.25}'
+                '], "die_width_mm": 10.0}',
+                encoding="utf-8",
+            )
+            (case / "power_grid.json").write_text(
+                '{"grid_size": 32, "tiers": []}', encoding="utf-8"
+            )
+            (case / "hotspot_manifest.json").write_text(
+                '{"input_granularity": "module"}', encoding="utf-8"
+            )
+            (case / "power.ptrace").write_text(
+                "pe0 pe1\n2.5 1.25\n", encoding="utf-8"
+            )
+            names, power, mappings = _module_source_map(case)
+            self.assertEqual(names, ["pe0", "pe1"])
+            np.testing.assert_allclose(power, [2.5, 1.25])
+            self.assertEqual(mappings[0]["source_cells"],
+                             [{"index": 0, "weight": 1.0}])
+            self.assertEqual(mappings[1]["source_cells"],
+                             [{"index": 1, "weight": 1.0}])
+
+    def test_module_input_source_map_rejects_power_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case = Path(directory)
+            (case / "layout.json").write_text(
+                '{"modules": [{"name": "pe0", "total_power_w": 2.5}]}',
+                encoding="utf-8",
+            )
+            (case / "power_grid.json").write_text(
+                '{"grid_size": 32, "tiers": []}', encoding="utf-8"
+            )
+            (case / "hotspot_manifest.json").write_text(
+                '{"input_granularity": "module"}', encoding="utf-8"
+            )
+            (case / "power.ptrace").write_text(
+                "pe0\n2.4\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "power mismatch"):
+                _module_source_map(case)
 
 
 class LinearSearchTests(unittest.TestCase):

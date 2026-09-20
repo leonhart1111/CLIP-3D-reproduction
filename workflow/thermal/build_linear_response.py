@@ -97,6 +97,31 @@ def _module_source_map(case_dir: Path) -> tuple[list[str], np.ndarray, list[dict
     ]
     if not source_modules:
         raise ValueError("baseline layout contains no positive-power modules")
+    manifest = read_json(case_dir / "hotspot_manifest.json")
+    if manifest.get("input_granularity", "grid-cell") == "module":
+        source_names, source_power, mappings = [], [], []
+        for module in source_modules:
+            name = str(module["name"])
+            if name not in indexed:
+                raise ValueError(
+                    f"module-input power trace is missing module source {name}"
+                )
+            index, trace_power = indexed[name]
+            module_power = float(module["total_power_w"])
+            if not math.isclose(trace_power, module_power, rel_tol=1e-9,
+                                abs_tol=1e-9):
+                raise ValueError(
+                    f"module power mismatch for {name}: layout={module_power} "
+                    f"trace={trace_power}"
+                )
+            source_names.append(name)
+            source_power.append(module_power)
+            mappings.append({
+                "module": name,
+                "source_cells": [{"index": index, "weight": 1.0}],
+                "source_power_w": module_power,
+            })
+        return source_names, np.asarray(source_power, dtype=np.float64), mappings
     cell_by_geometry = {}
     for tier in grid["tiers"]:
         for cell in tier["cells"]:
