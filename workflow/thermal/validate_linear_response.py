@@ -30,13 +30,26 @@ from workflow.thermal.linear_response import LinearThermalResponse, parse_ptrace
 from workflow.thermal.run_hotspot import DEFAULT_HOTSPOT, run_hotspot
 
 
-def _candidate_document(path: Path) -> list[dict[str, Any]]:
+def _candidate_document(path: Path, selected_only: bool = True) -> list[dict[str, Any]]:
     document = read_json(path)
     candidates = document.get("candidates")
     if document.get("schema_version") != 1 or not isinstance(candidates, list):
         raise ValueError("candidate document must have schema_version=1 and candidates")
     if not candidates:
         raise ValueError("candidate document must contain at least one candidate")
+    selected_ids = document.get("selected_for_full_evaluation_ids")
+    if selected_only and selected_ids is not None:
+        if (not isinstance(selected_ids, list)
+                or not all(isinstance(identifier, str) for identifier in selected_ids)):
+            raise ValueError("selected_for_full_evaluation_ids must be a string list")
+        by_id = {candidate.get("id"): candidate for candidate in candidates}
+        missing = [identifier for identifier in selected_ids if identifier not in by_id]
+        if missing:
+            raise ValueError(
+                "search report selects candidates missing from candidates: "
+                + ", ".join(missing)
+            )
+        return [by_id[identifier] for identifier in selected_ids]
     return candidates
 
 
@@ -125,7 +138,8 @@ def _validate_one(response: LinearThermalResponse, candidate: dict[str, Any],
 def validate(response_manifest: Path, candidates_path: Path, output: Path,
              hotspot: Path = DEFAULT_HOTSPOT, workers: int = 1,
              max_candidates: int | None = None, force: bool = False,
-             mae_limit_c: float = 1.0, max_error_limit_c: float = 2.0) -> dict[str, Any]:
+             mae_limit_c: float = 1.0, max_error_limit_c: float = 2.0,
+             selected_only: bool = True) -> dict[str, Any]:
     response = LinearThermalResponse.load(response_manifest)
     baseline_raw = response.metadata.get("baseline_case")
     if not isinstance(baseline_raw, str):
@@ -134,7 +148,7 @@ def validate(response_manifest: Path, candidates_path: Path, output: Path,
     if not baseline_case.is_dir():
         raise FileNotFoundError(f"baseline case does not exist: {baseline_case}")
     names, baseline_values = parse_ptrace(baseline_case / "power.ptrace")
-    candidates = _candidate_document(candidates_path)
+    candidates = _candidate_document(candidates_path, selected_only=selected_only)
     if max_candidates is not None:
         if max_candidates <= 0:
             raise ValueError("max_candidates must be positive")
@@ -191,12 +205,16 @@ def main() -> None:
     parser.add_argument("--max-candidates", type=int)
     parser.add_argument("--mae-limit-c", type=float, default=1.0)
     parser.add_argument("--max-error-limit-c", type=float, default=2.0)
+    parser.add_argument(
+        "--all-candidates", action="store_true",
+        help="validate every candidate in a search report, including pruned ones",
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     report = validate(
         args.response.resolve(), args.candidates.resolve(), args.output.resolve(),
         args.hotspot.resolve(), args.workers, args.max_candidates, args.force,
-        args.mae_limit_c, args.max_error_limit_c,
+        args.mae_limit_c, args.max_error_limit_c, not args.all_candidates,
     )
     print(
         f"linear response validation: {report['passed_count']}/"

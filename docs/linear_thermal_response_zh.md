@@ -207,7 +207,10 @@ python3 -m workflow.thermal.validate_linear_response \
 ```
 
 `--candidates` 可以是原始 candidate document，也可以是
-`run_linear_search.py` 生成的报告；两者均使用同一个 `candidates` 数组。
+`run_linear_search.py` 生成的报告；两者均使用同一个 `candidates` 数组。对于
+search report，验证器默认只读取其中的
+`selected_for_full_evaluation_ids`；只有显式加 `--all-candidates` 才会把被剪枝
+的候选也作为诊断重跑。
 验证输出中的每个候选目录保留了实际 HotSpot 输入和输出，便于复核。该步骤
 仍不是新的 floorplan 结果：如果候选改变了模块面积、坐标、tier、封装或
 网格合同，必须先由上游 floorplanner 生成新的 case，并重新构建线性响应。

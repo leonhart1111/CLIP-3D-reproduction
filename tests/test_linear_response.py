@@ -11,7 +11,7 @@ from workflow.thermal.linear_response import (
     soft_peak,
 )
 from workflow.thermal.build_linear_response import _module_source_map
-from workflow.thermal.validate_linear_response import _candidate_trace
+from workflow.thermal.validate_linear_response import _candidate_document, _candidate_trace
 from workflow.thermal.linear_search import (
     evaluate_candidates,
     pareto_front,
@@ -143,6 +143,23 @@ class LinearResponseTests(unittest.TestCase):
             response, np.array([1.0, 2.0, 3.0]), np.array([3.0, 0.5])
         )
         np.testing.assert_allclose(actual, [1.25, 2.75, 2.5])
+
+    def test_validation_selects_only_full_evaluation_candidates_from_search_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "search.json"
+            path.write_text(
+                '{"schema_version": 1, '
+                '"selected_for_full_evaluation_ids": ["keep"], '
+                '"candidates": ['
+                '{"id": "pruned"}, {"id": "keep"}]}',
+                encoding="utf-8",
+            )
+            self.assertEqual([item["id"] for item in _candidate_document(path)],
+                             ["keep"])
+            self.assertEqual(
+                [item["id"] for item in _candidate_document(path, selected_only=False)],
+                ["pruned", "keep"],
+            )
 
 
 class LinearSearchTests(unittest.TestCase):
