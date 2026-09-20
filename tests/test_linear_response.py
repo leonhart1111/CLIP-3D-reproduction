@@ -11,6 +11,7 @@ from workflow.thermal.linear_response import (
     soft_peak,
 )
 from workflow.thermal.build_linear_response import _module_source_map
+from workflow.thermal.validate_linear_response import _candidate_trace
 from workflow.thermal.linear_search import (
     evaluate_candidates,
     pareto_front,
@@ -123,6 +124,25 @@ class LinearResponseTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "power mismatch"):
                 _module_source_map(case)
+
+    def test_candidate_trace_preserves_grid_mapping_and_total_delta(self):
+        response = LinearThermalResponse(
+            ("m0", "m1"), ("t0",), np.array([2.0, 1.0]),
+            np.array([30.0]), np.array([[1.0, 2.0]]), np.array([26.0]),
+            {"source_mappings": [
+                {"module": "m0", "source_cells": [
+                    {"index": 0, "weight": 0.25},
+                    {"index": 1, "weight": 0.75},
+                ]},
+                {"module": "m1", "source_cells": [
+                    {"index": 2, "weight": 1.0},
+                ]},
+            ]},
+        )
+        actual = _candidate_trace(
+            response, np.array([1.0, 2.0, 3.0]), np.array([3.0, 0.5])
+        )
+        np.testing.assert_allclose(actual, [1.25, 2.75, 2.5])
 
 
 class LinearSearchTests(unittest.TestCase):

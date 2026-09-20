@@ -183,6 +183,35 @@ python3 -m workflow.thermal.run_linear_search \
 - 真实 HotSpot sensitivity 实验结果；
 - ML predictor。
 
+## 7.1 保留候选的 HotSpot 验收
+
+`run_linear_search.py` 只负责快速预测和剪枝。对被选中的候选，必须调用
+`validate_linear_response.py`：它复制 baseline 的几何、封装、材料、边界和
+HotSpot 配置，只替换候选功耗 trace，然后重新运行完整 3-D HotSpot。程序会
+逐点比较预测温度向量和 HotSpot 的 `grid.steady.txt`，并报告：
+
+- 温度图 MAE 和最大绝对误差；
+- `Tmax` 误差；
+- 平滑峰值 `Tsoft` 误差；
+- 是否满足验收门限。
+
+例如对排序报告中的候选执行：
+
+```bash
+python3 -m workflow.thermal.validate_linear_response \
+  --response runs/thermal_sensitivity/linear_response/<case>/linear_response.json \
+  --candidates runs/thermal_sensitivity/search/<round>/linear_search.json \
+  --output runs/thermal_sensitivity/validation/<round> \
+  --hotspot /home/zyjiang/Agenticflow/CLIP/tools/src/hotspot/hotspot \
+  --workers 4
+```
+
+`--candidates` 可以是原始 candidate document，也可以是
+`run_linear_search.py` 生成的报告；两者均使用同一个 `candidates` 数组。
+验证输出中的每个候选目录保留了实际 HotSpot 输入和输出，便于复核。该步骤
+仍不是新的 floorplan 结果：如果候选改变了模块面积、坐标、tier、封装或
+网格合同，必须先由上游 floorplanner 生成新的 case，并重新构建线性响应。
+
 所以当前实现完成的是非 ML 搜索核心，而不是完整的 Gemmini Architecture DSE。
 
 ## 8. 后续与 ML 的接口
