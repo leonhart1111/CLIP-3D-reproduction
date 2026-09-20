@@ -80,7 +80,7 @@ def _candidate_trace(response: LinearThermalResponse,
 def _validate_one(response: LinearThermalResponse, candidate: dict[str, Any],
                   baseline_case: Path, baseline_values: np.ndarray,
                   names: list[str], output_dir: Path, hotspot: Path,
-                  force: bool) -> dict[str, Any]:
+                  response_hash: str, force: bool) -> dict[str, Any]:
     identifier = candidate.get("id")
     if not isinstance(identifier, str) or not identifier:
         raise ValueError("each candidate needs a non-empty id")
@@ -96,7 +96,7 @@ def _validate_one(response: LinearThermalResponse, candidate: dict[str, Any],
     signature = {
         "candidate_id": identifier,
         "power_w": power.tolist(),
-        "response_manifest": response.metadata.get("response_manifest"),
+        "response_manifest_sha256": response_hash,
     }
     if result_path.is_file() and not force:
         existing = read_json(result_path)
@@ -155,18 +155,19 @@ def validate(response_manifest: Path, candidates_path: Path, output: Path,
         candidates = candidates[:max_candidates]
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    response_hash = sha256_file(response_manifest)
     if workers < 1:
         raise ValueError("workers must be positive")
     jobs = [(candidate, output / "cases") for candidate in candidates]
     if workers == 1:
         records = [_validate_one(response, candidate, baseline_case, baseline_values,
-                                 names, case_root, hotspot, force)
+                                 names, case_root, hotspot, response_hash, force)
                    for candidate, case_root in jobs]
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(
                 _validate_one, response, candidate, baseline_case, baseline_values,
-                names, case_root, hotspot, force,
+                names, case_root, hotspot, response_hash, force,
             ) for candidate, case_root in jobs]
             records = [future.result() for future in futures]
     for record in records:
