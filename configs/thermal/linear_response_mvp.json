@@ -15,7 +15,7 @@
   },
   "response": {
     "source_mode": "module",
-    "delta_w": 0.1,
+    "delta_w": 0.005,
     "smooth_peak_tau_c": 1.0,
     "finite_difference": "central",
     "require_complete_source_basis": true

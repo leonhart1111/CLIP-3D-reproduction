@@ -227,7 +227,7 @@ def _run_probe(baseline_case: Path, output_dir: Path, source_index: int,
 
 
 def build_response(baseline_case: Path, output_dir: Path,
-                   delta_w: float = 0.1, hotspot: Path = DEFAULT_HOTSPOT,
+                   delta_w: float = 0.005, hotspot: Path = DEFAULT_HOTSPOT,
                    workers: int = 1, source_mode: str = "module",
                    force: bool = False, run_baseline: bool = False) -> LinearThermalResponse:
     baseline_case = baseline_case.resolve()
@@ -322,7 +322,10 @@ def main() -> None:
     parser.add_argument("--baseline-case", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--source-mode", choices=("module",), default="module")
-    parser.add_argument("--delta-w", type=float, default=0.1)
+    parser.add_argument(
+        "--delta-w", type=float, default=0.005,
+        help="central-difference power step in W (must not exceed any source power)",
+    )
     parser.add_argument("--hotspot", type=Path, default=DEFAULT_HOTSPOT)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--run-baseline", action="store_true")

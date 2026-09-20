@@ -101,7 +101,7 @@ python3 -m workflow.thermal.build_linear_response \
   --baseline-case <completed-hotspot-case> \
   --output-dir runs/thermal_sensitivity/linear_response/<case-name> \
   --source-mode module \
-  --delta-w 0.1 \
+  --delta-w 0.005 \
   --hotspot /home/zyjiang/Agenticflow/CLIP/tools/src/hotspot/hotspot \
   --workers 2
 ```
