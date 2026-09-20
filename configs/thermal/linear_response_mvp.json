@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "name": "logicfolding_linear_response_mvp",
+  "classification": {
+    "mode": "non-ML HotSpot-calibrated linear thermal response",
+    "formal": false,
+    "paper_equivalent": false
+  },
+  "thermal_contract": {
+    "active_tiers": 2,
+    "grid_size": 32,
+    "input_granularity": "grid-cell",
+    "thermal_limit_c": 95.0,
+    "contract_policy": "all HotSpot material, geometry, package, grid and boundary files must be hash-identical across finite-difference probes"
+  },
+  "response": {
+    "source_mode": "module",
+    "delta_w": 0.1,
+    "smooth_peak_tau_c": 1.0,
+    "finite_difference": "central",
+    "require_complete_source_basis": true
+  },
+  "search": {
+    "top_k_full_evaluation": 32,
+    "thermal_feasibility_first": true,
+    "pareto_objectives": {
+      "maximize": [
+        "performance"
+      ],
+      "minimize": [
+        "energy",
+        "area",
+        "communication",
+        "predicted_tsoft_c"
+      ]
+    }
+  },
+  "acceptance": {
+    "temperature_delta_mae_c_max": 1.0,
+    "candidate_spearman_min": 0.8,
+    "sign_agreement_min": 0.8,
+    "selection_regret_c_max": 0.5
+  },
+  "provenance": {
+    "thermal_truth": "HotSpot detailed-3D steady state",
+    "ml_used": false,
+    "final_candidate_requires_hotspot": true,
+    "notes": [
+      "The linear model ranks and prunes candidates but does not replace final HotSpot validation.",
+      "The module-source MVP estimates actions expressed in the same ordered module-power basis as the calibrated response.",
+      "Geometry or package-contract changes require rebuilding the response."
+    ]
+  }
+}
