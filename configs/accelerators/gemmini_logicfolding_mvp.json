@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "name": "gemmini_logicfolding_mvp",
+  "description": "Gemmini-like systolic-array testbench for the first thermal-sensitivity MVP",
+  "accelerator": {
+    "family": "gemmini-systolic-array",
+    "generator_repo": "https://github.com/ucb-bar/gemmini.git",
+    "chipyard_repo": "https://github.com/ucb-bar/chipyard.git",
+    "generator_revision": "TO_BE_PINNED_BEFORE_FORMAL_RESULTS",
+    "chipyard_revision": "TO_BE_PINNED_BEFORE_FORMAL_RESULTS",
+    "default_config": "GemminiRocketConfig",
+    "mesh": {
+      "rows": 16,
+      "cols": 16
+    },
+    "dataflow": "output-stationary",
+    "scratchpad_kb": 256,
+    "dma_bus_bytes": 16,
+    "clock_hz": 1000000000
+  },
+  "workloads": [
+    {
+      "id": "gemm_64",
+      "family": "gemm",
+      "status": "selected",
+      "shape": {
+        "m": 64,
+        "n": 64,
+        "k": 64
+      },
+      "source": {
+        "kind": "gemmini-rocc-tests-or-equivalent",
+        "entrypoint": "matmul",
+        "official_binary_name": "revision_dependent"
+      },
+      "build": {
+        "note": "Smoke test. Verify the produced binary and record its path; do not infer it from this logical entrypoint."
+      },
+      "required_outputs": [
+        "cycles",
+        "instructions",
+        "dynamic_power_w",
+        "leakage_power_w",
+        "area_mm2"
+      ],
+      "thermal_role": "small_compute_probe"
+    },
+    {
+      "id": "gemm_256",
+      "family": "gemm",
+      "status": "selected",
+      "shape": {
+        "m": 256,
+        "n": 256,
+        "k": 256
+      },
+      "source": {
+        "kind": "gemmini-rocc-tests-or-equivalent",
+        "entrypoint": "matmul",
+        "official_binary_name": "revision_dependent"
+      },
+      "build": {
+        "note": "Primary thermal-sensitivity workload. Use the same binary and input contract for every architecture candidate."
+      },
+      "required_outputs": [
+        "cycles",
+        "instructions",
+        "dynamic_power_w",
+        "leakage_power_w",
+        "area_mm2"
+      ],
+      "thermal_role": "primary_compute_probe"
+    },
+    {
+      "id": "conv2d_8x8",
+      "family": "conv2d",
+      "status": "optional",
+      "shape": {
+        "batch": 1,
+        "input_channels": 16,
+        "output_channels": 32,
+        "height": 8,
+        "width": 8,
+        "kernel": 3
+      },
+      "source": {
+        "kind": "gemmini-rocc-tests-or-equivalent",
+        "entrypoint": "conv",
+        "official_binary_name": "revision_dependent"
+      },
+      "build": {
+        "note": "Enable after the GEMM smoke test has produced verified counters."
+      },
+      "required_outputs": [
+        "cycles",
+        "instructions",
+        "dynamic_power_w",
+        "leakage_power_w",
+        "area_mm2"
+      ],
+      "thermal_role": "memory_and_compute_probe"
+    },
+    {
+      "id": "transformer_mlp_tiny",
+      "family": "transformer",
+      "status": "planned",
+      "shape": {
+        "batch": 1,
+        "sequence": 32,
+        "hidden": 128,
+        "intermediate": 512
+      },
+      "source": {
+        "kind": "custom-baremetal-gemm-chain",
+        "entrypoint": "qkv_attention_and_ffn",
+        "official_binary_name": "not_claimed"
+      },
+      "build": {
+        "note": "Gemmini does not provide a universal transformer binary. Implement this as a sequence of tiled GEMMs and validate each counter before enabling it."
+      },
+      "required_outputs": [
+        "cycles",
+        "instructions",
+        "dynamic_power_w",
+        "leakage_power_w",
+        "area_mm2"
+      ],
+      "thermal_role": "future_transformer_probe"
+    }
+  ],
+  "suites": {
+    "smoke": {
+      "purpose": "Check that the selected Gemmini configuration can execute one small systolic GEMM.",
+      "workloads": [
+        "gemm_64"
+      ]
+    },
+    "sensitivity_mvp": {
+      "purpose": "Generate repeatable compute-heavy and optional convolution activity for the first HotSpot sensitivity labels.",
+      "workloads": [
+        "gemm_64",
+        "gemm_256",
+        "conv2d_8x8"
+      ]
+    },
+    "transformer_planned": {
+      "purpose": "Reserved for the custom tiled-GEMM transformer adapter.",
+      "workloads": [
+        "transformer_mlp_tiny"
+      ]
+    }
+  },
+  "selection_policy": {
+    "active_tiers": 2,
+    "thermal_grid": "32x32_per_active_tier",
+    "same_inputs_across_candidates": true,
+    "same_mesh_across_smoke_and_sensitivity": true,
+    "do_not_use_unbuilt_logical_entrypoints": true,
+    "transformer_requires_custom_adapter": true
+  },
+  "provenance": {
+    "status": "non-formal testbench selection; upstream revisions must be pinned before results are reported",
+    "gemmini_is_generator": true,
+    "chipyard_is_integration_and_simulation_host": true,
+    "thermal_labels_are_generated_by_CLIP_HotSpot": true
+  }
+}
